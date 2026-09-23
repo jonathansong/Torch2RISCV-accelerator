@@ -1,232 +1,139 @@
-# PicoRV32-on-PYNQ-Z2
+# Torch2RISCV-accelerator
 
-This repo is to achieve the picorv32 core on the xilinx PYNQ-Z2 board
+An end-to-end compiler stack that lowers PyTorch models to a custom RISC-V
+instruction set, running on a heterogeneous **ARM (host) + PicoRV32 (control
+core) + systolic-array accelerator** built on a PYNQ-Z1 board.
 
-<!-- PROJECT SHIELDS -->
-
-[![Contributors][contributors-shield]][contributors-url]
-[![Forks][forks-shield]][forks-url]
-[![Stargazers][stars-shield]][stars-url]
-[![Issues][issues-shield]][issues-url]
-[![MIT License][license-shield]][license-url]
-
-<!-- PROJECT LOGO -->
-<br />
-
-<p align="center">
-  <a href="https://github.com/JacoboJin/RISCV-on-PYNQ-Z2/">
-    <img src="ReadMe-deps/logo.png" alt="Logo" width="160" height="160">
-  </a>
-
-  <h3 align="center">PicoRV32 on Xilinx PYNQ-Z2</h3>
-  <p align="center">
-    A "perfect" readme document for you to start the project!
-    <br />
-    <a href="https://github.com/JacoboJin/RISCV-on-PYNQ-Z2"><strong>Explore the documentation of this project. »</strong></a>
-    <br />
-    <br />
-    <a href="https://github.com/JacoboJin/RISCV-on-PYNQ-Z2">View Demo</a>
-    ·
-    <a href="https://github.com/JacoboJin/RISCV-on-PYNQ-Z2/issues">Report Bug</a>
-    ·
-    <a href="https://github.com/JacoboJin/RISCV-on-PYNQ-Z2/issues">Issue</a>
-  </p>
-
-</p>
-
-<!-- PROJECT BODY -->
-## Contents
-
-- [PicoRV32-on-PYNQ-Z2](#picorv32-on-pynq-z2)
-  - [Contents](#contents)
-    - [Guide](#guide)
-      - [Requirements](#requirements)
-      - [Steps](#steps)
-    - [File Directory](#file-directory)
-    - [Project Summary](#project-summary)
-    - [Contributors](#contributors)
-    - [Version Control](#version-control)
-    - [Author](#author)
-    - [License](#license)
-    - [Acknowledgements](#acknowledgements)
-
-### Guide
-
-Please replace all ```JacoboJin/RISCV-on-PYNQ-Z2``` with ```your_github_name/your_repository```
-
-#### Requirements
-
-- Vivado 2021.1 on Windows/Linux
-- Serial/SSH softwate [(WindTerm)](https://github.com/kingToolbox/WindTerm)
-- PYNQ-Z2 Board (For imagefile, We use PYNQ Image 3.0)
-- Git [(Windows & Linux Tutorial)](https://www.atlassian.com/git/tutorials/install-git)
-
-#### Steps
-
-1. **Clone the repo**
-
-    ```sh
-    git clone https://github.com/JacoboJin/RISCV-on-PYNQ-Z2.git
-    ```
-
-2. **Create A BitStream**
-
-    - **Firstly**, you need to create the vivado project for packaging the pico32 core as picorv32_tut ip. (You can follow those operations outlined in the `notebooks/tutorial/2-Creating-A-Bitstream.ipynb` to complete this task).
-    - **Secondly**, we have provided an efficient method to complete the overall design by `.tcl` scripts.
-      - ```run ./scripts/pico_bit.tcl``` (it sources `pico_processor.tcl`, which defines the PicoRV32 hierarchy)
-      After running the above commands, you must create a wrapper for the design, add constraint files.
-    - **Finally**, generate the BitStream file.
-
-    **One-click build (PYNQ-Z1, Vivado 2024.1)**: steps above are automated by
-
-    ```sh
-    source <Xilinx>/Vivado/2024.1/settings64.sh
-    ./scripts/build_bitstream.sh          # default -jobs 4
-    ```
-
-    Outputs land in `build/output/` (`picorv32.bit`, `picorv32.hwh`, timing/utilization reports).
-    If some top-level ports have no pin in `constrs/PYNQ-Z1.xdc`, the build stops after synthesis and lists them;
-    add `-allow_unplaced_io` to build anyway.
-
-    You can get more details to the whole project in the `notebooks/tutorial` Folder. Meanwhile, you can also refer to the original project [RISC-V-On-PYNQ](https://github.com/drichmond/RISC-V-On-PYNQ) 
-    ><small>( Due to some errors in the referenced project in terms of details and code, we have made fixes in this project. We have successfully resolved the issues. Therefore, if there are still any problems, please feel free to create an issue for further discussion.)</small>
-3. **Compiling the RISC-V GCC Toolchain on your PYNQ Board**
-   - connect to the pynq-z2 board by ssh
-   - run command
-
-    ```bash
-      cd /home/xilinx/riscv-gnu-toolchain
-      ./configure --prefix=/opt/riscv32imc --with-arch=rv32imc
-      make
-    ```
-
-   - Configure the generated `/opt/riscv32imc/bin` into an environment variable `~/.bashrc` by executing the following code in Jupyter Notebooks:
-
-    ```Python
-      import os
-      path = os.environ['PATH'].split()
-      riscv_path = '/opt/riscv32imc/bin'
-      if(riscv_path not in path):
-          print('Updating /etc/environment file... ',end="")
-          !sed -i 's/PATH=\"\(.*\)\"/PATH=\"\/opt\/riscv32imc\/bin:\1\"/' /etc/environment
-          print('done')
-      else:
-          print("/etc/environment file already updated")
-    ```
-
-    - reboot PYNQ-Z2
-
-    ```bash
-      shutdown -r now
-    ```
-
-    - Confirm that the RISC-V toolchain has been successfully installed
-
-    ```bash
-      riscv32-unknown-elf-gcc --version
-    ```
-
-4. **Packaging an Overlay**
-
-### File Directory
-
-```text
-File Tree
-├── ARCHITECTURE.md
-├── LICENSE
-├── README.md
-├── /constrs/
-│  ├── PYNQ_Z2.xdc
-├── /gold_ip/
-│  ├── /pcpi_v1_0/
-│  ├── /picobram_if/
-│  ├── /picobridge/
-│  ├── /picorv32_axi/
-│  ├── /picorv32_bram/
-├── /ip/
-│  ├── /pcpi_v1_0/
-│  ├── /picobram_if/
-│  ├── /picobridge/
-│  ├── /picorv32_axi/
-│  ├── /picorv32_bram/
-│  ├── /picorv32_tut/
-├── /notebooks/
-│  ├── /examples/
-│  ├── /tutorial/
-|  │  ├── /pictures/
-|  │  ├── 0-How-To-RISC-V.ipynb
-|  │  ├── 1-Downloading-And-Configuring.ipynb
-|  │  ├── 2-Creating-A-Bitstream.ipynb
-|  │  ├── 3-Compiling-RISC-V-GCC-Toolchain.ipynb
-|  │  ├── 4-Packaging-An-Overlay.ipynb
-├── /picorv32/
-├── /ReadMe-deps/
-├── /scripts/
-│  ├── build.tcl
-│  ├── pico_bit.tcl
-│  ├── pico_processor.tcl
-├── /templates/
-├── useless.md
-├── LICENSE
-├── README.md
-└── /util/
+```
+PyTorch (ARM / Linux, host)
+  → torch-mlir → linalg dialect
+  → custom pattern-matching pass → sysarray dialect
+  → lowering pass → RISC-V custom instruction (inline asm, .insn encoding)
+  → PicoRV32 (RISC-V control core, bare-metal firmware)
+  → PCPI (Pico Co-Processor Interface) decode → accelerator trigger
+  → Matrix / Vector accelerator (PL, systolic array)
+  → result written back to DDR → verified on the ARM host
 ```
 
-### Project Summary
+This project covers the full hardware/software boundary of a small,
+from-scratch AI accelerator: ISA extension design, MLIR dialect + lowering
+passes, RTL accelerator implementation, and the runtime driver connecting the
+ARM host and the RISC-V control core.
 
-<img src="./ReadMe-deps/utilization.png" alt="Picorv32 Utilization" style="width: 520px;"/>
+---
 
-<img src="./ReadMe-deps/power.png" alt="Picorv32 Power" style="width: 520px;"/>
+## Why this project
 
-### Contributors
+Most "RISC-V on FPGA" repos stop at booting a core. This one goes further:
+it builds a full compiler path from a PyTorch model down to a **custom RISC-V
+instruction** that a hand-written coprocessor decodes and executes, with a
+working MLIR lowering pipeline generating that instruction automatically.
 
-Please read **CONTRIBUTING.md** to find the developers who have made contributions to this project.
+It intentionally mirrors the responsibilities of a compiler/accelerator
+architect role:
 
-*Contributions make the open-source community an excellent place for learning, inspiration, and creativity. Any contributions you make are **greatly appreciated**.*
+| Responsibility | Where it shows up in this project |
+|---|---|
+| PyTorch → custom hardware compilation path | torch-mlir → custom dialect → RISC-V custom-instruction firmware |
+| Op dispatch, kernel launch, tensor memory, runtime ABI | PyTorch backend dispatch → PYNQ driver → PCPI instruction ABI / CSR ABI |
+| ISA extension / custom instruction design | Custom opcode encoding + PCPI coprocessor RTL + instruction-level MLIR lowering |
+| MLIR / compiler infrastructure | Custom `sysarray` dialect, pattern-matching pass, inline-asm lowering |
+| Defining DMA, memory model, CSR, and kernel ABI across the HW/SW boundary | Designed and implemented end to end, single-owner |
+| Software/hardware co-verification | Golden-model (NumPy) comparison, latency tracing, loose- vs tight-coupling benchmark |
 
-```text
-  How to Get Involved in Open Source Projects
-  1. Fork the Project
-  2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-  3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-  4. Push to the Branch (`git push origin feature/AmazingFeature`)
-  5. Open a Pull Request
+---
+
+## Architecture
+
+```
+┌─────────────────────────────┐
+│  ARM Cortex-A9 (PS, Linux)  │  Host: PyTorch, torch-mlir, driver
+└──────────────┬──────────────┘
+               │ AXI-Lite (GP) — control/CSR
+               │ AXI (HP)      — bulk DDR data path
+┌──────────────▼──────────────┐
+│   PicoRV32 (PL, bare metal) │  Control core: decodes custom instruction
+│      + PCPI coprocessor     │  and dispatches to the accelerator
+└──────────────┬──────────────┘
+               │ PCPI handshake (pcpi_insn / rs1 / rs2 / wr / wait / ready)
+┌──────────────▼──────────────┐
+│  8x8 Systolic Array (PL)    │  int8 in, int32 accumulate, AXI staging buffer
+└──────────────────────────────┘
 ```
 
-### Version Control
+### Custom instruction encoding
 
-This project uses Git for version control. You can check the available versions in the repository.
+Uses the RISC-V reserved `custom-0` opcode space (`0001011`), so it never
+collides with the standard ISA. `funct3` selects the operation:
 
-### Author
+| funct3 | Mnemonic | Semantics |
+|---|---|---|
+| 0 | `mat_trigger` | rs1 = parameter block address, rs2 = destination address |
+| 1 | `mat_status` | rd = accelerator status register |
+| 2 | `mat_reset` | reset the accelerator |
 
-Jin.ZJ @Shanghai University
+No changes to the GCC/LLVM front end are required — instructions are emitted
+via the standard `.insn` pseudo-op, both by hand-written firmware and by the
+MLIR lowering pass (as an LLVM `InlineAsm` node).
 
- *You can also check the list of contributors to see all the developers involved in this project.*
+```asm
+# .insn r opcode, funct3, funct7, rd, rs1, rs2
+.insn r 0x0B, 0, 0, x0, a0, a1   # mat_trigger(param_addr=a0, dst_addr=a1)
+```
 
-### License
+---
 
-This project is licensed under the **MIT License**. For details, please refer to the [LICENSE](https://github.com/JacoboJin/RISCV-on-PYNQ-Z2/blob/main/LICENSE) file.
+## Repository layout (planned)
 
-### Acknowledgements
+```
+├── rtl/                  # PicoRV32 integration, PCPI coprocessor, systolic array
+├── firmware/             # Bare-metal C firmware, sysarray_intrinsics.h
+├── mlir/                 # sysarray dialect, pattern-matching + lowering passes
+├── driver/               # PYNQ Python driver (MMIO / allocate based)
+├── constrs/              # XDC constraints for PYNQ-Z1
+├── notebooks/            # End-to-end demo notebooks
+├── docs/
+│   ├── baseline_utilization.md
+│   ├── custom_isa_encoding.md
+│   ├── ps_pl_datapath.md
+│   └── tight_vs_loose_coupling.md
+└── scripts/               # Vivado .tcl build scripts
+```
 
-- [GitHub Emoji Cheat Sheet](https://www.webpagefx.com/tools/emoji-cheat-sheet)
-- [Img Shields](https://shields.io)
-- [Choose an Open Source License](https://choosealicense.com)
-- [GitHub Pages](https://pages.github.com)
-- [Animate.css](https://daneden.github.io/animate.css)
-- [riscv-gnu-toolchain](https://github.com/riscv-collab/riscv-gnu-toolchain)
-- [RISC-V-On-PYNQ](https://github.com/drichmond/RISC-V-On-PYNQ)
+---
 
-<!-- links -->
-[your-project-path]: JacoboJin/RISCV-on-PYNQ-Z2
-[contributors-shield]: https://img.shields.io/github/contributors/JacoboJin/RISCV-on-PYNQ-Z2.svg?style=flat-square
-[contributors-url]: https://github.com/JacoboJin/RISCV-on-PYNQ-Z2/graphs/contributors
-[forks-shield]: https://img.shields.io/github/forks/JacoboJin/RISCV-on-PYNQ-Z2.svg?style=flat-square
-[forks-url]: https://github.com/JacoboJin/RISCV-on-PYNQ-Z2/network/members
-[stars-shield]: https://img.shields.io/github/stars/JacoboJin/RISCV-on-PYNQ-Z2.svg?style=flat-square
-[stars-url]: https://github.com/JacoboJin/RISCV-on-PYNQ-Z2/stargazers
-[issues-shield]: https://img.shields.io/github/issues/JacoboJin/RISCV-on-PYNQ-Z2.svg?style=flat-square
-[issues-url]: https://img.shields.io/github/issues/JacoboJin/RISCV-on-PYNQ-Z2.svg
-[license-shield]: https://img.shields.io/github/license/JacoboJin/RISCV-on-PYNQ-Z2.svg?style=flat-square
-[license-url]: https://github.com/JacoboJin/RISCV-on-PYNQ-Z2/blob/main/LICENSE
-  
+## Project phases
+
+| Phase | Scope | Milestone |
+|---|---|---|
+| 0 | Environment setup, base overlay resource baseline | — |
+| 1 | PicoRV32 bring-up on PYNQ-Z1 | **M1** — bare-metal hello world |
+| 2 | Matrix accelerator (CSR/AXI, loose coupling) | **M2** — simulation-verified against NumPy |
+| 3 | End-to-end closed loop, CSR path, hand-written firmware | **M3** — first demo-able ARM→PicoRV32→accelerator run |
+| 4 | Custom instruction (PCPI) design + implementation | **M4** — `.insn`-triggered accelerator run, verified |
+| 5 | MLIR dialect + instruction-level lowering | **M5** — PyTorch model compiles straight to custom-instruction firmware |
+| 6 | Loose- vs tight-coupling benchmark | **M6** — quantified CSR vs PCPI comparison |
+| 7 | Vector unit (optional, resource-permitting) | M7 |
+| 8 | Auto-tiling + double buffering (optional) | M8 |
+| 9 | Documentation and write-up | M9 |
+
+**Minimum viable target: M5** — a PyTorch model compiles end to end into
+firmware that issues a custom RISC-V instruction, executed by a hand-built
+accelerator on real FPGA hardware.
+
+---
+
+## Acknowledgements
+
+- [PicoRV32](https://github.com/YosysHQ/picorv32) — the RISC-V core used as
+  the control core.
+- [drichmond/RISC-V-On-PYNQ](https://github.com/drichmond/RISC-V-On-PYNQ) and
+  [JacoboJin/RISCV-on-PYNQ-Z2](https://github.com/JacoboJin/RISCV-on-PYNQ-Z2) —
+  reference PS/PL bridging IP and PCPI integration used as a starting point
+  for the PicoRV32-on-Zynq bring-up.
+- [torch-mlir](https://github.com/llvm/torch-mlir) / [MLIR](https://mlir.llvm.org/) —
+  the compiler infrastructure this project's lowering passes build on.
+
+## License
+
+MIT (or your choice — update before publishing).
