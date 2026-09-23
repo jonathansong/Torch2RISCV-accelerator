@@ -1,0 +1,3 @@
+# local build output (bitstreams, deploy staging)
+/build/
+__pycache__/

@@ -11,11 +11,14 @@
 # Pins:
 #   S_AXI_MEM     ARM access to the program BRAM (psBramController)
 #   M_AXI_DDR     RISC-V master to PS DDR (-> S_AXI_HP0)
+#   M_AXI_PERIPH  RISC-V master to PL peripherals (matmul CSRs), riscv_clk
 #   riscv_clk     PicoRV32 clock domain (also clocks M_AXI_DDR)
 #   riscv_resetn  active-HIGH hold-in-reset from PS GPIO EMIO[0]
 #   por_resetn    active-low power-on reset (FCLK_RESET0_N)
 #   s_axi_aclk / s_axi_aresetn  clock/reset of S_AXI_MEM
 #   irq           PicoRV32 trap
+#   periph_aresetn  riscv_clk-domain peripheral reset (held while the ARM
+#                   holds the RISC-V in reset)
 ################################################################
 
 set pico_processor_ips {
@@ -60,9 +63,11 @@ proc create_hier_cell_pico_processor { parentCell nameHier } {
   # Create interface pins
   create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 S_AXI_MEM
   create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 M_AXI_DDR
+  create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 M_AXI_PERIPH
 
   # Create pins
   create_bd_pin -dir O irq
+  create_bd_pin -dir O -type rst periph_aresetn
   create_bd_pin -dir I -type rst por_resetn
   create_bd_pin -dir I -type clk riscv_clk
   create_bd_pin -dir I -type rst riscv_resetn
@@ -83,7 +88,7 @@ proc create_hier_cell_pico_processor { parentCell nameHier } {
   # Create instance: riscvAxiInterconnect, and set properties
   set riscvAxiInterconnect [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 riscvAxiInterconnect ]
   set_property -dict [ list \
-   CONFIG.NUM_MI {2} \
+   CONFIG.NUM_MI {3} \
  ] $riscvAxiInterconnect
 
   # Create instance: psBramController, and set properties
@@ -127,6 +132,7 @@ proc create_hier_cell_pico_processor { parentCell nameHier } {
   connect_bd_intf_net -intf_net picorv32_mem_axi [get_bd_intf_pins picorv32/mem_axi] [get_bd_intf_pins riscvAxiInterconnect/S00_AXI]
   connect_bd_intf_net -intf_net riscvAxiInterconnect_M00_AXI [get_bd_intf_pins riscvAxiInterconnect/M00_AXI] [get_bd_intf_pins riscvBramController/S_AXI]
   connect_bd_intf_net -intf_net riscvAxiInterconnect_M01_AXI [get_bd_intf_pins riscvAxiInterconnect/M01_AXI] [get_bd_intf_pins M_AXI_DDR]
+  connect_bd_intf_net -intf_net riscvAxiInterconnect_M02_AXI [get_bd_intf_pins riscvAxiInterconnect/M02_AXI] [get_bd_intf_pins M_AXI_PERIPH]
   connect_bd_intf_net -intf_net psBramController_BRAM_PORTA [get_bd_intf_pins psBramController/BRAM_PORTA] [get_bd_intf_pins riscvBram/BRAM_PORTB]
   connect_bd_intf_net -intf_net riscvBramController_BRAM_PORTA [get_bd_intf_pins riscvBram/BRAM_PORTA] [get_bd_intf_pins riscvBramController/BRAM_PORTA]
 
@@ -135,9 +141,9 @@ proc create_hier_cell_pico_processor { parentCell nameHier } {
   connect_bd_net -net clk_in1_1 [get_bd_pins s_axi_aclk] [get_bd_pins psBramController/s_axi_aclk]
   connect_bd_net -net ext_reset_in_1 [get_bd_pins por_resetn] [get_bd_pins riscvReset/ext_reset_in]
   connect_bd_net -net picorv32_axi_0_trap [get_bd_pins irq] [get_bd_pins picorv32/trap]
-  connect_bd_net -net riscvReset_peripheral_aresetn [get_bd_pins picorv32/resetn] [get_bd_pins riscvBramController/s_axi_aresetn] [get_bd_pins riscvReset/peripheral_aresetn] [get_bd_pins riscvAxiInterconnect/S00_ARESETN] [get_bd_pins riscvAxiInterconnect/M00_ARESETN] [get_bd_pins riscvAxiInterconnect/M01_ARESETN]
+  connect_bd_net -net riscvReset_peripheral_aresetn [get_bd_pins picorv32/resetn] [get_bd_pins riscvBramController/s_axi_aresetn] [get_bd_pins riscvReset/peripheral_aresetn] [get_bd_pins riscvAxiInterconnect/S00_ARESETN] [get_bd_pins riscvAxiInterconnect/M00_ARESETN] [get_bd_pins riscvAxiInterconnect/M01_ARESETN] [get_bd_pins riscvAxiInterconnect/M02_ARESETN] [get_bd_pins periph_aresetn]
   connect_bd_net -net riscvReset_interconnect_aresetn [get_bd_pins riscvReset/interconnect_aresetn] [get_bd_pins riscvAxiInterconnect/ARESETN]
-  connect_bd_net -net riscv_clk_1subprocessorClk [get_bd_pins riscv_clk] [get_bd_pins picorv32/clk] [get_bd_pins riscvBramController/s_axi_aclk] [get_bd_pins riscvReset/slowest_sync_clk] [get_bd_pins riscvAxiInterconnect/ACLK] [get_bd_pins riscvAxiInterconnect/S00_ACLK] [get_bd_pins riscvAxiInterconnect/M00_ACLK] [get_bd_pins riscvAxiInterconnect/M01_ACLK]
+  connect_bd_net -net riscv_clk_1subprocessorClk [get_bd_pins riscv_clk] [get_bd_pins picorv32/clk] [get_bd_pins riscvBramController/s_axi_aclk] [get_bd_pins riscvReset/slowest_sync_clk] [get_bd_pins riscvAxiInterconnect/ACLK] [get_bd_pins riscvAxiInterconnect/S00_ACLK] [get_bd_pins riscvAxiInterconnect/M00_ACLK] [get_bd_pins riscvAxiInterconnect/M01_ACLK] [get_bd_pins riscvAxiInterconnect/M02_ACLK]
   connect_bd_net -net s_axi_aresetn_1 [get_bd_pins s_axi_aresetn] [get_bd_pins psBramController/s_axi_aresetn]
 
   # Restore current instance
