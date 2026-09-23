@@ -1,13 +1,18 @@
-"""PYNQ driver for the Phase 3 overlay: ARM -> PicoRV32 -> matmul_unit.
+"""PYNQ driver for the overlay: ARM -> PicoRV32 -> matmul_unit.
 
-The ARM allocates A/B/C in DDR, hands their physical addresses to the
-PicoRV32 through the BRAM mailbox and releases it from reset. The
-firmware (firmware/matmul) programs the matmul CSRs for every 8x8x8 job,
-polls for completion and reports status and cycle counts back.
+The ARM allocates A/B/C (and a table of job descriptors) in DDR, hands
+their physical addresses to the PicoRV32 through the BRAM mailbox and
+releases it from reset. Two firmwares consume the same mailbox:
+
+  matmul_fw.bin       (firmware/matmul)       CSR path: programs the matmul
+                                              CSRs per job and polls STATUS
+  matmul_insn_fw.bin  (firmware/matmul_insn)  custom-instruction path:
+                                              mat_trigger(desc, C) + mat_wait
 
     from pynq_matmul import MatmulOverlay
-    mm = MatmulOverlay("picorv32.bit", "matmul_fw.bin")
+    mm = MatmulOverlay("picorv32.bit", "matmul_insn_fw.bin")
     C, stats = mm.matmul(A, B)      # A, B: (n, 8, 8) int8 -> C: (n, 8, 8) int32
+    mm.load_firmware("matmul_fw.bin")   # switch path without reloading the overlay
 
 Run as root inside the PYNQ venv with XRT sourced (Jupyter already is).
 """
@@ -25,15 +30,17 @@ BRAM_BYTES = 0x2000
 RESET_EMIO = 0                 # PS GPIO EMIO[0] -> RISC-V reset (1 = hold)
 RISCV_HZ = 50e6                # subprocessorClk; matmul_unit shares it
 
-# firmware/matmul/mailbox.h
+# firmware/include/mailbox.h
 MBOX = 0x1F00
 MBOX_STATUS, MBOX_N_JOBS, MBOX_A_BASE, MBOX_B_BASE, MBOX_C_BASE = 0x00, 0x04, 0x08, 0x0C, 0x10
 MBOX_JOBS_DONE, MBOX_ERRORS, MBOX_FIRST_ERR = 0x14, 0x18, 0x1C
 MBOX_TOTAL_CYCLES, MBOX_ACCEL_CYCLES, MBOX_UNIT_ID = 0x20, 0x24, 0x28
+MBOX_DESC_BASE = 0x2C
 MBOX_WORDS = 0x100 // 4
 STATUS_RUNNING, STATUS_DONE = 0x00000001, 0x600D600D
 ERR_NO_UNIT, ERR_TIMEOUT = 0xDEAD0001, 0xDEAD0002
 MATMUL_ID = 0x4D4D3038
+DIM_888 = 8 | (8 << 10) | (8 << 20)     # descriptor/CSR DIM_M_N_K
 
 MATMUL_ERR_CODES = {1: "bad DIM", 2: "bad address", 3: "read SLVERR/DECERR",
                     4: "write SLVERR/DECERR"}
@@ -56,9 +63,12 @@ class MatmulOverlay:
         self.reset = GPIO(GPIO.get_gpio_pin(RESET_EMIO), "out")
         self.bram = MMIO(BRAM_ARM_BASE, BRAM_BYTES)
         self.reset.write(1)
-        self._load_firmware(firmware)
+        self.load_firmware(firmware)
 
-    def _load_firmware(self, path):
+    def load_firmware(self, path):
+        """Copy a firmware image into the program BRAM (RISC-V held in reset)."""
+        self.reset.write(1)
+        self.firmware = os.path.basename(path)
         fw = open(path, "rb").read()
         if len(fw) > MBOX:
             raise ValueError(f"{path}: {len(fw)} bytes overlaps the mailbox at {MBOX:#x}")
@@ -82,8 +92,9 @@ class MatmulOverlay:
         abuf = allocate(shape=a.shape, dtype=np.int8)
         bbuf = allocate(shape=b.shape, dtype=np.int8)
         cbuf = allocate(shape=(n, 8, 8), dtype=np.int32)
+        dbuf = allocate(shape=(max(n, 1), 4), dtype=np.uint32)   # {A, B, DIM, 0} per job
         try:
-            for buf in (abuf, bbuf, cbuf):
+            for buf in (abuf, bbuf, cbuf, dbuf):
                 # jobs are 64/256 B slices; a 256 B aligned base keeps every
                 # slice inside one 4 KB page, as the unit requires
                 if buf.physical_address % 256:
@@ -91,7 +102,12 @@ class MatmulOverlay:
             abuf[:] = a
             bbuf[:] = b
             cbuf[:] = 0
-            for buf in (abuf, bbuf, cbuf):
+            jobs = np.arange(n, dtype=np.uint32)
+            dbuf[:n, 0] = abuf.physical_address + 64 * jobs
+            dbuf[:n, 1] = bbuf.physical_address + 64 * jobs
+            dbuf[:n, 2] = DIM_888
+            dbuf[:n, 3] = 0
+            for buf in (abuf, bbuf, cbuf, dbuf):
                 buf.flush()
 
             self.reset.write(1)
@@ -101,6 +117,7 @@ class MatmulOverlay:
             self.bram.write(MBOX + MBOX_A_BASE, abuf.physical_address)
             self.bram.write(MBOX + MBOX_B_BASE, bbuf.physical_address)
             self.bram.write(MBOX + MBOX_C_BASE, cbuf.physical_address)
+            self.bram.write(MBOX + MBOX_DESC_BASE, dbuf.physical_address)
 
             t0 = time.perf_counter()
             self.reset.write(0)
@@ -123,12 +140,13 @@ class MatmulOverlay:
             cbuf.invalidate()
             c = np.array(cbuf)
         finally:
-            for buf in (abuf, bbuf, cbuf):
+            for buf in (abuf, bbuf, cbuf, dbuf):
                 buf.freebuffer()
 
         total = self._mbox(MBOX_TOTAL_CYCLES)
         accel = self._mbox(MBOX_ACCEL_CYCLES)
         stats = {
+            "firmware": self.firmware,
             "jobs": n,
             "unit_id": hex(self._mbox(MBOX_UNIT_ID)),
             "riscv_cycles": total,

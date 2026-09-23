@@ -7,7 +7,7 @@ VIVADO_SETTINGS ?= /home/jon/Projects/Vivado/Vivado/2024.1/settings64.sh
 PYTHON          ?= python3
 CLOCK_NS        ?= 10.0
 
-RTL   := $(abspath systolic_array.v matmul_unit.v)
+RTL   := $(abspath systolic_array.v matmul_pcpi.v matmul_unit.v)
 TB    := $(abspath sim/tb_matmul_unit.v)
 SIM   := build/sim
 SYNTH := build/synth

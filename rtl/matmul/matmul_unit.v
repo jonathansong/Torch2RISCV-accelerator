@@ -3,7 +3,13 @@
 //
 //   s_axi_*   AXI4-Lite CSR slave (register map in README.md)
 //   m_axi_*   AXI4 64-bit master: fetches A and B from DDR, writes C back
+//   pcpi_*    PicoRV32 co-processor port: custom-0 matrix instructions
+//             (matmul_pcpi.v, docs/custom_isa_encoding.md)
 //   irq       IRQ_STATUS[0] & CTRL.irq_enable
+//
+// A job is started either by CTRL.start (addresses from the CSRs) or by
+// mat_trigger (rs1 = 16-byte descriptor {A, B, DIM, 0} in DDR that the unit
+// fetches itself, rs2 = C). Both paths share the checks and the datapath.
 //
 // Memory layout (all row-major, little-endian):
 //   A: 8 rows x 8 int8   = 64 bytes,  one 64-bit beat per row
@@ -118,6 +124,24 @@ module matmul_unit (
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m_axi BREADY" *)
     output reg         m_axi_bready,
 
+    // PicoRV32 co-processor interface (bus definition in RISCV-on-PYNQ-Z1/ip/pcpi_v1_0)
+    (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_valid", X_INTERFACE_MODE = "slave" *)
+    input  wire        pcpi_valid,
+    (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_insn" *)
+    input  wire [31:0] pcpi_insn,
+    (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_rs1" *)
+    input  wire [31:0] pcpi_rs1,
+    (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_rs2" *)
+    input  wire [31:0] pcpi_rs2,
+    (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_wr" *)
+    output wire        pcpi_wr,
+    (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_rd" *)
+    output wire [31:0] pcpi_rd,
+    (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_wait" *)
+    output wire        pcpi_wait,
+    (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_ready" *)
+    output wire        pcpi_ready,
+
     (* X_INTERFACE_INFO = "xilinx.com:signal:interrupt:1.0 irq INTERRUPT", X_INTERFACE_PARAMETER = "SENSITIVITY LEVEL_HIGH" *)
     output wire        irq
 );
@@ -140,7 +164,7 @@ module matmul_unit (
     localparam [3:0] ERR_NONE  = 4'd0;
     localparam [3:0] ERR_DIM   = 4'd1;   // DIM_M_N_K is not 8x8x8
     localparam [3:0] ERR_ADDR  = 4'd2;   // misaligned or crosses 4 KB
-    localparam [3:0] ERR_RRESP = 4'd3;   // SLVERR/DECERR reading A or B
+    localparam [3:0] ERR_RRESP = 4'd3;   // SLVERR/DECERR reading descriptor/A/B
     localparam [3:0] ERR_BRESP = 4'd4;   // SLVERR/DECERR writing C
 
     // -------------------------------------------------------------- FSM
@@ -151,6 +175,9 @@ module matmul_unit (
     localparam [2:0] S_WR_AW = 3'd4;
     localparam [2:0] S_WR_W  = 3'd5;
     localparam [2:0] S_WR_B  = 3'd6;
+    localparam [2:0] S_CHECK = 3'd7;   // validate DIM/addresses, then fetch A
+
+    localparam [1:0] RD_A = 2'd0, RD_B = 2'd1, RD_DESC = 2'd2;
 
     // Skewed operands reach PE(N-1,N-1) at t = (N-1)+(N-1)+(K-1).
     localparam [4:0] T_LAST = 2 * (N - 1) + N - 1;
@@ -160,7 +187,7 @@ module matmul_unit (
     reg  [3:0]  err_code;
     reg  [31:0] src_a, src_b, dst, dim, cycles;
 
-    reg         rd_sel;          // 0: fetching A, 1: fetching B
+    reg  [1:0]  rd_sel;          // RD_A / RD_B / RD_DESC
     reg  [2:0]  rd_beat;
     reg         rd_err;
     reg  [4:0]  t;               // compute step
@@ -174,6 +201,9 @@ module matmul_unit (
     wire [32*N*N-1:0] acc;       // acc[32*(i*N+j) +: 32] = C[i][j]
 
     wire busy = state != S_IDLE;
+    wire [31:0] status_word;         // STATUS CSR / mat_status / mat_wait
+    wire        cmd_valid, cmd_reset, cmd_accept;   // from/to matmul_pcpi
+    wire [31:0] cmd_desc, cmd_dst;
 
     // ---------------------------------------------- AXI4-Lite CSR slave
     reg        aw_got, w_got;
@@ -181,6 +211,7 @@ module matmul_unit (
     reg [31:0] wr_data;
     wire       csr_we  = aw_got && w_got && !s_axi_bvalid;
     wire [5:0] csr_reg = wr_addr[7:2];
+    wire       csr_start = csr_we && csr_reg == R_CTRL && wr_data[0] && !busy;
 
     assign s_axi_bresp = 2'b00;
     assign s_axi_rresp = 2'b00;
@@ -218,7 +249,7 @@ module matmul_unit (
                 s_axi_rvalid <= 1;
                 case (s_axi_araddr[7:2])
                     R_CTRL:       s_axi_rdata <= {29'd0, irq_en, 2'b00};
-                    R_STATUS:     s_axi_rdata <= {20'd0, err_code, 5'd0, error, busy, done};
+                    R_STATUS:     s_axi_rdata <= status_word;
                     R_SRC_A:      s_axi_rdata <= src_a;
                     R_SRC_B:      s_axi_rdata <= src_b;
                     R_DST:        s_axi_rdata <= dst;
@@ -235,7 +266,8 @@ module matmul_unit (
     end
 
     // ------------------------------------------------ control + AXI4 master
-    assign m_axi_arlen   = N - 1;               // one beat per row
+    assign m_axi_arlen   = rd_sel == RD_DESC ? 8'd1   // 16-byte descriptor
+                                             : N - 1; // one beat per row
     assign m_axi_arsize  = 3'd3;                // 8 bytes
     assign m_axi_arburst = 2'b01;               // INCR
     assign m_axi_arcache = 4'b0011;
@@ -251,6 +283,7 @@ module matmul_unit (
     assign m_axi_wdata   = acc[64*{wr_burst, wr_beat} +: 64];
 
     assign irq = irq_status & irq_en;
+    assign status_word = {20'd0, err_code, 5'd0, error, busy, done};
 
     // 8-byte aligned and [addr, addr+len) inside one 4 KB page
     function addr_ok(input [31:0] addr, input [12:0] len);
@@ -302,25 +335,13 @@ module matmul_unit (
                             err_code   <= ERR_NONE;
                             irq_status <= 0;
                         end
-                        if (!busy && wr_data[0]) begin          // start
+                        if (csr_start) begin                    // start
                             done        <= 0;
                             error       <= 0;
                             err_code    <= ERR_NONE;
                             cycles      <= 0;
                             array_clear <= 1;
-                            if (dim != DIM_888)
-                                finish(ERR_DIM);
-                            else if (!addr_ok(src_a, 13'd64) || !addr_ok(src_b, 13'd64) ||
-                                     !addr_ok(dst, 13'd256))
-                                finish(ERR_ADDR);
-                            else begin
-                                state         <= S_RD_AR;
-                                rd_sel        <= 0;
-                                rd_err        <= 0;
-                                wr_err        <= 0;
-                                m_axi_araddr  <= src_a;
-                                m_axi_arvalid <= 1;
-                            end
+                            state       <= S_CHECK;
                         end
                     end
                     R_SRC_A:      if (!busy) src_a <= wr_data;
@@ -332,7 +353,46 @@ module matmul_unit (
                 endcase
             end
 
+            // mat_reset / mat_trigger from the PCPI front end
+            if (cmd_reset) begin
+                done       <= 0;
+                error      <= 0;
+                err_code   <= ERR_NONE;
+                irq_status <= 0;
+            end
+            if (cmd_accept) begin
+                done        <= 0;
+                error       <= 0;
+                err_code    <= ERR_NONE;
+                cycles      <= 0;
+                array_clear <= 1;
+                dst         <= cmd_dst;
+                if (cmd_desc[3:0] != 4'd0)          // 16 B aligned: one burst, one page
+                    finish(ERR_ADDR);
+                else begin
+                    rd_sel        <= RD_DESC;
+                    rd_err        <= 0;
+                    m_axi_araddr  <= cmd_desc;
+                    m_axi_arvalid <= 1;
+                    state         <= S_RD_AR;
+                end
+            end
+
             case (state)
+                S_CHECK:
+                    if (dim != DIM_888)
+                        finish(ERR_DIM);
+                    else if (!addr_ok(src_a, 13'd64) || !addr_ok(src_b, 13'd64) ||
+                             !addr_ok(dst, 13'd256))
+                        finish(ERR_ADDR);
+                    else begin
+                        rd_sel        <= RD_A;
+                        rd_err        <= 0;
+                        wr_err        <= 0;
+                        m_axi_araddr  <= src_a;
+                        m_axi_arvalid <= 1;
+                        state         <= S_RD_AR;
+                    end
                 S_RD_AR:
                     if (m_axi_arready) begin
                         m_axi_arvalid <= 0;
@@ -342,8 +402,16 @@ module matmul_unit (
                     end
                 S_RD_R:
                     if (m_axi_rvalid) begin
-                        if (rd_sel) bbuf[64*rd_beat +: 64] <= m_axi_rdata;
-                        else        abuf[64*rd_beat +: 64] <= m_axi_rdata;
+                        case (rd_sel)
+                            RD_A: abuf[64*rd_beat +: 64] <= m_axi_rdata;
+                            RD_B: bbuf[64*rd_beat +: 64] <= m_axi_rdata;
+                            default:                     // descriptor {A, B, DIM, 0}
+                                if (rd_beat == 0) begin
+                                    src_a <= m_axi_rdata[31:0];
+                                    src_b <= m_axi_rdata[63:32];
+                                end else
+                                    dim   <= m_axi_rdata[31:0];
+                        endcase
                         rd_beat <= rd_beat + 1;
                         if (m_axi_rresp != 2'b00)
                             rd_err <= 1;
@@ -351,8 +419,10 @@ module matmul_unit (
                             m_axi_rready <= 0;
                             if (rd_err || m_axi_rresp != 2'b00)
                                 finish(ERR_RRESP);
-                            else if (!rd_sel) begin
-                                rd_sel        <= 1;
+                            else if (rd_sel == RD_DESC)
+                                state <= S_CHECK;
+                            else if (rd_sel == RD_A) begin
+                                rd_sel        <= RD_B;
                                 m_axi_araddr  <= src_b;
                                 m_axi_arvalid <= 1;
                                 state         <= S_RD_AR;
@@ -406,6 +476,31 @@ module matmul_unit (
             endcase
         end
     end
+
+    // ---------------------------------------------------- PCPI front end
+    // CTRL.start wins a same-cycle race; mat_trigger then waits for idle.
+    assign cmd_accept = cmd_valid && !busy && !csr_start;
+
+    matmul_pcpi pcpi (
+        .clk        (aclk),
+        .resetn     (aresetn),
+        .pcpi_valid (pcpi_valid),
+        .pcpi_insn  (pcpi_insn),
+        .pcpi_rs1   (pcpi_rs1),
+        .pcpi_rs2   (pcpi_rs2),
+        .pcpi_wr    (pcpi_wr),
+        .pcpi_rd    (pcpi_rd),
+        .pcpi_wait  (pcpi_wait),
+        .pcpi_ready (pcpi_ready),
+        .busy       (busy),
+        .status     (status_word),
+        .cycles     (cycles),
+        .cmd_valid  (cmd_valid),
+        .cmd_desc   (cmd_desc),
+        .cmd_dst    (cmd_dst),
+        .cmd_accept (cmd_accept),
+        .cmd_reset  (cmd_reset)
+    );
 
     // ---------------------------------------------------- systolic array
     // Row i of A enters i cycles late and column j of B j cycles late, so

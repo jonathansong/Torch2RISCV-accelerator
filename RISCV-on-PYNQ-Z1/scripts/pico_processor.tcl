@@ -12,6 +12,7 @@
 #   S_AXI_MEM     ARM access to the program BRAM (psBramController)
 #   M_AXI_DDR     RISC-V master to PS DDR (-> S_AXI_HP0)
 #   M_AXI_PERIPH  RISC-V master to PL peripherals (matmul CSRs), riscv_clk
+#   PCPI          PicoRV32 co-processor port (custom-0 matrix instructions)
 #   riscv_clk     PicoRV32 clock domain (also clocks M_AXI_DDR)
 #   riscv_resetn  active-HIGH hold-in-reset from PS GPIO EMIO[0]
 #   por_resetn    active-low power-on reset (FCLK_RESET0_N)
@@ -64,6 +65,7 @@ proc create_hier_cell_pico_processor { parentCell nameHier } {
   create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 S_AXI_MEM
   create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 M_AXI_DDR
   create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 M_AXI_PERIPH
+  create_bd_intf_pin -mode Master -vlnv cliffordwolf:ip:pcpi_rtl:1.0 PCPI
 
   # Create pins
   create_bd_pin -dir O irq
@@ -132,6 +134,7 @@ proc create_hier_cell_pico_processor { parentCell nameHier } {
   connect_bd_intf_net -intf_net picorv32_mem_axi [get_bd_intf_pins picorv32/mem_axi] [get_bd_intf_pins riscvAxiInterconnect/S00_AXI]
   connect_bd_intf_net -intf_net riscvAxiInterconnect_M00_AXI [get_bd_intf_pins riscvAxiInterconnect/M00_AXI] [get_bd_intf_pins riscvBramController/S_AXI]
   connect_bd_intf_net -intf_net riscvAxiInterconnect_M01_AXI [get_bd_intf_pins riscvAxiInterconnect/M01_AXI] [get_bd_intf_pins M_AXI_DDR]
+  connect_bd_intf_net -intf_net picorv32_pcpi [get_bd_intf_pins picorv32/ip_pcpi] [get_bd_intf_pins PCPI]
   connect_bd_intf_net -intf_net riscvAxiInterconnect_M02_AXI [get_bd_intf_pins riscvAxiInterconnect/M02_AXI] [get_bd_intf_pins M_AXI_PERIPH]
   connect_bd_intf_net -intf_net psBramController_BRAM_PORTA [get_bd_intf_pins psBramController/BRAM_PORTA] [get_bd_intf_pins riscvBram/BRAM_PORTB]
   connect_bd_intf_net -intf_net riscvBramController_BRAM_PORTA [get_bd_intf_pins riscvBram/BRAM_PORTA] [get_bd_intf_pins riscvBramController/BRAM_PORTA]

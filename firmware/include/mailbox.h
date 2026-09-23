@@ -1,11 +1,12 @@
 /*
  * ARM <-> PicoRV32 mailbox for the matmul batch firmware, in the last
  * 256 bytes of the program BRAM (RISC-V 0xC0001F00, ARM 0x40010000+0x1F00).
- * Keep in sync with driver/pynq_matmul.py and sim/tb_system.v.
+ * Shared by the CSR firmware (matmul/) and the custom-instruction firmware
+ * (matmul_insn/). Keep in sync with driver/pynq_matmul.py and sim/tb_system.v.
  *
- * Job i uses A = A_BASE + 64*i, B = B_BASE + 64*i, C = C_BASE + 256*i
- * (DDR physical addresses; buffers must not straddle 4 KB pages, which
- * holds for page-aligned bases).
+ * Job i uses A = A_BASE + 64*i, B = B_BASE + 64*i, C = C_BASE + 256*i and
+ * descriptor D = DESC_BASE + 16*i = {A, B, DIM, 0} (DDR physical addresses;
+ * buffers must not straddle 4 KB pages, which holds for page-aligned bases).
  */
 #ifndef MAILBOX_H
 #define MAILBOX_H
@@ -24,6 +25,7 @@
 #define MBOX_TOTAL_CYCLES  0x20  /* out: RISC-V cycles for the whole batch      */
 #define MBOX_ACCEL_CYCLES  0x24  /* out: sum of matmul CYCLES over all jobs     */
 #define MBOX_UNIT_ID       0x28  /* out: matmul ID register as read by the core */
+#define MBOX_DESC_BASE     0x2C  /* in:  descriptor table (mat_trigger path)    */
 
 #define STATUS_RUNNING     0x00000001u
 #define STATUS_DONE        0x600D600Du

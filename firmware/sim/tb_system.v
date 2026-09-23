@@ -1,5 +1,7 @@
-// System test for Phase 3: matmul_fw running on picorv32_axi drives the
-// real matmul_unit through its CSRs; matmul_unit reads/writes a DDR model.
+// System test: firmware (fw.hex: CSR path firmware/matmul or custom-instruction
+// path firmware/matmul_insn) running on picorv32_axi drives the real
+// matmul_unit through its CSRs or its PCPI port, as wired in the overlay;
+// matmul_unit reads/writes a DDR model.
 // Mirrors the overlay's RISC-V memory map:
 //   0xC0000000  8 KB program BRAM (+ mailbox at 0xC0001F00)
 //   0x80000000  matmul_unit CSRs
@@ -18,6 +20,7 @@ module tb_system;
     localparam [31:0] A_BASE     = DDR_BASE;             // NC * 64 B
     localparam [31:0] B_BASE     = DDR_BASE + 32'h1000;  // NC * 64 B
     localparam [31:0] C_BASE     = DDR_BASE + 32'h2000;  // NC * 256 B
+    localparam [31:0] DESC_BASE  = DDR_BASE + 32'h5000;  // NC * 16 B (gap after C for the guard check)
     localparam [31:0] MBOX       = 32'h1F00 / 4;
 
     reg clk = 0, resetn = 0;
@@ -38,6 +41,9 @@ module tb_system;
     wire        c_awready, c_wready, c_bvalid, c_arready, c_rvalid;
     wire [31:0] c_rdata;
 
+    wire        pcpi_valid, pcpi_wr, pcpi_wait, pcpi_ready;   // CPU <-> matmul_unit
+    wire [31:0] pcpi_insn, pcpi_rs1, pcpi_rs2, pcpi_rd;
+
     picorv32_axi #(
         .COMPRESSED_ISA (1), .ENABLE_MUL (1), .ENABLE_DIV (1), .ENABLE_PCPI (1),
         .PROGADDR_RESET (32'hC000_0000), .STACKADDR (32'hC000_2000)
@@ -52,7 +58,8 @@ module tb_system;
         .mem_axi_araddr(c_araddr),   .mem_axi_arprot(c_arprot),
         .mem_axi_rvalid(c_rvalid),   .mem_axi_rready(c_rready),
         .mem_axi_rdata(c_rdata),
-        .pcpi_wr(1'b0), .pcpi_rd(32'b0), .pcpi_wait(1'b0), .pcpi_ready(1'b0),
+        .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
+        .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
         .irq(32'b0)
     );
 
@@ -60,6 +67,12 @@ module tb_system;
     // PicoRV32 keeps awaddr/araddr stable for the whole transaction.
     wire aw_csr = c_awaddr[31:12] == CSR_BASE[31:12];
     wire ar_csr = c_araddr[31:12] == CSR_BASE[31:12];
+
+    // CPU-side CSR traffic (0 expected for the custom-instruction firmware)
+    integer csr_accesses = 0;
+    always @(posedge clk)
+        if (resetn)
+            csr_accesses = csr_accesses + (c_awvalid && c_awready && aw_csr) + (c_arvalid && c_arready && ar_csr);
 
     wire        mm_awready, mm_wready, mm_bvalid, mm_arready, mm_rvalid;
     wire [31:0] mm_rdata;
@@ -142,6 +155,8 @@ module tb_system;
         .m_axi_wdata(m_wdata), .m_axi_wstrb(m_wstrb), .m_axi_wlast(m_wlast),
         .m_axi_wvalid(m_wvalid), .m_axi_wready(m_wready),
         .m_axi_bresp(2'b00), .m_axi_bvalid(m_bvalid), .m_axi_bready(m_bready),
+        .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
+        .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
         .irq(mm_irq)
     );
 
@@ -214,7 +229,7 @@ module tb_system;
         $readmemh("b.hex", b_vec);
         $readmemh("c.hex", c_vec);
         for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
-        $readmemh("matmul_fw.hex", bram);
+        $readmemh("fw.hex", bram);
         for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = 8'hA5;
 
         // A/B rows: one 64-bit word per row; job i at +64*i
@@ -229,6 +244,16 @@ module tb_system;
         bram[MBOX + 2] = A_BASE;
         bram[MBOX + 3] = B_BASE;
         bram[MBOX + 4] = C_BASE;
+        bram[MBOX + 11] = DESC_BASE;
+
+        // descriptors {A, B, DIM 8x8x8, 0} for the mat_trigger path
+        for (i = 0; i < NC; i = i + 1)
+            for (k = 0; k < 4; k = k + 1) begin
+                got = k == 0 ? A_BASE + 64 * i : k == 1 ? B_BASE + 64 * i :
+                      k == 2 ? {2'b0, 10'd8, 10'd8, 10'd8} : 32'd0;
+                {ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 3], ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 2],
+                 ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 1], ddr[DESC_BASE - DDR_BASE + 16*i + 4*k]} = got;
+            end
 
         repeat (20) @(posedge clk);
         resetn <= 1;
@@ -239,7 +264,10 @@ module tb_system;
 
         if (!trap)                          begin $display("TB ERROR: no trap"); errors = errors + 1; end
         if (bram[MBOX] !== 32'h600D600D)    begin $display("TB ERROR: mailbox status %08x", bram[MBOX]); errors = errors + 1; end
-        if (bram[MBOX + 10] !== 32'h4D4D3038) begin $display("TB ERROR: unit id %08x", bram[MBOX + 10]); errors = errors + 1; end
+        // the CSR firmware reports the ID register; the PCPI firmware never reads CSRs
+        if (bram[MBOX + 10] !== 32'h4D4D3038 && bram[MBOX + 10] !== 0) begin
+            $display("TB ERROR: unit id %08x", bram[MBOX + 10]); errors = errors + 1;
+        end
         if (bram[MBOX + 5] !== NC)          begin $display("TB ERROR: jobs done %0d / %0d", bram[MBOX + 5], NC); errors = errors + 1; end
         if (bram[MBOX + 6] !== 0)           begin $display("TB ERROR: fw errors %0d, first %08x", bram[MBOX + 6], bram[MBOX + 7]); errors = errors + 1; end
 
@@ -257,9 +285,9 @@ module tb_system;
             $display("TB ERROR: byte after last C overwritten"); errors = errors + 1;
         end
 
-        $display("TB %s: %0d jobs, %0d errors; batch %0d cycles (%0d / job), accelerator %0d cycles (%0d / job)",
+        $display("TB %s: %0d jobs, %0d errors; batch %0d cycles (%0d / job), accelerator %0d cycles (%0d / job), CPU CSR accesses %0d",
                  errors ? "FAIL" : "PASS", NC, errors, bram[MBOX + 8], bram[MBOX + 8] / NC,
-                 bram[MBOX + 9], bram[MBOX + 9] / NC);
+                 bram[MBOX + 9], bram[MBOX + 9] / NC, csr_accesses);
         $finish;
     end
 endmodule

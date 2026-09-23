@@ -1,9 +1,14 @@
-# matmul_unit — 8×8×8 int8 matrix multiply (Phase 2)
+# matmul_unit — 8×8×8 int8 matrix multiply (Phase 2 + Phase 4)
 
-Loosely-coupled accelerator: software programs a few AXI4-Lite CSRs, the unit
-fetches A and B from DDR through its own AXI4 master, computes
+The unit fetches A and B from DDR through its own AXI4 master, computes
 `C = A · B` on an 8×8 output-stationary systolic array (int8 × int8 → int32),
-and writes C back to DDR.
+and writes C back to DDR. A job is started either
+
+- **loosely coupled** (Phase 2/3): software programs AXI4-Lite CSRs and sets
+  `CTRL.start`, or
+- **tightly coupled** (Phase 4): the PicoRV32 executes `mat_trigger` on its
+  PCPI port with a pointer to a 16-byte job descriptor — see
+  [`docs/custom_isa_encoding.md`](../../docs/custom_isa_encoding.md).
 
 ```
             s_axi (AXI4-Lite CSR)           m_axi (AXI4, 64-bit) ──► DDR (PS7 S_AXI_HP*)
@@ -20,7 +25,8 @@ and writes C back to DDR.
 | File | Contents |
 |---|---|
 | `systolic_array.v` | `systolic_pe` (MAC, forwards a → right, b → down) and the N×N array |
-| `matmul_unit.v` | CSRs, control FSM, AXI4 master, input skew |
+| `matmul_unit.v` | CSRs, control FSM, AXI4 master, input skew, descriptor fetch |
+| `matmul_pcpi.v` | PCPI decoder for the custom-0 matrix instructions |
 | `sim/gen_vectors.py` | random + corner-case vectors, NumPy golden model |
 | `sim/tb_matmul_unit.v` | xsim testbench (AXI memory model, CSR master) |
 | `synth_ooc.tcl` | out-of-context synth/place/route for resource/timing numbers |
@@ -60,7 +66,7 @@ ports through a protocol converter/interconnect.
 
 ## Timing of one run
 
-read A, read B → 22 compute cycles (`t = i + j + k`, last at 2·7 + 7) → write
+(`mat_trigger` only: read the descriptor →) read A, read B → 22 compute cycles (`t = i + j + k`, last at 2·7 + 7) → write
 C. In simulation with 0–3 cycle random AXI stalls: 143–169 cycles per
 8×8×8 matmul (512 MACs).
 
@@ -72,21 +78,28 @@ make synth               # CLOCK_NS=10.0 by default
 ```
 
 `make sim` runs 32 golden cases (zeros, identity, ±128/127 extremes, patterns,
-24 random) plus CSR, interrupt, busy-write, soft-reset and all four error
-paths, with protocol checks on every burst (length, INCR, 8-byte size,
-4 KB, WSTRB, WLAST). Mutation checks (unsigned B, one compute step short,
-early WLAST) all make it fail.
+24 random) through the CSR path **and** the PCPI path, plus CSR, interrupt,
+busy-write, soft-reset and all four error paths, and the PCPI instruction
+tests (status while busy, trigger-while-busy stall, descriptor errors,
+`mat_reset`, unclaimed encodings, CSR/PCPI interleaving), with protocol checks
+on every burst (length, INCR, 8-byte size, 4 KB, WSTRB, WLAST). Mutation
+checks (unsigned B, one compute step short, early WLAST, `pcpi_wait` never
+asserted, funct7 not decoded) all make it fail.
 
 Out-of-context results on xc7z020clg400-1 (Vivado 2024.1):
 
-| LUT | FF | DSP48E1 | BRAM | 100 MHz WNS |
-|---|---|---|---|---|
-| 1279 (2.4 %) | 2010 (1.9 %) | 64 (29 %) | 0 | +0.450 ns (≈105 MHz) |
+| Version | LUT | FF | DSP48E1 | BRAM | 100 MHz WNS |
+|---|---|---|---|---|---|
+| CSR only (Phase 2) | 1279 (2.4 %) | 2010 (1.9 %) | 64 (29 %) | 0 | +0.450 ns (≈105 MHz) |
+| + PCPI / descriptors (Phase 4) | 1545 (2.9 %) | 2116 (2.0 %) | 64 (29 %) | 0 | +0.486 ns (≈105 MHz) |
 
 Without the `use_dsp` attribute on `systolic_pe`, Vivado builds the 8×8
 multipliers from LUTs: 7178 LUTs, 0 DSPs, and 100 MHz fails by 0.15 ns.
 
-## Not done yet (Phase 3)
+## Integration
 
-Integration into the overlay block design (CSR slave on the PicoRV32 and ARM
-buses, master on S_AXI_HP2), PicoRV32 firmware driver, board test.
+In the overlay (`RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl`) the unit is
+`matmul_0`: CSRs at 0x80000000 on the PicoRV32 bus, `m_axi` on S_AXI_HP2,
+`pcpi` on the PicoRV32 co-processor port, all on `riscv_clk`. Firmware:
+`firmware/matmul` (CSR) and `firmware/matmul_insn` (custom instructions);
+driver: `driver/pynq_matmul.py`; memory map: `docs/memory_model.md`.

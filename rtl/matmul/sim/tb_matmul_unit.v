@@ -7,7 +7,7 @@ module tb_matmul_unit;
     `include "n_cases.vh"
 
     localparam [31:0] MEM_BASE  = 32'h1000_0000;
-    localparam integer MEM_BYTES = 65536;
+    localparam integer MEM_BYTES = 131072;
     localparam [31:0] DIM_888   = {2'b0, 10'd8, 10'd8, 10'd8};
 
     localparam [7:0] CTRL = 8'h00, STATUS = 8'h04, SRC_A = 8'h08, SRC_B = 8'h0C,
@@ -37,6 +37,11 @@ module tb_matmul_unit;
     reg  [1:0]  m_rresp = 0, m_bresp = 0;
     wire        irq;
 
+    reg         pcpi_valid = 0;
+    reg  [31:0] pcpi_insn = 0, pcpi_rs1 = 0, pcpi_rs2 = 0;
+    wire        pcpi_wr, pcpi_wait, pcpi_ready;
+    wire [31:0] pcpi_rd;
+
     matmul_unit dut (
         .aclk(aclk), .aresetn(aresetn),
         .s_axi_awaddr(s_awaddr), .s_axi_awvalid(s_awvalid), .s_axi_awready(s_awready),
@@ -55,6 +60,8 @@ module tb_matmul_unit;
         .m_axi_wdata(m_wdata), .m_axi_wstrb(m_wstrb), .m_axi_wlast(m_wlast),
         .m_axi_wvalid(m_wvalid), .m_axi_wready(m_wready),
         .m_axi_bresp(m_bresp), .m_axi_bvalid(m_bvalid), .m_axi_bready(m_bready),
+        .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
+        .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
         .irq(irq)
     );
 
@@ -287,6 +294,53 @@ module tb_matmul_unit;
         end
     endtask
 
+    // ------------------------------------------ PCPI master (PicoRV32 model)
+    localparam [2:0] F_TRIGGER = 0, F_STATUS = 1, F_RESET = 2, F_WAIT = 3, F_CYCLES = 4;
+
+    function [31:0] custom0(input [2:0] f3, input [6:0] f7);
+        custom0 = {f7, 5'd11, 5'd10, f3, 5'd5, 7'b0001011};   // rd=x5 rs1=x10 rs2=x11
+    endfunction
+
+    // Issue one instruction like picorv32 does: hold valid/insn/rs until
+    // ready; the core would trap if pcpi_wait were low for 16 cycles.
+    integer    pc_cycles, pc_nowait;
+    reg [31:0] pc_rd;
+    reg        pc_wr;
+    task pcpi_exec(input [31:0] insn, input [31:0] rs1, input [31:0] rs2);
+        begin
+            @(posedge aclk);
+            #1 pcpi_valid = 1; pcpi_insn = insn; pcpi_rs1 = rs1; pcpi_rs2 = rs2;
+            pc_cycles = 0; pc_nowait = 0;
+            @(posedge aclk);
+            while (!pcpi_ready && pc_nowait < 16) begin
+                pc_nowait = pcpi_wait ? 0 : pc_nowait + 1;
+                pc_cycles = pc_cycles + 1;
+                @(posedge aclk);
+            end
+            pc_rd = pcpi_rd;
+            pc_wr = pcpi_wr;
+            if (!pcpi_ready) pc_cycles = -1;       // would have trapped
+            #1 pcpi_valid = 0; pcpi_insn = 0;
+        end
+    endtask
+
+    task mat_op(input [2:0] f3, input [31:0] rs1, input [31:0] rs2);
+        begin
+            pcpi_exec(custom0(f3, 7'd0), rs1, rs2);
+            if (pc_cycles < 0) fail("PCPI instruction timed out (would trap)");
+        end
+    endtask
+
+    // descriptor {A, B, DIM, 0} at d
+    task put_desc(input [31:0] d, input [31:0] a, input [31:0] b, input [31:0] dimv);
+        integer j;
+        reg [127:0] w;
+        begin
+            w = {32'd0, dimv, b, a};
+            for (j = 0; j < 16; j = j + 1) mem[d - MEM_BASE + j] = w[8*j +: 8];
+        end
+    endtask
+
     // ---------------------------------------------------------- tests
     integer    cs, total_cycles, min_cycles, max_cycles, bursts_before;
     reg [31:0] a_addr, b_addr, c_addr, cyc;
@@ -403,8 +457,81 @@ module tb_matmul_unit;
         if (status !== 32'h1) fail("recovery run: wrong STATUS");
         check_c(cs, c_addr);
 
+        // ================= custom-instruction (PCPI) path =================
+        // --- all golden vectors via mat_trigger / mat_wait, no CSR access
+        for (cs = 0; cs < NC; cs = cs + 1) begin
+            // own 1 KB block per case: A +0x000, B +0x080, C +0x100 (+ small offsets)
+            a_addr = MEM_BASE + 32'h10000 + cs * 32'h400 + (cs % 8) * 8;
+            b_addr = MEM_BASE + 32'h10000 + cs * 32'h400 + 32'h80 + (cs % 4) * 8;
+            c_addr = MEM_BASE + 32'h10000 + cs * 32'h400 + 32'h100 + (cs % 3) * 8;
+            load_matrix(a_addr, 8 * cs, 0);
+            load_matrix(b_addr, 8 * cs, 1);
+            poison(c_addr, 272);
+            put_desc(MEM_BASE + 32'h18000 + 16 * cs, a_addr, b_addr, DIM_888);
+            mat_op(F_TRIGGER, MEM_BASE + 32'h18000 + 16 * cs, c_addr);
+            if (pc_wr) fail("mat_trigger wrote rd");
+            mat_op(F_WAIT, 0, 0);
+            if (!pc_wr || pc_rd !== 32'h1) fail("mat_wait: status not done/ok");
+            check_c(cs, c_addr);
+            mat_op(F_CYCLES, 0, 0);
+            if (!pc_wr || pc_rd == 0) fail("mat_cycles returned 0");
+        end
+        expect_csr(SRC_A, a_addr, "SRC_A after mat_trigger (from descriptor)");
+        expect_csr(DST, c_addr, "DST after mat_trigger");
+
+        // --- mat_status while busy, then trigger-while-busy stalls until idle
+        cs = 3;
+        a_addr = MEM_BASE + 32'hC000; b_addr = MEM_BASE + 32'hC100; c_addr = MEM_BASE + 32'hC200;
+        load_matrix(a_addr, 8 * cs, 0);
+        load_matrix(b_addr, 8 * cs, 1);
+        poison(c_addr, 272);
+        poison(MEM_BASE + 32'hC400, 272);
+        put_desc(MEM_BASE + 32'hF000, a_addr, b_addr, DIM_888);
+        mat_op(F_TRIGGER, MEM_BASE + 32'hF000, c_addr);
+        mat_op(F_STATUS, 0, 0);
+        if (pc_rd[1] !== 1'b1 || pc_cycles > 2) fail("mat_status: not immediate / busy not set");
+        mat_op(F_TRIGGER, MEM_BASE + 32'hF000, MEM_BASE + 32'hC400);   // same A/B, second C
+        if (pc_cycles < 40) fail("mat_trigger while busy did not stall");
+        mat_op(F_WAIT, 0, 0);
+        if (pc_rd !== 32'h1) fail("second job status");
+        check_c(cs, c_addr);
+        check_c(cs, MEM_BASE + 32'hC400);
+
+        // --- errors: misaligned descriptor, bad DIM in descriptor
+        mat_op(F_TRIGGER, MEM_BASE + 32'hF008, c_addr);
+        mat_op(F_WAIT, 0, 0);
+        if (pc_rd !== {20'd0, 4'd2, 5'd0, 3'b101}) fail("misaligned descriptor: wrong status");
+        put_desc(MEM_BASE + 32'hF010, a_addr, b_addr, {2'b0, 10'd16, 10'd8, 10'd8});
+        mat_op(F_TRIGGER, MEM_BASE + 32'hF010, c_addr);
+        mat_op(F_WAIT, 0, 0);
+        if (pc_rd !== {20'd0, 4'd1, 5'd0, 3'b101}) fail("descriptor DIM error: wrong status");
+        csr_write(DIM, DIM_888);   // the descriptor also loaded DIM into the CSR
+
+        // --- mat_reset clears status
+        mat_op(F_RESET, 0, 0);
+        mat_op(F_STATUS, 0, 0);
+        if (pc_rd !== 32'h0) fail("mat_reset did not clear status");
+
+        // --- unknown encodings are not claimed (core must trap)
+        pcpi_exec(custom0(3'd5, 7'd0), 0, 0);
+        if (pc_cycles >= 0) fail("funct3=5 was answered");
+        pcpi_exec(custom0(3'd0, 7'd1), 0, 0);
+        if (pc_cycles >= 0) fail("funct7!=0 was answered");
+        pcpi_exec(32'h02B50533, 0, 0);            // mul a0,a0,a1 (not custom-0)
+        if (pc_cycles >= 0) fail("standard MUL claimed by matmul_pcpi");
+
+        // --- CSR start, then mat_trigger while the CSR job runs
+        poison(c_addr, 272);
+        poison(MEM_BASE + 32'hC400, 272);
+        run(a_addr, b_addr, c_addr, 3'b000);
+        mat_op(F_TRIGGER, MEM_BASE + 32'hF000, MEM_BASE + 32'hC400);
+        mat_op(F_WAIT, 0, 0);
+        if (pc_rd !== 32'h1) fail("CSR + PCPI mix: status");
+        check_c(cs, c_addr);
+        check_c(cs, MEM_BASE + 32'hC400);
+
         repeat (20) @(posedge aclk);
-        $display("TB %s: %0d golden cases + CSR/error tests, %0d errors; cycles per 8x8x8 matmul: min %0d / avg %0d / max %0d (AXI stalls randomized)",
+        $display("TB %s: %0d golden cases x (CSR + PCPI) + CSR/PCPI/error tests, %0d errors; cycles per 8x8x8 matmul: min %0d / avg %0d / max %0d (AXI stalls randomized)",
                  errors ? "FAIL" : "PASS", NC, errors, min_cycles, total_cycles / NC, max_cycles);
         $finish;
     end

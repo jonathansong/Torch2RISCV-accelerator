@@ -23,6 +23,7 @@ source [file join $script_folder pico_processor.tcl]
 # Matrix unit RTL (<repo>/rtl/matmul), instantiated as a module reference
 set matmul_rtl_dir [file normalize [file join $script_folder .. .. rtl matmul]]
 set matmul_rtl [list [file join $matmul_rtl_dir systolic_array.v] \
+                     [file join $matmul_rtl_dir matmul_pcpi.v] \
                      [file join $matmul_rtl_dir matmul_unit.v]]
 
 ################################################################
@@ -1169,6 +1170,7 @@ Flash#unassigned#unassigned#unassigned#unassigned#unassigned#UART 0#UART 0#Enet\
   connect_bd_intf_net -intf_net S_AXI_MEM [get_bd_intf_pins pico_processor_0/S_AXI_MEM] [get_bd_intf_pins psAxiInterconnect/M02_AXI]
   connect_bd_intf_net -intf_net M_AXI_DDR [get_bd_intf_pins pico_processor_0/M_AXI_DDR] [get_bd_intf_pins processing_system7_0/S_AXI_HP0]
   connect_bd_intf_net -intf_net M_AXI_PERIPH [get_bd_intf_pins pico_processor_0/M_AXI_PERIPH] [get_bd_intf_pins matmul_0/s_axi]
+  connect_bd_intf_net -intf_net PCPI [get_bd_intf_pins pico_processor_0/PCPI] [get_bd_intf_pins matmul_0/pcpi]
   connect_bd_intf_net -intf_net matmul_m_axi [get_bd_intf_pins matmul_0/m_axi] [get_bd_intf_pins matmulHpConverter/S_AXI]
   connect_bd_intf_net -intf_net matmul_hp2 [get_bd_intf_pins matmulHpConverter/M_AXI] [get_bd_intf_pins processing_system7_0/S_AXI_HP2]
   connect_bd_net -net periph_aresetn [get_bd_pins pico_processor_0/periph_aresetn] [get_bd_pins matmul_0/aresetn] [get_bd_pins matmulHpConverter/aresetn]
