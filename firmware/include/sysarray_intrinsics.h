@@ -78,8 +78,22 @@ static inline uint32_t mat_cycles(void)
  * a later load of the same DDR bytes.
  * ---------------------------------------------------------------------- */
 
+/*
+ * Array size D (8 or 16) of the loaded overlay. By default it is read at run
+ * time from the CAPS CSR ([7:0], RISC-V address 0x80000024) by sa_init(), so
+ * one firmware image runs on every build; -DSA_D=<n> fixes it at compile time.
+ */
 #ifndef SA_D
-#define SA_D            8u                          /* array size of the build     */
+static uint32_t sa_d_runtime = 8u;
+#define SA_D            sa_d_runtime
+static inline uint32_t sa_init(void)
+{
+    uint32_t d = *(volatile uint32_t *)0x80000024u & 0xFFu;
+    sa_d_runtime = (d == 8u || d == 16u) ? d : 8u;
+    return sa_d_runtime;
+}
+#else
+static inline uint32_t sa_init(void) { return SA_D; }
 #endif
 #define SA_SPAD_WORDS   (131072u / SA_D)            /* per SPAD, D-byte words      */
 #define SA_ACC_WORDS    (262144u / (4u * SA_D))     /* D x int32 words             */

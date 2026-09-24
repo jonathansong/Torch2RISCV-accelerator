@@ -2,6 +2,7 @@
 # A firmware directory sets FW (output name) and SRCS, then includes this:
 #   make        -> $(FW).bin  (load into the program BRAM; see driver/pynq_matmul.py)
 #   make sim    -> sim/tb_system.v: the firmware on picorv32_axi driving the
+#                  (SIM_D=16: the D = 16 unit)
 #                  real sa_unit (CSR + PCPI) against a DDR model
 #                  (SIM_DEFINES: GEMM_TEST for the GEMM firmware)
 # clang/lld, rv32imc (matches the overlay's PicoRV32 configuration).
@@ -22,7 +23,9 @@ PYTHON          ?= python3
 SA  := $(ROOT)/rtl/sysarray
 RTL := $(ROOT)/RISCV-on-PYNQ-Z1/picorv32/picorv32.v $(wildcard $(SA)/*.v)
 SIM_DEFINES ?=
-SIM := build/sim
+# array size of the simulated unit (8 or 16)
+SIM_D       ?= 8
+SIM := build/sim$(SIM_D)
 
 all: $(FW).bin
 
@@ -43,7 +46,7 @@ $(SIM)/n_cases.vh: $(ROOT)/rtl/matmul/sim/gen_vectors.py
 
 sim: $(SIM)/fw.hex $(SIM)/n_cases.vh
 	cd $(SIM) && bash -c 'source $(VIVADO_SETTINGS) >/dev/null && \
-	  xvlog -i . -i $(SA) $(addprefix -d ,$(SIM_DEFINES)) $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { grep ERROR xvlog.out; exit 1; }; \
+	  xvlog -i . -i $(SA) $(addprefix -d ,$(SIM_DEFINES)) -d SIM_D=$(strip $(SIM_D)) $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { grep ERROR xvlog.out; exit 1; }; \
 	  xelab -debug off tb_system -s tb >xelab.out 2>&1 || { cat xelab.out; exit 1; }; \
 	  xsim tb -R' | grep -E "^(TB|ERROR|FATAL)"
 

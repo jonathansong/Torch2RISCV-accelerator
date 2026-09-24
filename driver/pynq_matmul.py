@@ -25,6 +25,7 @@ releases it from reset. Two firmwares consume the same mailbox:
 Run as root inside the PYNQ venv with XRT sourced (Jupyter already is).
 """
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -58,7 +59,7 @@ BW_TESTS = [  # name, bytes moved (bwtest_fw.c)
     ("LD  8-byte rows, pitch 16 (1-beat bursts)", 65536),
     ("LD SPAD_B + ST SPAD_A concurrently", 131072),
 ]
-SA_D = 8                                 # array size of the overlay build
+SA_D = 8                                 # array size if the .hwh does not say (M1-M3 builds)
 SPAD_BYTES = 128 * 1024                  # per SPAD
 MBOX_WORDS = 0x100 // 4
 STATUS_RUNNING, STATUS_DONE = 0x00000001, 0x600D600D
@@ -88,6 +89,20 @@ MATMUL_ERR_CODES = {1: "bad DIM", 2: "bad address", 3: "read SLVERR/DECERR",
                     4: "write SLVERR/DECERR"}
 
 
+def overlay_params(bitfile):
+    """D and NPORTS of the sa_unit in the overlay, from the .hwh next to the .bit
+    (module-reference parameters); (SA_D, 1) if not found."""
+    try:
+        hwh = open(os.path.splitext(bitfile)[0] + ".hwh").read()
+    except OSError:
+        return SA_D, 1
+    i = hwh.find('MODTYPE="sa_unit"')
+    if i < 0:
+        return SA_D, 1
+    params = dict(re.findall(r'<PARAMETER NAME="(\w+)" VALUE="([^"]*)"', hwh[i:i + 20000]))
+    return int(params.get("D", SA_D)), int(params.get("NPORTS", 1))
+
+
 def _describe(first_err):
     if first_err == ERR_NO_UNIT:
         return "matmul unit not found (ID mismatch)"
@@ -102,6 +117,7 @@ class MatmulOverlay:
         bitfile = bitfile or os.path.join(HERE, "picorv32.bit")
         firmware = firmware or os.path.join(HERE, "matmul_fw.bin")
         self.overlay = Overlay(bitfile, download=download)
+        self.d, self.nports = overlay_params(bitfile)     # array size, DMA ports
         self.reset = GPIO(GPIO.get_gpio_pin(RESET_EMIO), "out")
         self.bram = MMIO(BRAM_ARM_BASE, BRAM_BYTES)
         self.reset.write(1)
@@ -247,17 +263,21 @@ class MatmulOverlay:
         quant None: bias (M, N) int32 or None -> C (M, N) int32.
         quant Requant(...) (M3): C (M, N) int8 = requant(relu(A @ B + bias)) computed
         by the vector engine on the chip; bias is then an int32 vector (N,) or None.
-        M, N, K multiples of 8; B must fit in SPAD_B (K * N <= 128 KB), K <= 8192
-        (int8 output: K <= 4096, N <= 3640)."""
+        M, N, K multiples of D (8 or 16, self.d); B must fit in SPAD_B (K * N <= 128 KB),
+        K <= 65536 / D (int8 output: K <= 32768 / D, N + N / D <= 32768 / D)."""
         self._use("gemm_fw.bin")
         a = np.ascontiguousarray(a, dtype=np.int8)
         b = np.ascontiguousarray(b, dtype=np.int8)
         (m, k), (k2, n) = a.shape, b.shape
-        if k != k2 or m % SA_D or n % SA_D or k % SA_D:
-            raise ValueError(f"shapes {a.shape} x {b.shape}: need matching K and multiples of {SA_D}")
-        if k * n > SPAD_BYTES or k > SPAD_BYTES // 16:
+        d = self.d
+        bank = SPAD_BYTES // d // 2                    # SPAD bank words = A strip limit on K
+        if k != k2 or m % d or n % d or k % d:
+            raise ValueError(f"shapes {a.shape} x {b.shape}: need matching K and multiples of {d}")
+        if k * n > SPAD_BYTES or k > bank:
             raise ValueError(f"B ({k} x {n}) does not fit the resident-B schedule")
-        if quant is not None and (k > SPAD_BYTES // 32 or n + n // SA_D > SPAD_BYTES // 32):
+        # int8 output: A strip and int8 strip share a SPAD bank (halves); C strip
+        # + bias vector in one ACC bank (bank / 2 words, D int32 each)
+        if quant is not None and (k > bank // 2 or n > bank // 2 or n + n // d > bank // 2):
             raise ValueError(f"int8 output: K {k} or N {n} too large for the epilogue layout")
         bshape = ((n,) if quant is not None else (m, n))
         bufs = [allocate(shape=a.shape, dtype=np.int8), allocate(shape=b.shape, dtype=np.int8),
@@ -294,8 +314,8 @@ class MatmulOverlay:
         """One vector-engine operation with vector_fw.bin (M3):
             out = saturate(clip(requant(relu(op(x, y)))))
         op: "add" "sub" "mul" "max" "min" "copy" (y unused); x: 1-D int8 / int16 / int32
-        (mul: int8 / int16 only), length a multiple of 8; y: same dtype, the same
-        length or 8 * period elements, period <= 512 (repeated; 8 = broadcast one group);
+        (mul: int8 / int16 only), length a multiple of D; y: same dtype, the same
+        length or D * period elements, period <= 512 (repeated; D = broadcast one group);
         out_dtype int8 / int16 / int32 (default x's); requant: Requant or None."""
         self._use("vector_fw.bin")
         x = np.ascontiguousarray(x).ravel()
@@ -304,20 +324,21 @@ class MatmulOverlay:
         ot = VTYPES[out_dtype]
         code = VOPS[op]
         n = x.size
-        if n % SA_D or n == 0:
-            raise ValueError(f"length {n}: need a positive multiple of {SA_D}")
+        d = self.d
+        if n % d or n == 0:
+            raise ValueError(f"length {n}: need a positive multiple of {d}")
         if op == "mul" and it == 2:
             raise ValueError("mul takes int8 / int16 inputs")
         if op == "copy":
-            y, period = x[:SA_D], 0
+            y, period = x[:d], 0
         else:
             y = np.ascontiguousarray(y, dtype=x.dtype).ravel()
             if y.size == n:
                 period = 0
-            elif y.size % SA_D == 0 and 0 < y.size // SA_D <= 512:
-                period = y.size // SA_D
+            elif y.size % d == 0 and 0 < y.size // d <= 512:
+                period = y.size // d
             else:
-                raise ValueError(f"y: {y.size} elements, need {n} or 8 * period (period <= 512)")
+                raise ValueError(f"y: {y.size} elements, need {n} or {d} * period (period <= 512)")
         bufs = [allocate(shape=(n,), dtype=x.dtype), allocate(shape=(y.size,), dtype=x.dtype),
                 allocate(shape=(n,), dtype=out_dtype)]
         xbuf, ybuf, obuf = bufs

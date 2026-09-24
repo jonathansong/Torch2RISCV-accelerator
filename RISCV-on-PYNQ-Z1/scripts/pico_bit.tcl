@@ -245,6 +245,15 @@ proc create_root_design { parentCell } {
      update_compile_order -fileset sources_1
   }
   set matmul_0 [ create_bd_cell -type module -reference sa_unit matmul_0 ]
+  # array size from build_bitstream.tcl -sa_d (M4: 16); DSP_COLS stays 8.
+  # The module reference freezes the parameter defaults at D = 8, so the
+  # memory depths that derive from D must be set explicitly as well
+  # (128 KB per SPAD, 256 KB ACC).
+  if { [info exists ::sa_d] } {
+     set_property -dict [list CONFIG.D $::sa_d \
+                              CONFIG.SPAD_WORDS [expr {131072 / $::sa_d}] \
+                              CONFIG.ACC_WORDS [expr {262144 / (4 * $::sa_d)}]] $matmul_0
+  }
 
   # Create instance: matmulHpConverter (AXI4 -> AXI3 for S_AXI_HP2)
   set matmulHpConverter [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_protocol_converter:2.1 matmulHpConverter ]

@@ -16,8 +16,9 @@
  * DMA loads chunk n+1 into the other and stores chunk n-1 (hardware bank
  * scoreboard, as in the GEMM firmware). Placement per bank:
  *   int8 / int16 in:  src1 SPAD_A word 0, src2 SPAD_B word 0
- *   int32 in:         src1 ACC word 0,    src2 ACC word 1024
- *   int8 / int16 out: SPAD_B word SA_SPAD_BANK/2;  int32 out: ACC word 2048
+ *   int32 in:         src1 ACC word 0,    src2 ACC word SA_ACC_BANK/4
+ *   int8 / int16 out: SPAD_B word SA_SPAD_BANK/2;  int32 out: ACC word SA_ACC_BANK/2
+ * (a chunk of 512 groups fits every slot at D = 8 and D = 16)
  */
 #include <stdint.h>
 #include "mailbox.h"
@@ -73,6 +74,7 @@ static void store(uint32_t ddr, uint32_t mem, uint32_t word, uint32_t bytes)
 int main(void)
 {
     MBOX(MBOX_STATUS) = STATUS_RUNNING;
+    sa_init();                                     /* D of the overlay (CAPS) */
 
     uint32_t src1 = MBOX(MBOX_A_BASE), src2 = MBOX(MBOX_B_BASE), dst = MBOX(MBOX_C_BASE);
     uint32_t len = MBOX(MBOX_V_LEN), op = MBOX(MBOX_V_OP), types = MBOX(MBOX_V_TYPES);
@@ -82,9 +84,9 @@ int main(void)
 
     uint32_t m1 = tmem_in(it);
     uint32_t m2 = it == SA_VT_I32 ? SA_MEM_ACC : SA_MEM_SPAD_B;
-    uint32_t w2 = it == SA_VT_I32 ? 1024u : 0u;
+    uint32_t w2 = it == SA_VT_I32 ? SA_ACC_BANK / 4u : 0u;
     uint32_t md = ot == SA_VT_I32 ? SA_MEM_ACC : SA_MEM_SPAD_B;
-    uint32_t wd = ot == SA_VT_I32 ? 2048u : SA_SPAD_BANK / 2u;
+    uint32_t wd = ot == SA_VT_I32 ? SA_ACC_BANK / 2u : SA_SPAD_BANK / 2u;
     uint32_t gin = SA_D * esize(it), gout = SA_D * esize(ot);   /* bytes per group */
 
     /* a chunk restarts the src2 period, so it holds whole periods */

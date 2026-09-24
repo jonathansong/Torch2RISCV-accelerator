@@ -88,8 +88,9 @@ module sa_legacy #(
     reg  [127:0] desc_reg;
 
     localparam [3:0] L_IDLE = 0, L_FENCE = 1, L_DESC = 2, L_DESC_W = 3, L_CHECK = 4,
-                     L_PUSH = 5, L_RUN = 6;
+                     L_PUSH = 5, L_RUN = 6, L_ERRW = 7;
     reg  [3:0]  lstate;
+    reg  [3:0]  pend_code;        // L_ERRW: error of this job, reported once the engines are idle
     reg         from_desc;
     reg  [31:0] desc_addr;
     reg  [1:0]  pidx;
@@ -240,8 +241,8 @@ module sa_legacy #(
                     end
                 L_DESC_W:
                     if (sched_err) begin
-                        clear_error <= 1;
-                        finish(ERR_RRESP);
+                        pend_code <= ERR_RRESP;
+                        lstate    <= L_ERRW;
                     end else if (sched_idle) begin
                         src_a  <= desc_reg[31:0];
                         src_b  <= desc_reg[63:32];
@@ -268,10 +269,19 @@ module sa_legacy #(
                     end
                 L_RUN:
                     if (sched_err) begin
-                        clear_error <= 1;
-                        finish(map_err(sched_code));
+                        pend_code <= map_err(sched_code);
+                        lstate    <= L_ERRW;
                     end else if (sched_idle)
                         finish(ERR_NONE);
+                // a job command failed: the scheduler stops dispatching (the rest of
+                // the job stays queued until clear_error flushes it), but another
+                // engine of the job may still be running and would set the sticky
+                // error again after an early clear - clear once the engines are idle
+                L_ERRW:
+                    if (eng_idle) begin
+                        clear_error <= 1;
+                        finish(pend_code);
+                    end
                 default: lstate <= L_IDLE;
             endcase
         end

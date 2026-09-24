@@ -23,6 +23,11 @@ module sa_tdpram #(
 );
     (* ram_style = "block" *) reg [DATA_WIDTH-1:0] ram_block [(2**ADDR_WIDTH)-1:0];
 
+    // power-on contents zero (BRAM INIT values): the legacy sequencer relies on
+    // its reserved tile slot being zero outside the 8x8 corner when D > 8
+    integer k;
+    initial for (k = 0; k < 2**ADDR_WIDTH; k = k + 1) ram_block[k] = {DATA_WIDTH{1'b0}};
+
     integer i;
     always @(posedge clk) begin
         if (enaA) begin

@@ -20,9 +20,14 @@ behavior (CSRs, funct7 = 0 instructions) is kept by `sa_legacy`.
 ## Verify / build
 
 ```sh
-make test          # all unit testbenches (PYTHON=... with numpy for tb_sa_unit)
-make synth         # OOC synth/place/route, 50 MHz (SYNTH_GEN="D=8 NPORTS=1")
+make test          # all unit testbenches at D = 8 (PYTHON=... with numpy for tb_sa_unit)
+make test16        # the same at D = 16 (M4)
+make synth         # OOC synth/place/route, 50 MHz (SYNTH_GEN="D=16 NPORTS=1")
 ```
+
+Every testbench takes D as a top-level generic (`make sim TB=tb_sa_ve GEN=D=16`,
+`GEN="NP=3 D=16"`); fixed word addresses are written relative to the bank
+boundaries or scaled with the memory depth.
 
 | Testbench | Covers |
 |---|---|

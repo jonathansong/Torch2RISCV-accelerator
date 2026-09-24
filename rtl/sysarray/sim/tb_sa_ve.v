@@ -9,9 +9,13 @@
 
 module tb_sa_ve;
     `include "sa_defs.vh"
-    localparam integer D  = 8;
-    localparam integer SW = 16384, CW = 8192;
-    localparam integer SAW = 14, CAW = 13;
+    parameter  integer D  = 8;                           // GEN=D=16
+    localparam integer SW = 131072 / D, CW = 262144 / (4 * D);
+    localparam integer SAW = $clog2(SW), CAW = $clog2(CW);
+    localparam integer AW = 32 * D;                      // widest word (ACC)
+    // D = 8 word addresses scaled to the memory depth
+    function integer S(input integer w); S = w * SW / 16384; endfunction
+    function integer C(input integer w); C = w * CW / 8192; endfunction
 
     reg clk = 0, resetn = 0;
     always #10 clk = ~clk;
@@ -55,39 +59,39 @@ module tb_sa_ve;
         .b_en(1'b0), .b_we({4*D{1'b0}}), .b_addr({CAW{1'b0}}), .b_din({32*D{1'b0}}), .b_dout(nu_c));
 
     // ------------------------------------------- memory views and shadows
-    reg [63:0]  sh_a [0:SW-1];
-    reg [63:0]  sh_b [0:SW-1];
-    reg [255:0] sh_c [0:CW-1];
-    task hw_set(input [3:0] m, input integer w, input [255:0] v);
+    reg [8*D-1:0] sh_a [0:SW-1];
+    reg [8*D-1:0] sh_b [0:SW-1];
+    reg [AW-1:0]  sh_c [0:CW-1];
+    task hw_set(input [3:0] m, input integer w, input [AW-1:0] v);
         case (m)
-            MEM_SPAD_A: if (w < SW/2) spad_a.bank[0].ram.ram_block[w] = v[63:0]; else spad_a.bank[1].ram.ram_block[w - SW/2] = v[63:0];
-            MEM_SPAD_B: if (w < SW/2) spad_b.bank[0].ram.ram_block[w] = v[63:0]; else spad_b.bank[1].ram.ram_block[w - SW/2] = v[63:0];
+            MEM_SPAD_A: if (w < SW/2) spad_a.bank[0].ram.ram_block[w] = v[8*D-1:0]; else spad_a.bank[1].ram.ram_block[w - SW/2] = v[8*D-1:0];
+            MEM_SPAD_B: if (w < SW/2) spad_b.bank[0].ram.ram_block[w] = v[8*D-1:0]; else spad_b.bank[1].ram.ram_block[w - SW/2] = v[8*D-1:0];
             default:    if (w < CW/2) accm.bank[0].ram.ram_block[w]   = v;        else accm.bank[1].ram.ram_block[w - CW/2]   = v;
         endcase
     endtask
-    function [255:0] hw_get(input [3:0] m, input integer w);
+    function [AW-1:0] hw_get(input [3:0] m, input integer w);
         case (m)
             MEM_SPAD_A: hw_get = w < SW/2 ? spad_a.bank[0].ram.ram_block[w] : spad_a.bank[1].ram.ram_block[w - SW/2];
             MEM_SPAD_B: hw_get = w < SW/2 ? spad_b.bank[0].ram.ram_block[w] : spad_b.bank[1].ram.ram_block[w - SW/2];
             default:    hw_get = w < CW/2 ? accm.bank[0].ram.ram_block[w]   : accm.bank[1].ram.ram_block[w - CW/2];
         endcase
     endfunction
-    function [255:0] sh_get(input [3:0] m, input integer w);
-        sh_get = m == MEM_SPAD_A ? {192'd0, sh_a[w]} : m == MEM_SPAD_B ? {192'd0, sh_b[w]} : sh_c[w];
+    function [AW-1:0] sh_get(input [3:0] m, input integer w);
+        sh_get = m == MEM_SPAD_A ? {{AW-8*D{1'b0}}, sh_a[w]} : m == MEM_SPAD_B ? {{AW-8*D{1'b0}}, sh_b[w]} : sh_c[w];
     endfunction
-    task sh_set(input [3:0] m, input integer w, input [255:0] v);
+    task sh_set(input [3:0] m, input integer w, input [AW-1:0] v);
         begin
-            if (m == MEM_SPAD_A) sh_a[w] = v[63:0];
-            else if (m == MEM_SPAD_B) sh_b[w] = v[63:0];
+            if (m == MEM_SPAD_A) sh_a[w] = v[8*D-1:0];
+            else if (m == MEM_SPAD_B) sh_b[w] = v[8*D-1:0];
             else sh_c[w] = v;
         end
     endtask
     task fill(input [3:0] m, input integer from, input integer n);
         integer w, j;
-        reg [255:0] v;
+        reg [AW-1:0] v;
         for (w = from; w < from + n; w = w + 1) begin
-            for (j = 0; j < 8; j = j + 1) v[32*j +: 32] = $random(seed);
-            if (m != MEM_ACC) v[255:64] = 0;
+            for (j = 0; j < D; j = j + 1) v[32*j +: 32] = $random(seed);
+            if (m != MEM_ACC) v[AW-1:8*D] = 0;
             sh_set(m, w, v);
             hw_set(m, w, v);
         end
@@ -96,7 +100,7 @@ module tb_sa_ve;
     // ---------------------------------------------------- reference model
     function integer wpg(input [1:0] t); wpg = t == VT_I16 ? 2 : 1; endfunction
     function signed [31:0] ref_elem(input [3:0] m, input integer base, input [1:0] t, input integer e);
-        reg [255:0] w0, w1;
+        reg [AW-1:0] w0, w1;
         begin
             w0 = sh_get(m, base); w1 = sh_get(m, base + 1);
             if (t == VT_I8)       ref_elem = $signed(w0[8*e +: 8]);
@@ -112,7 +116,7 @@ module tb_sa_ve;
     task ref_ve;
         integer g, g2, e;
         reg signed [63:0] a, b, r, q, tmin, tmax;
-        reg [255:0] w0, w1;
+        reg [AW-1:0] w0, w1;
         begin
             tmin = c_types[3:2] == VT_I8 ? -128 : c_types[3:2] == VT_I16 ? -32768 : -64'sd2147483648;
             tmax = c_types[3:2] == VT_I8 ?  127 : c_types[3:2] == VT_I16 ?  32767 :  64'sd2147483647;
@@ -178,7 +182,7 @@ module tb_sa_ve;
 
     // compare one word with the reference. Function results go through regs:
     // xsim can misreport `!==` between two function calls in one expression
-    reg [255:0] cmp_h, cmp_r;
+    reg [AW-1:0] cmp_h, cmp_r;
     task cmp(input [3:0] m, input integer w);
         begin
             cmp_h = hw_get(m, w); cmp_r = sh_get(m, w);
@@ -205,30 +209,30 @@ module tb_sa_ve;
 
         // --- fused GEMM epilogue: C strip (8 x 64 int32, row-major in ACC) + bias
         //     row (64 int32 = 8 words, period 8) -> RELU -> REQUANT -> int8 SPAD
-        run(MEM_ACC, 100, MEM_ACC, 4200, MEM_SPAD_A, 300, 64, VOP_ADD, 1, 1, VT_I32, VT_I8,
+        run(MEM_ACC, C(100), MEM_ACC, C(4200), MEM_SPAD_A, S(300), 64, VOP_ADD, 1, 1, VT_I32, VT_I8,
             8, 181, 15, -3, I32MIN, I32MAX);
         epi_cycles = last_cycles;
         // --- same without RELU, output int32 in place (dst = src1)
-        run(MEM_ACC, 100, MEM_ACC, 4200, MEM_ACC, 100, 64, VOP_ADD, 0, 0, VT_I32, VT_I32,
+        run(MEM_ACC, C(100), MEM_ACC, C(4200), MEM_ACC, C(100), 64, VOP_ADD, 0, 0, VT_I32, VT_I32,
             8, 1, 0, 0, I32MIN, I32MAX);
         // --- int8 elementwise: every op, SPAD_A x SPAD_B -> SPAD_B
         for (n = 0; n <= 5; n = n + 1)
-            run(MEM_SPAD_A, 1000, MEM_SPAD_B, 2000, MEM_SPAD_B, 9000 + 64*n, 32, n, 0, 0, VT_I8, VT_I8,
+            run(MEM_SPAD_A, S(1000), MEM_SPAD_B, S(2000), MEM_SPAD_B, S(9000 + 64*n), 32, n, 0, 0, VT_I8, VT_I8,
                 0, 1, 0, 0, I32MIN, I32MAX);
         // --- int8 -> int16 / int32 widening, int16 -> int16, int16 MUL -> int32 (ACC)
-        run(MEM_SPAD_A, 1000, MEM_SPAD_B, 2000, MEM_SPAD_A, 12000, 16, VOP_MUL, 0, 0, VT_I8, VT_I16, 0, 1, 0, 0, I32MIN, I32MAX);
-        run(MEM_SPAD_A, 1000, MEM_SPAD_B, 2000, MEM_ACC,    6000,  16, VOP_SUB, 0, 0, VT_I8, VT_I32, 0, 1, 0, 0, I32MIN, I32MAX);
-        run(MEM_SPAD_A, 3000, MEM_SPAD_B, 3000, MEM_SPAD_A, 12100, 16, VOP_ADD, 0, 0, VT_I16, VT_I16, 0, 1, 0, 0, I32MIN, I32MAX);
-        run(MEM_SPAD_A, 3000, MEM_SPAD_B, 3000, MEM_ACC,    6100,  16, VOP_MUL, 1, 0, VT_I16, VT_I32, 0, 1, 0, 0, I32MIN, I32MAX);
+        run(MEM_SPAD_A, S(1000), MEM_SPAD_B, S(2000), MEM_SPAD_A, S(12000), 16, VOP_MUL, 0, 0, VT_I8, VT_I16, 0, 1, 0, 0, I32MIN, I32MAX);
+        run(MEM_SPAD_A, S(1000), MEM_SPAD_B, S(2000), MEM_ACC,    C(6000),  16, VOP_SUB, 0, 0, VT_I8, VT_I32, 0, 1, 0, 0, I32MIN, I32MAX);
+        run(MEM_SPAD_A, S(3000), MEM_SPAD_B, S(3000), MEM_SPAD_A, S(12100), 16, VOP_ADD, 0, 0, VT_I16, VT_I16, 0, 1, 0, 0, I32MIN, I32MAX);
+        run(MEM_SPAD_A, S(3000), MEM_SPAD_B, S(3000), MEM_ACC,    C(6100),  16, VOP_MUL, 1, 0, VT_I16, VT_I32, 0, 1, 0, 0, I32MIN, I32MAX);
         // --- broadcast src2 (period 1), clamp window, same memory for all operands (port sharing)
-        run(MEM_SPAD_A, 4000, MEM_SPAD_A, 4500, MEM_SPAD_A, 4600, 40, VOP_MAX, 0, 0, VT_I8, VT_I8, 1, 1, 0, 0, -20, 30);
-        run(MEM_ACC, 200, MEM_ACC, 7000, MEM_ACC, 7100, 24, VOP_ADD, 0, 1, VT_I32, VT_I32, 1, -300, 7, 1000, -500000, 500000);
+        run(MEM_SPAD_A, S(4000), MEM_SPAD_A, S(4500), MEM_SPAD_A, S(4600), 40, VOP_MAX, 0, 0, VT_I8, VT_I8, 1, 1, 0, 0, -20, 30);
+        run(MEM_ACC, C(200), MEM_ACC, C(7000), MEM_ACC, C(7100), 24, VOP_ADD, 0, 1, VT_I32, VT_I32, 1, -300, 7, 1000, -500000, 500000);
         // --- saturation: int32 ADD overflow, int8 narrowing
-        hw_set(MEM_ACC, 7500, {8{32'h7FFFFFF0}}); sh_set(MEM_ACC, 7500, {8{32'h7FFFFFF0}});
-        hw_set(MEM_ACC, 7501, {8{32'h00000100}}); sh_set(MEM_ACC, 7501, {8{32'h00000100}});
-        run(MEM_ACC, 7500, MEM_ACC, 7501, MEM_ACC, 7502, 1, VOP_ADD, 0, 0, VT_I32, VT_I32, 0, 1, 0, 0, I32MIN, I32MAX);
-        cmp_h = hw_get(MEM_ACC, 7502);
-        if (cmp_h !== {8{32'h7FFFFFFF}}) begin errors = errors + 1; $display("TB ERROR: int32 ADD did not saturate"); end
+        hw_set(MEM_ACC, C(7500), {D{32'h7FFFFFF0}}); sh_set(MEM_ACC, C(7500), {D{32'h7FFFFFF0}});
+        hw_set(MEM_ACC, C(7500) + 1, {D{32'h00000100}}); sh_set(MEM_ACC, C(7500) + 1, {D{32'h00000100}});
+        run(MEM_ACC, C(7500), MEM_ACC, C(7500) + 1, MEM_ACC, C(7500) + 2, 1, VOP_ADD, 0, 0, VT_I32, VT_I32, 0, 1, 0, 0, I32MIN, I32MAX);
+        cmp_h = hw_get(MEM_ACC, C(7500) + 2);
+        if (cmp_h !== {D{32'h7FFFFFFF}}) begin errors = errors + 1; $display("TB ERROR: int32 ADD did not saturate"); end
         // --- bank-crossing ranges
         run(MEM_SPAD_A, SW/2 - 10, MEM_SPAD_B, SW/2 - 3, MEM_SPAD_B, SW/2 + 100, 20, VOP_SUB, 1, 1, VT_I8, VT_I8, 3, 77, 3, 5, I32MIN, I32MAX);
 
@@ -239,8 +243,8 @@ module tb_sa_ve;
             m2_ = it_ == VT_I32 ? MEM_ACC : 1 + rnd(1);
             md_ = ot_ == VT_I32 ? MEM_ACC : 1 + rnd(1);
             groups = 1 + rnd(20);
-            run(m1_, rnd(40) + (it_ == VT_I32 ? 0 : 1000), m2_, 200 + rnd(40) + (it_ == VT_I32 ? 0 : 1000),
-                md_, (ot_ == VT_I32 ? 3000 : 6000) + 64 * (n % 32),
+            run(m1_, rnd(40) + (it_ == VT_I32 ? 0 : S(1000)), m2_, 200 + rnd(40) + (it_ == VT_I32 ? 0 : S(1000)),
+                md_, (ot_ == VT_I32 ? C(3000) : S(6000)) + 64 * (n % 32) * 8 / D,
                 groups, it_ == VT_I32 ? rnd(4) - (rnd(4) == 2 ? 0 : 0) : rnd(5), rnd(1), rnd(1), it_, ot_,
                 rnd(3), $signed(rnd(4000)) - 2000, rnd(20), $signed(rnd(200)) - 100,
                 rnd(1) ? I32MIN : -rnd(100000), rnd(1) ? I32MAX : rnd(100000));
@@ -255,8 +259,8 @@ module tb_sa_ve;
             m2_ = it_ == VT_I32 ? MEM_ACC : 1 + rnd(1);
             md_ = ot_ == VT_I32 ? MEM_ACC : 1 + rnd(1);
             groups = 1 + rnd(20);
-            run(m1_, rnd(40) + (it_ == VT_I32 ? 0 : 1000), m2_, 200 + rnd(40) + (it_ == VT_I32 ? 0 : 1000),
-                md_, (ot_ == VT_I32 ? 3000 : 6000) + 64 * (n % 32),
+            run(m1_, rnd(40) + (it_ == VT_I32 ? 0 : S(1000)), m2_, 200 + rnd(40) + (it_ == VT_I32 ? 0 : S(1000)),
+                md_, (ot_ == VT_I32 ? C(3000) : S(6000)) + 64 * (n % 32) * 8 / D,
                 groups, rnd(5), rnd(1), rnd(1), it_, ot_,
                 rnd(3), $signed(rnd(4000)) - 2000, rnd(20), $signed(rnd(200)) - 100,
                 rnd(1) ? I32MIN : -rnd(100000), rnd(1) ? I32MAX : rnd(100000));
@@ -268,8 +272,8 @@ module tb_sa_ve;
             if (n < CW) cmp(MEM_ACC, n);
         end
 
-        $display("TB %s: %0d vector commands, %0d errors; fused epilogue (64 groups, bias period 8) %0d cycles",
-                 errors ? "FAIL" : "PASS", ncmd, errors, epi_cycles);
+        $display("TB %s: D=%0d, %0d vector commands, %0d errors; fused epilogue (64 groups, bias period 8) %0d cycles",
+                 errors ? "FAIL" : "PASS", D, ncmd, errors, epi_cycles);
         $finish;
     end
 

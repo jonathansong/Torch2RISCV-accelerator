@@ -15,6 +15,9 @@
 `timescale 1ns / 1ps
 
 `include "sa_macros.vh"
+`ifndef SIM_D
+`define SIM_D 8          // array size: make sim SIM_D=16
+`endif
 module tb_system;
     `include "n_cases.vh"
 
@@ -143,7 +146,8 @@ module tb_system;
     reg  [63:0] m_rdata = 0;
     wire        mm_irq;
 
-    sa_unit #(.D(8), .NPORTS(1)) mm (
+    localparam integer D = `SIM_D;
+    sa_unit #(.D(D), .NPORTS(1)) mm (
         .aclk(clk), .aresetn(resetn),
         .s_axi_awaddr(c_awaddr[7:0]), .s_axi_awvalid(c_awvalid & aw_csr), .s_axi_awready(mm_awready),
         .s_axi_wdata(c_wdata), .s_axi_wstrb(c_wstrb), .s_axi_wvalid(c_wvalid & aw_csr), .s_axi_wready(mm_wready),
@@ -320,7 +324,7 @@ module tb_system;
             resetn <= 0;
             repeat (5) @(posedge clk);
             for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = 8'hA5;
-            vn2 = period == 0 ? len : 8 * period;
+            vn2 = period == 0 ? len : D * period;
             for (i = 0; i < len * esz(it); i = i + 1) ddr[V1_ADDR - DDR_BASE + i] = $random(seed);
             for (i = 0; i < vn2 * esz(it); i = i + 1) ddr[V2_ADDR - DDR_BASE + i] = $random(seed);
             if (it == 2)                                      // int32: moderate values, some saturation
@@ -377,11 +381,12 @@ module tb_system;
     endtask
 
     initial begin
-        run_vec(5000, 8'h00, 0, 0, 0, 1, 0, 0, I32MIN, I32MAX);        // i8 + i8 -> i8 (saturating)
-        run_vec(1032, 8'h02, 0, 1, 0, 1, 0, 0, I32MIN, I32MAX);        // i8 * i8 -> i16
+        // lengths are multiples of 16 (both D); 20000 int8 = several chunks
+        run_vec(20000, 8'h00, 0, 0, 0, 1, 0, 0, I32MIN, I32MAX);       // i8 + i8 -> i8 (saturating)
+        run_vec(1040, 8'h02, 0, 1, 0, 1, 0, 0, I32MIN, I32MAX);        // i8 * i8 -> i16
         run_vec(2400, 8'h30, 2, 0, 4, 181, 15, -3, I32MIN, I32MAX);    // i32 + bias(period 4), relu, requant -> i8
-        run_vec(776,  8'h03, 1, 1, 1, 1, 0, 0, -1000, 20000);          // max(i16, broadcast), clamp -> i16
-        run_vec(4104, 8'h15, 2, 2, 0, 1, 0, 0, I32MIN, I32MAX);        // relu copy i32 -> i32 (513 groups)
+        run_vec(784,  8'h03, 1, 1, 1, 1, 0, 0, -1000, 20000);           // max(i16, broadcast), clamp -> i16
+        run_vec(4112, 8'h15, 2, 2, 0, 1, 0, 0, I32MIN, I32MAX);        // relu copy i32 -> i32 (D = 8: 514 groups)
         run_vec(5600, 8'h01, 0, 2, 3, 1, 0, 0, I32MIN, I32MAX);        // i8 - i8(period 3) -> i32
         run_vec(2048, 8'h22, 1, 2, 0, -300, 7, 1000, -500000, 500000); // i16 * i16, requant, clamp -> i32
         $display("TB %s: %0d vector operations, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
@@ -392,8 +397,8 @@ module tb_system;
     localparam [31:0] GA_ADDR = DDR_BASE,           GB_ADDR = DDR_BASE + 32'h4000,
                       GC_ADDR = DDR_BASE + 32'h8000, GBIAS_ADDR = DDR_BASE + 32'h10000;
     reg signed [7:0]  GA [0:63][0:127];
-    reg signed [7:0]  GB [0:127][0:63];
-    reg signed [31:0] GBIAS [0:63][0:63];
+    reg signed [7:0]  GB [0:127][0:127];
+    reg signed [31:0] GBIAS [0:63][0:127];
     integer gi, gj, gk, runs = 0, total_macs, best_mpc;
     reg signed [31:0] gsum;
 
@@ -448,7 +453,7 @@ module tb_system;
             if (bram[MBOX + 6] !== 0 || bram[MBOX + 16][1]) begin
                 $display("TB ERROR: GEMM ext status %08x", bram[MBOX + 16]); errors = errors + 1;
             end
-            if (bram[MBOX + 5] !== (M/8) * (N/8)) begin $display("TB ERROR: tiles %0d", bram[MBOX + 5]); errors = errors + 1; end
+            if (bram[MBOX + 5] !== (M/D) * (N/D)) begin $display("TB ERROR: tiles %0d", bram[MBOX + 5]); errors = errors + 1; end
             for (gi = 0; gi < M; gi = gi + 1) for (gj = 0; gj < N; gj = gj + 1) begin
                 gsum = GBIAS[gi][gj];
                 for (gk = 0; gk < K; gk = gk + 1) gsum = gsum + GA[gi][gk] * GB[gk][gj];
@@ -477,13 +482,15 @@ module tb_system;
     endtask
 
     initial begin
-        run_gemm(32, 32, 64, 0,  0, 0, 1, 0, 0);
-        run_gemm(24, 16, 40, 1,  0, 0, 1, 0, 0);
-        run_gemm(16, 48, 128, 1, 0, 0, 1, 0, 0);
-        run_gemm(8, 8, 8, 0,     0, 0, 1, 0, 0);
-        run_gemm(32, 32, 64, 1,  1, 1, 181, 15, -3);
-        run_gemm(24, 48, 40, 0,  1, 0, -97, 12, 7);
-        run_gemm(16, 16, 128, 1, 1, 1, 1, 0, 0);
+        // shapes in units of D (D = 8: 32x32x64, 24x16x40, 16x48x128, 8x8x8;
+        // int8: 32x32x64, 24x48x40, 16x16x128)
+        run_gemm(4*D, 4*D, 8*D, 0, 0, 0, 1, 0, 0);
+        run_gemm(3*D, 2*D, 5*D, 1, 0, 0, 1, 0, 0);
+        run_gemm(2*D, 6*D, 128, 1, 0, 0, 1, 0, 0);
+        run_gemm(D, D, D, 0,       0, 0, 1, 0, 0);
+        run_gemm(4*D, 4*D, 8*D, 1, 1, 1, 181, 15, -3);
+        run_gemm(3*D, 6*D, 5*D, 0, 1, 0, -97, 12, 7);
+        run_gemm(2*D, 2*D, 128, 1, 1, 1, 1, 0, 0);
         $display("TB %s: %0d GEMMs, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
         $finish;
     end

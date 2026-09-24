@@ -13,7 +13,11 @@ done and verified on the board** (`RISCV-on-PYNQ-Z1/bitstreams/m3/`): fused
 int8 GEMM (bias + RELU + requant on the chip) bit-exact at 53.5 MAC/cycle
 for 256³ (int32 output: 56.5), standalone vector ops bit-exact for every
 op/type combination; decisions taken while building it are marked *(M3)*
-(§6.4, §8.4). Next: M4 (D = 16).
+(§6.4, §8.4). **M4 (D = 16) done and verified on the board**
+(`RISCV-on-PYNQ-Z1/bitstreams/m4/`): 256³ at 180.4 MAC/cycle (3.2× M3),
+512×256×256 at 191.1, all M1–M3 tests bit-exact; the measurements show one
+HP port is not the limit at D = 16, so the three ports are not built (§10.3).
+Changes are marked *(M4)*.
 
 ## 1. Goals and decisions
 
@@ -441,6 +445,13 @@ of its memory. The queue packet is 261 bits wide (`SA_PKT_W`).
   `firmware/matmul`, `firmware/matmul_insn` and `driver/pynq_matmul.py` run
   unchanged; their Phase 3/4 board numbers are the regression baseline.
 - `mat_reset` also clears the sticky error of §5.4.
+- *(M4)* At D = 16 an 8×8×8 job loads its 8-byte rows into the low half of
+  the reserved slot; the rest of the slot must be zero. The RAMs power up
+  zero (`sa_tdpram` initial values) and only the sequencer writes the slot,
+  so the padding holds as long as new-ISA commands keep off the last D words.
+- *(M4)* After a failed job command the sequencer waits for all engines to go
+  idle before clearing the sticky error (another command of the same job
+  could still be running and set it again; seen at D = 16).
 
 ## 9. Block design changes
 
@@ -512,6 +523,33 @@ port (contiguous transfers unchanged at 99 %). What remains for small
 problems is fixed cost (loading B, the first A strip, the final store and
 fence) that later strips cannot hide.
 
+### 10.3 M4 on the board, and the three-port decision *(M4)*
+
+| GEMM | D = 8 (M3) | D = 16 (M4) | % of 256 |
+|---|---|---|---|
+| 64³ | 37.5 | 70.1 | 27 % |
+| 128³ | 49.7 | 132.1 | 52 % |
+| 256³ | 56.5 | 180.4 | 70 % |
+| 512×256×256 | – | 191.1 | 75 % |
+| 256×128×1024 | – | 180.2 | 70 % |
+
+256³ in 93.0k cycles, against lower bounds of ≈ 73.5k for the array
+(16 strips × 16 tiles × (K + 2(D-1) + 1)) and ≈ 48.6k for the DMA (A 64 KB +
+B 64 KB + C 256 KB at 7.9 B/cycle; reads and writes overlap, LD + ST reach
+15.76 B/cycle). One port is therefore **not** the bottleneck for GEMMs of this
+size, and three ports would not remove the remaining ≈ 20k cycles, which
+come from the schedule (estimated, not profiled):
+
+- the resident-B load (64 KB ≈ 8.3k cycles) runs before the first exec;
+- in-order dispatch: the firmware queues LD A(i), EX(i), ST(i) per strip, so
+  LD A(i+1) waits behind ST(i), which waits for EX(i) - the next strip's A
+  load (4 KB ≈ 520 cycles) does not overlap the current exec (16 × ≈ 600).
+
+Decision: no three-port DMA. Small-K shapes (32×256×64: 17 %) are C-write
+bound, which the int8 epilogue addresses (4× less C traffic) rather than
+more ports. Next steps are in the firmware schedule (issue LD A(i+1) before
+ST(i); split the B load so the first exec starts early).
+
 ## 11. Resource estimate
 
 Baseline: Phase 4 board build (6640 LUT, 7421 FF, 64 DSP, 16 BRAM), of which
@@ -526,6 +564,13 @@ the Phase 4 unit is 1545 LUT / 2116 FF / 64 DSP.
 eight lanes of saturating add, 48-bit rounding shift and two clamps),
 11.6k FF, 96 DSP (array 64, VE 24), 128 BRAM36, WNS +2.5 ns at 50 MHz. The
 VE is larger than estimated; LUTs stay at 31 %.
+
+*(M4)* Board build at D = 16 (8 DSP columns + 8 LUT columns, VL = 16, one
+port): 47.6k LUT (89.5 %; array 21.3k, VE 14.5k in OOC), 34.2k FF, 184 DSP
+(84 %; array 128, VE 48), 130 BRAM36, WNS +1.3 ns. LUTs are the tight
+resource: more logic would need 10 DSP columns (≈ 5k LUT freed, 216 DSP).
+The module reference freezes derived parameter defaults, so the block design
+sets `SPAD_WORDS` / `ACC_WORDS` together with `D` (`-sa_d`).
 
 Everything runs at 50 MHz; the Phase 2 LUT-PE array alone reached ≈ 99 MHz,
 so timing margin is large. BRAM has no room for an ILA without shrinking
@@ -542,7 +587,7 @@ regression, then the tested bitstream is committed under
 | **M1** | D = 8: SPAD/ACC, LD/ST with one port (HP2), K-streaming EX, scoreboard, funct7 = 1 ISA, legacy sequencer, 8 KB program BRAM | NumPy-exact GEMMs (several shapes incl. non-square, K ≫ D) with double-buffered firmware; legacy tests pass; cycles measured |
 | **M2** *(redefined)* | DMA bandwidth self-test (§10.1); repeat `mat_exec` + strip-wide `mat_store`; 8 outstanding bursts per port | Measured HP efficiency; same tests incl. repeat commands; GEMM command overhead reduced on the board |
 | **M3** | Vector engine VL = D, funct7 = 2 | Fused GEMM + bias + ReLU + requant and standalone elementwise ops exact vs NumPy *(done, board-verified)* |
-| **M4** | D = 16 build (8 DSP columns, VL = 16); three HP ports with striping if the D = 16 measurements need them (§10.1) | All of the above at D = 16; resource/timing report |
+| **M4** | D = 16 build (8 DSP columns, VL = 16); three HP ports with striping if the D = 16 measurements need them (§10.1) | All of the above at D = 16; resource/timing report *(done, board-verified; three ports not needed, §10.3)* |
 
 ## 13. Verification
 

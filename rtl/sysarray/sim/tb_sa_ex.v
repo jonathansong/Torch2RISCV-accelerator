@@ -5,9 +5,11 @@
 `timescale 1ns / 1ps
 
 module tb_sa_ex;
-    localparam integer D          = 8;
-    localparam integer SPAD_WORDS = 16384;
-    localparam integer ACC_WORDS  = 8192;
+    parameter  integer D          = 8;             // make sim TB=tb_sa_ex GEN=D=16
+    localparam integer SPAD_WORDS = 131072 / D;
+    localparam integer ACC_WORDS  = 262144 / (4 * D);
+    localparam integer SB         = SPAD_WORDS / 2;  // first word of bank 1
+    localparam integer CB         = ACC_WORDS / 2;
     localparam integer SAW        = $clog2(SPAD_WORDS);
     localparam integer CAW        = $clog2(ACC_WORDS);
     localparam integer MAXK       = 512;
@@ -225,6 +227,11 @@ module tb_sa_ex;
     integer dones = 0;
     always @(posedge clk) if (done) dones = dones + 1;
 
+    // the D = 8 addresses scaled to the memory depth, and Kt scaled so a
+    // strip (Kt*D words) shrinks with it and strips never overlap
+    function integer sw(input integer w); sw = w * SPAD_WORDS / 16384; endfunction
+    function integer ktd(input integer kt); ktd = kt * 64 / (D * D) < 1 ? 1 : kt * 64 / (D * D); endfunction
+
     integer n, t0, t1, tr0, single_cycles, rep_cycles;
     initial begin
         repeat (5) @(posedge clk);
@@ -240,17 +247,18 @@ module tb_sa_ex;
 
         // --- batch of commands issued back-to-back; strips crossing the bank
         //     boundary (SPAD bank = 8192 words, ACC bank = 4096 words)
-        make_cmd(1, 100,  200,  16, 2,  0, 0, 0);
-        make_cmd(2, 8192 - 3*D, 8192 - 5, 4096 - 3, 5, 0, 0, 0);   // A, B and C straddle banks
-        make_cmd(3, 9000, 300,  4200, 16, 0, 0, 0);
-        make_cmd(4, 2000, 9100, 32, 64, 0, 0, 0);                   // K = 512
-        make_cmd(5, 5000, 5000, 48, 3,  1, 0, 0);                   // accumulate
-        make_cmd(6, 6000, 6000, 64, 64, 0, 1, 1);                   // -128 * -128, K = 512
-        make_cmd(7, 7000, 7000, 80, 7,  0, 1, 2);                   // -128 * 127
-        make_cmd(8, 12000, 12000, 96, 1, 1, 2, 2);                  // accumulate, Kt = 1
-        make_cmd(9, 13000, 13000, 112, 1, 0, 0, 0);
-        make_cmd(10, 14000, 14000, 128, 2, 0, 0, 0);
-        make_cmd(11, 15000, 15000, 144, 1, 1, 0, 0);
+        //     boundary (SPAD bank = SB words, ACC bank = CB words; D = 8: 8192 / 4096)
+        make_cmd(1, sw(100),  sw(200),  2*D, ktd(2),  0, 0, 0);
+        make_cmd(2, SB - 3*D, SB - 5, CB - 3, ktd(5), 0, 0, 0);     // A, B and C straddle banks
+        make_cmd(3, sw(9000), sw(300),  CB + 104, ktd(16), 0, 0, 0);
+        make_cmd(4, sw(2000), sw(9100), 4*D, ktd(64), 0, 0, 0);     // K = 512
+        make_cmd(5, sw(5000), sw(5000), 6*D, ktd(3),  1, 0, 0);     // accumulate
+        make_cmd(6, sw(6000), sw(6000), 8*D, ktd(64), 0, 1, 1);     // -128 * -128, K = 512
+        make_cmd(7, sw(7000), sw(7000), 10*D, ktd(7),  0, 1, 2);    // -128 * 127
+        make_cmd(8, sw(12000), sw(12000), 12*D, 1, 1, 2, 2);        // accumulate, Kt = 1
+        make_cmd(9, sw(13000), sw(13000), 14*D, 1, 0, 0, 0);
+        make_cmd(10, sw(14000), sw(14000), 16*D, ktd(2), 0, 0, 0);
+        make_cmd(11, sw(15000), sw(15000), 18*D, 1, 1, 0, 0);
         t0 = $time;
         for (n = 1; n < NCMD; n = n + 1) issue(n);
         while (dones < NCMD) @(posedge clk);
@@ -258,18 +266,18 @@ module tb_sa_ex;
         for (n = 1; n < NCMD; n = n + 1) check(n);
 
         // --- M2: repeat commands (one done per command)
-        make_rep(1000, 2000, 64, 3000, 1, 8, 8, 8, 0);            // resident-B strip, row-major C strip
+        make_rep(sw(1000), sw(2000), 64, CB - 1096, 1, 8, 64 / D, 8, 0); // resident-B strip, row-major C strip
         tr0 = $time; n = dones;
         issue_rep;
         while (dones < n + 1) @(posedge clk);
         rep_cycles = ($time - tr0) / 20;
         check_rep;
         if (dones != n + 1) begin errors = errors + 1; $display("TB ERROR: done count for repeat"); end
-        make_rep(4000, 5000, 100, 3500, 8, 1, 2, 3, 1);           // gaps between B strips, tile blocks, accumulate
+        make_rep(sw(4000), sw(5000), 100, CB - 596, D, 1, 2, 3, 1); // gaps between B strips, tile blocks, accumulate
         issue_rep;
         while (dones < n + 2) @(posedge clk);
         check_rep;
-        make_rep(8192 - 16, 8192 - 40, 16, 4096 - 20, 1, 5, 2, 5, 0); // across bank boundaries
+        make_rep(SB - 16, SB - 40, 2*D, CB - 20, 1, 5, 2, 5, 0);   // across bank boundaries
         issue_rep;
         while (dones < n + 3) @(posedge clk);
         check_rep;

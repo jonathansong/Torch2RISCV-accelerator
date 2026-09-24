@@ -8,11 +8,13 @@
 
 module tb_sa_dma;
     parameter integer NP = 1;
+    parameter integer D  = 8;                    // GEN="NP=3 D=16"
 
     `include "sa_defs.vh"
-    localparam integer D          = 8;
-    localparam integer SPAD_WORDS = 16384;
-    localparam integer ACC_WORDS  = 8192;
+    localparam integer SPAD_WORDS = 131072 / D;
+    localparam integer ACC_WORDS  = 262144 / (4 * D);
+    localparam integer SB         = SPAD_WORDS / 2;   // first word of bank 1
+    localparam integer CB         = ACC_WORDS / 2;
     localparam integer SAW        = $clog2(SPAD_WORDS);
     localparam integer CAW        = $clog2(ACC_WORDS);
     localparam [31:0]  DDR_BASE   = 32'h2000_0000;
@@ -362,19 +364,19 @@ module tb_sa_dma;
         // ---- loads
         do_ld(DDR_BASE + 32'h0FE8, MEM_SPAD_A, 100, 5, 40, 48, 0);         // crosses 4 KB, 5 rows
         do_ld(DDR_BASE + 32'h1000, MEM_SPAD_B, 300, 8, 64, 104, 1);        // INTERLEAVE: A strip, K = 64
-        do_ld(DDR_BASE + 32'h2000, MEM_SPAD_A, 8192 - 20, 8, 256, 256, 1); // INTERLEAVE across the bank boundary
+        do_ld(DDR_BASE + 32'h2000, MEM_SPAD_A, SB - 20, 8, 256, 256, 1);    // INTERLEAVE across the bank boundary
         do_ld(DDR_BASE + 32'h3000, MEM_ACC, 40, 3, 32, 32, 0);            // one ACC word per row
         do_ld(DDR_BASE + 32'h3100, MEM_ACC, 60, 4, 24, 40, 0);            // partial ACC words
-        do_ld(DDR_BASE + 32'h3200, MEM_ACC, 4096 - 3, 2, 72, 80, 0);      // 2.25 words per row, across banks
-        do_ld(DDR_BASE + 32'h4008, MEM_SPAD_B, 8000, 1, 4160, 4160, 0);    // one long row, many bursts
+        do_ld(DDR_BASE + 32'h3200, MEM_ACC, CB - 3, 2, 72, 80, 0);         // 2.25 words per row, across banks
+        do_ld(DDR_BASE + 32'h4008, MEM_SPAD_B, SB - 192, 1, 4160, 4160, 0);    // one long row, many bursts
         do_ld(DDR_BASE + 32'h6000, MEM_SPAD_A, 2000, 64, 8, 8, 0);         // B strip: 64 rows of one word
 
         // ---- stores
         do_st(DDR_BASE + 32'h8000, MEM_ACC, 200, 8, 32, 32);              // C tile
         do_st(DDR_BASE + 32'h8FE0, MEM_ACC, 300, 2, 64, 96);              // crosses 4 KB, 2 words per row
         do_st(DDR_BASE + 32'hA000, MEM_SPAD_A, 500, 4, 24, 40);           // gaps between rows untouched
-        do_st(DDR_BASE + 32'hB008, MEM_SPAD_B, 8190, 1, 2056, 2056);   // long row across the bank boundary
-        do_st(DDR_BASE + 32'hC000, MEM_ACC, 4000, 3, 40, 48);             // partial words
+        do_st(DDR_BASE + 32'hB008, MEM_SPAD_B, SB - 2, 1, 2056, 2056);   // long row across the bank boundary
+        do_st(DDR_BASE + 32'hC000, MEM_ACC, CB - 96, 3, 40, 48);             // partial words
 
         // ---- errors, then recovery
         inj_rresp = 1;
@@ -391,8 +393,8 @@ module tb_sa_dma;
         do_st(DDR_BASE + 32'hE800, MEM_SPAD_A, 900, 4, 32, 32);
 
         repeat (20) @(posedge clk);
-        $display("TB %s: NP=%0d, %0d errors (%0d read / %0d write bursts)",
-                 errors ? "FAIL" : "PASS", NP, errors, ar_bursts, aw_bursts);
+        $display("TB %s: NP=%0d D=%0d, %0d errors (%0d read / %0d write bursts)",
+                 errors ? "FAIL" : "PASS", NP, D, errors, ar_bursts, aw_bursts);
         $finish;
     end
 

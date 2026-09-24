@@ -12,6 +12,8 @@
 `include "sa_macros.vh"
 module tb_sa_unit;
     `include "n_cases.vh"
+    parameter  integer D  = 8;                    // make sim TB=tb_sa_unit GEN=D=16
+    localparam integer AW = 32 * D;               // widest local word (ACC)
 
     localparam [31:0] MEM_BASE  = 32'h1000_0000;
     localparam integer MEM_BYTES = 262144;
@@ -49,7 +51,7 @@ module tb_sa_unit;
     wire        pcpi_wr, pcpi_wait, pcpi_ready;
     wire [31:0] pcpi_rd;
 
-    sa_unit #(.D(8), .NPORTS(1)) dut (
+    sa_unit #(.D(D), .NPORTS(1)) dut (
         .aclk(aclk), .aresetn(aresetn),
         .s_axi_awaddr(s_awaddr), .s_axi_awvalid(s_awvalid), .s_axi_awready(s_awready),
         .s_axi_wdata(s_wdata), .s_axi_wstrb(4'hF), .s_axi_wvalid(s_wvalid), .s_axi_wready(s_wready),
@@ -137,7 +139,8 @@ module tb_sa_unit;
                     #1;
                     for (k = 0; k < 8; k = k + 1)
                         m_rdata[8*k +: 8] = in_mem(r_addr + 8*rb + k, 1) ? mem[r_addr + 8*rb + k - MEM_BASE] : 8'hXX;
-                    m_rresp  = (inject_rresp && rb == 3) ? 2'b10 : 2'b00;
+                    // beat 3, or the last beat of a shorter burst (D = 16: 1-beat rows)
+                    m_rresp  = (inject_rresp && rb == (r_len < 3 ? r_len : 3)) ? 2'b10 : 2'b00;
                     m_rlast  = rb == r_len;
                     m_rvalid = 1;
                     @(posedge aclk);
@@ -366,7 +369,7 @@ module tb_sa_unit;
                      K_ST_ROWS = 4, K_ST_RB = 5, K_ST_PITCH = 6,
                      K_EX_REP = 7, K_EX_BSTEP = 8, K_EX_CSTEP = 9, K_EX_CROW = 10;
     localparam [3:0] M_A = 1, M_B = 2, M_C = 3;
-    localparam integer SW = 16384, CW = 8192;          // SPAD / ACC words (D = 8)
+    localparam integer SW = 131072 / D, CW = 262144 / (4 * D);   // SPAD / ACC words
 
     task n_op(input [2:0] f3, input [31:0] rs1, input [31:0] rs2);
         begin
@@ -393,15 +396,15 @@ module tb_sa_unit;
     endtask
 
     // direct views of the unit's memories (bank = upper half)
-    reg [255:0] cmp_h, cmp_r;
-    function [63:0]  hw_a(input integer w); hw_a = w < SW/2 ? dut.spad_a.bank[0].ram.ram_block[w] : dut.spad_a.bank[1].ram.ram_block[w - SW/2]; endfunction
-    function [63:0]  hw_b(input integer w); hw_b = w < SW/2 ? dut.spad_b.bank[0].ram.ram_block[w] : dut.spad_b.bank[1].ram.ram_block[w - SW/2]; endfunction
-    function [255:0] hw_c(input integer w); hw_c = w < CW/2 ? dut.accm.bank[0].ram.ram_block[w]   : dut.accm.bank[1].ram.ram_block[w - CW/2];   endfunction
+    reg [AW-1:0] cmp_h, cmp_r;
+    function [8*D-1:0] hw_a(input integer w); hw_a = w < SW/2 ? dut.spad_a.bank[0].ram.ram_block[w] : dut.spad_a.bank[1].ram.ram_block[w - SW/2]; endfunction
+    function [8*D-1:0] hw_b(input integer w); hw_b = w < SW/2 ? dut.spad_b.bank[0].ram.ram_block[w] : dut.spad_b.bank[1].ram.ram_block[w - SW/2]; endfunction
+    function [AW-1:0]  hw_c(input integer w); hw_c = w < CW/2 ? dut.accm.bank[0].ram.ram_block[w]   : dut.accm.bank[1].ram.ram_block[w - CW/2];   endfunction
 
     // --------------------------------------------------- tiled GEMM test
-    reg signed [7:0]  GA [0:63][0:127];
-    reg signed [7:0]  GB [0:127][0:63];
-    reg signed [31:0] GBIAS [0:63][0:63];
+    reg signed [7:0]  GA [0:127][0:127];
+    reg signed [7:0]  GB [0:127][0:127];
+    reg signed [31:0] GBIAS [0:127][0:127];
     integer gi, gj, gk, gt, gbk, gti, gtj;
     reg signed [31:0] gsum, ggot;
     integer gemm_cycles;
@@ -423,24 +426,24 @@ module tb_sa_unit;
             poison(ca, 4*M*N + 16);
             t0 = $time;
             // B resident: one INTERLEAVE load of the whole K x N matrix puts
-            // column strip jt at SPAD_B word jt*K (word k = B[k][8jt .. 8jt+7])
+            // column strip jt at SPAD_B word jt*K (word k = B[k][D*jt .. D*jt+D-1])
             cfg_ld(K, N, N, 1);
             ld(ba, M_B, 0);
-            // M2: one mat_exec per A strip computes its N/8 C tiles, laid out
-            // row-major in ACC (tile j row i at word j + i*N/8), so one store
-            // writes the whole 8 x N strip of C
-            cfg_ex(N/8, K, 1, N/8);
-            cfg_st(8, 4*N, 4*N);
-            for (gti = 0; gti < M/8; gti = gti + 1) begin
+            // M2: one mat_exec per A strip computes its N/D C tiles, laid out
+            // row-major in ACC (tile j row i at word j + i*N/D), so one store
+            // writes the whole D x N strip of C
+            cfg_ex(N/D, K, 1, N/D);
+            cfg_st(D, 4*N, 4*N);
+            for (gti = 0; gti < M/D; gti = gti + 1) begin
                 gbk = gti % 2;                                             // strips alternate banks
-                cfg_ld(8, K, K, 1);
-                ld(aa + gti*8*K, M_A, gbk * SW/2);
+                cfg_ld(D, K, K, 1);
+                ld(aa + gti*D*K, M_A, gbk * SW/2);
                 if (use_bias) begin
-                    cfg_ld(8, 4*N, 4*N, 0);                                // bias strip, same layout as C
-                    ld(biasa + gti*8*4*N, M_C, gbk * CW/2);
+                    cfg_ld(D, 4*N, 4*N, 0);                                // bias strip, same layout as C
+                    ld(biasa + gti*D*4*N, M_C, gbk * CW/2);
                 end
-                ex(gbk * SW/2, 0, gbk * CW/2, K/8, use_bias);
-                st(ca + gti*8*4*N, M_C, gbk * CW/2);
+                ex(gbk * SW/2, 0, gbk * CW/2, K/D, use_bias);
+                st(ca + gti*D*4*N, M_C, gbk * CW/2);
             end
             fence(0);
             gemm_cycles = ($time - t0) / 10;
@@ -462,20 +465,20 @@ module tb_sa_unit;
     endtask
 
     // ------------------------------------------ random stream vs reference
-    reg [63:0]  sh_a [0:SW-1];
-    reg [63:0]  sh_b [0:SW-1];
-    reg [255:0] sh_c [0:CW-1];
+    reg [8*D-1:0] sh_a [0:SW-1];
+    reg [8*D-1:0] sh_b [0:SW-1];
+    reg [AW-1:0]  sh_c [0:CW-1];
     localparam [31:0] RS = MEM_BASE + 32'h30000, RD = MEM_BASE + 32'h38000;   // 32 KB each
     reg [7:0] rd_sh [0:32767];
     integer   ri, rj;
-    reg [63:0] rk;
+    reg [8*D-1:0] rk;
     reg [31:0] ext_rd;
 
     task ref_ld(input [31:0] d, input [3:0] m, input integer w, input integer rows, input integer rb,
                 input integer pitch, input integer mode);
         integer rr, bb, wd, byt, wb_, wpr;
         begin
-            wb_ = m == M_C ? 32 : 8;
+            wb_ = m == M_C ? 4*D : D;
             wpr = (rb + wb_ - 1) / wb_;
             for (rr = 0; rr < rows; rr = rr + 1)
                 for (bb = 0; bb < rb; bb = bb + 1) begin
@@ -491,7 +494,7 @@ module tb_sa_unit;
                 input integer pitch);
         integer rr, bb, wd, byt, wb_, wpr;
         begin
-            wb_ = m == M_C ? 32 : 8;
+            wb_ = m == M_C ? 4*D : D;
             wpr = (rb + wb_ - 1) / wb_;
             for (rr = 0; rr < rows; rr = rr + 1)
                 for (bb = 0; bb < rb; bb = bb + 1) begin
@@ -504,19 +507,19 @@ module tb_sa_unit;
     endtask
     task ref_ex(input integer a, input integer b, input integer c, input integer kt, input integer acc,
                 input integer R, input integer bstep, input integer cstep, input integer crow);
-        reg signed [31:0] res [0:7][0:7];
+        reg signed [31:0] res [0:D-1][0:D-1];
         integer i, j, k, r, bb, cc;
         begin
             for (r = 0; r < R; r = r + 1) begin                 // tiles run in order
                 bb = b + r * bstep;
                 cc = c + r * cstep;
-                for (i = 0; i < 8; i = i + 1) for (j = 0; j < 8; j = j + 1) begin
+                for (i = 0; i < D; i = i + 1) for (j = 0; j < D; j = j + 1) begin
                     res[i][j] = acc ? $signed(sh_c[cc + i*crow][32*j +: 32]) : 0;
-                    for (k = 0; k < kt*8; k = k + 1)
-                        res[i][j] = res[i][j] + $signed(sh_a[a + (k/8)*8 + i][8*(k%8) +: 8]) *
+                    for (k = 0; k < kt*D; k = k + 1)
+                        res[i][j] = res[i][j] + $signed(sh_a[a + (k/D)*D + i][8*(k%D) +: 8]) *
                                                 $signed(sh_b[bb + k][8*j +: 8]);
                 end
-                for (i = 0; i < 8; i = i + 1) for (j = 0; j < 8; j = j + 1) sh_c[cc + i*crow][32*j +: 32] = res[i][j];
+                for (i = 0; i < D; i = i + 1) for (j = 0; j < D; j = j + 1) sh_c[cc + i*crow][32*j +: 32] = res[i][j];
             end
         end
     endtask
@@ -543,13 +546,15 @@ module tb_sa_unit;
         begin
             n_ld = 0; n_ex = 0; n_st = 0; n_ve = 0;
             for (ri = 0; ri < SW; ri = ri + 1) begin
-                sh_a[ri] = {$random(seed), $random(seed)};
-                sh_b[ri] = {$random(seed), $random(seed)};
+                for (rj = 0; rj < D/4; rj = rj + 1) begin
+                    sh_a[ri][32*rj +: 32] = $random(seed);
+                    sh_b[ri][32*rj +: 32] = $random(seed);
+                end
                 if (ri < SW/2) begin dut.spad_a.bank[0].ram.ram_block[ri] = sh_a[ri]; dut.spad_b.bank[0].ram.ram_block[ri] = sh_b[ri]; end
                 else begin dut.spad_a.bank[1].ram.ram_block[ri - SW/2] = sh_a[ri]; dut.spad_b.bank[1].ram.ram_block[ri - SW/2] = sh_b[ri]; end
             end
             for (ri = 0; ri < CW; ri = ri + 1) begin
-                for (rj = 0; rj < 8; rj = rj + 1) sh_c[ri][32*rj +: 32] = $random(seed) >>> 6;
+                for (rj = 0; rj < D; rj = rj + 1) sh_c[ri][32*rj +: 32] = $random(seed) >>> 6;
                 if (ri < CW/2) dut.accm.bank[0].ram.ram_block[ri] = sh_c[ri]; else dut.accm.bank[1].ram.ram_block[ri - CW/2] = sh_c[ri];
             end
             for (ri = 0; ri < 32768; ri = ri + 1) begin
@@ -563,7 +568,10 @@ module tb_sa_unit;
                     m = 1 + rnd(2);
                     mode = m != M_C && rnd(2) == 0;
                     rows = 1 + rnd(7); rb = 8 * (1 + rnd(7)); pitch = rb + 8 * rnd(3);
-                    span = mode ? (rb / 8) * rows : rows * ((rb + (m == M_C ? 31 : 7)) / (m == M_C ? 32 : 8));
+                    if (mode && rb % D) begin                      // INTERLEAVE rows: whole D-byte chunks
+                        pitch = pitch + D - rb % D; rb = rb + D - rb % D;
+                    end
+                    span = mode ? ((rb + D - 1) / D) * rows : rows * ((rb + (m == M_C ? 4*D : D) - 1) / (m == M_C ? 4*D : D));
                     w = pick(m == M_C ? CW : SW, span);
                     d = RS + 8 * rnd((32768 - rows * pitch) / 8 - 1);
                     cfg_ld(rows, rb, pitch, mode);
@@ -573,8 +581,8 @@ module tb_sa_unit;
                 end else if (typ <= 6) begin                          // EX (M2: 1-4 tiles, random strides)
                     kt = 1 + rnd(3);
                     er = 1 + rnd(3); ebs = rnd(40); ecs = 1 + rnd(9); ecr = 1 + rnd(9);
-                    a = pick(SW, kt*8); b = pick(SW, (er - 1)*ebs + kt*8);
-                    cc = pick(CW, (er - 1)*ecs + 7*ecr + 1); acc = rnd(1);
+                    a = pick(SW, kt*D); b = pick(SW, (er - 1)*ebs + kt*D);
+                    cc = pick(CW, (er - 1)*ecs + (D-1)*ecr + 1); acc = rnd(1);
                     cfg_ex(er, ebs, ecs, ecr);
                     ex(a, b, cc, kt, acc);
                     ref_ex(a, b, cc, kt, acc, er, ebs, ecs, ecr);
@@ -600,7 +608,7 @@ module tb_sa_unit;
                 end else begin                                        // ST
                     m = 1 + rnd(2);
                     rows = 1 + rnd(3); rb = 8 * (1 + rnd(7)); pitch = rb + 8 * rnd(2);
-                    span = rows * ((rb + (m == M_C ? 31 : 7)) / (m == M_C ? 32 : 8));
+                    span = rows * ((rb + (m == M_C ? 4*D : D) - 1) / (m == M_C ? 4*D : D));
                     w = pick(m == M_C ? CW : SW, span);
                     d = RD + 8 * rnd((32768 - rows * pitch) / 8 - 1);
                     cfg_st(rows, rb, pitch);
@@ -646,7 +654,7 @@ module tb_sa_unit;
               input integer period, input integer scale, input integer shift, input integer zp,
               input integer lo, input integer hi);
         begin
-            vcfg(V_OP, {requant, relu, 1'b0, op}); vcfg(V_LEN, groups * 8); vcfg(V_DST, {md, 12'd0, wd[15:0]});
+            vcfg(V_OP, {requant, relu, 1'b0, op}); vcfg(V_LEN, groups * D); vcfg(V_DST, {md, 12'd0, wd[15:0]});
             vcfg(V_TYPES, {ot, it}); vcfg(V_MOD, period); vcfg(V_SCALE, scale); vcfg(V_SHIFT, shift);
             vcfg(V_ZP, zp); vcfg(V_LO, lo); vcfg(V_HI, hi);
             v_op(3'd1, {m1, 12'd0, w1[15:0]}, {m2, 12'd0, w2[15:0]});
@@ -654,15 +662,15 @@ module tb_sa_unit;
     endtask
 
     function integer vwpg(input [1:0] t); vwpg = t == T16 ? 2 : 1; endfunction
-    function [255:0] shg(input [3:0] m, input integer w);
-        shg = m == M_A ? {192'd0, sh_a[w]} : m == M_B ? {192'd0, sh_b[w]} : sh_c[w];
+    function [AW-1:0] shg(input [3:0] m, input integer w);
+        shg = m == M_A ? {{AW-8*D{1'b0}}, sh_a[w]} : m == M_B ? {{AW-8*D{1'b0}}, sh_b[w]} : sh_c[w];
     endfunction
     function signed [31:0] relem(input [3:0] m, input integer base, input [1:0] t, input integer e);
-        reg [255:0] w0, w1;
+        reg [AW-1:0] w0, w1;
         begin
             w0 = shg(m, base); w1 = shg(m, base + 1);
             if (t == T8)       relem = $signed(w0[8*e +: 8]);
-            else if (t == T16) relem = e < 4 ? $signed(w0[16*e +: 16]) : $signed(w1[16*(e - 4) +: 16]);
+            else if (t == T16) relem = e < D/2 ? $signed(w0[16*e +: 16]) : $signed(w1[16*(e - D/2) +: 16]);
             else               relem = $signed(w0[32*e +: 32]);
         end
     endfunction
@@ -690,18 +698,18 @@ module tb_sa_unit;
                               ot == T8 ?  127 : ot == T16 ?  32767 :  64'sd2147483647);
         end
     endfunction
-    reg signed [31:0] vres [0:4095][0:7];
+    reg signed [31:0] vres [0:4095][0:D-1];
     task ref_ve(input [3:0] m1, input integer w1, input [3:0] m2, input integer w2, input [3:0] md, input integer wd,
                 input integer groups, input [2:0] op, input relu, input requant, input [1:0] it, input [1:0] ot,
                 input integer period, input integer scale, input integer shift, input integer zp,
                 input integer lo, input integer hi);
         integer g, g2, e;
         reg signed [31:0] ea, eb;
-        reg [255:0] x0, x1;
+        reg [AW-1:0] x0, x1;
         begin
             for (g = 0; g < groups; g = g + 1) begin
                 g2 = period == 0 ? g : period == 1 ? 0 : g % period;
-                for (e = 0; e < 8; e = e + 1) begin
+                for (e = 0; e < D; e = e + 1) begin
                     // one relem call per statement: xsim returns the last call's
                     // value for every call of a static function in one expression
                     ea = relem(m1, w1 + g * vwpg(it), it, e);
@@ -711,12 +719,12 @@ module tb_sa_unit;
             end
             for (g = 0; g < groups; g = g + 1) begin
                 x0 = 0; x1 = 0;
-                for (e = 0; e < 8; e = e + 1)
+                for (e = 0; e < D; e = e + 1)
                     if (ot == T8)       x0[8*e +: 8] = vres[g][e][7:0];
-                    else if (ot == T16) begin if (e < 4) x0[16*e +: 16] = vres[g][e][15:0]; else x1[16*(e - 4) +: 16] = vres[g][e][15:0]; end
+                    else if (ot == T16) begin if (e < D/2) x0[16*e +: 16] = vres[g][e][15:0]; else x1[16*(e - D/2) +: 16] = vres[g][e][15:0]; end
                     else                x0[32*e +: 32] = vres[g][e];
-                if (md == M_A) begin sh_a[wd + g * vwpg(ot)] = x0[63:0]; if (ot == T16) sh_a[wd + 2*g + 1] = x1[63:0]; end
-                if (md == M_B) begin sh_b[wd + g * vwpg(ot)] = x0[63:0]; if (ot == T16) sh_b[wd + 2*g + 1] = x1[63:0]; end
+                if (md == M_A) begin sh_a[wd + g * vwpg(ot)] = x0[8*D-1:0]; if (ot == T16) sh_a[wd + 2*g + 1] = x1[8*D-1:0]; end
+                if (md == M_B) begin sh_b[wd + g * vwpg(ot)] = x0[8*D-1:0]; if (ot == T16) sh_b[wd + 2*g + 1] = x1[8*D-1:0]; end
                 if (md == M_C) sh_c[wd + g] = x0;
             end
         end
@@ -750,24 +758,24 @@ module tb_sa_unit;
             end
             poison(QC, M*N + 16);
             t0 = $time;
-            vb = CW/2 - N/8;                                     // bias vector: end of ACC bank 0
+            vb = CW/2 - N/D;                                     // bias vector: end of ACC bank 0
             cfg_ld(K, N, N, 1); ld(QB, M_B, 0);                  // resident B
             if (mode == 0) begin cfg_ld(1, 4*N, 4*N, 0); ld(QBIAS, M_C, vb); end
-            cfg_ex(N/8, K, 1, N/8);
-            cfg_st(8, N, N);                                     // int8 strip: 8 rows of N bytes
-            for (i = 0; i < M/8; i = i + 1) begin
+            cfg_ex(N/D, K, 1, N/D);
+            cfg_st(D, N, N);                                     // int8 strip: D rows of N bytes
+            for (i = 0; i < M/D; i = i + 1) begin
                 bk = i % 2;
-                cfg_ld(8, K, K, 1);
-                ld(QA + i*8*K, M_A, bk * SW/2);
-                if (mode == 1) begin cfg_ld(8, 4*N, 4*N, 0); ld(QBIAS + i*8*4*N, M_C, bk * CW/2); end
-                ex(bk * SW/2, 0, bk * CW/2, K/8, mode == 1);
+                cfg_ld(D, K, K, 1);
+                ld(QA + i*D*K, M_A, bk * SW/2);
+                if (mode == 1) begin cfg_ld(D, 4*N, 4*N, 0); ld(QBIAS + i*D*4*N, M_C, bk * CW/2); end
+                ex(bk * SW/2, 0, bk * CW/2, K/D, mode == 1);
                 if (mode == 0)
-                    vrun(M_C, bk * CW/2, M_C, vb, M_A, bk * SW/2 + 4096, N, VADD, 1, 1, T32, T8,
-                         N/8, scale, shift, zp, -32'sd2147483648, 32'sd2147483647);
+                    vrun(M_C, bk * CW/2, M_C, vb, M_A, bk * SW/2 + SW/4, N, VADD, 1, 1, T32, T8,
+                         N/D, scale, shift, zp, -32'sd2147483648, 32'sd2147483647);
                 else
-                    vrun(M_C, bk * CW/2, M_C, 0, M_A, bk * SW/2 + 4096, N, VCOPY, 1, 1, T32, T8,
+                    vrun(M_C, bk * CW/2, M_C, 0, M_A, bk * SW/2 + SW/4, N, VCOPY, 1, 1, T32, T8,
                          0, scale, shift, zp, -32'sd2147483648, 32'sd2147483647);
-                st(QC + i*8*N, M_A, bk * SW/2 + 4096);
+                st(QC + i*D*N, M_A, bk * SW/2 + SW/4);
             end
             fence(0);
             qgemm_cycles = ($time - t0) / 10;
@@ -887,7 +895,7 @@ module tb_sa_unit;
         run(a_addr, b_addr, c_addr, 3'b000);
         wait_done(0);
         inject_rresp = 0;
-        if (status !== {20'd0, 4'd3, 5'd0, 3'b101}) fail("read SLVERR: wrong STATUS");
+        if (status !== {20'd0, 4'd3, 5'd0, 3'b101}) begin fail("read SLVERR: wrong STATUS"); $display("   STATUS = %08x, timeout %0d", status, timeout); end
         if (mem32(c_addr) !== 32'hA5A5A5A5) fail("read SLVERR: C was written anyway");
 
         // --- error: SLVERR on write response
@@ -895,13 +903,13 @@ module tb_sa_unit;
         run(a_addr, b_addr, c_addr, 3'b000);
         wait_done(0);
         inject_bresp = 0;
-        if (status !== {20'd0, 4'd4, 5'd0, 3'b101}) fail("write SLVERR: wrong STATUS");
+        if (status !== {20'd0, 4'd4, 5'd0, 3'b101}) begin fail("write SLVERR: wrong STATUS"); $display("   STATUS = %08x, timeout %0d", status, timeout); end
 
         // --- recovery after errors
         poison(c_addr, 272);
         run(a_addr, b_addr, c_addr, 3'b000);
         wait_done(0);
-        if (status !== 32'h1) fail("recovery run: wrong STATUS");
+        if (status !== 32'h1) begin fail("recovery run: wrong STATUS"); $display("   STATUS = %08x, timeout %0d", status, timeout); end
         check_c(cs, c_addr);
 
         // ================= custom-instruction (PCPI) path =================
@@ -980,16 +988,18 @@ module tb_sa_unit;
         check_c(cs, MEM_BASE + 32'hC400);
 
         // =============================================== new ISA: GEMM
-        gemm(24, 16, 40,  MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 0, 0);
-        gemm(16, 32, 128, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
-        gemm(8, 8, 8,     MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
-        gemm(32, 32, 64,  MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 0, 0);
+        // shapes in units of D (D = 8: 24x16x40, 16x32x128, 8x8x8, 32x32x64)
+        gemm(3*D, 2*D, 5*D, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 0, 0);
+        gemm(2*D, 4*D, 128, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
+        gemm(D, D, D,       MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
+        gemm(4*D, 4*D, 8*D, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 0, 0);
 
         // ======================================= M3: quantized GEMMs
-        qgemm(32, 32, 64, 0, 181, 15, -3);
+        // D = 8: 32x32x64, 16x48x40, 24x16x128
+        qgemm(4*D, 4*D, 8*D, 0, 181, 15, -3);
         qgemm_cycles_first = qgemm_cycles;
-        qgemm(16, 48, 40, 1, -97, 12, 7);
-        qgemm(24, 16, 128, 0, 1, 0, 0);
+        qgemm(2*D, 6*D, 5*D, 1, -97, 12, 7);
+        qgemm(3*D, 2*D, 128, 0, 1, 0, 0);
 
         // ===================================== scoreboard: random stream
         random_stream(120);
@@ -1003,14 +1013,16 @@ module tb_sa_unit;
         cfg_ld(1, 8, 8, 0);
         ld(MEM_BASE + 32'h30000, M_A, 200);                   // dropped while the error is set
         fence(0);
-        if (hw_a(200) !== rk) fail("command executed after a sticky error");
+        cmp_h = hw_a(200);
+        if (cmp_h[8*D-1:0] !== rk) fail("command executed after a sticky error");
         mat_op(F_RESET, 0, 0);
         fence(0);
         if (xst[1]) fail("mat_reset did not clear the sticky error");
         ld(MEM_BASE + 32'h30000, M_A, 200);
         fence(0);
-        if (xst[1] || hw_a(200) !== {mem[32'h30007], mem[32'h30006], mem[32'h30005], mem[32'h30004],
-                                     mem[32'h30003], mem[32'h30002], mem[32'h30001], mem[32'h30000]})
+        cmp_h = hw_a(200);                                    // 8 bytes: lane 0 of the word
+        if (xst[1] || cmp_h[63:0] !== {mem[32'h30007], mem[32'h30006], mem[32'h30005], mem[32'h30004],
+                                       mem[32'h30003], mem[32'h30002], mem[32'h30001], mem[32'h30000]})
             fail("LD after mat_reset");
         ex(SW - 8, 0, 0, 2, 0);                               // A strip past the end of SPAD_A
         fence(0);
@@ -1022,14 +1034,14 @@ module tb_sa_unit;
         mat_op(F_RESET, 0, 0);
         pcpi_exec(custom0(3'd5, 7'd1), 0, 0);
         if (pc_cycles >= 0) fail("funct7=1 funct3=5 was answered");
-        expect_csr(8'h24, 32'h0001_0808, "CAPS");
+        expect_csr(8'h24, 32'h0001_0000 + D * 256 + D, "CAPS");      // 1 port, VL = D, D
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");
 
         repeat (20) @(posedge aclk);
-        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | new ISA: 4 GEMMs (32x32x64 in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (32x32x64 in %0d cycles) | error paths",
-                 errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, gemm_cycles, 32*32*64 / gemm_cycles,
-                 n_ld, n_ex, n_st, n_ve, qgemm_cycles_first);
+        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | error paths",
+                 errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, D, 4*D, 4*D, 8*D, gemm_cycles, 4*D*4*D*8*D / gemm_cycles,
+                 n_ld, n_ex, n_st, n_ve, 4*D, 4*D, 8*D, qgemm_cycles_first);
         $finish;
     end
 

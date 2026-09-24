@@ -3,7 +3,10 @@
 #
 # Usage (from anywhere):
 #   vivado -mode batch -source scripts/build_bitstream.tcl \
-#          -tclargs [-jobs N] [-proj_dir DIR] [-allow_unplaced_io]
+#          -tclargs [-jobs N] [-sa_d 8|16] [-proj_dir DIR] [-allow_unplaced_io]
+#
+#   -sa_d   array size D of the accelerator (sa_unit parameter D); default 16
+#           (M4). -sa_d 8 rebuilds the M1-M3 configuration.
 #
 # Or simply:  ./scripts/build_bitstream.sh [same options]
 #
@@ -31,6 +34,7 @@ set top_bd        design_1
 set out_name      picorv32
 
 set jobs              4
+set sa_d              16
 set_param general.maxThreads 4    ;# main Vivado process; runs use -jobs
 set proj_dir          [file join $repo_root build $proj_name]
 set allow_unplaced_io 0
@@ -49,14 +53,19 @@ for {set i 0} {$i < [llength $argv]} {incr i} {
     set arg [lindex $argv $i]
     switch -- $arg {
         -jobs              { set jobs [lindex $argv [incr i]] }
+        -sa_d              { set sa_d [lindex $argv [incr i]] }
         -proj_dir          { set proj_dir [file normalize [lindex $argv [incr i]]] }
         -allow_unplaced_io { set allow_unplaced_io 1 }
-        default            { die "Unknown argument '$arg'. Valid: -jobs N, -proj_dir DIR, -allow_unplaced_io" }
+        default            { die "Unknown argument '$arg'. Valid: -jobs N, -sa_d 8|16, -proj_dir DIR, -allow_unplaced_io" }
     }
 }
 if {![string is integer -strict $jobs] || $jobs < 1} {
     die "-jobs expects a positive integer, got '$jobs'"
 }
+if {$sa_d != 8 && $sa_d != 16} {
+    die "-sa_d expects 8 or 16, got '$sa_d'"
+}
+info_msg "accelerator array size D = $sa_d"
 
 # The generated BD scripts silently `return` (instead of erroring) on a
 # version mismatch, so check up front and fail loudly.

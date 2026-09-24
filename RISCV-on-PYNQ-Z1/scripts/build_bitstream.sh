@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-click PicoRV32/PYNQ-Z1 bitstream build. Options are passed through to
-# build_bitstream.tcl: [-jobs N] [-proj_dir DIR] [-allow_unplaced_io]
+# build_bitstream.tcl: [-jobs N] [-sa_d 8|16] [-proj_dir DIR] [-allow_unplaced_io]
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
