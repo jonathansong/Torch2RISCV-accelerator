@@ -39,12 +39,16 @@ module sa_sched #(
     output wire               ex_valid,
     input  wire               ex_ready,
     output wire [`SA_PKT_W-1:0] ex_pkt,
+    output wire               ve_valid,
+    input  wire               ve_ready,
+    output wire [`SA_PKT_W-1:0] ve_pkt,
 
     input  wire               ld_done,
     input  wire               ld_err,
     input  wire               st_done,
     input  wire               st_err,
     input  wire               ex_done,
+    input  wire               ve_done,
 
     input  wire               clear_error,
     input  wire [3:0]         fence_mask,     // engines a fence waits for (0 = all)
@@ -135,6 +139,29 @@ module sa_sched #(
     wire [31:0] c_last    = h_c + d1_cext;
     wire        ex_range  = h_a + k_words <= SPAD_WORDS && b_last < SPAD_WORDS && c_last < ACC_WORDS;
 
+    // VE command (M3)
+    wire [3:0]  v_m1 = d1[33:30],  v_m2 = d1[65:62],  v_md = d1[97:94];
+    wire [15:0] v_w1 = d1[17:2],   v_w2 = d1[49:34],  v_wd = d1[81:66];
+    wire [15:0] v_groups = d1[113:98];
+    wire [2:0]  v_op = d1[116:114];
+    wire [1:0]  v_it = d1[123:122], v_ot = d1[125:124];
+    wire [15:0] v_mod = d1[143:128];
+    wire        v_unary = v_op == VOP_COPY;
+    wire [31:0] v_wg_in  = v_it == VT_I16 ? 2 : 1;
+    wire [31:0] v_wg_out = v_ot == VT_I16 ? 2 : 1;
+    wire [31:0] v_g2 = v_mod == 0 ? v_groups : v_mod == 1 ? 1 : (v_mod < v_groups ? v_mod : v_groups);
+    wire [31:0] v_last1 = v_w1 + v_groups * v_wg_in - 1;
+    wire [31:0] v_last2 = v_w2 + v_g2 * v_wg_in - 1;
+    wire [31:0] v_lastd = v_wd + v_groups * v_wg_out - 1;
+    function mem_for(input [1:0] t, input [3:0] m);       // int32 in ACC, int8/int16 in SPAD
+        mem_for = t == VT_I32 ? m == MEM_ACC : (m == MEM_SPAD_A || m == MEM_SPAD_B);
+    endfunction
+    wire        v_shape_ok = v_groups != 0 && v_it <= VT_I32 && v_ot <= VT_I32 && v_op <= VOP_COPY &&
+                             !(v_op == VOP_MUL && v_it == VT_I32);
+    wire        v_range_ok = mem_for(v_it, v_m1) && (v_unary || mem_for(v_it, v_m2)) && mem_for(v_ot, v_md) &&
+                             v_last1 < depth_of(v_m1) && (v_unary || v_last2 < depth_of(v_m2)) &&
+                             v_lastd < depth_of(v_md);
+
     reg         c_valid_cmd;
     reg  [3:0]  c_err_code;
     reg  [1:0]  c_eng;
@@ -142,7 +169,8 @@ module sa_sched #(
     always @* begin
         c_valid_cmd = 1;
         c_err_code  = 0;
-        c_eng       = h_type == CMD_LD ? ENG_LD : h_type == CMD_ST ? ENG_ST : ENG_EX;
+        c_eng       = h_type == CMD_LD ? ENG_LD : h_type == CMD_ST ? ENG_ST :
+                      h_type == CMD_EX ? ENG_EX : ENG_VE;
         c_r = 0;
         c_w = 0;
         case (h_type)
@@ -173,6 +201,15 @@ module sa_sched #(
                           (h_acc ? banks(MEM_ACC, h_c, c_last) : 6'd0);
                     c_w = banks(MEM_ACC, h_c, c_last);
                 end
+            CMD_VE:
+                if (!v_shape_ok) begin
+                    c_valid_cmd = 0; c_err_code = XERR_SHAPE;
+                end else if (!v_range_ok) begin
+                    c_valid_cmd = 0; c_err_code = XERR_RANGE;
+                end else begin
+                    c_r = banks(v_m1, v_w1, v_last1) | (v_unary ? 6'd0 : banks(v_m2, v_w2, v_last2));
+                    c_w = banks(v_md, v_wd, v_lastd);
+                end
             default: begin
                 c_valid_cmd = 0; c_err_code = XERR_SHAPE;
             end
@@ -187,16 +224,16 @@ module sa_sched #(
     reg [5:0]        h_r, h_w;
 
     // ------------------------------------------- in-flight masks per engine
-    reg  [5:0] mr [0:2][0:QMSK-1];
-    reg  [5:0] mw [0:2][0:QMSK-1];
-    reg  [3:0] m_wp [0:2];
-    reg  [3:0] m_rp [0:2];
-    reg  [5:0] eng_r [0:2];
-    reg  [5:0] eng_w [0:2];
-    wire [2:0] m_empty, m_full;
+    reg  [5:0] mr [0:3][0:QMSK-1];
+    reg  [5:0] mw [0:3][0:QMSK-1];
+    reg  [3:0] m_wp [0:3];
+    reg  [3:0] m_rp [0:3];
+    reg  [5:0] eng_r [0:3];
+    reg  [5:0] eng_w [0:3];
+    wire [3:0] m_empty, m_full;
     genvar ge;
     generate
-        for (ge = 0; ge < 3; ge = ge + 1) begin : msk
+        for (ge = 0; ge < 4; ge = ge + 1) begin : msk
             wire [3:0] used = m_wp[ge] - m_rp[ge];
             assign m_empty[ge] = used == 0;
             assign m_full[ge]  = used == QMSK;
@@ -213,23 +250,28 @@ module sa_sched #(
         end
     endgenerate
 
-    // hazard against the other engines
+    // hazard against the other engines (RAW, WAR, WAW); EX and VE also share
+    // the memory ports of SPAD side B / ACC side A, so any common bank
+    // between them conflicts, even two readers (M3)
     reg hazard;
     integer o;
     always @* begin
         hazard = 0;
-        for (o = 0; o < 3; o = o + 1)
-            if (o != h_eng)
+        for (o = 0; o < 4; o = o + 1)
+            if (o != h_eng) begin
                 hazard = hazard | |(h_r & eng_w[o]) | |(h_w & eng_r[o]) | |(h_w & eng_w[o]);
+                if ((h_eng == ENG_EX && o == ENG_VE) || (h_eng == ENG_VE && o == ENG_EX))
+                    hazard = hazard | |((h_r | h_w) & (eng_r[o] | eng_w[o]));
+            end
     end
 
     // ------------------------------------------------------ engine queues
-    reg  [PKT_W-1:0] eq [0:2][0:QENG-1];
-    reg  [2:0]       e_wp [0:2];
-    reg  [2:0]       e_rp [0:2];
-    wire [2:0]       e_empty, e_full;
+    reg  [PKT_W-1:0] eq [0:3][0:QENG-1];
+    reg  [2:0]       e_wp [0:3];
+    reg  [2:0]       e_rp [0:3];
+    wire [3:0]       e_empty, e_full;
     generate
-        for (ge = 0; ge < 3; ge = ge + 1) begin : eqs
+        for (ge = 0; ge < 4; ge = ge + 1) begin : eqs
             wire [2:0] used = e_wp[ge] - e_rp[ge];
             assign e_empty[ge] = used == 0;
             assign e_full[ge]  = used == QENG;
@@ -242,8 +284,10 @@ module sa_sched #(
     assign ld_pkt   = eq[ENG_LD][e_rp[ENG_LD][1:0]];
     assign st_pkt   = eq[ENG_ST][e_rp[ENG_ST][1:0]];
     assign ex_pkt   = eq[ENG_EX][e_rp[ENG_EX][1:0]];
-    wire [2:0] e_pop = {ex_valid && ex_ready, st_valid && st_ready, ld_valid && ld_ready};
-    wire [2:0] e_done = {ex_done, st_done, ld_done};
+    assign ve_valid = !e_empty[ENG_VE];
+    assign ve_pkt   = eq[ENG_VE][e_rp[ENG_VE][1:0]];
+    wire [3:0] e_pop = {ve_valid && ve_ready, ex_valid && ex_ready, st_valid && st_ready, ld_valid && ld_ready};
+    wire [3:0] e_done = {ve_done, ex_done, st_done, ld_done};
 
     wire dispatch = d2_v && !err && h_valid_cmd && !hazard &&
                     !e_full[h_eng] && !m_full[h_eng];
@@ -259,7 +303,7 @@ module sa_sched #(
             in_wp <= 0; in_rp <= 0;
             d1_v <= 0; d2_v <= 0;
             err <= 0; err_code <= 0; err_eng <= 0;
-            for (e = 0; e < 3; e = e + 1) begin
+            for (e = 0; e < 4; e = e + 1) begin
                 m_wp[e] <= 0; m_rp[e] <= 0; e_wp[e] <= 0; e_rp[e] <= 0;
             end
         end else begin
@@ -295,7 +339,7 @@ module sa_sched #(
             if (reject) begin
                 err <= 1; err_code <= h_err_code; err_eng <= h_eng;
             end
-            for (e = 0; e < 3; e = e + 1) begin
+            for (e = 0; e < 4; e = e + 1) begin
                 if (e_pop[e])  e_rp[e] <= e_rp[e] + 1;
                 if (e_done[e]) m_rp[e] <= m_rp[e] + 1;
             end
@@ -311,11 +355,11 @@ module sa_sched #(
     end
 
     // -------------------------------------------------------------- status
-    wire [3:0] eng_busy = {1'b0, !m_empty[2], !m_empty[1], !m_empty[0]};
-    wire [3:0] fm       = fence_mask == 0 ? 4'b0111 : fence_mask;
+    wire [3:0] eng_busy = ~m_empty;
+    wire [3:0] fm       = fence_mask == 0 ? 4'b1111 : fence_mask;
     wire       pipe_empty = in_empty && !d1_v && !d2_v;
     wire [4:0] queued     = in_used + d1_v + d2_v;
-    assign idle     = pipe_empty && m_empty == 3'b111;
+    assign idle     = pipe_empty && m_empty == 4'b1111;
     assign fence_ok = pipe_empty && (eng_busy & fm) == 0;
     assign ext_status = {8'd0, 3'd0, queued, err_eng, err_code, eng_busy, 2'b00, err, idle};
 endmodule

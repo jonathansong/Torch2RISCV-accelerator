@@ -3,7 +3,10 @@
 // unit's DMA port 0 reads/writes a DDR model.
 //   default   : 32 independent 8x8x8 jobs (firmware/matmul CSR path or
 //               firmware/matmul_insn mat_trigger path)
-//   GEMM_TEST : firmware/gemm, tiled GEMMs on the funct7 = 1 ISA
+//   GEMM_TEST : firmware/gemm, tiled GEMMs on the funct7 = 1 ISA, int32 and
+//               (M3) int8 output through the vector-engine epilogue
+//   VEC_TEST  : firmware/vector, standalone vector operations (funct7 = 2)
+//   BW_TEST   : firmware/bwtest, DMA bandwidth (simulated DDR model)
 // Mirrors the overlay's RISC-V memory map:
 //   0xC0000000  8 KB program BRAM (+ mailbox at 0xC0001F00)
 //   0x80000000  matmul_unit CSRs
@@ -233,6 +236,34 @@ module tb_system;
     integer    i, e, cycles;
     reg [31:0] got;
 
+    // VE arithmetic of one element (rtl/sysarray/sa_ve.v); automatic, and each
+    // call in its own statement (xsim mixes up results of several calls of one
+    // static function in a single expression)
+    function automatic signed [63:0] clamp64(input signed [63:0] x, input signed [63:0] lo_, input signed [63:0] hi_);
+        clamp64 = x < lo_ ? lo_ : x > hi_ ? hi_ : x;
+    endfunction
+    function automatic signed [31:0] ve_ref(input signed [31:0] a, input signed [31:0] b, input [7:0] op,
+                                            input [1:0] ot, input integer scale, input integer shift,
+                                            input integer zp, input integer lo, input integer hi);
+        reg signed [63:0] r, q;
+        begin
+            case (op[2:0])
+                3'd0: r = clamp64(a + b, -64'sd2147483648, 64'sd2147483647);
+                3'd1: r = clamp64(a - b, -64'sd2147483648, 64'sd2147483647);
+                3'd2: r = $signed(a[15:0]) * $signed(b[15:0]);
+                3'd3: r = a > b ? a : b;
+                3'd4: r = a < b ? a : b;
+                default: r = a;
+            endcase
+            if (op[4] && r < 0) r = 0;
+            q = op[5] ? ((r * $signed(scale[15:0]) + (shift == 0 ? 0 : (64'sd1 <<< (shift - 1)))) >>> shift) + zp : r;
+            q = clamp64(q, lo, hi);
+            ve_ref = clamp64(q, ot == 0 ? -128 : ot == 1 ? -32768 : -64'sd2147483648,
+                                ot == 0 ?  127 : ot == 1 ?  32767 :  64'sd2147483647);
+        end
+    endfunction
+    localparam integer I32MIN = 32'h80000000, I32MAX = 32'h7FFFFFFF;
+
 `ifdef BW_TEST
     // -------------------------------------------------------- BW_TEST
     localparam [31:0] BW_SRC = DDR_BASE, BW_DST = DDR_BASE + 32'h10000;
@@ -267,6 +298,95 @@ module tb_system;
                  errors ? "FAIL" : "PASS", errors);
         $finish;
     end
+`elsif VEC_TEST
+    // ------------------------------------------------------- VEC_TEST
+    localparam [31:0] V1_ADDR = DDR_BASE, V2_ADDR = DDR_BASE + 32'h10000, VD_ADDR = DDR_BASE + 32'h20000;
+    integer runs = 0, vi, vj, vn2;
+    reg signed [31:0] va, vb, vexp, vgot;
+
+    function automatic integer esz(input [1:0] t); esz = t == 0 ? 1 : t == 1 ? 2 : 4; endfunction
+    function automatic signed [31:0] get_el(input [31:0] addr, input [1:0] t, input integer i);
+        integer o;
+        begin
+            o = addr - DDR_BASE + esz(t) * i;
+            get_el = t == 0 ? $signed(ddr[o]) : t == 1 ? $signed({ddr[o + 1], ddr[o]})
+                            : $signed({ddr[o + 3], ddr[o + 2], ddr[o + 1], ddr[o]});
+        end
+    endfunction
+
+    task run_vec(input integer len, input [7:0] op, input [1:0] it, input [1:0] ot, input integer period,
+                 input integer scale, input integer shift, input integer zp, input integer lo, input integer hi);
+        begin
+            resetn <= 0;
+            repeat (5) @(posedge clk);
+            for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = 8'hA5;
+            vn2 = period == 0 ? len : 8 * period;
+            for (i = 0; i < len * esz(it); i = i + 1) ddr[V1_ADDR - DDR_BASE + i] = $random(seed);
+            for (i = 0; i < vn2 * esz(it); i = i + 1) ddr[V2_ADDR - DDR_BASE + i] = $random(seed);
+            if (it == 2)                                      // int32: moderate values, some saturation
+                for (i = 0; i < len; i = i + 1) if (rnd(7) != 0) begin
+                    e = V1_ADDR - DDR_BASE + 4*i; ddr[e + 3] = {8{ddr[e + 2][7]}};
+                end
+            for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
+            $readmemh("fw.hex", bram);
+            bram[MBOX + 2]  = V1_ADDR;
+            bram[MBOX + 3]  = V2_ADDR;
+            bram[MBOX + 4]  = VD_ADDR;
+            bram[MBOX + 24] = len;
+            bram[MBOX + 25] = op;
+            bram[MBOX + 26] = {ot, it};
+            bram[MBOX + 27] = period;
+            bram[MBOX + 28] = scale;
+            bram[MBOX + 29] = shift;
+            bram[MBOX + 30] = zp;
+            bram[MBOX + 31] = lo;
+            bram[MBOX + 32] = hi;
+
+            repeat (5) @(posedge clk);
+            resetn <= 1;
+            cycles = 0;
+            while (!trap && cycles < 3000000) begin @(posedge clk); cycles = cycles + 1; end
+            repeat (5) @(posedge clk);
+
+            if (!trap) begin $display("TB ERROR: vector run %0d no trap", runs); errors = errors + 1; end
+            if (bram[MBOX] !== 32'h600D600D) begin $display("TB ERROR: mailbox status %08x", bram[MBOX]); errors = errors + 1; end
+            if (bram[MBOX + 6] !== 0 || bram[MBOX + 16][1]) begin
+                $display("TB ERROR: vector ext status %08x", bram[MBOX + 16]); errors = errors + 1;
+            end
+            for (vi = 0; vi < len; vi = vi + 1) begin
+                va = get_el(V1_ADDR, it, vi);
+                vb = get_el(V2_ADDR, it, period == 0 ? vi : vi % vn2);
+                vexp = ve_ref(va, vb, op, ot, scale, shift, zp, lo, hi);
+                vgot = get_el(VD_ADDR, ot, vi);
+                if (vgot !== vexp) begin
+                    errors = errors + 1;
+                    if (errors <= 10) $display("TB ERROR vector run %0d element %0d = %0d, expected %0d (a %0d b %0d)",
+                                               runs, vi, vgot, vexp, va, vb);
+                end
+            end
+            for (vi = 0; vi < 8; vi = vi + 1)
+                if (ddr[VD_ADDR - DDR_BASE + len * esz(ot) + vi] !== 8'hA5) begin
+                    $display("TB ERROR: vector run %0d wrote past dst", runs); errors = errors + 1; vi = 8;
+                end
+            $display("TB vector op %0d%0s%0s %0s->%0s len %0d period %0d: %0d RISC-V cycles, %0d.%02d elements/cycle",
+                     op[2:0], op[4] ? " relu" : "", op[5] ? " requant" : "",
+                     it == 0 ? "i8" : it == 1 ? "i16" : "i32", ot == 0 ? "i8" : ot == 1 ? "i16" : "i32",
+                     len, period, bram[MBOX + 8], len / bram[MBOX + 8], (len * 100 / bram[MBOX + 8]) % 100);
+            runs = runs + 1;
+        end
+    endtask
+
+    initial begin
+        run_vec(5000, 8'h00, 0, 0, 0, 1, 0, 0, I32MIN, I32MAX);        // i8 + i8 -> i8 (saturating)
+        run_vec(1032, 8'h02, 0, 1, 0, 1, 0, 0, I32MIN, I32MAX);        // i8 * i8 -> i16
+        run_vec(2400, 8'h30, 2, 0, 4, 181, 15, -3, I32MIN, I32MAX);    // i32 + bias(period 4), relu, requant -> i8
+        run_vec(776,  8'h03, 1, 1, 1, 1, 0, 0, -1000, 20000);          // max(i16, broadcast), clamp -> i16
+        run_vec(4104, 8'h15, 2, 2, 0, 1, 0, 0, I32MIN, I32MAX);        // relu copy i32 -> i32 (513 groups)
+        run_vec(5600, 8'h01, 0, 2, 3, 1, 0, 0, I32MIN, I32MAX);        // i8 - i8(period 3) -> i32
+        run_vec(2048, 8'h22, 1, 2, 0, -300, 7, 1000, -500000, 500000); // i16 * i16, requant, clamp -> i32
+        $display("TB %s: %0d vector operations, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
+        $finish;
+    end
 `elsif GEMM_TEST
     // ------------------------------------------------------ GEMM_TEST
     localparam [31:0] GA_ADDR = DDR_BASE,           GB_ADDR = DDR_BASE + 32'h4000,
@@ -281,7 +401,10 @@ module tb_system;
         {ddr[addr - DDR_BASE + 3], ddr[addr - DDR_BASE + 2], ddr[addr - DDR_BASE + 1], ddr[addr - DDR_BASE]} = v;
     endtask
 
-    task run_gemm(input integer M, input integer N, input integer K, input integer use_bias);
+    reg signed [31:0] qexp;
+    task run_gemm(input integer M, input integer N, input integer K, input integer use_bias,
+                  input integer quant, input integer relu, input integer scale, input integer shift,
+                  input integer zp);
         begin
             resetn <= 0;
             repeat (5) @(posedge clk);
@@ -293,8 +416,9 @@ module tb_system;
                 GB[gk][gj] = $random(seed); ddr[GB_ADDR - DDR_BASE + gk*N + gj] = GB[gk][gj];
             end
             for (gi = 0; gi < M; gi = gi + 1) for (gj = 0; gj < N; gj = gj + 1) begin
-                GBIAS[gi][gj] = use_bias ? $random(seed) >>> 8 : 0;
-                put32(GBIAS_ADDR + 4*(gi*N + gj), GBIAS[gi][gj]);
+                // int8 output: one bias vector of N (row 0), else a full M x N matrix
+                GBIAS[gi][gj] = !use_bias ? 0 : quant && gi > 0 ? GBIAS[0][gj] : $random(seed) >>> (quant ? 14 : 8);
+                if (!quant || gi == 0) put32(GBIAS_ADDR + 4*(gi*N + gj), GBIAS[gi][gj]);
             end
             for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
             $readmemh("fw.hex", bram);
@@ -305,6 +429,13 @@ module tb_system;
             bram[MBOX + 13] = N;
             bram[MBOX + 14] = K;
             bram[MBOX + 15] = use_bias ? GBIAS_ADDR : 0;
+            bram[MBOX + 33] = quant;                          // GEMM_Q
+            bram[MBOX + 25] = (relu ? 32'h10 : 0) | 32'h20;   // V_OP: RELU, REQUANT
+            bram[MBOX + 28] = scale;
+            bram[MBOX + 29] = shift;
+            bram[MBOX + 30] = zp;
+            bram[MBOX + 31] = I32MIN;
+            bram[MBOX + 32] = I32MAX;
 
             repeat (5) @(posedge clk);
             resetn <= 1;
@@ -321,28 +452,38 @@ module tb_system;
             for (gi = 0; gi < M; gi = gi + 1) for (gj = 0; gj < N; gj = gj + 1) begin
                 gsum = GBIAS[gi][gj];
                 for (gk = 0; gk < K; gk = gk + 1) gsum = gsum + GA[gi][gk] * GB[gk][gj];
-                e = GC_ADDR - DDR_BASE + 4*(gi*N + gj);
-                got = {ddr[e + 3], ddr[e + 2], ddr[e + 1], ddr[e]};
+                if (quant) begin
+                    qexp = ve_ref(gsum, 0, {2'b00, 1'b1, relu[0], 1'b0, 3'd5}, 2'd0, scale, shift, zp, I32MIN, I32MAX);
+                    gsum = qexp;
+                    got = {{24{ddr[GC_ADDR - DDR_BASE + gi*N + gj][7]}}, ddr[GC_ADDR - DDR_BASE + gi*N + gj]};
+                end else begin
+                    e = GC_ADDR - DDR_BASE + 4*(gi*N + gj);
+                    got = {ddr[e + 3], ddr[e + 2], ddr[e + 1], ddr[e]};
+                end
                 if (got !== gsum) begin
                     errors = errors + 1;
                     if (errors <= 10) $display("TB ERROR GEMM %0dx%0dx%0d C[%0d][%0d] = %0d, expected %0d",
                                                M, N, K, gi, gj, $signed(got), gsum);
                 end
             end
-            if (ddr[GC_ADDR - DDR_BASE + 4*M*N] !== 8'hA5) begin
+            if (ddr[GC_ADDR - DDR_BASE + (quant ? 1 : 4)*M*N] !== 8'hA5) begin
                 $display("TB ERROR: byte after C overwritten"); errors = errors + 1;
             end
-            $display("TB GEMM %0dx%0dx%0d%s: %0d RISC-V cycles, %0d MAC/cycle, CPU CSR accesses %0d",
-                     M, N, K, use_bias ? " + bias" : "", bram[MBOX + 8], M*N*K / bram[MBOX + 8], csr_accesses);
+            $display("TB GEMM %0dx%0dx%0d%0s%0s: %0d RISC-V cycles, %0d MAC/cycle, CPU CSR accesses %0d",
+                     M, N, K, use_bias ? " + bias" : "", quant ? (relu ? " -> relu/requant int8" : " -> requant int8") : "",
+                     bram[MBOX + 8], M*N*K / bram[MBOX + 8], csr_accesses);
             runs = runs + 1;
         end
     endtask
 
     initial begin
-        run_gemm(32, 32, 64, 0);
-        run_gemm(24, 16, 40, 1);
-        run_gemm(16, 48, 128, 1);
-        run_gemm(8, 8, 8, 0);
+        run_gemm(32, 32, 64, 0,  0, 0, 1, 0, 0);
+        run_gemm(24, 16, 40, 1,  0, 0, 1, 0, 0);
+        run_gemm(16, 48, 128, 1, 0, 0, 1, 0, 0);
+        run_gemm(8, 8, 8, 0,     0, 0, 1, 0, 0);
+        run_gemm(32, 32, 64, 1,  1, 1, 181, 15, -3);
+        run_gemm(24, 48, 40, 0,  1, 0, -97, 12, 7);
+        run_gemm(16, 16, 128, 1, 1, 1, 1, 0, 0);
         $display("TB %s: %0d GEMMs, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
         $finish;
     end

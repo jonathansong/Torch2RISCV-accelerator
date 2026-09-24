@@ -5,7 +5,8 @@
 //   m0..2_axi   DMA masters (NPORTS used, the rest tied off) -> S_AXI_HP1..3
 //   pcpi        custom-0 instructions: funct7 = 0 legacy, funct7 = 1 new ISA
 //
-// Engines: LD (DDR -> SPAD/ACC), ST (SPAD/ACC -> DDR), EX (array).
+// Engines: LD (DDR -> SPAD/ACC), ST (SPAD/ACC -> DDR), EX (array),
+// VE (vector ops on SPAD/ACC, VL = D; M3).
 // Memories: SPAD_A / SPAD_B (D-byte words) and ACC (D x int32 words), each
 // double-banked; sa_sched orders commands with a bank scoreboard.
 `timescale 1ns / 1ps
@@ -279,9 +280,9 @@ module sa_unit #(
     wire [3:0]  fence_mask;
     wire [31:0] ext_status;
 
-    wire        ld_v, ld_r, st_v, st_r, ex_v, ex_r;
-    wire [PKT_W-1:0] ld_pkt, st_pkt, ex_pkt;
-    wire        ld_done, ld_err, st_done, st_err, ex_done;
+    wire        ld_v, ld_r, st_v, st_r, ex_v, ex_r, ve_v, ve_r;
+    wire [PKT_W-1:0] ld_pkt, st_pkt, ex_pkt, ve_pkt;
+    wire        ld_done, ld_err, st_done, st_err, ex_done, ve_done;
 
     sa_sched #(.D(D), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS)) sched (
         .clk(aclk), .resetn(resetn),
@@ -289,7 +290,9 @@ module sa_unit #(
         .ld_valid(ld_v), .ld_ready(ld_r), .ld_pkt(ld_pkt),
         .st_valid(st_v), .st_ready(st_r), .st_pkt(st_pkt),
         .ex_valid(ex_v), .ex_ready(ex_r), .ex_pkt(ex_pkt),
+        .ve_valid(ve_v), .ve_ready(ve_r), .ve_pkt(ve_pkt),
         .ld_done(ld_done), .ld_err(ld_err), .st_done(st_done), .st_err(st_err), .ex_done(ex_done),
+        .ve_done(ve_done),
         .clear_error(clear_error), .fence_mask(fence_mask), .fence_ok(fence_ok),
         .idle(sched_idle), .ext_status(ext_status));
 
@@ -297,7 +300,7 @@ module sa_unit #(
     wire        leg_trigger, leg_accept, leg_busy, leg_reset, leg_reset_done;
     wire [31:0] leg_desc, leg_dst, leg_status, leg_cycles;
 
-    sa_pcpi pcpi (
+    sa_pcpi #(.D(D)) pcpi (
         .clk(aclk), .resetn(resetn),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
         .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
@@ -314,7 +317,7 @@ module sa_unit #(
     wire [7:0]  lw_lane;
     wire [63:0] lw_data;
 
-    sa_legacy #(.D(D), .NPORTS(NPORTS), .VL(0), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS)) legacy (
+    sa_legacy #(.D(D), .NPORTS(NPORTS), .VL(D), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS)) legacy (
         .clk(aclk), .resetn(resetn),
         .s_axi_awaddr(s_axi_awaddr), .s_axi_awvalid(s_axi_awvalid), .s_axi_awready(s_axi_awready),
         .s_axi_wdata(s_axi_wdata), .s_axi_wvalid(s_axi_wvalid), .s_axi_wready(s_axi_wready),
@@ -381,9 +384,29 @@ module sa_unit #(
         .sb_en(sb_en), .sb_addr(sb_addr), .sb_dout(sb_dout),
         .acc_en(acc_en), .acc_we(acc_we), .acc_addr(acc_addr), .acc_din(acc_din), .acc_dout(acc_dout));
 
+    wire               vsa_en, vsb_en, vac_en;
+    wire [D-1:0]       vsa_we, vsb_we;
+    wire [4*D-1:0]     vac_we;
+    wire [SAW-1:0]     vsa_addr, vsb_addr;
+    wire [CAW-1:0]     vac_addr;
+    wire [8*D-1:0]     vsa_din, vsb_din, vsa_dout, vsb_dout;
+    wire [32*D-1:0]    vac_din, vac_dout;
+
+    sa_ve #(.D(D), .SPAD_AW(SAW), .ACC_AW(CAW)) ve (
+        .clk(aclk), .resetn(resetn),
+        .cmd_valid(ve_v), .cmd_ready(ve_r),
+        .cmd_src1(ve_pkt[33:2]), .cmd_src2(ve_pkt[65:34]), .cmd_dst(ve_pkt[97:66]),
+        .cmd_groups(ve_pkt[113:98]), .cmd_op(ve_pkt[121:114]), .cmd_types(ve_pkt[127:122]),
+        .cmd_mod(ve_pkt[143:128]), .cmd_scale(ve_pkt[159:144]), .cmd_shift(ve_pkt[164:160]),
+        .cmd_zp(ve_pkt[196:165]), .cmd_lo(ve_pkt[228:197]), .cmd_hi(ve_pkt[260:229]),
+        .done(ve_done), .busy(),
+        .sa_en(vsa_en), .sa_we(vsa_we), .sa_addr(vsa_addr), .sa_din(vsa_din), .sa_dout(vsa_dout),
+        .sb_en(vsb_en), .sb_we(vsb_we), .sb_addr(vsb_addr), .sb_din(vsb_din), .sb_dout(vsb_dout),
+        .ac_en(vac_en), .ac_we(vac_we), .ac_addr(vac_addr), .ac_din(vac_din), .ac_dout(vac_dout));
+
     // ---------------------------------------------------------- memories
-    // SPAD side A: [0] LD write, [1] ST read; side B: EX read.
-    // ACC  side A: EX drain / accumulate;  side B: [0] LD write, [1] ST read.
+    // SPAD side A: [0] LD write, [1] ST read; side B: [0] EX read, [1] VE.
+    // ACC  side A: [0] EX drain / accumulate, [1] VE;  side B: [0] LD write, [1] ST read.
     wire [D-1:0]   spad_we = {D{1'b0}} | ({8'hFF} << (8 * lw_lane));
     wire [4*D-1:0] acc_lwe = {4*D{1'b0}} | ({8'hFF} << (8 * lw_lane));
     wire ld_a = lw_en && lw_mem == MEM_SPAD_A, ld_b = lw_en && lw_mem == MEM_SPAD_B, ld_c = lw_en && lw_mem == MEM_ACC;
@@ -391,21 +414,24 @@ module sa_unit #(
     wire [8*D-1:0]  unused_a, unused_b;
     wire [32*D-1:0] unused_c;
 
-    sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(1)) spad_a (
+    sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(2)) spad_a (
         .clk(aclk),
         .a_en({st_a, ld_a}), .a_we({{D{1'b0}}, spad_we}),
         .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, {D/8{lw_data}}}),
         .a_dout({lr_a, unused_a}),
-        .b_en(sa_en), .b_we({D{1'b0}}), .b_addr(sa_addr), .b_din({8*D{1'b0}}), .b_dout(sa_dout));
-    sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(1)) spad_b (
+        .b_en({vsa_en, sa_en}), .b_we({vsa_we, {D{1'b0}}}), .b_addr({vsa_addr, sa_addr}),
+        .b_din({vsa_din, {8*D{1'b0}}}), .b_dout({vsa_dout, sa_dout}));
+    sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(2)) spad_b (
         .clk(aclk),
         .a_en({st_b, ld_b}), .a_we({{D{1'b0}}, spad_we}),
         .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, {D/8{lw_data}}}),
         .a_dout({lr_b, unused_b}),
-        .b_en(sb_en), .b_we({D{1'b0}}), .b_addr(sb_addr), .b_din({8*D{1'b0}}), .b_dout(sb_dout));
-    sa_bankmem #(.W(32*D), .DEPTH(ACC_WORDS), .NA(1), .NB(2)) accm (
+        .b_en({vsb_en, sb_en}), .b_we({vsb_we, {D{1'b0}}}), .b_addr({vsb_addr, sb_addr}),
+        .b_din({vsb_din, {8*D{1'b0}}}), .b_dout({vsb_dout, sb_dout}));
+    sa_bankmem #(.W(32*D), .DEPTH(ACC_WORDS), .NA(2), .NB(2)) accm (
         .clk(aclk),
-        .a_en(acc_en), .a_we(acc_we), .a_addr(acc_addr), .a_din(acc_din), .a_dout(acc_dout),
+        .a_en({vac_en, acc_en}), .a_we({vac_we, acc_we}), .a_addr({vac_addr, acc_addr}),
+        .a_din({vac_din, acc_din}), .a_dout({vac_dout, acc_dout}),
         .b_en({st_c, ld_c}), .b_we({{4*D{1'b0}}, acc_lwe}),
         .b_addr({lr_word[CAW-1:0], lw_word[CAW-1:0]}), .b_din({{32*D{1'b0}}, {D/2{lw_data}}}),
         .b_dout({lr_c, unused_c}));

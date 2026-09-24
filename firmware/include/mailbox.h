@@ -1,8 +1,8 @@
 /*
  * ARM <-> PicoRV32 mailbox for the matmul batch firmware, in the last
  * 256 bytes of the program BRAM (RISC-V 0xC0001F00, ARM 0x40010000+0x1F00).
- * Shared by the CSR firmware (matmul/) and the custom-instruction firmware
- * (matmul_insn/). Keep in sync with driver/pynq_matmul.py and sim/tb_system.v.
+ * Shared by all firmware directories (matmul/, matmul_insn/, gemm/,
+ * bwtest/, vector/). Keep in sync with driver/pynq_matmul.py and sim/tb_system.v.
  *
  * Job i uses A = A_BASE + 64*i, B = B_BASE + 64*i, C = C_BASE + 256*i and
  * descriptor D = DESC_BASE + 16*i = {A, B, DIM, 0} (DDR physical addresses;
@@ -34,6 +34,21 @@
 #define MBOX_BW_SRC        0x08  /* bwtest firmware: source buffer (= A_BASE)     */
 #define MBOX_BW_DST        0x10  /*                  destination (= C_BASE)       */
 #define MBOX_BW_CYCLES     0x44  /* out: bwtest cycles per test, 6 words          */
+/* M3 vector engine (firmware/vector: standalone op; firmware/gemm: epilogue).
+ * VE parameters, same meaning as the vec_cfg keys (sysarray_intrinsics.h): */
+#define MBOX_V_LEN         0x60  /* in:  vector firmware: elements, multiple of 8 */
+#define MBOX_V_OP          0x64  /* in:  op | RELU << 4 | REQUANT << 5            */
+#define MBOX_V_TYPES       0x68  /* in:  vector firmware: in | out << 2           */
+#define MBOX_V_PERIOD      0x6C  /* in:  vector firmware: src2 period in groups   */
+#define MBOX_V_SCALE       0x70  /* in:  REQUANT: y = ((x*scale + rnd) >> shift)  */
+#define MBOX_V_SHIFT       0x74  /*      + zp, clamped to [lo, hi]                */
+#define MBOX_V_ZP          0x78
+#define MBOX_V_LO          0x7C
+#define MBOX_V_HI          0x80
+#define MBOX_GEMM_Q        0x84  /* in:  GEMM firmware: 1 = int8 output through the
+                                  *      VE epilogue (+ bias vector, V_OP RELU,
+                                  *      REQUANT with V_SCALE..V_HI); BIAS_BASE is
+                                  *      then an int32 vector of N (0 = none)      */
 
 #define STATUS_RUNNING     0x00000001u
 #define STATUS_DONE        0x600D600Du

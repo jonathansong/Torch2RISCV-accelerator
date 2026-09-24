@@ -13,12 +13,13 @@ localparam [3:0] MEM_DESC   = 4'hF;   // internal: legacy descriptor registers (
 localparam integer ENG_LD = 0;
 localparam integer ENG_ST = 1;
 localparam integer ENG_EX = 2;
-localparam integer ENG_VE = 3;        // reserved (M3)
+localparam integer ENG_VE = 3;        // M3 vector engine
 
 // Command types in the dispatch queue
 localparam [1:0] CMD_LD = 2'd0;
 localparam [1:0] CMD_ST = 2'd1;
 localparam [1:0] CMD_EX = 2'd2;
+localparam [1:0] CMD_VE = 2'd3;       // M3
 
 // Transfer modes (LD_MODE)
 localparam integer MODE_INTERLEAVE = 0;   // bit index
@@ -37,6 +38,22 @@ localparam [7:0] CFG_EX_B_STEP    = 8'd8;    //     SPAD_B words between tiles' 
 localparam [7:0] CFG_EX_C_STEP    = 8'd9;    //     ACC words between tiles
 localparam [7:0] CFG_EX_C_ROW     = 8'd10;   //     ACC words between rows of a tile
 
+// vec_cfg keys (funct7 = 2, funct3 = 0), M3
+localparam [7:0] VCFG_OP       = 8'd0;   // [2:0] op, [4] RELU, [5] REQUANT
+localparam [7:0] VCFG_LEN      = 8'd1;   // elements (multiple of VL)
+localparam [7:0] VCFG_DST      = 8'd2;   // destination LADDR
+localparam [7:0] VCFG_TYPES    = 8'd3;   // [1:0] input type, [5:4] output type
+localparam [7:0] VCFG_SRC2_MOD = 8'd4;   // src2 period in groups: 0 = none, 1 = broadcast
+localparam [7:0] VCFG_SCALE    = 8'd5;   // REQUANT multiplier (int16)
+localparam [7:0] VCFG_SHIFT    = 8'd6;   // REQUANT right shift (0 .. 31)
+localparam [7:0] VCFG_ZP       = 8'd7;   // REQUANT zero point (int32)
+localparam [7:0] VCFG_CLAMP_LO = 8'd8;   // result clamp (int32), then saturation to the type
+localparam [7:0] VCFG_CLAMP_HI = 8'd9;
+
+localparam [2:0] VOP_ADD = 3'd0, VOP_SUB = 3'd1, VOP_MUL = 3'd2, VOP_MAX = 3'd3,
+                 VOP_MIN = 3'd4, VOP_COPY = 3'd5;
+localparam [1:0] VT_I8 = 2'd0, VT_I16 = 2'd1, VT_I32 = 2'd2;   // I32 in ACC, I8/I16 in SPAD
+
 // Sticky error codes (extended status bits 11:8)
 localparam [3:0] XERR_SHAPE = 4'd1;   // bad address / shape / alignment
 localparam [3:0] XERR_RANGE = 4'd2;   // local address out of range / bad memory id
@@ -52,6 +69,10 @@ localparam [3:0] XERR_BRESP = 4'd4;   // DMA write response SLVERR/DECERR
 //   [129:98]  pitch                 (LD/ST)
 //   [131:130] mode                  (LD)
 //   [132]     internal              (issued by the legacy sequencer; allows MEM_DESC)
+// VE (M3):
+//   [33:2] src1 LADDR  [65:34] src2 LADDR  [97:66] dst LADDR  [113:98] groups (of VL elements)
+//   [121:114] op byte  [127:122] types {out[3:2], in[1:0]}  [143:128] src2 period
+//   [159:144] scale  [164:160] shift  [196:165] zp  [228:197] clamp lo  [260:229] clamp hi
 // EX reuses the fields:
 //   [17:2]    A word   [33:18] B word   [49:34] C word   [61:50] Kt   [62] accumulate
 //   [74:63]   repeat - 1 (tiles)   [90:75] B step   [106:91] C step   [122:107] C row stride

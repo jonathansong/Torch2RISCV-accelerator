@@ -5,6 +5,7 @@
 //              mat_wait / mat_cycles -> legacy block
 //   funct7 = 1: mat_cfg (0), mat_load (1), mat_store (2), mat_exec (3),
 //              mat_fence (4) -> command queue / scheduler
+//   funct7 = 2: vec_cfg (0), vec_run (1) -> command queue (M3 vector engine)
 // Load/store/exec capture the current configuration into the packet, so
 // software may reconfigure right after issuing. With a sticky error set,
 // new commands are dropped (the core never blocks on a halted queue).
@@ -13,7 +14,9 @@
 `timescale 1ns / 1ps
 `include "sa_macros.vh"
 
-module sa_pcpi (
+module sa_pcpi #(
+    parameter integer D = 8                // VL: vec_cfg LEN is in elements
+) (
     input  wire                  clk,
     input  wire                  resetn,
 
@@ -51,8 +54,9 @@ module sa_pcpi (
     wire [6:0] opcode = pcpi_insn[6:0];
     wire [2:0] funct3 = pcpi_insn[14:12];
     wire [6:0] funct7 = pcpi_insn[31:25];
-    wire       ours   = opcode == 7'b0001011 && funct3 <= 3'd4 &&
-                        (funct7 == 7'd0 || funct7 == 7'd1);
+    wire       ours   = opcode == 7'b0001011 &&
+                        (((funct7 == 7'd0 || funct7 == 7'd1) && funct3 <= 3'd4) ||
+                         (funct7 == 7'd2 && funct3 <= 3'd1));
 
     assign pcpi_wait = pcpi_valid && ours;
 
@@ -62,11 +66,19 @@ module sa_pcpi (
     reg [1:0]  ld_mode;
     reg [11:0] ex_rep;                 // tiles per mat_exec (M2)
     reg [15:0] ex_bstep, ex_cstep, ex_crow;
+    // vector configuration (vec_cfg), M3
+    reg [7:0]  v_op;
+    reg [15:0] v_groups;
+    reg [31:0] v_dst;
+    reg [5:0]  v_types;
+    reg [15:0] v_mod, v_scale;
+    reg [4:0]  v_shift;
+    reg [31:0] v_zp, v_lo, v_hi;
     wire [11:0] ex_rep_m1 = ex_rep == 0 ? 12'd0 : ex_rep - 12'd1;
 
     localparam [1:0] S_IDLE = 0, S_EXEC = 1, S_DONE = 2;
     reg [1:0]  state;
-    reg        grp;          // 0: funct7 = 0, 1: funct7 = 1
+    reg [1:0]  grp;          // funct7
     reg [2:0]  op;
     reg [31:0] rs1, rs2;
 
@@ -88,11 +100,13 @@ module sa_pcpi (
             ld_rows <= 1; ld_rb <= 8; ld_pitch <= 8; ld_mode <= 0;
             st_rows <= 1; st_rb <= 8; st_pitch <= 8;
             ex_rep <= 1; ex_bstep <= 0; ex_cstep <= 0; ex_crow <= 1;
+            v_op <= 0; v_groups <= 1; v_dst <= 0; v_types <= {2'd2, 2'd2}; v_mod <= 0;
+            v_scale <= 1; v_shift <= 0; v_zp <= 0; v_lo <= 32'h80000000; v_hi <= 32'h7FFFFFFF;
         end else begin
             case (state)
                 S_IDLE:
                     if (pcpi_valid && ours) begin
-                        grp   <= funct7[0];
+                        grp   <= funct7[1:0];
                         op    <= funct3;
                         rs1   <= pcpi_rs1;
                         rs2   <= pcpi_rs2;
@@ -107,10 +121,37 @@ module sa_pcpi (
                             q_pkt <= {10'd0, ex_crow, ex_cstep, ex_bstep, ex_rep_m1,
                                       pcpi_rs2[28], pcpi_rs2[27:16], pcpi_rs2[15:0],
                                       pcpi_rs1[31:16], pcpi_rs1[15:0], CMD_EX};
+                        if (funct7 == 7'd2 && funct3 == 3'd1)  // vec_run: src1, src2 + VE config
+                            q_pkt <= {v_hi, v_lo, v_zp, v_shift, v_scale, v_mod, v_types, v_op, v_groups,
+                                      v_dst, pcpi_rs2, pcpi_rs1, CMD_VE};
                         fence_mask <= pcpi_rs1[3:0];
                     end
                 S_EXEC:
-                    if (!grp) begin
+                    if (grp == 2'd2) begin
+                        if (op == 3'd0) begin                // vec_cfg
+                            case (rs1[7:0])
+                                VCFG_OP:       v_op     <= rs2[7:0];
+                                VCFG_LEN:      v_groups <= rs2[31:0] >> $clog2(D);   // elements / VL
+                                VCFG_DST:      v_dst    <= rs2;
+                                VCFG_TYPES:    v_types  <= rs2[5:0];
+                                VCFG_SRC2_MOD: v_mod    <= rs2[15:0];
+                                VCFG_SCALE:    v_scale  <= rs2[15:0];
+                                VCFG_SHIFT:    v_shift  <= rs2[4:0];
+                                VCFG_ZP:       v_zp     <= rs2;
+                                VCFG_CLAMP_LO: v_lo     <= rs2;
+                                VCFG_CLAMP_HI: v_hi     <= rs2;
+                                default: ;
+                            endcase
+                            respond(0, 0);
+                        end else if (q_valid && q_ready) begin   // vec_run
+                            q_valid <= 0;
+                            respond(0, 0);
+                        end else if (sched_err) begin
+                            q_valid <= 0;
+                            respond(0, 0);
+                        end else
+                            q_valid <= 1;
+                    end else if (grp == 2'd0) begin
                         case (op)
                             3'd0: if (leg_trigger && leg_accept) begin
                                       leg_trigger <= 0;

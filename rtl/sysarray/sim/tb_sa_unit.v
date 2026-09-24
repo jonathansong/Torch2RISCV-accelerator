@@ -358,6 +358,10 @@ module tb_sa_unit;
 
 
     // ==================================================== new ISA helpers
+    localparam [7:0] V_OP = 0, V_LEN = 1, V_DST = 2, V_TYPES = 3, V_MOD = 4, V_SCALE = 5,
+                     V_SHIFT = 6, V_ZP = 7, V_LO = 8, V_HI = 9;
+    localparam [2:0] VADD = 0, VSUB = 1, VMUL = 2, VMAX = 3, VMIN = 4, VCOPY = 5;
+    localparam [1:0] T8 = 0, T16 = 1, T32 = 2;
     localparam [7:0] K_LD_ROWS = 0, K_LD_RB = 1, K_LD_PITCH = 2, K_LD_MODE = 3,
                      K_ST_ROWS = 4, K_ST_RB = 5, K_ST_PITCH = 6,
                      K_EX_REP = 7, K_EX_BSTEP = 8, K_EX_CSTEP = 9, K_EX_CROW = 10;
@@ -389,6 +393,7 @@ module tb_sa_unit;
     endtask
 
     // direct views of the unit's memories (bank = upper half)
+    reg [255:0] cmp_h, cmp_r;
     function [63:0]  hw_a(input integer w); hw_a = w < SW/2 ? dut.spad_a.bank[0].ram.ram_block[w] : dut.spad_a.bank[1].ram.ram_block[w - SW/2]; endfunction
     function [63:0]  hw_b(input integer w); hw_b = w < SW/2 ? dut.spad_b.bank[0].ram.ram_block[w] : dut.spad_b.bank[1].ram.ram_block[w - SW/2]; endfunction
     function [255:0] hw_c(input integer w); hw_c = w < CW/2 ? dut.accm.bank[0].ram.ram_block[w]   : dut.accm.bank[1].ram.ram_block[w - CW/2];   endfunction
@@ -531,11 +536,12 @@ module tb_sa_unit;
         end
     endfunction
 
-    integer n_ld, n_ex, n_st;
+    integer n_ld, n_ex, n_st, n_ve;
     task random_stream(input integer ncmd);
         integer c, typ, m, mode, rows, rb, pitch, w, span, d, kt, a, b, cc, acc, er, ebs, ecs, ecr;
+        integer vit, vot, vgr, vop, vm1, vm2, vmd, vw1, vw2, vwd, vper;
         begin
-            n_ld = 0; n_ex = 0; n_st = 0;
+            n_ld = 0; n_ex = 0; n_st = 0; n_ve = 0;
             for (ri = 0; ri < SW; ri = ri + 1) begin
                 sh_a[ri] = {$random(seed), $random(seed)};
                 sh_b[ri] = {$random(seed), $random(seed)};
@@ -552,7 +558,7 @@ module tb_sa_unit;
                 rd_sh[ri] = mem[RD - MEM_BASE + ri];
             end
             for (c = 0; c < ncmd; c = c + 1) begin
-                typ = rnd(9);
+                typ = rnd(12);
                 if (typ <= 3) begin                                   // LD
                     m = 1 + rnd(2);
                     mode = m != M_C && rnd(2) == 0;
@@ -573,6 +579,24 @@ module tb_sa_unit;
                     ex(a, b, cc, kt, acc);
                     ref_ex(a, b, cc, kt, acc, er, ebs, ecs, ecr);
                     n_ex = n_ex + 1;
+                end else if (typ >= 10) begin                         // VE (M3)
+                    vit = rnd(2); vot = rnd(2); vgr = 1 + rnd(12); vop = rnd(5);
+                    if (vop == VMUL && vit == T32) vop = VADD;
+                    vm1 = vit == T32 ? M_C : 1 + rnd(1);
+                    vm2 = vit == T32 ? M_C : 1 + rnd(1);
+                    vmd = vot == T32 ? M_C : 1 + rnd(1);
+                    vw1 = pick(vm1 == M_C ? CW : SW, vgr * vwpg(vit));
+                    vw2 = pick(vm2 == M_C ? CW : SW, vgr * vwpg(vit));
+                    // destination away from the sources (partial overlap is undefined)
+                    vwd = (vmd == M_C ? CW : SW) / 4 + rnd(200);
+                    vper = rnd(3);
+                    vrun(vm1, vw1, vm2, vw2, vmd, vwd, vgr, vop, rnd(1), rnd(1), vit, vot, vper,
+                         $signed(rnd(4000)) - 2000, rnd(20), $signed(rnd(200)) - 100,
+                         -32'sd2147483648, 32'sd2147483647);
+                    ref_ve(vm1, vw1, vm2, vw2, vmd, vwd, vgr, vop, dut.pcpi.v_op[4], dut.pcpi.v_op[5], vit, vot,
+                           vper, $signed(dut.pcpi.v_scale), dut.pcpi.v_shift, $signed(dut.pcpi.v_zp),
+                           -32'sd2147483648, 32'sd2147483647);
+                    n_ve = n_ve + 1;
                 end else begin                                        // ST
                     m = 1 + rnd(2);
                     rows = 1 + rnd(3); rb = 8 * (1 + rnd(7)); pitch = rb + 8 * rnd(2);
@@ -589,15 +613,178 @@ module tb_sa_unit;
             cfg_ex(1, 0, 0, 1);
             if (xst[1]) fail("random stream: sticky error");
             for (ri = 0; ri < SW; ri = ri + 1) begin
-                if (hw_a(ri) !== sh_a[ri]) begin errors = errors + 1; if (errors <= 20) $display("TB ERROR random: SPAD_A[%0d]", ri); end
-                if (hw_b(ri) !== sh_b[ri]) begin errors = errors + 1; if (errors <= 20) $display("TB ERROR random: SPAD_B[%0d]", ri); end
+                // function results go through regs first: xsim can report a
+                // false mismatch when `!==` compares a function result directly
+                cmp_h = hw_a(ri); cmp_r = sh_a[ri];
+                if (cmp_h !== cmp_r) begin errors = errors + 1; if (errors <= 20) $display("TB ERROR random: SPAD_A[%0d] = %h, expected %h", ri, cmp_h, cmp_r); end
+                cmp_h = hw_b(ri); cmp_r = sh_b[ri];
+                if (cmp_h !== cmp_r) begin errors = errors + 1; if (errors <= 20) $display("TB ERROR random: SPAD_B[%0d] = %h, expected %h", ri, cmp_h, cmp_r); end
             end
-            for (ri = 0; ri < CW; ri = ri + 1)
-                if (hw_c(ri) !== sh_c[ri]) begin errors = errors + 1; if (errors <= 20) $display("TB ERROR random: ACC[%0d]", ri); end
+            for (ri = 0; ri < CW; ri = ri + 1) begin
+                cmp_h = hw_c(ri); cmp_r = sh_c[ri];
+                if (cmp_h !== cmp_r) begin errors = errors + 1; if (errors <= 20) $display("TB ERROR random: ACC[%0d] = %h, expected %h", ri, cmp_h, cmp_r); end
+            end
             for (ri = 0; ri < 32768; ri = ri + 1)
                 if (mem[RD - MEM_BASE + ri] !== rd_sh[ri]) begin
                     errors = errors + 1; if (errors <= 20) $display("TB ERROR random: DDR RD+%0d", ri);
                 end
+        end
+    endtask
+
+
+    // ============================================== vector engine (M3)
+    task v_op(input [2:0] f3, input [31:0] rs1, input [31:0] rs2);
+        begin
+            pcpi_exec(custom0(f3, 7'd2), rs1, rs2);
+            if (pc_cycles < 0) fail("vector instruction timed out (would trap)");
+        end
+    endtask
+    task vcfg(input [7:0] key, input [31:0] v); v_op(3'd0, key, v); endtask
+    // full vector command: all parameters, then vec_run
+    task vrun(input [3:0] m1, input integer w1, input [3:0] m2, input integer w2, input [3:0] md, input integer wd,
+              input integer groups, input [2:0] op, input relu, input requant, input [1:0] it, input [1:0] ot,
+              input integer period, input integer scale, input integer shift, input integer zp,
+              input integer lo, input integer hi);
+        begin
+            vcfg(V_OP, {requant, relu, 1'b0, op}); vcfg(V_LEN, groups * 8); vcfg(V_DST, {md, 12'd0, wd[15:0]});
+            vcfg(V_TYPES, {ot, it}); vcfg(V_MOD, period); vcfg(V_SCALE, scale); vcfg(V_SHIFT, shift);
+            vcfg(V_ZP, zp); vcfg(V_LO, lo); vcfg(V_HI, hi);
+            v_op(3'd1, {m1, 12'd0, w1[15:0]}, {m2, 12'd0, w2[15:0]});
+        end
+    endtask
+
+    function integer vwpg(input [1:0] t); vwpg = t == T16 ? 2 : 1; endfunction
+    function [255:0] shg(input [3:0] m, input integer w);
+        shg = m == M_A ? {192'd0, sh_a[w]} : m == M_B ? {192'd0, sh_b[w]} : sh_c[w];
+    endfunction
+    function signed [31:0] relem(input [3:0] m, input integer base, input [1:0] t, input integer e);
+        reg [255:0] w0, w1;
+        begin
+            w0 = shg(m, base); w1 = shg(m, base + 1);
+            if (t == T8)       relem = $signed(w0[8*e +: 8]);
+            else if (t == T16) relem = e < 4 ? $signed(w0[16*e +: 16]) : $signed(w1[16*(e - 4) +: 16]);
+            else               relem = $signed(w0[32*e +: 32]);
+        end
+    endfunction
+    function signed [63:0] clampv(input signed [63:0] x, input signed [63:0] lo_, input signed [63:0] hi_);
+        clampv = x < lo_ ? lo_ : x > hi_ ? hi_ : x;
+    endfunction
+    // the arithmetic of one element (also the golden model of the quantized GEMM)
+    function signed [31:0] vcalc(input signed [31:0] a, input signed [31:0] b, input [2:0] op, input relu,
+                                 input requant, input [1:0] ot, input integer scale, input integer shift,
+                                 input integer zp, input integer lo, input integer hi);
+        reg signed [63:0] r, q;
+        begin
+            case (op)
+                VADD: r = clampv(a + b, -64'sd2147483648, 64'sd2147483647);
+                VSUB: r = clampv(a - b, -64'sd2147483648, 64'sd2147483647);
+                VMUL: r = $signed(a[15:0]) * $signed(b[15:0]);
+                VMAX: r = a > b ? a : b;
+                VMIN: r = a < b ? a : b;
+                default: r = a;
+            endcase
+            if (relu && r < 0) r = 0;
+            q = requant ? ((r * $signed(scale[15:0]) + (shift == 0 ? 0 : (64'sd1 <<< (shift - 1)))) >>> shift) + zp : r;
+            q = clampv(q, lo, hi);
+            vcalc = clampv(q, ot == T8 ? -128 : ot == T16 ? -32768 : -64'sd2147483648,
+                              ot == T8 ?  127 : ot == T16 ?  32767 :  64'sd2147483647);
+        end
+    endfunction
+    reg signed [31:0] vres [0:4095][0:7];
+    task ref_ve(input [3:0] m1, input integer w1, input [3:0] m2, input integer w2, input [3:0] md, input integer wd,
+                input integer groups, input [2:0] op, input relu, input requant, input [1:0] it, input [1:0] ot,
+                input integer period, input integer scale, input integer shift, input integer zp,
+                input integer lo, input integer hi);
+        integer g, g2, e;
+        reg signed [31:0] ea, eb;
+        reg [255:0] x0, x1;
+        begin
+            for (g = 0; g < groups; g = g + 1) begin
+                g2 = period == 0 ? g : period == 1 ? 0 : g % period;
+                for (e = 0; e < 8; e = e + 1) begin
+                    // one relem call per statement: xsim returns the last call's
+                    // value for every call of a static function in one expression
+                    ea = relem(m1, w1 + g * vwpg(it), it, e);
+                    eb = op == VCOPY ? 0 : relem(m2, w2 + g2 * vwpg(it), it, e);
+                    vres[g][e] = vcalc(ea, eb, op, relu, requant, ot, scale, shift, zp, lo, hi);
+                end
+            end
+            for (g = 0; g < groups; g = g + 1) begin
+                x0 = 0; x1 = 0;
+                for (e = 0; e < 8; e = e + 1)
+                    if (ot == T8)       x0[8*e +: 8] = vres[g][e][7:0];
+                    else if (ot == T16) begin if (e < 4) x0[16*e +: 16] = vres[g][e][15:0]; else x1[16*(e - 4) +: 16] = vres[g][e][15:0]; end
+                    else                x0[32*e +: 32] = vres[g][e];
+                if (md == M_A) begin sh_a[wd + g * vwpg(ot)] = x0[63:0]; if (ot == T16) sh_a[wd + 2*g + 1] = x1[63:0]; end
+                if (md == M_B) begin sh_b[wd + g * vwpg(ot)] = x0[63:0]; if (ot == T16) sh_b[wd + 2*g + 1] = x1[63:0]; end
+                if (md == M_C) sh_c[wd + g] = x0;
+            end
+        end
+    endtask
+
+    // ---- quantized GEMM: int8 C = requant(relu(A x B + bias)), fused on the chip
+    //      mode 0: VE adds the bias vector (period N/8) + RELU + REQUANT
+    //      mode 1: bias rows preloaded into ACC, EX accumulates, VE does RELU + REQUANT (COPY)
+    integer qgemm_cycles, qgemm_cycles_first;
+    task qgemm(input integer M, input integer N, input integer K, input integer mode,
+               input integer scale, input integer shift, input integer zp);
+        localparam [31:0] QA = MEM_BASE + 32'h20000, QB = MEM_BASE + 32'h22000,
+                          QC = MEM_BASE + 32'h24000, QBIAS = MEM_BASE + 32'h28000;
+        integer t0, i, j, k, bk, vb;
+        reg signed [31:0] acc32;
+        reg signed [31:0] qexp;
+        begin
+            for (i = 0; i < M; i = i + 1) for (k = 0; k < K; k = k + 1) begin
+                GA[i][k] = $random(seed); mem[QA - MEM_BASE + i*K + k] = GA[i][k];
+            end
+            for (k = 0; k < K; k = k + 1) for (j = 0; j < N; j = j + 1) begin
+                GB[k][j] = $random(seed); mem[QB - MEM_BASE + k*N + j] = GB[k][j];
+            end
+            for (j = 0; j < N; j = j + 1) begin                  // bias vector (and its M replicated rows)
+                GBIAS[0][j] = $random(seed) >>> 14;
+                for (i = 0; i < M; i = i + 1) begin
+                    GBIAS[i][j] = GBIAS[0][j];
+                    {mem[QBIAS - MEM_BASE + 4*(i*N + j) + 3], mem[QBIAS - MEM_BASE + 4*(i*N + j) + 2],
+                     mem[QBIAS - MEM_BASE + 4*(i*N + j) + 1], mem[QBIAS - MEM_BASE + 4*(i*N + j)]} = GBIAS[0][j];
+                end
+            end
+            poison(QC, M*N + 16);
+            t0 = $time;
+            vb = CW/2 - N/8;                                     // bias vector: end of ACC bank 0
+            cfg_ld(K, N, N, 1); ld(QB, M_B, 0);                  // resident B
+            if (mode == 0) begin cfg_ld(1, 4*N, 4*N, 0); ld(QBIAS, M_C, vb); end
+            cfg_ex(N/8, K, 1, N/8);
+            cfg_st(8, N, N);                                     // int8 strip: 8 rows of N bytes
+            for (i = 0; i < M/8; i = i + 1) begin
+                bk = i % 2;
+                cfg_ld(8, K, K, 1);
+                ld(QA + i*8*K, M_A, bk * SW/2);
+                if (mode == 1) begin cfg_ld(8, 4*N, 4*N, 0); ld(QBIAS + i*8*4*N, M_C, bk * CW/2); end
+                ex(bk * SW/2, 0, bk * CW/2, K/8, mode == 1);
+                if (mode == 0)
+                    vrun(M_C, bk * CW/2, M_C, vb, M_A, bk * SW/2 + 4096, N, VADD, 1, 1, T32, T8,
+                         N/8, scale, shift, zp, -32'sd2147483648, 32'sd2147483647);
+                else
+                    vrun(M_C, bk * CW/2, M_C, 0, M_A, bk * SW/2 + 4096, N, VCOPY, 1, 1, T32, T8,
+                         0, scale, shift, zp, -32'sd2147483648, 32'sd2147483647);
+                st(QC + i*8*N, M_A, bk * SW/2 + 4096);
+            end
+            fence(0);
+            qgemm_cycles = ($time - t0) / 10;
+            cfg_ex(1, 0, 0, 1);
+            if (xst[1]) fail("quantized GEMM: sticky error");
+            for (i = 0; i < M; i = i + 1) for (j = 0; j < N; j = j + 1) begin
+                acc32 = GBIAS[i][j];
+                for (k = 0; k < K; k = k + 1) acc32 = acc32 + GA[i][k] * GB[k][j];
+                qexp = vcalc(acc32, 0, VCOPY, 1, 1, T8, scale, shift, zp, -32'sd2147483648, 32'sd2147483647);
+                if ($signed(mem[QC - MEM_BASE + i*N + j]) !== qexp[7:0] && mem[QC - MEM_BASE + i*N + j] !== qexp[7:0]) begin
+                    errors = errors + 1;
+                    if (errors <= 20) $display("TB ERROR qGEMM mode %0d C[%0d][%0d] = %0d, expected %0d",
+                                               mode, i, j, $signed(mem[QC - MEM_BASE + i*N + j]), qexp);
+                end
+            end
+            for (i = M*N; i < M*N + 16; i = i + 1)
+                if (mem[QC - MEM_BASE + i] !== 8'hA5) fail("quantized GEMM: guard overwritten");
         end
     endtask
 
@@ -775,8 +962,10 @@ module tb_sa_unit;
         // --- unknown encodings are not claimed (core must trap)
         pcpi_exec(custom0(3'd5, 7'd0), 0, 0);
         if (pc_cycles >= 0) fail("funct3=5 was answered");
-        pcpi_exec(custom0(3'd0, 7'd2), 0, 0);
-        if (pc_cycles >= 0) fail("funct7=2 (vector, not in M1) was answered");
+        pcpi_exec(custom0(3'd0, 7'd3), 0, 0);
+        if (pc_cycles >= 0) fail("funct7=3 was answered");
+        pcpi_exec(custom0(3'd2, 7'd2), 0, 0);
+        if (pc_cycles >= 0) fail("funct7=2 funct3=2 was answered");
         pcpi_exec(32'h02B50533, 0, 0);            // mul a0,a0,a1 (not custom-0)
         if (pc_cycles >= 0) fail("standard MUL claimed by matmul_pcpi");
 
@@ -795,6 +984,12 @@ module tb_sa_unit;
         gemm(16, 32, 128, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
         gemm(8, 8, 8,     MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
         gemm(32, 32, 64,  MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 0, 0);
+
+        // ======================================= M3: quantized GEMMs
+        qgemm(32, 32, 64, 0, 181, 15, -3);
+        qgemm_cycles_first = qgemm_cycles;
+        qgemm(16, 48, 40, 1, -97, 12, 7);
+        qgemm(24, 16, 128, 0, 1, 0, 0);
 
         // ===================================== scoreboard: random stream
         random_stream(120);
@@ -827,14 +1022,14 @@ module tb_sa_unit;
         mat_op(F_RESET, 0, 0);
         pcpi_exec(custom0(3'd5, 7'd1), 0, 0);
         if (pc_cycles >= 0) fail("funct7=1 funct3=5 was answered");
-        expect_csr(8'h24, 32'h0001_0008, "CAPS");
+        expect_csr(8'h24, 32'h0001_0808, "CAPS");
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");
 
         repeat (20) @(posedge aclk);
-        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | new ISA: 4 GEMMs (32x32x64 in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST | error paths",
+        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | new ISA: 4 GEMMs (32x32x64 in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (32x32x64 in %0d cycles) | error paths",
                  errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, gemm_cycles, 32*32*64 / gemm_cycles,
-                 n_ld, n_ex, n_st);
+                 n_ld, n_ex, n_st, n_ve, qgemm_cycles_first);
         $finish;
     end
 

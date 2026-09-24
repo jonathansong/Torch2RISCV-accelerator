@@ -1,12 +1,13 @@
 /*
  * C wrappers for the matmul custom instructions (docs/custom_isa_encoding.md).
  *
- * R-type in the custom-0 opcode space (0x0B), funct7 = 0, funct3 = op.
+ * R-type in the custom-0 opcode space (0x0B), funct7 = group, funct3 = op.
  * Emitted with the assembler's `.insn` directive, so no compiler changes are
  * needed; the Phase 5 MLIR lowering emits the same `.insn` strings as LLVM
  * inline asm.
  *
- * Executed by rtl/matmul/matmul_pcpi.v through the PicoRV32 PCPI port.
+ * funct7 = 0 is executed by rtl/matmul/matmul_pcpi.v (Phase 4) or
+ * rtl/sysarray/sa_legacy.v; funct7 = 1 / 2 by rtl/sysarray (M1-M3).
  */
 #ifndef SYSARRAY_INTRINSICS_H
 #define SYSARRAY_INTRINSICS_H
@@ -168,6 +169,59 @@ static inline void mat_cfg_store(uint32_t rows, uint32_t row_bytes, uint32_t pit
     mat_cfg(SA_CFG_ST_ROWS, rows);
     mat_cfg(SA_CFG_ST_ROW_BYTES, row_bytes);
     mat_cfg(SA_CFG_ST_PITCH, pitch);
+}
+
+/* ------------------------------------------------------------------------
+ * funct7 = 2: vector engine (M3, docs/double_buffer_design.md §6)
+ * vec_run queues dst[g] = post(op(src1[g], src2[g'])) over LEN / SA_D
+ * groups of SA_D elements; g' = g (period 0), 0 (period 1) or g mod period.
+ * Types live in fixed memories: int32 in ACC (1 word per group), int8 in
+ * SPAD (1 word), int16 in SPAD (2 words). Ordered against LD/ST/EX by the
+ * same bank scoreboard; mat_fence waits for it too.
+ * ---------------------------------------------------------------------- */
+#define SA_VCFG_OP           0u      /* op | SA_V_RELU | SA_V_REQUANT              */
+#define SA_VCFG_LEN          1u      /* elements, multiple of SA_D                 */
+#define SA_VCFG_DST          2u      /* LADDR                                      */
+#define SA_VCFG_TYPES        3u      /* in | out << 2                              */
+#define SA_VCFG_SRC2_MOD     4u      /* src2 period in groups (0 = elementwise)    */
+#define SA_VCFG_SCALE        5u      /* REQUANT: y = ((x*scale + 2^(shift-1))      */
+#define SA_VCFG_SHIFT        6u      /*          >> shift) + zp, clamp [lo, hi]    */
+#define SA_VCFG_ZP           7u
+#define SA_VCFG_CLAMP_LO     8u
+#define SA_VCFG_CLAMP_HI     9u
+
+#define SA_VOP_ADD           0u      /* int32 saturating                           */
+#define SA_VOP_SUB           1u
+#define SA_VOP_MUL           2u      /* int8 / int16 inputs only                   */
+#define SA_VOP_MAX           3u
+#define SA_VOP_MIN           4u
+#define SA_VOP_COPY          5u      /* unary: src2 ignored                        */
+#define SA_V_RELU            (1u << 4)
+#define SA_V_REQUANT         (1u << 5)
+#define SA_VT_I8             0u
+#define SA_VT_I16            1u
+#define SA_VT_I32            2u
+#define SA_VTYPES(in, out)   ((uint32_t)(in) | ((uint32_t)(out) << 2))
+
+static inline void vec_cfg(uint32_t key, uint32_t value)
+{
+    __asm__ volatile (".insn r 0x0B, 0, 2, x0, %0, %1" :: "r"(key), "r"(value));
+}
+
+/* queue one vector command reading LADDRs src1 / src2 (all other operands from vec_cfg) */
+static inline void vec_run(uint32_t src1, uint32_t src2)
+{
+    __asm__ volatile (".insn r 0x0B, 1, 2, x0, %0, %1" :: "r"(src1), "r"(src2) : "memory");
+}
+
+/* REQUANT parameters and output clamp window */
+static inline void vec_cfg_requant(int32_t scale, uint32_t shift, int32_t zp, int32_t lo, int32_t hi)
+{
+    vec_cfg(SA_VCFG_SCALE, (uint32_t)scale);
+    vec_cfg(SA_VCFG_SHIFT, shift);
+    vec_cfg(SA_VCFG_ZP, (uint32_t)zp);
+    vec_cfg(SA_VCFG_CLAMP_LO, (uint32_t)lo);
+    vec_cfg(SA_VCFG_CLAMP_HI, (uint32_t)hi);
 }
 
 #endif

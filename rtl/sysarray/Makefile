@@ -37,6 +37,7 @@ test:
 	@$(MAKE) -s sim TB=tb_sa_dma GEN=NP=1
 	@$(MAKE) -s sim TB=tb_sa_dma GEN=NP=3
 	@$(MAKE) -s sim TB=tb_sa_unit
+	@$(MAKE) -s sim TB=tb_sa_ve
 
 clean:
 	rm -rf build

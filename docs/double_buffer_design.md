@@ -8,7 +8,12 @@ measurements** (§10.1): one HP port already runs at 99 % of its 8 B/cycle,
 so M2 cuts command-issue overhead instead (repeat `mat_exec`, §4.1) and the
 three DMA ports move to M4. Changes are marked *(M2)*. **M2 done and verified
 on the board** (`RISCV-on-PYNQ-Z1/bitstreams/m2/`): 64³ 13.0 → 38.3 MAC/cycle,
-128³ 28.4 → 49.8, 256³ 56.5 (88 % of peak). Next: M3 (vector engine).
+128³ 28.4 → 49.8, 256³ 56.5 (88 % of peak). **M3 (vector engine)
+done and verified on the board** (`RISCV-on-PYNQ-Z1/bitstreams/m3/`): fused
+int8 GEMM (bias + RELU + requant on the chip) bit-exact at 53.5 MAC/cycle
+for 256³ (int32 output: 56.5), standalone vector ops bit-exact for every
+op/type combination; decisions taken while building it are marked *(M3)*
+(§6.4, §8.4). Next: M4 (D = 16).
 
 ## 1. Goals and decisions
 
@@ -258,6 +263,27 @@ broadcast (stride 0 → one row repeated, e.g. a bias vector):
 
 Types: in int8/int16/int32, out int8/int16/int32 (per-op legality in the RTL spec).
 
+*(M3)* As built (`rtl/sysarray/sa_ve.v`):
+
+| Op | Semantics |
+|---|---|
+| ADD, SUB | int32 saturating |
+| MUL | int8/int16 inputs only (16 × 16 → 32, exact) |
+| MAX, MIN | elementwise |
+| COPY | unary (src2 not read): type conversion, move, or a pure post-op |
+
+followed by optional flags applied in this order: **RELU**, **REQUANT**
+(`((x · scale + 2^(shift-1)) >>> shift) + zp`, scale int16, shift 0–31),
+then the clamp window `[lo, hi]` (always applied; default full int32) and
+saturation to the output type. RELU and REQUANT are flags on any op, not
+ops of their own, so "bias ADD + RELU + REQUANT" is one command. MAC was
+dropped: `mat_exec` with `accumulate` covers the GEMM case, and a
+read-modify-write of dst would need a third read port slot per group.
+
+src2 is addressed by a **period** instead of a stride: group g reads src2
+group g (period 0), 0 (period 1, broadcast) or g mod period. A bias vector
+of N int32 is N/8 groups, so the fused epilogue over a row-major 8 × N strip
+uses period N/8.
 ### 6.3 Uses
 
 - **Fused after matmul**: `mat_exec → ACC bank b`, then `vec_run(REQUANT or
@@ -271,6 +297,28 @@ For data from DDR the three HP ports limit elementwise ops to ≈ 3 int16
 elements/cycle, so VL matters most for fused ops and multi-pass work on data
 that is already on chip.
 
+### 6.4 Implementation *(M3)*
+
+- **Types are tied to memories**: int32 lives only in ACC (one word per
+  group of D), int8 only in SPAD (one word), int16 only in SPAD (two words:
+  elements 0..D/2-1, then D/2..D-1). Any SPAD may hold either operand or the
+  result; src1 and src2 have the same input type.
+- **Pipeline**: a read unit issues one local-memory read per cycle (the
+  src1 word(s), then the src2 word(s); a broadcast src2 is read once per
+  command), four compute stages (op; RELU + REQUANT multiply; rounding
+  shift; zero point + clamp + saturate + pack), an 8-entry output FIFO and a
+  write stage (one word per cycle, priority over reads on the same memory).
+  A credit counter keeps at most 8 groups between read and write, so the
+  FIFO cannot overflow. Throughput: 1 group per max(reads + writes on the
+  busiest port) cycles — the fused int32 → int8 epilogue with a periodic
+  bias runs at ≈ 2 cycles/group (64 groups in 136 cycles).
+- **DSPs**: 24 at D = 8 (16 × 16 MUL and 32 × 16 requant multiply per lane,
+  the latter split by synthesis).
+- **Scoreboard** (§7): VE reads banks(src1) ∪ banks(src2) and writes
+  banks(dst). Besides RAW/WAR/WAW, EX and VE share the ACC and SPAD ports,
+  so an EX and a VE command that touch any common bank never run together.
+  Partial overlap of dst with a source inside one command is undefined
+  (exact in-place, dst = src1, is allowed).
 ## 7. Ordering: bank scoreboard
 
 Commands are dispatched **in program order** from the dispatch queue to the
@@ -368,6 +416,22 @@ may change it immediately after issuing.
 V_SRC2_STRIDE (0 = broadcast one word), V_SCALE, V_SHIFT, V_ZP, V_CLAMP.
 Captured at queue time like `mat_cfg`.
 
+*(M3)* As built (`firmware/include/sysarray_intrinsics.h`):
+
+| key | name | value |
+|---|---|---|
+| 0 | OP | `op[2:0]` (ADD 0, SUB 1, MUL 2, MAX 3, MIN 4, COPY 5), bit 4 RELU, bit 5 REQUANT |
+| 1 | LEN | elements, a multiple of D (stored as groups) |
+| 2 | DST | LADDR |
+| 3 | TYPES | `in[1:0] | out[3:2]` (int8 0, int16 1, int32 2) |
+| 4 | SRC2_MOD | src2 period in groups (0 elementwise, 1 broadcast) |
+| 5–7 | SCALE, SHIFT, ZP | REQUANT (int16, 0–31, int32) |
+| 8, 9 | CLAMP_LO, CLAMP_HI | int32 clamp window (reset: full range) |
+
+Validation at dispatch (sticky error, like §5.4): zero groups, a type > 2,
+op > COPY, MUL on int32, a type in the wrong memory, or a range past the end
+of its memory. The queue packet is 261 bits wide (`SA_PKT_W`).
+
 ### 8.5 Compatibility
 
 - **CSRs and funct7 = 0** (`mat_trigger`, `mat_status`, `mat_reset`,
@@ -458,6 +522,11 @@ the Phase 4 unit is 1545 LUT / 2116 FF / 64 DSP.
 | D = 8, VL = 8 | ≈ 14k (26 %) | ≈ 17k (16 %) | 80 (36 %) | 130 (93 %) |
 | D = 16, VL = 16, 8 DSP columns | ≈ 28k (53 %) | ≈ 30k (28 %) | 160 (73 %) | 130 (93 %) |
 
+*(M3)* Measured OOC (D = 8, NPORTS = 1, with the VE): 16.4k LUT (VE 8.1k:
+eight lanes of saturating add, 48-bit rounding shift and two clamps),
+11.6k FF, 96 DSP (array 64, VE 24), 128 BRAM36, WNS +2.5 ns at 50 MHz. The
+VE is larger than estimated; LUTs stay at 31 %.
+
 Everything runs at 50 MHz; the Phase 2 LUT-PE array alone reached ≈ 99 MHz,
 so timing margin is large. BRAM has no room for an ILA without shrinking
 the memory parameters.
@@ -472,7 +541,7 @@ regression, then the tested bitstream is committed under
 |---|---|---|
 | **M1** | D = 8: SPAD/ACC, LD/ST with one port (HP2), K-streaming EX, scoreboard, funct7 = 1 ISA, legacy sequencer, 8 KB program BRAM | NumPy-exact GEMMs (several shapes incl. non-square, K ≫ D) with double-buffered firmware; legacy tests pass; cycles measured |
 | **M2** *(redefined)* | DMA bandwidth self-test (§10.1); repeat `mat_exec` + strip-wide `mat_store`; 8 outstanding bursts per port | Measured HP efficiency; same tests incl. repeat commands; GEMM command overhead reduced on the board |
-| **M3** | Vector engine VL = D, funct7 = 2 | Fused GEMM + bias + ReLU + requant and standalone elementwise ops exact vs NumPy |
+| **M3** | Vector engine VL = D, funct7 = 2 | Fused GEMM + bias + ReLU + requant and standalone elementwise ops exact vs NumPy *(done, board-verified)* |
 | **M4** | D = 16 build (8 DSP columns, VL = 16); three HP ports with striping if the D = 16 measurements need them (§10.1) | All of the above at D = 16; resource/timing report |
 
 ## 13. Verification
