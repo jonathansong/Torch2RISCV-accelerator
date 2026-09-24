@@ -102,6 +102,18 @@ MLIR lowering pass (as an LLVM `InlineAsm` node).
 
 ---
 
+## Documentation
+
+- [Hardware learning path](docs/hardware_learning_path.md) - a staged guide
+  from digital design fundamentals to the accelerator RTL, verification,
+  timing closure and board measurements, with labs on this repository
+- [Double-buffered accelerator design](docs/double_buffer_design.md) - the
+  `rtl/sysarray` architecture, ISA and board results (M1-M4)
+- [Custom instruction encoding](docs/custom_isa_encoding.md) and
+  [memory model](docs/memory_model.md) - Phase 4 ISA and address maps
+
+---
+
 ## Project phases
 
 | Phase | Scope | Milestone |
