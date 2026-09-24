@@ -83,22 +83,41 @@ MLIR lowering pass (as an LLVM `InlineAsm` node).
 
 ---
 
-## Repository layout (planned)
+## Repository layout
 
 ```
-├── rtl/                  # PicoRV32 integration, PCPI coprocessor, systolic array
-├── firmware/             # Bare-metal C firmware, sysarray_intrinsics.h
-├── mlir/                 # sysarray dialect, pattern-matching + lowering passes
-├── driver/               # PYNQ Python driver (MMIO / allocate based)
-├── constrs/              # XDC constraints for PYNQ-Z1
-├── notebooks/            # End-to-end demo notebooks
-├── docs/
-│   ├── baseline_utilization.md
-│   ├── custom_isa_encoding.md
-│   ├── ps_pl_datapath.md
-│   └── tight_vs_loose_coupling.md
-└── scripts/               # Vivado .tcl build scripts
+├── rtl/
+│   ├── sysarray/            # current accelerator (M1-M4): double-buffered D x D systolic
+│   │   │                    #   array, LD/ST DMA, vector engine, bank scoreboard, PCPI + CSRs
+│   │   ├── sa_*.v, *.vh     #   RTL (file table in rtl/sysarray/README.md)
+│   │   ├── sim/             #   unit testbenches (make test / make test16)
+│   │   └── synth_ooc.tcl    #   out-of-context synth + timing (make synth)
+│   └── matmul/              # Phase 2-4 8x8x8 unit (reference; CSR + PCPI, NumPy vectors)
+├── firmware/                # bare-metal PicoRV32 firmware (clang, rv32imc)
+│   ├── include/             #   sysarray_intrinsics.h (.insn wrappers), mailbox.h, matmul_csr.h
+│   ├── common/, common.mk   #   start.S, link.ld, build + system-simulation rules
+│   ├── gemm/                #   tiled GEMM, int32 or int8 output (VE epilogue)
+│   ├── vector/              #   standalone vector-engine operations
+│   ├── bwtest/              #   DMA bandwidth self-test
+│   ├── matmul/, matmul_insn/#   Phase 3 (CSR) / Phase 4 (custom-instruction) job firmware
+│   └── sim/tb_system.v      #   firmware on PicoRV32 + the accelerator RTL (make sim)
+├── driver/pynq_matmul.py    # PYNQ driver: MatmulOverlay (gemm, vector, bandwidth, matmul)
+├── notebooks/               # board scripts per milestone (phase3/4, m1-m4, m4_sched_tune)
+├── docs/                    # design docs and the hardware learning path (see below)
+└── RISCV-on-PYNQ-Z1/        # the PYNQ-Z1 overlay (PicoRV32 + PS7 + accelerator)
+    ├── scripts/             #   build_bitstream.sh/.tcl (one-shot build, -jobs, -sa_d),
+    │                        #   pico_bit.tcl / pico_processor.tcl (block design)
+    ├── bitstreams/          #   board-verified bit/hwh + results: phase3, phase4, m1-m4
+    ├── ip/, gold_ip/        #   PicoRV32 IP repository used by the build (+ reference copy)
+    ├── picorv32/            #   upstream PicoRV32 sources
+    ├── constrs/             #   PYNQ-Z1 / PYNQ-Z2 XDC constraints
+    ├── tests/ddr_access/    #   RISC-V -> DDR access test (firmware, sim, board script)
+    └── notebooks/           #   upstream tutorial / example notebooks
 ```
+
+The MLIR lowering (Phase 5) is not in the repository yet. Build output
+(`build/`) is not tracked; tested bitstreams are copied to
+`RISCV-on-PYNQ-Z1/bitstreams/`.
 
 ---
 
