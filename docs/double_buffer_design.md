@@ -547,8 +547,30 @@ come from the schedule (estimated, not profiled):
 
 Decision: no three-port DMA. Small-K shapes (32×256×64: 17 %) are C-write
 bound, which the int8 epilogue addresses (4× less C traffic) rather than
-more ports. Next steps are in the firmware schedule (issue LD A(i+1) before
-ST(i); split the B load so the first exec starts early).
+more ports.
+
+**Firmware schedule tuning** (`firmware/gemm`, `notebooks/m4_sched_tune.py`,
+same bitstream; MAC/cycle on the board, D = 16):
+
+| GEMM | M4 | + A prefetch | + B split (forced) | both | default |
+|---|---|---|---|---|---|
+| 64³ | 64.1 | 63.0 | 48.4 | 47.3 | 63.0 |
+| 128³ | 131.7 | 150.0 | 136.9 | **156.7** | 156.7 |
+| 48×32×80 + bias | 32.9 | **34.0** | 27.2 | 26.0 | 34.0 |
+| 32×256×64 + bias | 44.0 | **50.7** | 46.9 | 50.6 | 50.6 |
+| 256³ | 180.3 | 197.2 | 184.8 | **202.6** | 202.6 (79 %) |
+| 512×256×256 | 191.1 | 210.9 | 193.6 | **213.9** | 213.9 (84 %) |
+| 256×128×1024 | 180.2 | 216.2 | 184.3 | **222.2** | 222.2 (87 %) |
+| 256³ int8 + bias | 167.8 | **182.0** | 167.7 | 181.9 | 181.9 |
+
+- *A prefetch*: queue EX(i), LD A(i+1), ST(i) - the next A strip loads during
+  EX(i) instead of queueing behind ST(i). +9-20 % on 128³ and up.
+- *B split*: the scoreboard tracks banks, so B's column halves go to the two
+  SPAD_B banks (loaded half 0, A(0), half 1) and each strip runs two execs;
+  the first exec starts after half of B. +3 % on top of the prefetch for
+  large B, but -25 % at 64³ (two short execs per strip), so the firmware
+  splits only when B >= 16 KB ("default" column; the table's default values
+  are the measured cells that rule selects).
 
 ## 11. Resource estimate
 

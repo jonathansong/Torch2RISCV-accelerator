@@ -49,6 +49,12 @@
                                   *      VE epilogue (+ bias vector, V_OP RELU,
                                   *      REQUANT with V_SCALE..V_HI); BIAS_BASE is
                                   *      then an int32 vector of N (0 = none)      */
+#define MBOX_GEMM_FLAGS    0x88  /* in:  GEMM firmware schedule switches (0 = tuned
+                                  *      default): bit 0 no A prefetch, bit 1 no B
+                                  *      split, bit 2 B split even for B < 16 KB */
+#define GEMM_NO_PREFETCH   (1u << 0)
+#define GEMM_NO_BSPLIT     (1u << 1)
+#define GEMM_FORCE_BSPLIT  (1u << 2)
 
 #define STATUS_RUNNING     0x00000001u
 #define STATUS_DONE        0x600D600Du

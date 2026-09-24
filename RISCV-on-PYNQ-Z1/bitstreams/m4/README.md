@@ -22,6 +22,11 @@ int32 GEMM (peak 256 MAC/cycle):
 | 512×256×256 | – | PASS | 175556 | 191.1 | 74.7 % | – |
 | 256×128×1024 | – | PASS | 186174 | 180.2 | 70.4 % | – |
 
+Firmware schedule tuning on this bitstream (`notebooks/m4_sched_tune.py`,
+A prefetch + B split for B >= 16 KB, now the `gemm_fw` default): 128³ 156.7,
+256³ 202.6 (79 % of peak), 512×256×256 213.9, 256×128×1024 222.2 (87 %),
+int8 256³ 181.9 MAC/cycle; details in docs/double_buffer_design.md §10.3.
+
 Fused int8 GEMM (bias + RELU + requant on the VE): 64³ 57.5, 128³ 120.5,
 256³ 167.6 MAC/cycle, all PASS.
 

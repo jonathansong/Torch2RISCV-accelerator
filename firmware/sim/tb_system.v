@@ -407,6 +407,7 @@ module tb_system;
     endtask
 
     reg signed [31:0] qexp;
+    integer gemm_flags = 0;                          // MBOX_GEMM_FLAGS: 0 = tuned schedule
     task run_gemm(input integer M, input integer N, input integer K, input integer use_bias,
                   input integer quant, input integer relu, input integer scale, input integer shift,
                   input integer zp);
@@ -435,6 +436,7 @@ module tb_system;
             bram[MBOX + 14] = K;
             bram[MBOX + 15] = use_bias ? GBIAS_ADDR : 0;
             bram[MBOX + 33] = quant;                          // GEMM_Q
+            bram[MBOX + 34] = gemm_flags;                     // GEMM_FLAGS
             bram[MBOX + 25] = (relu ? 32'h10 : 0) | 32'h20;   // V_OP: RELU, REQUANT
             bram[MBOX + 28] = scale;
             bram[MBOX + 29] = shift;
@@ -474,8 +476,10 @@ module tb_system;
             if (ddr[GC_ADDR - DDR_BASE + (quant ? 1 : 4)*M*N] !== 8'hA5) begin
                 $display("TB ERROR: byte after C overwritten"); errors = errors + 1;
             end
-            $display("TB GEMM %0dx%0dx%0d%0s%0s: %0d RISC-V cycles, %0d MAC/cycle, CPU CSR accesses %0d",
+            $display("TB GEMM %0dx%0dx%0d%0s%0s%0s: %0d RISC-V cycles, %0d MAC/cycle, CPU CSR accesses %0d",
                      M, N, K, use_bias ? " + bias" : "", quant ? (relu ? " -> relu/requant int8" : " -> requant int8") : "",
+                     gemm_flags == 3 ? " [M4 schedule]" : gemm_flags == 1 ? " [no prefetch]" : gemm_flags == 2 ? " [no B split]" :
+                     gemm_flags == 4 ? " [B split forced]" : "",
                      bram[MBOX + 8], M*N*K / bram[MBOX + 8], csr_accesses);
             runs = runs + 1;
         end
@@ -491,6 +495,18 @@ module tb_system;
         run_gemm(4*D, 4*D, 8*D, 1, 1, 1, 181, 15, -3);
         run_gemm(3*D, 6*D, 5*D, 0, 1, 0, -97, 12, 7);
         run_gemm(2*D, 2*D, 128, 1, 1, 1, 1, 0, 0);
+        // the same GEMMs with parts of the schedule tuning switched off
+        for (gemm_flags = 1; gemm_flags <= 3; gemm_flags = gemm_flags + 1) begin
+            run_gemm(4*D, 4*D, 8*D, 0, 0, 0, 1, 0, 0);
+            run_gemm(3*D, 2*D, 5*D, 1, 0, 0, 1, 0, 0);
+            run_gemm(4*D, 4*D, 8*D, 1, 1, 1, 181, 15, -3);
+        end
+        // B split below the 16 KB threshold (the split path on small shapes)
+        gemm_flags = 4;
+        run_gemm(4*D, 4*D, 8*D, 0, 0, 0, 1, 0, 0);
+        run_gemm(3*D, 2*D, 5*D, 1, 0, 0, 1, 0, 0);
+        run_gemm(4*D, 4*D, 8*D, 1, 1, 1, 181, 15, -3);
+        gemm_flags = 0;
         $display("TB %s: %0d GEMMs, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
         $finish;
     end

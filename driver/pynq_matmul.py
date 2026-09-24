@@ -51,6 +51,8 @@ MBOX_BW_CYCLES = 0x44
 MBOX_V_LEN, MBOX_V_OP, MBOX_V_TYPES, MBOX_V_PERIOD = 0x60, 0x64, 0x68, 0x6C
 MBOX_V_SCALE, MBOX_V_SHIFT, MBOX_V_ZP, MBOX_V_LO, MBOX_V_HI = 0x70, 0x74, 0x78, 0x7C, 0x80
 MBOX_GEMM_Q = 0x84
+MBOX_GEMM_FLAGS = 0x88                   # gemm_fw schedule switches (0 = tuned)
+GEMM_NO_PREFETCH, GEMM_NO_BSPLIT, GEMM_FORCE_BSPLIT = 1, 2, 4   # default: B split if B >= 16 KB
 BW_TESTS = [  # name, bytes moved (bwtest_fw.c)
     ("LD  DDR -> SPAD_A, 64 KB contiguous", 65536),
     ("ST  SPAD_A -> DDR, 64 KB", 65536),
@@ -257,13 +259,14 @@ class MatmulOverlay:
         return c, stats
 
 
-    def gemm(self, a, b, bias=None, quant=None, relu=False, timeout=5.0):
+    def gemm(self, a, b, bias=None, quant=None, relu=False, flags=0, timeout=5.0):
         """C = A @ B (+ bias) with gemm_fw.bin: A (M, K) int8, B (K, N) int8.
 
         quant None: bias (M, N) int32 or None -> C (M, N) int32.
         quant Requant(...) (M3): C (M, N) int8 = requant(relu(A @ B + bias)) computed
         by the vector engine on the chip; bias is then an int32 vector (N,) or None.
-        M, N, K multiples of D (8 or 16, self.d); B must fit in SPAD_B (K * N <= 128 KB),
+        flags: schedule switches for measurements (GEMM_NO_PREFETCH | GEMM_NO_BSPLIT |
+        GEMM_FORCE_BSPLIT; 3 = the M4 schedule, 0 = tuned default). M, N, K multiples of D (8 or 16, self.d); B must fit in SPAD_B (K * N <= 128 KB),
         K <= 65536 / D (int8 output: K <= 32768 / D, N + N / D <= 32768 / D)."""
         self._use("gemm_fw.bin")
         a = np.ascontiguousarray(a, dtype=np.int8)
@@ -295,7 +298,8 @@ class MatmulOverlay:
                 buf.flush()
             params = {MBOX_A_BASE: abuf.physical_address, MBOX_B_BASE: bbuf.physical_address,
                       MBOX_C_BASE: cbuf.physical_address, MBOX_GEMM_M: m, MBOX_GEMM_N: n, MBOX_GEMM_K: k,
-                      MBOX_BIAS_BASE: bufs[3].physical_address if bias is not None else 0}
+                      MBOX_BIAS_BASE: bufs[3].physical_address if bias is not None else 0,
+                      MBOX_GEMM_FLAGS: flags}
             if quant is not None:
                 params.update(self._requant_params(V_REQUANT | (V_RELU if relu else 0), quant))
                 params[MBOX_GEMM_Q] = 1
