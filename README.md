@@ -46,31 +46,66 @@ architect role:
 ## Architecture
 
 ```
-┌─────────────────────────────┐
-│  ARM Cortex-A9 (PS, Linux)  │  Host: PyTorch, torch-mlir, driver
-└──────────────┬──────────────┘
-               │ AXI-Lite (GP) — control/CSR
-               │ AXI (HP)      — bulk DDR data path
-┌──────────────▼──────────────┐
-│   PicoRV32 (PL, bare metal) │  Control core: decodes custom instruction
-│      + PCPI coprocessor     │  and dispatches to the accelerator
-└──────────────┬──────────────┘
-               │ PCPI handshake (pcpi_insn / rs1 / rs2 / wr / wait / ready)
-┌──────────────▼──────────────┐
-│  8x8 Systolic Array (PL)    │  int8 in, int32 accumulate, AXI staging buffer
-└──────────────────────────────┘
+┌──────────────────────────────────┐
+│   ARM Cortex-A9 (PS, Linux)      │  Host: PyTorch, driver/pynq_matmul.py
+└──┬──────────────────┬────────────┘
+   │ AXI GP           │ EMIO GPIO[0]
+   │ firmware +       │ RISC-V reset
+   │ mailbox (BRAM)   │
+┌──▼──────────────────▼────────────┐         ┌──────────────────────────┐
+│  PicoRV32 (PL, rv32imc, 50 MHz)  │── HP0 ─►│                          │
+│  8 KB program BRAM, bare metal   │         │   DDR3 (512 MB, shared)  │
+└──┬────────────────────┬──────────┘         │                          │
+   │ PCPI: custom-0     │ AXI-Lite: legacy   └──────────────▲───────────┘
+   │ instructions       │ CSRs (0x80000000)                 │
+┌──▼────────────────────▼─────────────────────────────┐     │ HP2
+│  sa_unit — double-buffered accelerator (PL)         │     │ (AXI4 → AXI3)
+│                                                     │     │
+│  command queue → decode → bank scoreboard           │     │
+│      │ in-order dispatch to four engines            │     │
+│      ├─► LD  DDR → local memory   ┐                 │     │
+│      ├─► ST  local memory → DDR   ┴─ DMA, 64-bit ───┼─────┘
+│      ├─► EX  D×D systolic array, int8 × int8 → int32 (K-streaming)
+│      └─► VE  vector engine, VL = D: add/sub/mul/max/min/copy,
+│              RELU, requant → int8/int16/int32
+│                                                     │
+│  SPAD_A 128 KB · SPAD_B 128 KB · ACC 256 KB         │
+│  (each two banks: DMA fills one while EX/VE use the other)
+└─────────────────────────────────────────────────────┘
 ```
+
+The board build (M4) uses D = 16: a 16×16 array (8 DSP + 8 LUT columns),
+256 MAC/cycle peak at 50 MHz, one HP port for the accelerator. Details:
+[`docs/double_buffer_design.md`](docs/double_buffer_design.md).
 
 ### Custom instruction encoding
 
-Uses the RISC-V reserved `custom-0` opcode space (`0001011`), so it never
-collides with the standard ISA. `funct3` selects the operation:
+All instructions are R-type in the RISC-V reserved `custom-0` opcode space
+(`0x0B`), so they never collide with the standard ISA. `funct7` selects the
+instruction group and `funct3` the operation:
 
-| funct3 | Mnemonic | Semantics |
-|---|---|---|
-| 0 | `mat_trigger` | rs1 = parameter block address, rs2 = destination address |
-| 1 | `mat_status` | rd = accelerator status register |
-| 2 | `mat_reset` | reset the accelerator |
+| funct7 | funct3 | Mnemonic | Operands | Semantics |
+|---|---|---|---|---|
+| 0 | 0 | `mat_trigger` | rs1 = descriptor, rs2 = C | one 8×8×8 job (Phase 4, kept for compatibility) |
+| 0 | 1 | `mat_status` | rd | STATUS, never stalls |
+| 0 | 2 | `mat_reset` | — | clear done/error (also the sticky error of the new ISA) |
+| 0 | 3 | `mat_wait` | rd | stall until idle, return STATUS |
+| 0 | 4 | `mat_cycles` | rd | cycles of the last job |
+| 1 | 0 | `mat_cfg` | rs1 = key, rs2 = value | DMA shape, exec repeat/strides |
+| 1 | 1 | `mat_load` | rs1 = DDR, rs2 = local addr | queue DDR → SPAD/ACC |
+| 1 | 2 | `mat_store` | rs1 = DDR, rs2 = local addr | queue SPAD/ACC → DDR |
+| 1 | 3 | `mat_exec` | rs1 = B<<16 \| A, rs2 = acc<<28 \| Kt<<16 \| C | queue C (+)= A strip × B strips |
+| 1 | 4 | `mat_fence` | rs1 = engine mask, rd | stall until the engines are idle, return extended status |
+| 2 | 0 | `vec_cfg` | rs1 = key, rs2 = value | op, length, types, dst, src2 period, requant, clamp |
+| 2 | 1 | `vec_run` | rs1 = src1, rs2 = src2 | queue one vector command |
+
+Queued commands return immediately; ordering between the engines is kept by
+the hardware scoreboard (DDR is not tracked, so software fences between a
+store and a later load of the same bytes). Full semantics:
+[`docs/custom_isa_encoding.md`](docs/custom_isa_encoding.md) (funct7 = 0)
+and [`docs/double_buffer_design.md`](docs/double_buffer_design.md) §8
+(funct7 = 1, 2); C wrappers in
+[`firmware/include/sysarray_intrinsics.h`](firmware/include/sysarray_intrinsics.h).
 
 No changes to the GCC/LLVM front end are required — instructions are emitted
 via the standard `.insn` pseudo-op, both by hand-written firmware and by the
@@ -78,7 +113,9 @@ MLIR lowering pass (as an LLVM `InlineAsm` node).
 
 ```asm
 # .insn r opcode, funct3, funct7, rd, rs1, rs2
-.insn r 0x0B, 0, 0, x0, a0, a1   # mat_trigger(param_addr=a0, dst_addr=a1)
+.insn r 0x0B, 1, 1, x0, a0, a1   # mat_load(ddr=a0, laddr=a1)
+.insn r 0x0B, 3, 1, x0, a2, a3   # mat_exec(a2 = B<<16 | A, a3 = acc<<28 | Kt<<16 | C)
+.insn r 0x0B, 4, 1, a0, x0, x0   # a0 = mat_fence(all engines)
 ```
 
 ---
