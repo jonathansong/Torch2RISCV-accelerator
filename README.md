@@ -135,22 +135,35 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
 
 ## Project phases
 
-| Phase | Scope | Milestone |
-|---|---|---|
-| 0 | Environment setup, base overlay resource baseline | — |
-| 1 | PicoRV32 bring-up on PYNQ-Z1 | **M1** — bare-metal hello world |
-| 2 | Matrix accelerator (CSR/AXI, loose coupling) | **M2** — simulation-verified against NumPy |
-| 3 | End-to-end closed loop, CSR path, hand-written firmware | **M3** — first demo-able ARM→PicoRV32→accelerator run |
-| 4 | Custom instruction (PCPI) design + implementation | **M4** — `.insn`-triggered accelerator run, verified |
-| 5 | MLIR dialect + instruction-level lowering | **M5** — PyTorch model compiles straight to custom-instruction firmware |
-| 6 | Loose- vs tight-coupling benchmark | **M6** — quantified CSR vs PCPI comparison |
-| 7 | Vector unit (optional, resource-permitting) | M7 |
-| 8 | Auto-tiling + double buffering (optional) | M8 |
-| 9 | Documentation and write-up | M9 |
+| Phase | Scope | Status | Result / where |
+|---|---|---|---|
+| 0 | Environment, one-shot Vivado build | ✅ done | `RISCV-on-PYNQ-Z1/scripts/build_bitstream.sh` |
+| 1 | PicoRV32 bring-up on PYNQ-Z1, RISC-V → DDR access | ✅ board-verified | `RISCV-on-PYNQ-Z1/tests/ddr_access` |
+| 2 | 8×8×8 matrix unit (CSR + AXI master, loose coupling) | ✅ simulation-verified vs NumPy | `rtl/matmul` |
+| 3 | End-to-end closed loop, CSR path, hand-written firmware | ✅ board-verified | 522.6 cycles/job; `bitstreams/phase3` |
+| 4 | Custom instructions (PCPI, `.insn`) | ✅ board-verified | 311.9 cycles/job; `bitstreams/phase4` |
+| M1–M4 | Accelerator rebuild: double-buffered systolic array (table below) | ✅ board-verified | `rtl/sysarray`, `bitstreams/m1`–`m4` |
+| 5 | MLIR dialect + instruction-level lowering | ⏳ next | targets `firmware/include/sysarray_intrinsics.h` |
+| 6 | Loose- vs tight-coupling benchmark | 🟡 partial | Phase 3 vs 4 board numbers exist; write-up pending |
+| 7 | Vector unit | ✅ done in M3 | fused int8 epilogue + standalone vector ops |
+| 8 | Auto-tiling + double buffering | 🟡 double buffering done (M1); compiler auto-tiling with Phase 5 | tiling is hand-written in `firmware/gemm` today |
+| 9 | Documentation and write-up | 🟡 in progress | `docs/` (design doc, learning path) |
 
-**Minimum viable target: M5** — a PyTorch model compiles end to end into
-firmware that issues a custom RISC-V instruction, executed by a hand-built
-accelerator on real FPGA hardware.
+The accelerator rebuild replaced the Phase 2–4 unit with a double-buffered
+design (`docs/double_buffer_design.md`); each milestone was measured on the
+board before choosing the next one:
+
+| Milestone | Scope | Board result (MAC/cycle at 50 MHz) |
+|---|---|---|
+| M1 | D = 8 array, SPAD/ACC banks, LD/ST DMA, bank scoreboard, funct7 = 1 ISA, legacy compatibility | 256³ GEMM at 54.5 (35× Phase 4) |
+| M2 | Repeat `mat_exec`, 8 outstanding bursts, DMA bandwidth test (one HP port at 99 %) | 64³ 13.0 → 38.3, 256³ 56.5 |
+| M3 | Vector engine (funct7 = 2): bias/RELU/requant → int8, standalone vector ops | int8 GEMM 256³ at 53.5 |
+| M4 | D = 16 (8 DSP + 8 LUT columns, VL = 16); three HP ports measured as unnecessary; firmware schedule tuning | 256³ at 202.6 (79 % of peak), 256×128×1024 at 222.2 |
+
+**Minimum viable target: Phase 5** — a PyTorch model compiles end to end
+into firmware that issues a custom RISC-V instruction, executed by a
+hand-built accelerator on real FPGA hardware. The hardware side of that
+target is complete.
 
 ---
 
