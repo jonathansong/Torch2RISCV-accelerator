@@ -3,7 +3,12 @@
 Status: **M1 done and verified on the board** (`rtl/sysarray`, D = 8, one
 DMA port; bitstream and results in `RISCV-on-PYNQ-Z1/bitstreams/m1/`:
 256×256×256 at 54.5 MAC/cycle, 85 % of the array peak, 35× Phase 4).
-Notes from the implementation are marked *(M1)*. Next: M2 (three DMA ports).
+Notes from the implementation are marked *(M1)*. **M2 was redefined from
+measurements** (§10.1): one HP port already runs at 99 % of its 8 B/cycle,
+so M2 cuts command-issue overhead instead (repeat `mat_exec`, §4.1) and the
+three DMA ports move to M4. Changes are marked *(M2)*. **M2 done and verified
+on the board** (`RISCV-on-PYNQ-Z1/bitstreams/m2/`): 64³ 13.0 → 38.3 MAC/cycle,
+128³ 28.4 → 49.8, 256³ 56.5 (88 % of peak). Next: M3 (vector engine).
 
 ## 1. Goals and decisions
 
@@ -125,6 +130,14 @@ C[i][j] (+)= Σ_{k < Kt·D} A[i][k] · B[k][j]
 reading the A strip at SPAD_A word A, the B strip at SPAD_B word B, writing
 D ACC words at C. `flags.accumulate` adds to the current ACC contents (bias
 preload, or K split across several commands); otherwise ACC is overwritten.
+
+*(M2)* One command can compute `repeat` output tiles with the same A strip
+(configured with `mat_cfg` EX keys, §8.2): tile r reads the B strip at
+B + r·Bstep and writes its row i to ACC word C + r·Cstep + i·Crow. With
+Bstep = K, Cstep = 1, Crow = N/D a whole row of C tiles is computed by one
+command and laid out row-major in ACC, so one `mat_store` writes the D × N
+strip back. Tiles stream back to back like separate commands; the command
+completes after its last tile.
 
 ### 4.2 K-streaming dataflow
 
@@ -325,6 +338,10 @@ dispatch queue (8 entries) is full.
 | 4 ST_ROWS | rows |
 | 5 ST_ROW_BYTES | bytes per row |
 | 6 ST_PITCH | DDR pitch |
+| 7 EX_REPEAT *(M2)* | output tiles per `mat_exec` (1 .. 4095, default 1) |
+| 8 EX_B_STEP *(M2)* | SPAD_B words between the tiles' B strips |
+| 9 EX_C_STEP *(M2)* | ACC words between tiles |
+| 10 EX_C_ROW *(M2)* | ACC words between rows of a tile (default 1) |
 
 Configuration is copied into each command when it is queued, so software
 may change it immediately after issuing.
@@ -388,8 +405,48 @@ max(compute, per-port traffic, DDR total); 50 MHz; HP port ≈ 6 B/cycle
   the full 128 BRAM (C tiles up to 128×256) and the three ports.
 - int8 output through the vector engine removes most of the small-K C
   traffic (not included above).
-- The HP efficiency is an assumption; milestone M2 measures it (DMA
-  bandwidth self-test) and this table gets updated.
+- The HP efficiency above is the design-time assumption (75 %); §10.1 has
+  the measurement.
+
+### 10.1 Measured DMA bandwidth *(M2)*
+
+`firmware/bwtest` on the M1 bitstream (one port, HP2, 50 MHz; 64 KB per test):
+
+| Transfer | B/cycle | MB/s | of 8 B/cycle |
+|---|---|---|---|
+| LD DDR → SPAD / ACC, contiguous | 7.94 | 397 | 99 % |
+| ST SPAD / ACC → DDR | 7.91–7.93 | 396 | 99 % |
+| LD, 8-byte rows (single-beat bursts) | 1.93 | 97 | 24 % |
+| LD and ST at the same time | 15.76 | 788 | read + write both at 99 % |
+
+One port is saturated by long bursts, and its read and write channels run
+concurrently. The engines take one 64-bit beat per cycle, which equals one
+port. Re-running the model with 8 B/cycle per direction: D = 8 is
+compute-bound on every workload with one port; D = 16 is memory-bound only
+for small K (1024×1024×64: 128 MAC/cycle), where the int32 C writes
+dominate — fixed by int8 output (M3) or more write ports (M4 decision).
+Single-beat bursts are latency-bound (≈ 16 cycles round trip, 4 in
+flight); M2 raises the outstanding bursts per port from 4 to 8.
+
+On the board, M1 GEMMs of size 64³ ran at 13 MAC/cycle against a model of
+≈ 60: about 300 cycles per C tile went to PicoRV32 issuing commands (each
+instruction is fetched over AXI) against 78 cycles of compute. M2's repeat
+`mat_exec` issues 3 commands per A strip instead of 2+ per tile.
+
+### 10.2 M2 on the board *(M2)*
+
+| GEMM | M1 MAC/cycle | M2 MAC/cycle |
+|---|---|---|
+| 24×16×40 + bias | 4.3 | 7.7 |
+| 64×64×64 | 13.0 | 38.3 |
+| 128×128×128 | 28.4 | 49.8 |
+| 32×256×64 + bias | 13.1 | 29.0 |
+| 256×256×256 | 54.5 | 56.5 |
+
+Single-beat LD bursts: 1.93 → 3.81 B/cycle with 8 outstanding bursts per
+port (contiguous transfers unchanged at 99 %). What remains for small
+problems is fixed cost (loading B, the first A strip, the final store and
+fence) that later strips cannot hide.
 
 ## 11. Resource estimate
 
@@ -414,9 +471,9 @@ regression, then the tested bitstream is committed under
 | | Scope | Acceptance |
 |---|---|---|
 | **M1** | D = 8: SPAD/ACC, LD/ST with one port (HP2), K-streaming EX, scoreboard, funct7 = 1 ISA, legacy sequencer, 8 KB program BRAM | NumPy-exact GEMMs (several shapes incl. non-square, K ≫ D) with double-buffered firmware; legacy tests pass; cycles measured |
-| **M2** | Three HP ports with striping; DMA bandwidth self-test | Same tests; measured HP efficiency; updated §10 |
+| **M2** *(redefined)* | DMA bandwidth self-test (§10.1); repeat `mat_exec` + strip-wide `mat_store`; 8 outstanding bursts per port | Measured HP efficiency; same tests incl. repeat commands; GEMM command overhead reduced on the board |
 | **M3** | Vector engine VL = D, funct7 = 2 | Fused GEMM + bias + ReLU + requant and standalone elementwise ops exact vs NumPy |
-| **M4** | D = 16 build (8 DSP columns, VL = 16) | All of the above at D = 16; resource/timing report |
+| **M4** | D = 16 build (8 DSP columns, VL = 16); three HP ports with striping if the D = 16 measurements need them (§10.1) | All of the above at D = 16; resource/timing report |
 
 ## 13. Verification
 

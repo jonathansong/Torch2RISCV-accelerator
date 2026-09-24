@@ -374,6 +374,8 @@ module sa_unit #(
         .clk(aclk), .resetn(resetn),
         .cmd_valid(ex_v), .cmd_ready(ex_r), .cmd_a(ex_pkt[17:2]), .cmd_b(ex_pkt[33:18]),
         .cmd_c(ex_pkt[49:34]), .cmd_kt(ex_pkt[61:50]), .cmd_acc(ex_pkt[62]),
+        .cmd_rep(ex_pkt[74:63]), .cmd_bstep(ex_pkt[90:75]), .cmd_cstep(ex_pkt[106:91]),
+        .cmd_crow(ex_pkt[122:107]),
         .done(ex_done), .busy(),
         .sa_en(sa_en), .sa_addr(sa_addr), .sa_dout(sa_dout),
         .sb_en(sb_en), .sb_addr(sb_addr), .sb_dout(sb_dout),

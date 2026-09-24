@@ -3,6 +3,7 @@
 set clock_ns [lindex $argv 0]
 set rtl      [lrange $argv 1 end]
 
+set_param general.maxThreads 4    ;# keep Vivado to 4 threads
 read_verilog $rtl
 synth_design -top matmul_unit -part xc7z020clg400-1 -mode out_of_context
 create_clock -name aclk -period $clock_ns [get_ports aclk]

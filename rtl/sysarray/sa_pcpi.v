@@ -60,6 +60,9 @@ module sa_pcpi (
     reg [15:0] ld_rows, ld_rb, st_rows, st_rb;
     reg [31:0] ld_pitch, st_pitch;
     reg [1:0]  ld_mode;
+    reg [11:0] ex_rep;                 // tiles per mat_exec (M2)
+    reg [15:0] ex_bstep, ex_cstep, ex_crow;
+    wire [11:0] ex_rep_m1 = ex_rep == 0 ? 12'd0 : ex_rep - 12'd1;
 
     localparam [1:0] S_IDLE = 0, S_EXEC = 1, S_DONE = 2;
     reg [1:0]  state;
@@ -84,6 +87,7 @@ module sa_pcpi (
             fence_mask  <= 0;
             ld_rows <= 1; ld_rb <= 8; ld_pitch <= 8; ld_mode <= 0;
             st_rows <= 1; st_rb <= 8; st_pitch <= 8;
+            ex_rep <= 1; ex_bstep <= 0; ex_cstep <= 0; ex_crow <= 1;
         end else begin
             case (state)
                 S_IDLE:
@@ -99,8 +103,9 @@ module sa_pcpi (
                             q_pkt <= {1'b0, ld_mode, ld_pitch, ld_rb, ld_rows, pcpi_rs2, pcpi_rs1, CMD_LD};
                         if (funct7[0] && funct3 == 3'd2)
                             q_pkt <= {1'b0, 2'b00, st_pitch, st_rb, st_rows, pcpi_rs2, pcpi_rs1, CMD_ST};
-                        if (funct7[0] && funct3 == 3'd3)       // {acc, Kt, C} {B, A}
-                            q_pkt <= {70'd0, pcpi_rs2[28], pcpi_rs2[27:16], pcpi_rs2[15:0],
+                        if (funct7[0] && funct3 == 3'd3)       // {acc, Kt, C} {B, A} + EX config
+                            q_pkt <= {10'd0, ex_crow, ex_cstep, ex_bstep, ex_rep_m1,
+                                      pcpi_rs2[28], pcpi_rs2[27:16], pcpi_rs2[15:0],
                                       pcpi_rs1[31:16], pcpi_rs1[15:0], CMD_EX};
                         fence_mask <= pcpi_rs1[3:0];
                     end
@@ -135,6 +140,10 @@ module sa_pcpi (
                                     CFG_ST_ROWS:      st_rows  <= rs2[15:0];
                                     CFG_ST_ROW_BYTES: st_rb    <= rs2[15:0];
                                     CFG_ST_PITCH:     st_pitch <= rs2;
+                                    CFG_EX_REPEAT:    ex_rep   <= rs2[11:0];
+                                    CFG_EX_B_STEP:    ex_bstep <= rs2[15:0];
+                                    CFG_EX_C_STEP:    ex_cstep <= rs2[15:0];
+                                    CFG_EX_C_ROW:     ex_crow  <= rs2[15:0];
                                     default: ;
                                 endcase
                                 respond(0, 0);

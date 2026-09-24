@@ -359,7 +359,8 @@ module tb_sa_unit;
 
     // ==================================================== new ISA helpers
     localparam [7:0] K_LD_ROWS = 0, K_LD_RB = 1, K_LD_PITCH = 2, K_LD_MODE = 3,
-                     K_ST_ROWS = 4, K_ST_RB = 5, K_ST_PITCH = 6;
+                     K_ST_ROWS = 4, K_ST_RB = 5, K_ST_PITCH = 6,
+                     K_EX_REP = 7, K_EX_BSTEP = 8, K_EX_CSTEP = 9, K_EX_CROW = 10;
     localparam [3:0] M_A = 1, M_B = 2, M_C = 3;
     localparam integer SW = 16384, CW = 8192;          // SPAD / ACC words (D = 8)
 
@@ -382,6 +383,9 @@ module tb_sa_unit;
     endtask
     task cfg_st(input integer rows, input integer rb, input integer pitch);
         begin cfg(K_ST_ROWS, rows); cfg(K_ST_RB, rb); cfg(K_ST_PITCH, pitch); end
+    endtask
+    task cfg_ex(input integer r, input integer bstep, input integer cstep, input integer crow);
+        begin cfg(K_EX_REP, r); cfg(K_EX_BSTEP, bstep); cfg(K_EX_CSTEP, cstep); cfg(K_EX_CROW, crow); end
     endtask
 
     // direct views of the unit's memories (bank = upper half)
@@ -417,24 +421,25 @@ module tb_sa_unit;
             // column strip jt at SPAD_B word jt*K (word k = B[k][8jt .. 8jt+7])
             cfg_ld(K, N, N, 1);
             ld(ba, M_B, 0);
-            gt = 0;
+            // M2: one mat_exec per A strip computes its N/8 C tiles, laid out
+            // row-major in ACC (tile j row i at word j + i*N/8), so one store
+            // writes the whole 8 x N strip of C
+            cfg_ex(N/8, K, 1, N/8);
+            cfg_st(8, 4*N, 4*N);
             for (gti = 0; gti < M/8; gti = gti + 1) begin
-                gbk = gti % 2;                                             // A strips alternate banks
-                cfg_ld(8, K, K, 1);                                        // A strip, k-tile major
+                gbk = gti % 2;                                             // strips alternate banks
+                cfg_ld(8, K, K, 1);
                 ld(aa + gti*8*K, M_A, gbk * SW/2);
-                for (gtj = 0; gtj < N/8; gtj = gtj + 1) begin
-                    if (use_bias) begin
-                        cfg_ld(8, 32, 4*N, 0);                             // bias tile -> ACC
-                        ld(biasa + gti*8*4*N + gtj*32, M_C, (gt % 2) * CW/2);
-                    end
-                    ex(gbk * SW/2, gtj * K, (gt % 2) * CW/2, K/8, use_bias);   // C tiles alternate banks
-                    cfg_st(8, 32, 4*N);
-                    st(ca + gti*8*4*N + gtj*32, M_C, (gt % 2) * CW/2);
-                    gt = gt + 1;
+                if (use_bias) begin
+                    cfg_ld(8, 4*N, 4*N, 0);                                // bias strip, same layout as C
+                    ld(biasa + gti*8*4*N, M_C, gbk * CW/2);
                 end
+                ex(gbk * SW/2, 0, gbk * CW/2, K/8, use_bias);
+                st(ca + gti*8*4*N, M_C, gbk * CW/2);
             end
             fence(0);
             gemm_cycles = ($time - t0) / 10;
+            cfg_ex(1, 0, 0, 1);                                            // back to single tiles
             if (xst[1]) fail("GEMM: sticky error");
             for (gi = 0; gi < M; gi = gi + 1) for (gj = 0; gj < N; gj = gj + 1) begin
                 gsum = GBIAS[gi][gj];
@@ -492,17 +497,22 @@ module tb_sa_unit;
                 end
         end
     endtask
-    task ref_ex(input integer a, input integer b, input integer c, input integer kt, input integer acc);
+    task ref_ex(input integer a, input integer b, input integer c, input integer kt, input integer acc,
+                input integer R, input integer bstep, input integer cstep, input integer crow);
         reg signed [31:0] res [0:7][0:7];
-        integer i, j, k;
+        integer i, j, k, r, bb, cc;
         begin
-            for (i = 0; i < 8; i = i + 1) for (j = 0; j < 8; j = j + 1) begin
-                res[i][j] = acc ? $signed(sh_c[c + i][32*j +: 32]) : 0;
-                for (k = 0; k < kt*8; k = k + 1)
-                    res[i][j] = res[i][j] + $signed(sh_a[a + (k/8)*8 + i][8*(k%8) +: 8]) *
-                                            $signed(sh_b[b + k][8*j +: 8]);
+            for (r = 0; r < R; r = r + 1) begin                 // tiles run in order
+                bb = b + r * bstep;
+                cc = c + r * cstep;
+                for (i = 0; i < 8; i = i + 1) for (j = 0; j < 8; j = j + 1) begin
+                    res[i][j] = acc ? $signed(sh_c[cc + i*crow][32*j +: 32]) : 0;
+                    for (k = 0; k < kt*8; k = k + 1)
+                        res[i][j] = res[i][j] + $signed(sh_a[a + (k/8)*8 + i][8*(k%8) +: 8]) *
+                                                $signed(sh_b[bb + k][8*j +: 8]);
+                end
+                for (i = 0; i < 8; i = i + 1) for (j = 0; j < 8; j = j + 1) sh_c[cc + i*crow][32*j +: 32] = res[i][j];
             end
-            for (i = 0; i < 8; i = i + 1) for (j = 0; j < 8; j = j + 1) sh_c[c + i][32*j +: 32] = res[i][j];
         end
     endtask
 
@@ -523,7 +533,7 @@ module tb_sa_unit;
 
     integer n_ld, n_ex, n_st;
     task random_stream(input integer ncmd);
-        integer c, typ, m, mode, rows, rb, pitch, w, span, d, kt, a, b, cc, acc;
+        integer c, typ, m, mode, rows, rb, pitch, w, span, d, kt, a, b, cc, acc, er, ebs, ecs, ecr;
         begin
             n_ld = 0; n_ex = 0; n_st = 0;
             for (ri = 0; ri < SW; ri = ri + 1) begin
@@ -554,11 +564,14 @@ module tb_sa_unit;
                     ld(d, m, w);
                     ref_ld(d, m, w, rows, rb, pitch, mode);
                     n_ld = n_ld + 1;
-                end else if (typ <= 6) begin                          // EX
+                end else if (typ <= 6) begin                          // EX (M2: 1-4 tiles, random strides)
                     kt = 1 + rnd(3);
-                    a = pick(SW, kt*8); b = pick(SW, kt*8); cc = pick(CW, 8); acc = rnd(1);
+                    er = 1 + rnd(3); ebs = rnd(40); ecs = 1 + rnd(9); ecr = 1 + rnd(9);
+                    a = pick(SW, kt*8); b = pick(SW, (er - 1)*ebs + kt*8);
+                    cc = pick(CW, (er - 1)*ecs + 7*ecr + 1); acc = rnd(1);
+                    cfg_ex(er, ebs, ecs, ecr);
                     ex(a, b, cc, kt, acc);
-                    ref_ex(a, b, cc, kt, acc);
+                    ref_ex(a, b, cc, kt, acc, er, ebs, ecs, ecr);
                     n_ex = n_ex + 1;
                 end else begin                                        // ST
                     m = 1 + rnd(2);
@@ -573,6 +586,7 @@ module tb_sa_unit;
                 end
             end
             fence(0);
+            cfg_ex(1, 0, 0, 1);
             if (xst[1]) fail("random stream: sticky error");
             for (ri = 0; ri < SW; ri = ri + 1) begin
                 if (hw_a(ri) !== sh_a[ri]) begin errors = errors + 1; if (errors <= 20) $display("TB ERROR random: SPAD_A[%0d]", ri); end

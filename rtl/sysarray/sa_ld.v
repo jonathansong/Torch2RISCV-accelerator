@@ -55,7 +55,7 @@ module sa_ld #(
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
     localparam integer PB   = NPORTS > 1 ? $clog2(NPORTS) : 1;
-    localparam integer QD   = 4;                      // outstanding bursts per port
+    localparam integer QD   = 8;                      // outstanding bursts per port
 
     // lanes per word (log2) of a memory
     function [3:0] lpw_log2(input [3:0] mem);
@@ -101,8 +101,8 @@ module sa_ld #(
     // per-port burst queues: {word, lane, beats}
     reg  [15:0] q_word  [0:NPORTS-1][0:QD-1];
     reg  [7:0]  q_lane  [0:NPORTS-1][0:QD-1];
-    reg  [2:0]  q_wp    [0:NPORTS-1];
-    reg  [2:0]  q_rp    [0:NPORTS-1];
+    reg  [3:0]  q_wp    [0:NPORTS-1];
+    reg  [3:0]  q_rp    [0:NPORTS-1];
     wire [NPORTS-1:0] q_full, q_empty;
 
     reg  [PB-1:0] ar_rr;          // next port to issue on
@@ -113,8 +113,8 @@ module sa_ld #(
     genvar gp;
     generate
         for (gp = 0; gp < NPORTS; gp = gp + 1) begin : qst
-            // 3-bit difference: modulo-8 pointers (a 32-bit compare breaks on wrap)
-            wire [2:0] used = q_wp[gp] - q_rp[gp];
+            // 4-bit difference: modulo-16 pointers (a 32-bit compare breaks on wrap)
+            wire [3:0] used = q_wp[gp] - q_rp[gp];
             assign q_full[gp]  = used == QD;
             assign q_empty[gp] = used == 0;
         end
@@ -164,8 +164,8 @@ module sa_ld #(
                 m_arvalid[ar_rr]            <= 1;
                 m_araddr[32*ar_rr +: 32]    <= addr;
                 m_arlen[8*ar_rr +: 8]       <= beats - 1;
-                q_word[ar_rr][q_wp[ar_rr][1:0]] <= cur_word;
-                q_lane[ar_rr][q_wp[ar_rr][1:0]] <= cur_lane;
+                q_word[ar_rr][q_wp[ar_rr][2:0]] <= cur_word;
+                q_lane[ar_rr][q_wp[ar_rr][2:0]] <= cur_lane;
                 q_wp[ar_rr]                 <= q_wp[ar_rr] + 1;
                 issued                      <= issued + 1;
                 ar_rr <= ar_rr == NPORTS - 1 ? 0 : ar_rr + 1;
@@ -216,8 +216,8 @@ module sa_ld #(
     end
 
     reg  [4:0] beat_idx [0:NPORTS-1];     // beats already taken from the head burst
-    wire [15:0] h_word = q_word[r_sel][q_rp[r_sel][1:0]];
-    wire [7:0]  h_lane = q_lane[r_sel][q_rp[r_sel][1:0]];
+    wire [15:0] h_word = q_word[r_sel][q_rp[r_sel][2:0]];
+    wire [7:0]  h_lane = q_lane[r_sel][q_rp[r_sel][2:0]];
     wire [8:0]  h_sum  = h_lane + beat_idx[r_sel];
 
     assign lw_en   = r_any;

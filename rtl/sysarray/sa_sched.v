@@ -93,11 +93,16 @@ module sa_sched #(
     reg              d1_v;
     reg [PKT_W-1:0]  d1;
     reg [31:0]       d1_span;          // LD/ST words;  EX: Kt*D
+    reg [31:0]       d1_bext;          // EX: (repeat-1) * B step
+    reg [31:0]       d1_cext;          // EX: (repeat-1) * C step + (D-1) * C row stride
     wire [3:0]  f_mem = fh[65:62];
     wire [15:0] f_rows = fh[81:66];
     wire [15:0] f_rb   = fh[97:82];
     wire [3:0]  f_wbl  = wb_log2(f_mem);
     wire [31:0] f_wpr  = (f_rb + (32'd1 << f_wbl) - 1) >> f_wbl;
+    wire [15:0] f_crow = fh[122:107] == 0 ? 16'd1 : fh[122:107];
+    wire [31:0] f_bext = fh[74:63] * fh[90:75];
+    wire [31:0] f_cext = fh[74:63] * fh[106:91] + (D - 1) * f_crow;
     wire [31:0] f_span = fh[1:0] == CMD_EX ? fh[61:50] * D :
                          fh[130] ? (f_rb >> LOGD) * f_rows : f_wpr * f_rows;
 
@@ -126,8 +131,9 @@ module sa_sched #(
     wire        range_ok  = mem_ok && last_word < depth_of(h_mem);
     wire [31:0] k_words   = d1_span;
     wire        ex_ok     = h_kt != 0;
-    wire        ex_range  = h_a + k_words <= SPAD_WORDS && h_b + k_words <= SPAD_WORDS &&
-                            h_c + D <= ACC_WORDS;
+    wire [31:0] b_last    = h_b + d1_bext + k_words - 1;
+    wire [31:0] c_last    = h_c + d1_cext;
+    wire        ex_range  = h_a + k_words <= SPAD_WORDS && b_last < SPAD_WORDS && c_last < ACC_WORDS;
 
     reg         c_valid_cmd;
     reg  [3:0]  c_err_code;
@@ -163,9 +169,9 @@ module sa_sched #(
                     c_valid_cmd = 0; c_err_code = XERR_RANGE;
                 end else begin
                     c_r = banks(MEM_SPAD_A, h_a, h_a + k_words - 1) |
-                          banks(MEM_SPAD_B, h_b, h_b + k_words - 1) |
-                          (h_acc ? banks(MEM_ACC, h_c, h_c + D - 1) : 6'd0);
-                    c_w = banks(MEM_ACC, h_c, h_c + D - 1);
+                          banks(MEM_SPAD_B, h_b, b_last) |
+                          (h_acc ? banks(MEM_ACC, h_c, c_last) : 6'd0);
+                    c_w = banks(MEM_ACC, h_c, c_last);
                 end
             default: begin
                 c_valid_cmd = 0; c_err_code = XERR_SHAPE;
@@ -265,6 +271,8 @@ module sa_sched #(
             if (fifo_pop) begin
                 d1      <= fh;
                 d1_span <= f_span;
+                d1_bext <= f_bext;
+                d1_cext <= f_cext;
                 in_rp   <= in_rp + 1;
             end
             if (d1_free) d1_v <= fifo_pop;

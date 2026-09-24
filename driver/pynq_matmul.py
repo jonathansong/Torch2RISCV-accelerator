@@ -40,6 +40,15 @@ MBOX_JOBS_DONE, MBOX_ERRORS, MBOX_FIRST_ERR = 0x14, 0x18, 0x1C
 MBOX_TOTAL_CYCLES, MBOX_ACCEL_CYCLES, MBOX_UNIT_ID = 0x20, 0x24, 0x28
 MBOX_DESC_BASE = 0x2C
 MBOX_GEMM_M, MBOX_GEMM_N, MBOX_GEMM_K, MBOX_BIAS_BASE, MBOX_EXT_STATUS = 0x30, 0x34, 0x38, 0x3C, 0x40
+MBOX_BW_CYCLES = 0x44
+BW_TESTS = [  # name, bytes moved (bwtest_fw.c)
+    ("LD  DDR -> SPAD_A, 64 KB contiguous", 65536),
+    ("ST  SPAD_A -> DDR, 64 KB", 65536),
+    ("LD  DDR -> ACC, 64 KB contiguous", 65536),
+    ("ST  ACC -> DDR, 64 KB", 65536),
+    ("LD  8-byte rows, pitch 16 (1-beat bursts)", 65536),
+    ("LD SPAD_B + ST SPAD_A concurrently", 131072),
+]
 SA_D = 8                                 # array size of the overlay build
 SPAD_BYTES = 128 * 1024                  # per SPAD
 MBOX_WORDS = 0x100 // 4
@@ -224,6 +233,42 @@ class MatmulOverlay:
         return c, {"firmware": self.firmware, "shape": (m, n, k), "tiles": self._mbox(MBOX_JOBS_DONE),
                    "riscv_cycles": cycles, "mac_per_cycle": m * n * k / cycles if cycles else 0,
                    "us": cycles / RISCV_HZ * 1e6, "wall_s": wall}
+
+
+    def bandwidth(self, timeout=5.0):
+        """DMA bandwidth self-test (bwtest_fw.bin). Returns [(name, bytes, cycles, B/cycle)]
+        and checks the three stored copies against the source."""
+        src = allocate(shape=(65536,), dtype=np.uint8)
+        dst = allocate(shape=(3 * 65536,), dtype=np.uint8)
+        try:
+            src[:] = np.random.default_rng(7).integers(0, 256, 65536, dtype=np.uint8)
+            dst[:] = 0xA5
+            src.flush()
+            dst.flush()
+            self.reset.write(1)
+            for w in range(MBOX_WORDS):
+                self.bram.write(MBOX + 4 * w, 0)
+            self.bram.write(MBOX + MBOX_A_BASE, src.physical_address)
+            self.bram.write(MBOX + MBOX_C_BASE, dst.physical_address)
+            t0 = time.perf_counter()
+            self.reset.write(0)
+            while time.perf_counter() - t0 < timeout and self._mbox(MBOX_STATUS) != STATUS_DONE:
+                pass
+            self.reset.write(1)
+            if self._mbox(MBOX_STATUS) != STATUS_DONE:
+                raise TimeoutError("bandwidth firmware did not finish")
+            if self._mbox(MBOX_ERRORS):
+                raise RuntimeError(f"DMA error, ext status {self._mbox(MBOX_FIRST_ERR):#x}")
+            dst.invalidate()
+            copies_ok = all(np.array_equal(dst[65536 * i:65536 * (i + 1)], src) for i in range(3))
+        finally:
+            src.freebuffer()
+            dst.freebuffer()
+        res = []
+        for i, (name, nbytes) in enumerate(BW_TESTS):
+            cyc = self._mbox(MBOX_BW_CYCLES + 4 * i)
+            res.append((name, nbytes, cyc, nbytes / cyc if cyc else 0.0))
+        return res, copies_ok
 
 
 def golden(a, b):

@@ -7,8 +7,12 @@
  * Schedule (docs/double_buffer_design.md §7):
  *   - B resident: one INTERLEAVE load of the whole K x N matrix puts
  *     column strip j at SPAD_B word j*K (word k = B[k][8j .. 8j+7]).
- *   - A row strips (8 x K, k-tile major) alternate between the two SPAD_A
- *     banks; C tiles alternate between the two ACC banks.
+ *   - Per 8-row strip of A (alternating SPAD_A / ACC banks), M2 commands:
+ *     load the A strip, one mat_exec with repeat N/8 (B step K) that lays
+ *     the strip's C tiles out row-major in ACC (tile j row i at word
+ *     j + i*N/8), one mat_store of the whole 8 x N strip. With a bias, the
+ *     bias strip is loaded into ACC in the same layout first and the exec
+ *     accumulates onto it.
  *   - Commands are only queued here; the hardware scoreboard overlaps the
  *     next A load / C store with the current exec and orders the rest.
  */
@@ -39,23 +43,22 @@ int main(void)
 
     mat_cfg_load(K, N, N, SA_LD_INTERLEAVE);       /* whole B, resident in SPAD_B */
     mat_load(b, SA_LADDR(SA_MEM_SPAD_B, 0));
-    mat_cfg_store(SA_D, 4 * SA_D, 4 * N);          /* C tiles */
+    mat_cfg_exec(N / SA_D, K, 1, N / SA_D);        /* a row of C tiles per exec, row-major */
+    mat_cfg_store(SA_D, 4 * N, 4 * N);             /* a whole 8 x N strip of C */
 
     for (uint32_t i = 0; i < M; i += SA_D) {
-        uint32_t abank = ((i / SA_D) & 1u) * SA_SPAD_BANK;
+        uint32_t odd   = (i / SA_D) & 1u;
+        uint32_t abank = odd * SA_SPAD_BANK;
+        uint32_t cbank = odd * SA_ACC_BANK;
         mat_cfg_load(SA_D, K, K, SA_LD_INTERLEAVE);
         mat_load(a + i * K, SA_LADDR(SA_MEM_SPAD_A, abank));
-        if (bias)
-            mat_cfg_load(SA_D, 4 * SA_D, 4 * N, SA_LD_LINEAR);
-        for (uint32_t j = 0; j < N; j += SA_D) {
-            uint32_t cbank = (tiles & 1u) * SA_ACC_BANK;
-            uint32_t off   = i * 4 * N + j * 4;
-            if (bias)
-                mat_load(bias + off, SA_LADDR(SA_MEM_ACC, cbank));
-            mat_exec(abank, (j / SA_D) * K, cbank, kt, bias != 0);
-            mat_store(c + off, SA_LADDR(SA_MEM_ACC, cbank));
-            tiles++;
+        if (bias) {
+            mat_cfg_load(SA_D, 4 * N, 4 * N, SA_LD_LINEAR);
+            mat_load(bias + i * 4 * N, SA_LADDR(SA_MEM_ACC, cbank));
         }
+        mat_exec(abank, 0, cbank, kt, bias != 0);
+        mat_store(c + i * 4 * N, SA_LADDR(SA_MEM_ACC, cbank));
+        tiles += N / SA_D;
     }
     uint32_t st = mat_fence(SA_ENG_ALL);
     uint32_t t1 = rdcycle();

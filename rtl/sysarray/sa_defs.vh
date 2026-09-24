@@ -32,6 +32,10 @@ localparam [7:0] CFG_LD_MODE      = 8'd3;
 localparam [7:0] CFG_ST_ROWS      = 8'd4;
 localparam [7:0] CFG_ST_ROW_BYTES = 8'd5;
 localparam [7:0] CFG_ST_PITCH     = 8'd6;
+localparam [7:0] CFG_EX_REPEAT    = 8'd7;    // M2: output tiles per mat_exec (1 .. 4095)
+localparam [7:0] CFG_EX_B_STEP    = 8'd8;    //     SPAD_B words between tiles' B strips
+localparam [7:0] CFG_EX_C_STEP    = 8'd9;    //     ACC words between tiles
+localparam [7:0] CFG_EX_C_ROW     = 8'd10;   //     ACC words between rows of a tile
 
 // Sticky error codes (extended status bits 11:8)
 localparam [3:0] XERR_SHAPE = 4'd1;   // bad address / shape / alignment
@@ -50,4 +54,7 @@ localparam [3:0] XERR_BRESP = 4'd4;   // DMA write response SLVERR/DECERR
 //   [132]     internal              (issued by the legacy sequencer; allows MEM_DESC)
 // EX reuses the fields:
 //   [17:2]    A word   [33:18] B word   [49:34] C word   [61:50] Kt   [62] accumulate
+//   [74:63]   repeat - 1 (tiles)   [90:75] B step   [106:91] C step   [122:107] C row stride
+//   (tile r: B strip at B + r*Bstep, C row i at C + r*Cstep + i*Crow; a zero C row
+//    stride means 1, so a zero-filled extension is the M1 single-tile command)
 localparam integer PKT_W = `SA_PKT_W;   // sa_macros.vh

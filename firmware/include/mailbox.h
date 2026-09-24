@@ -31,6 +31,9 @@
 #define MBOX_GEMM_K        0x38
 #define MBOX_BIAS_BASE     0x3C  /* in:  int32 M x N bias, 0 = none              */
 #define MBOX_EXT_STATUS    0x40  /* out: mat_fence extended status at the end    */
+#define MBOX_BW_SRC        0x08  /* bwtest firmware: source buffer (= A_BASE)     */
+#define MBOX_BW_DST        0x10  /*                  destination (= C_BASE)       */
+#define MBOX_BW_CYCLES     0x44  /* out: bwtest cycles per test, 6 words          */
 
 #define STATUS_RUNNING     0x00000001u
 #define STATUS_DONE        0x600D600Du

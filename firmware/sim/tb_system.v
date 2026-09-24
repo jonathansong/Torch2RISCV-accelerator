@@ -19,7 +19,7 @@ module tb_system;
     localparam        BRAM_WORDS = 2048;
     localparam [31:0] CSR_BASE   = 32'h8000_0000;
     localparam [31:0] DDR_BASE   = 32'h1800_0000;
-    localparam        DDR_BYTES  = 131072;
+    localparam        DDR_BYTES  = 327680;
     localparam [31:0] A_BASE     = DDR_BASE;             // NC * 64 B
     localparam [31:0] B_BASE     = DDR_BASE + 32'h1000;  // NC * 64 B
     localparam [31:0] C_BASE     = DDR_BASE + 32'h2000;  // NC * 256 B
@@ -233,74 +233,41 @@ module tb_system;
     integer    i, e, cycles;
     reg [31:0] got;
 
-`ifndef GEMM_TEST
+`ifdef BW_TEST
+    // -------------------------------------------------------- BW_TEST
+    localparam [31:0] BW_SRC = DDR_BASE, BW_DST = DDR_BASE + 32'h10000;
+    integer t;
+    reg [31:0] bw_cyc;
     initial begin
-        $readmemh("a.hex", a_vec);
-        $readmemh("b.hex", b_vec);
-        $readmemh("c.hex", c_vec);
+        for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = i < 65536 ? $random(seed) : 8'hA5;
         for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
         $readmemh("fw.hex", bram);
-        for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = 8'hA5;
-
-        // A/B rows: one 64-bit word per row; job i at +64*i
-        for (i = 0; i < NC * 8; i = i + 1)
-            for (k = 0; k < 8; k = k + 1) begin
-                ddr[A_BASE - DDR_BASE + 8*i + k] = a_vec[i][8*k +: 8];
-                ddr[B_BASE - DDR_BASE + 8*i + k] = b_vec[i][8*k +: 8];
-            end
-
-        bram[MBOX + 0] = 0;
-        bram[MBOX + 1] = NC;
-        bram[MBOX + 2] = A_BASE;
-        bram[MBOX + 3] = B_BASE;
-        bram[MBOX + 4] = C_BASE;
-        bram[MBOX + 11] = DESC_BASE;
-
-        // descriptors {A, B, DIM 8x8x8, 0} for the mat_trigger path
-        for (i = 0; i < NC; i = i + 1)
-            for (k = 0; k < 4; k = k + 1) begin
-                got = k == 0 ? A_BASE + 64 * i : k == 1 ? B_BASE + 64 * i :
-                      k == 2 ? {2'b0, 10'd8, 10'd8, 10'd8} : 32'd0;
-                {ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 3], ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 2],
-                 ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 1], ddr[DESC_BASE - DDR_BASE + 16*i + 4*k]} = got;
-            end
-
+        bram[MBOX + 2] = BW_SRC;
+        bram[MBOX + 4] = BW_DST;
         repeat (20) @(posedge clk);
         resetn <= 1;
-
         cycles = 0;
-        while (!trap && cycles < 2000000) begin @(posedge clk); cycles = cycles + 1; end
+        while (!trap && cycles < 4000000) begin @(posedge clk); cycles = cycles + 1; end
         repeat (5) @(posedge clk);
-
-        if (!trap)                          begin $display("TB ERROR: no trap"); errors = errors + 1; end
-        if (bram[MBOX] !== 32'h600D600D)    begin $display("TB ERROR: mailbox status %08x", bram[MBOX]); errors = errors + 1; end
-        // the CSR firmware reports the ID register; the PCPI firmware never reads CSRs
-        if (bram[MBOX + 10] !== 32'h4D4D3038 && bram[MBOX + 10] !== 0) begin
-            $display("TB ERROR: unit id %08x", bram[MBOX + 10]); errors = errors + 1;
+        if (!trap)                        begin $display("TB ERROR: no trap"); errors = errors + 1; end
+        if (bram[MBOX] !== 32'h600D600D)  begin $display("TB ERROR: mailbox status %08x", bram[MBOX]); errors = errors + 1; end
+        if (bram[MBOX + 6] !== 0)         begin $display("TB ERROR: fw errors, first %08x", bram[MBOX + 7]); errors = errors + 1; end
+        for (t = 0; t < 3; t = t + 1)                    // three ST copies of the source
+            for (i = 0; i < 65536; i = i + 1)
+                if (ddr[BW_DST - DDR_BASE + 65536*t + i] !== ddr[i]) begin
+                    errors = errors + 1;
+                    if (errors <= 5) $display("TB ERROR: copy %0d byte %0d", t, i);
+                end
+        for (t = 0; t < 6; t = t + 1) begin
+            bw_cyc = bram[MBOX + 17 + t];
+            $display("TB BW test %0d: %0d cycles, %0d.%02d B/cycle", t, bw_cyc,
+                     (t == 5 ? 131072 : 65536) / bw_cyc, ((t == 5 ? 131072 : 65536) * 100 / bw_cyc) % 100);
         end
-        if (bram[MBOX + 5] !== NC)          begin $display("TB ERROR: jobs done %0d / %0d", bram[MBOX + 5], NC); errors = errors + 1; end
-        if (bram[MBOX + 6] !== 0)           begin $display("TB ERROR: fw errors %0d, first %08x", bram[MBOX + 6], bram[MBOX + 7]); errors = errors + 1; end
-
-        for (i = 0; i < NC * 64; i = i + 1) begin
-            e = C_BASE - DDR_BASE + 4 * i;
-            got = {ddr[e + 3], ddr[e + 2], ddr[e + 1], ddr[e]};
-            if (got !== c_vec[i]) begin
-                errors = errors + 1;
-                if (errors <= 10)
-                    $display("TB ERROR job %0d C[%0d][%0d] = %0d, expected %0d", i / 64,
-                             (i % 64) / 8, i % 8, $signed(got), $signed(c_vec[i]));
-            end
-        end
-        if (ddr[C_BASE - DDR_BASE + NC * 256] !== 8'hA5) begin
-            $display("TB ERROR: byte after last C overwritten"); errors = errors + 1;
-        end
-
-        $display("TB %s: %0d jobs, %0d errors; batch %0d cycles (%0d / job), accelerator %0d cycles (%0d / job), CPU CSR accesses %0d",
-                 errors ? "FAIL" : "PASS", NC, errors, bram[MBOX + 8], bram[MBOX + 8] / NC,
-                 bram[MBOX + 9], bram[MBOX + 9] / NC, csr_accesses);
+        $display("TB %s: bandwidth test, %0d errors (simulated DDR model, not board numbers)",
+                 errors ? "FAIL" : "PASS", errors);
         $finish;
     end
-`else
+`elsif GEMM_TEST
     // ------------------------------------------------------ GEMM_TEST
     localparam [31:0] GA_ADDR = DDR_BASE,           GB_ADDR = DDR_BASE + 32'h4000,
                       GC_ADDR = DDR_BASE + 32'h8000, GBIAS_ADDR = DDR_BASE + 32'h10000;
@@ -377,6 +344,73 @@ module tb_system;
         run_gemm(16, 48, 128, 1);
         run_gemm(8, 8, 8, 0);
         $display("TB %s: %0d GEMMs, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
+        $finish;
+    end
+`else
+    initial begin
+        $readmemh("a.hex", a_vec);
+        $readmemh("b.hex", b_vec);
+        $readmemh("c.hex", c_vec);
+        for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
+        $readmemh("fw.hex", bram);
+        for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = 8'hA5;
+
+        // A/B rows: one 64-bit word per row; job i at +64*i
+        for (i = 0; i < NC * 8; i = i + 1)
+            for (k = 0; k < 8; k = k + 1) begin
+                ddr[A_BASE - DDR_BASE + 8*i + k] = a_vec[i][8*k +: 8];
+                ddr[B_BASE - DDR_BASE + 8*i + k] = b_vec[i][8*k +: 8];
+            end
+
+        bram[MBOX + 0] = 0;
+        bram[MBOX + 1] = NC;
+        bram[MBOX + 2] = A_BASE;
+        bram[MBOX + 3] = B_BASE;
+        bram[MBOX + 4] = C_BASE;
+        bram[MBOX + 11] = DESC_BASE;
+
+        // descriptors {A, B, DIM 8x8x8, 0} for the mat_trigger path
+        for (i = 0; i < NC; i = i + 1)
+            for (k = 0; k < 4; k = k + 1) begin
+                got = k == 0 ? A_BASE + 64 * i : k == 1 ? B_BASE + 64 * i :
+                      k == 2 ? {2'b0, 10'd8, 10'd8, 10'd8} : 32'd0;
+                {ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 3], ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 2],
+                 ddr[DESC_BASE - DDR_BASE + 16*i + 4*k + 1], ddr[DESC_BASE - DDR_BASE + 16*i + 4*k]} = got;
+            end
+
+        repeat (20) @(posedge clk);
+        resetn <= 1;
+
+        cycles = 0;
+        while (!trap && cycles < 2000000) begin @(posedge clk); cycles = cycles + 1; end
+        repeat (5) @(posedge clk);
+
+        if (!trap)                          begin $display("TB ERROR: no trap"); errors = errors + 1; end
+        if (bram[MBOX] !== 32'h600D600D)    begin $display("TB ERROR: mailbox status %08x", bram[MBOX]); errors = errors + 1; end
+        // the CSR firmware reports the ID register; the PCPI firmware never reads CSRs
+        if (bram[MBOX + 10] !== 32'h4D4D3038 && bram[MBOX + 10] !== 0) begin
+            $display("TB ERROR: unit id %08x", bram[MBOX + 10]); errors = errors + 1;
+        end
+        if (bram[MBOX + 5] !== NC)          begin $display("TB ERROR: jobs done %0d / %0d", bram[MBOX + 5], NC); errors = errors + 1; end
+        if (bram[MBOX + 6] !== 0)           begin $display("TB ERROR: fw errors %0d, first %08x", bram[MBOX + 6], bram[MBOX + 7]); errors = errors + 1; end
+
+        for (i = 0; i < NC * 64; i = i + 1) begin
+            e = C_BASE - DDR_BASE + 4 * i;
+            got = {ddr[e + 3], ddr[e + 2], ddr[e + 1], ddr[e]};
+            if (got !== c_vec[i]) begin
+                errors = errors + 1;
+                if (errors <= 10)
+                    $display("TB ERROR job %0d C[%0d][%0d] = %0d, expected %0d", i / 64,
+                             (i % 64) / 8, i % 8, $signed(got), $signed(c_vec[i]));
+            end
+        end
+        if (ddr[C_BASE - DDR_BASE + NC * 256] !== 8'hA5) begin
+            $display("TB ERROR: byte after last C overwritten"); errors = errors + 1;
+        end
+
+        $display("TB %s: %0d jobs, %0d errors; batch %0d cycles (%0d / job), accelerator %0d cycles (%0d / job), CPU CSR accesses %0d",
+                 errors ? "FAIL" : "PASS", NC, errors, bram[MBOX + 8], bram[MBOX + 8] / NC,
+                 bram[MBOX + 9], bram[MBOX + 9] / NC, csr_accesses);
         $finish;
     end
 `endif

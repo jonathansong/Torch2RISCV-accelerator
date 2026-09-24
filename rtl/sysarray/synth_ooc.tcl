@@ -4,6 +4,7 @@ set clock_ns [lindex $argv 0]
 set srcdir   [lindex $argv 1]
 set generics [lrange $argv 2 end]
 
+set_param general.maxThreads 4    ;# keep Vivado to 4 threads
 read_verilog [glob $srcdir/*.v]
 set_property include_dirs $srcdir [current_fileset]
 synth_design -top sa_unit -part xc7z020clg400-1 -mode out_of_context \

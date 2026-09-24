@@ -12,7 +12,13 @@
 // issued one cycle ahead (BRAM latency). A command streams for
 // K + 2(D-1) steps (K = Kt*D), then swaps into the shadow accumulators; the
 // drain (D cycles, 2D with accumulate) runs while the next command streams.
-// `done` pulses when a command's C tile is written, in command order.
+//
+// M2: one command computes `repeat` output tiles with the same A strip:
+// tile r reads the B strip at b + r*bstep and writes its row i to ACC word
+// c + r*cstep + i*crow (cstep = 1, crow = N/D lays a row of C tiles out
+// row-major, so one mat_store writes it back). Tiles stream back to back
+// like separate commands. `done` pulses once per command, after its last
+// tile is written, in command order.
 `timescale 1ns / 1ps
 
 module sa_ex #(
@@ -31,6 +37,10 @@ module sa_ex #(
     input  wire [15:0]          cmd_c,
     input  wire [11:0]          cmd_kt,
     input  wire                 cmd_acc,
+    input  wire [11:0]          cmd_rep,       // repeat - 1
+    input  wire [15:0]          cmd_bstep,
+    input  wire [15:0]          cmd_cstep,
+    input  wire [15:0]          cmd_crow,      // 0 means 1
     output reg                  done,
     output wire                 busy,
 
@@ -56,6 +66,8 @@ module sa_ex #(
     reg  [17:0] t_end;         // K + 2(D-1) + 1: swap cycle
     reg  [15:0] a_base, b_base, c_base;
     reg         acc_mode;
+    reg  [11:0] rep_left;      // tiles still to start after the current one
+    reg  [15:0] bstep, cstep, crow;
 
     reg  [8*D-1:0] rowreg [0:D-1];     // current A word of each row
     reg  [8*D-1:0] bsr    [0:D-2];     // B words t-1 .. t-(D-1)
@@ -105,6 +117,10 @@ module sa_ex #(
             acc_mode  <= cmd_acc;
             k_len     <= cmd_kt * D;
             t_end     <= cmd_kt * D + 2 * (D - 1) + 1;
+            rep_left  <= cmd_rep;
+            bstep     <= cmd_bstep;
+            cstep     <= cmd_cstep;
+            crow      <= cmd_crow == 0 ? 16'd1 : cmd_crow;
             for (r = 0; r < D; r = r + 1)     rowreg[r] <= 0;
             for (r = 0; r < D - 1; r = r + 1) bsr[r]    <= 0;
         end else if (streaming) begin
@@ -116,8 +132,17 @@ module sa_ex #(
             end
             if (c != t_end)
                 c <= c + 1;
-            else if (swap_now)
-                streaming <= 0;          // wait here if the previous drain is still running
+            else if (swap_now) begin     // (waits here while the previous drain runs)
+                if (rep_left != 0) begin // next tile of this command, same A strip
+                    rep_left <= rep_left - 1;
+                    c        <= 0;
+                    b_base   <= b_base + bstep;
+                    c_base   <= c_base + cstep;
+                    for (r = 0; r < D; r = r + 1)     rowreg[r] <= 0;
+                    for (r = 0; r < D - 1; r = r + 1) bsr[r]    <= 0;
+                end else
+                    streaming <= 0;
+            end
         end
     end
 
@@ -138,14 +163,16 @@ module sa_ex #(
     // ------------------------------------------------------------- drain
     reg [LD:0]   drow;          // row being drained
     reg          dphase;        // accumulate: 0 = read old, 1 = write sum
-    reg [15:0]   d_base;
+    reg [15:0]   d_addr;        // ACC word of the row being drained
+    reg [15:0]   d_crow;
     reg          d_acc;
+    reg          d_last;        // last tile of its command: pulse done
 
     integer e;
     always @* begin
         acc_en   = 0;
         acc_we   = 0;
-        acc_addr = d_base + drow;
+        acc_addr = d_addr;
         acc_din  = drain_row;
         shift    = 0;
         if (drain_active) begin
@@ -168,17 +195,20 @@ module sa_ex #(
             drain_active <= 1;
             drow         <= 0;
             dphase       <= 0;
-            d_base       <= c_base;
+            d_addr       <= c_base;
+            d_crow       <= crow;
             d_acc        <= acc_mode;
+            d_last       <= rep_left == 0;
         end else if (drain_active) begin
             if (d_acc && !dphase)
                 dphase <= 1;
             else begin
                 dphase <= 0;
                 drow   <= drow + 1;
+                d_addr <= d_addr + d_crow;
                 if (drow == D - 1) begin
                     drain_active <= 0;
-                    done         <= 1;
+                    done         <= d_last;
                 end
             end
         end

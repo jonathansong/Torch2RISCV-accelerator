@@ -31,6 +31,7 @@ set top_bd        design_1
 set out_name      picorv32
 
 set jobs              4
+set_param general.maxThreads 4    ;# main Vivado process; runs use -jobs
 set proj_dir          [file join $repo_root build $proj_name]
 set allow_unplaced_io 0
 

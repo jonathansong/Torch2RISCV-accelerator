@@ -25,6 +25,8 @@ module tb_sa_ex;
     reg  [15:0]  cmd_a, cmd_b, cmd_c;
     reg  [11:0]  cmd_kt;
     reg          cmd_acc;
+    reg  [11:0]  cmd_rep = 0;
+    reg  [15:0]  cmd_bstep = 0, cmd_cstep = 0, cmd_crow = 0;
     wire         sa_en, sb_en, acc_en;
     wire [SAW-1:0] sa_addr, sb_addr;
     wire [CAW-1:0] acc_addr;
@@ -35,7 +37,9 @@ module tb_sa_ex;
     sa_ex #(.D(D), .DSP_COLS(D), .SPAD_AW(SAW), .ACC_AW(CAW)) dut (
         .clk(clk), .resetn(resetn),
         .cmd_valid(cmd_valid), .cmd_ready(cmd_ready), .cmd_a(cmd_a), .cmd_b(cmd_b),
-        .cmd_c(cmd_c), .cmd_kt(cmd_kt), .cmd_acc(cmd_acc), .done(done), .busy(busy),
+        .cmd_c(cmd_c), .cmd_kt(cmd_kt), .cmd_acc(cmd_acc),
+        .cmd_rep(cmd_rep), .cmd_bstep(cmd_bstep), .cmd_cstep(cmd_cstep), .cmd_crow(cmd_crow),
+        .done(done), .busy(busy),
         .sa_en(sa_en), .sa_addr(sa_addr), .sa_dout(sa_dout),
         .sb_en(sb_en), .sb_addr(sb_addr), .sb_dout(sb_dout),
         .acc_en(acc_en), .acc_we(acc_we), .acc_addr(acc_addr), .acc_din(acc_din), .acc_dout(acc_dout));
@@ -158,10 +162,70 @@ module tb_sa_ex;
         end
     endtask
 
+    // ---- M2: one command, R output tiles (shared A strip, B strip per tile)
+    localparam integer MAXR = 8, MAXRK = 64;
+    reg signed [7:0]  RA [0:D-1][0:MAXRK-1];
+    reg signed [7:0]  RB [0:MAXR-1][0:MAXRK-1][0:D-1];
+    reg signed [31:0] RPRE [0:MAXR-1][0:D-1][0:D-1];
+    integer ra, rb, rbs, rc, rcs, rcr, rkt, rR, racc, rr;
+    task make_rep(input integer a, input integer b, input integer bstep, input integer c,
+                  input integer cstep, input integer crow, input integer kt, input integer R, input integer acc);
+        begin
+            ra = a; rb = b; rbs = bstep; rc = c; rcs = cstep; rcr = crow; rkt = kt; rR = R; racc = acc;
+            for (i = 0; i < D; i = i + 1) for (k = 0; k < kt * D; k = k + 1) RA[i][k] = $random(seed);
+            for (w = 0; w < kt; w = w + 1)
+                for (i = 0; i < D; i = i + 1) begin
+                    for (j = 0; j < D; j = j + 1) word[8*j +: 8] = RA[i][w*D + j];
+                    wr_spad(0, a + w*D + i, word);
+                end
+            for (rr = 0; rr < R; rr = rr + 1) begin
+                for (k = 0; k < kt * D; k = k + 1) begin
+                    for (j = 0; j < D; j = j + 1) begin RB[rr][k][j] = $random(seed); word[8*j +: 8] = RB[rr][k][j]; end
+                    wr_spad(1, b + rr*bstep + k, word);
+                end
+                for (i = 0; i < D; i = i + 1) begin
+                    for (j = 0; j < D; j = j + 1) begin
+                        RPRE[rr][i][j] = acc ? $random(seed) : 0;
+                        rd_word[32*j +: 32] = RPRE[rr][i][j];
+                    end
+                    wr_acc(c + rr*cstep + i*crow, rd_word);
+                end
+            end
+        end
+    endtask
+    task issue_rep;
+        begin
+            @(posedge clk); #1;
+            cmd_valid = 1; cmd_a = ra; cmd_b = rb; cmd_c = rc; cmd_kt = rkt; cmd_acc = racc;
+            cmd_rep = rR - 1; cmd_bstep = rbs; cmd_cstep = rcs; cmd_crow = rcr;
+            @(posedge clk);
+            while (!cmd_ready) @(posedge clk);
+            #1 cmd_valid = 0; cmd_rep = 0; cmd_bstep = 0; cmd_cstep = 0; cmd_crow = 0;
+        end
+    endtask
+    task check_rep;
+        begin
+            for (rr = 0; rr < rR; rr = rr + 1)
+                for (i = 0; i < D; i = i + 1) begin
+                    rd_acc(rc + rr*rcs + i*rcr);
+                    for (j = 0; j < D; j = j + 1) begin
+                        expect = RPRE[rr][i][j];
+                        for (k = 0; k < rkt * D; k = k + 1) expect = expect + RA[i][k] * RB[rr][k][j];
+                        got = rd_word[32*j +: 32];
+                        if (got !== expect) begin
+                            errors = errors + 1;
+                            if (errors <= 10) $display("TB ERROR repeat R=%0d tile %0d: C[%0d][%0d] = %0d, expected %0d",
+                                                       rR, rr, i, j, got, expect);
+                        end
+                    end
+                end
+        end
+    endtask
+
     integer dones = 0;
     always @(posedge clk) if (done) dones = dones + 1;
 
-    integer n, t0, t1, single_cycles;
+    integer n, t0, t1, tr0, single_cycles, rep_cycles;
     initial begin
         repeat (5) @(posedge clk);
         #1 resetn = 1;
@@ -193,8 +257,25 @@ module tb_sa_ex;
         t1 = $time;
         for (n = 1; n < NCMD; n = n + 1) check(n);
 
-        $display("TB %s: %0d commands, %0d errors; single 8x8x8 %0d cycles (issue to C written), batch %0d cycles",
-                 errors ? "FAIL" : "PASS", NCMD, errors, single_cycles, (t1 - t0) / 20);
+        // --- M2: repeat commands (one done per command)
+        make_rep(1000, 2000, 64, 3000, 1, 8, 8, 8, 0);            // resident-B strip, row-major C strip
+        tr0 = $time; n = dones;
+        issue_rep;
+        while (dones < n + 1) @(posedge clk);
+        rep_cycles = ($time - tr0) / 20;
+        check_rep;
+        if (dones != n + 1) begin errors = errors + 1; $display("TB ERROR: done count for repeat"); end
+        make_rep(4000, 5000, 100, 3500, 8, 1, 2, 3, 1);           // gaps between B strips, tile blocks, accumulate
+        issue_rep;
+        while (dones < n + 2) @(posedge clk);
+        check_rep;
+        make_rep(8192 - 16, 8192 - 40, 16, 4096 - 20, 1, 5, 2, 5, 0); // across bank boundaries
+        issue_rep;
+        while (dones < n + 3) @(posedge clk);
+        check_rep;
+
+        $display("TB %s: %0d commands + 3 repeat commands, %0d errors; single 8x8x8 %0d cycles, batch %0d cycles, 8 tiles x Kt 8 in one command %0d cycles",
+                 errors ? "FAIL" : "PASS", NCMD, errors, single_cycles, (t1 - t0) / 20, rep_cycles);
         $finish;
     end
 

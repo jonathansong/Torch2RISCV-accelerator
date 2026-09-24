@@ -98,6 +98,10 @@ static inline uint32_t mat_cycles(void)
 #define SA_CFG_ST_ROWS       4u
 #define SA_CFG_ST_ROW_BYTES  5u
 #define SA_CFG_ST_PITCH      6u
+#define SA_CFG_EX_REPEAT     7u      /* M2: C tiles per mat_exec          */
+#define SA_CFG_EX_B_STEP     8u      /*     SPAD_B words between B strips */
+#define SA_CFG_EX_C_STEP     9u      /*     ACC words between tiles       */
+#define SA_CFG_EX_C_ROW      10u     /*     ACC words between tile rows   */
 #define SA_LD_LINEAR         0u
 #define SA_LD_INTERLEAVE     1u
 
@@ -147,6 +151,16 @@ static inline void mat_cfg_load(uint32_t rows, uint32_t row_bytes, uint32_t pitc
     mat_cfg(SA_CFG_LD_ROW_BYTES, row_bytes);
     mat_cfg(SA_CFG_LD_PITCH, pitch);
     mat_cfg(SA_CFG_LD_MODE, mode);
+}
+
+/* mat_exec computes `repeat` C tiles: tile r uses B strip b + r*b_step and
+ * writes its row i to ACC word c + r*c_step + i*c_row */
+static inline void mat_cfg_exec(uint32_t repeat, uint32_t b_step, uint32_t c_step, uint32_t c_row)
+{
+    mat_cfg(SA_CFG_EX_REPEAT, repeat);
+    mat_cfg(SA_CFG_EX_B_STEP, b_step);
+    mat_cfg(SA_CFG_EX_C_STEP, c_step);
+    mat_cfg(SA_CFG_EX_C_ROW, c_row);
 }
 
 static inline void mat_cfg_store(uint32_t rows, uint32_t row_bytes, uint32_t pitch)

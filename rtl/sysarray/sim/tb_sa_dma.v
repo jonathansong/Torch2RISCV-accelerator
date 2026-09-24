@@ -183,28 +183,28 @@ module tb_sa_dma;
     generate
         for (gp = 0; gp < NP; gp = gp + 1) begin : port
             // read: AR queue, R served in order with random gaps
-            reg [31:0] rq_a [0:7];
-            reg [7:0]  rq_l [0:7];
+            reg [31:0] rq_a [0:15];
+            reg [7:0]  rq_l [0:15];
             integer    rq_w = 0, rq_r = 0, rb, k;
             initial forever begin
                 @(posedge clk);
                 if (arvalid[gp] && arready[gp]) begin
                     chk_burst(araddr[32*gp +: 32], arlen[8*gp +: 8]);
-                    rq_a[rq_w % 8] = araddr[32*gp +: 32]; rq_l[rq_w % 8] = arlen[8*gp +: 8];
+                    rq_a[rq_w % 16] = araddr[32*gp +: 32]; rq_l[rq_w % 16] = arlen[8*gp +: 8];
                     rq_w = rq_w + 1; ar_bursts = ar_bursts + 1;
                 end
-                #1 arready[gp] = (rq_w - rq_r < 6) && rnd(3) != 0;
+                #1 arready[gp] = (rq_w - rq_r < 10) && rnd(3) != 0;
             end
             initial forever begin
                 @(posedge clk);
                 if (rq_r != rq_w) begin
-                    for (rb = 0; rb <= rq_l[rq_r % 8]; rb = rb + 1) begin
+                    for (rb = 0; rb <= rq_l[rq_r % 16]; rb = rb + 1) begin
                         repeat (rnd(3)) @(posedge clk);
                         #1;
                         for (k = 0; k < 8; k = k + 1)
-                            rdata[64*gp + 8*k +: 8] = ddr[rq_a[rq_r % 8] - DDR_BASE + 8*rb + k];
+                            rdata[64*gp + 8*k +: 8] = ddr[rq_a[rq_r % 16] - DDR_BASE + 8*rb + k];
                         rresp[2*gp +: 2] = inj_rresp && rb == 1 ? 2'b10 : 2'b00;
-                        rlast[gp] = rb == rq_l[rq_r % 8];
+                        rlast[gp] = rb == rq_l[rq_r % 16];
                         rvalid[gp] = 1;
                         @(posedge clk);
                         while (!rready[gp]) @(posedge clk);
@@ -214,30 +214,30 @@ module tb_sa_dma;
                 end
             end
             // write: AW queue, W consumed in AW order, B after each burst
-            reg [31:0] wq_a [0:7];
-            reg [7:0]  wq_l [0:7];
+            reg [31:0] wq_a [0:15];
+            reg [7:0]  wq_l [0:15];
             integer    wq_w = 0, wq_r = 0, wb, j;
             initial forever begin
                 @(posedge clk);
                 if (awvalid[gp] && awready[gp]) begin
                     chk_burst(awaddr[32*gp +: 32], awlen[8*gp +: 8]);
-                    wq_a[wq_w % 8] = awaddr[32*gp +: 32]; wq_l[wq_w % 8] = awlen[8*gp +: 8];
+                    wq_a[wq_w % 16] = awaddr[32*gp +: 32]; wq_l[wq_w % 16] = awlen[8*gp +: 8];
                     wq_w = wq_w + 1; aw_bursts = aw_bursts + 1;
                 end
                 if (wvalid[gp] && wq_w == wq_r) fail("W beat before its AW");
-                #1 awready[gp] = (wq_w - wq_r < 6) && rnd(3) != 0;
+                #1 awready[gp] = (wq_w - wq_r < 10) && rnd(3) != 0;
             end
             initial forever begin
                 @(posedge clk);
                 if (wq_r != wq_w) begin
-                    for (wb = 0; wb <= wq_l[wq_r % 8]; wb = wb + 1) begin
+                    for (wb = 0; wb <= wq_l[wq_r % 16]; wb = wb + 1) begin
                         repeat (rnd(3)) @(posedge clk);
                         #1 wready[gp] = 1;
                         @(posedge clk);
                         while (!wvalid[gp]) @(posedge clk);
-                        if (wlast[gp] != (wb == wq_l[wq_r % 8])) fail("WLAST on wrong beat");
+                        if (wlast[gp] != (wb == wq_l[wq_r % 16])) fail("WLAST on wrong beat");
                         for (j = 0; j < 8; j = j + 1)
-                            ddr[wq_a[wq_r % 8] - DDR_BASE + 8*wb + j] = wdata[64*gp + 8*j +: 8];
+                            ddr[wq_a[wq_r % 16] - DDR_BASE + 8*wb + j] = wdata[64*gp + 8*j +: 8];
                         #1 wready[gp] = 0;
                     end
                     repeat (rnd(4)) @(posedge clk);

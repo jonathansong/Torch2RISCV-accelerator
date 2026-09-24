@@ -51,7 +51,7 @@ module sa_st #(
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
     localparam integer PB   = NPORTS > 1 ? $clog2(NPORTS) : 1;
-    localparam integer QD   = 4;          // queued bursts per port
+    localparam integer QD   = 8;          // queued bursts per port
     localparam integer SD   = 4;          // skid entries per port
 
     function [3:0] lpw_log2(input [3:0] mem);
@@ -95,17 +95,17 @@ module sa_st #(
     reg  [15:0] q_word  [0:NPORTS-1][0:QD-1];
     reg  [7:0]  q_lane  [0:NPORTS-1][0:QD-1];
     reg  [4:0]  q_beats [0:NPORTS-1][0:QD-1];
-    reg  [2:0]  q_wp    [0:NPORTS-1];
-    reg  [2:0]  q_rp    [0:NPORTS-1];
+    reg  [3:0]  q_wp    [0:NPORTS-1];
+    reg  [3:0]  q_rp    [0:NPORTS-1];
     reg  [PB-1:0] aw_rr;
 
     wire [NPORTS-1:0] q_full, q_empty;
     genvar gp;
     generate
         for (gp = 0; gp < NPORTS; gp = gp + 1) begin : qst
-            // 3-bit difference: modulo-8 pointers (a 32-bit compare breaks on wrap);
+            // 4-bit difference: modulo-16 pointers (a 32-bit compare breaks on wrap);
             // an AW in flight also owns a queue slot
-            wire [2:0] used = q_wp[gp] - q_rp[gp];
+            wire [3:0] used = q_wp[gp] - q_rp[gp];
             assign q_full[gp]  = used + m_awvalid[gp] >= QD;
             assign q_empty[gp] = used == 0;
         end
@@ -136,9 +136,9 @@ module sa_st #(
             for (p = 0; p < NPORTS; p = p + 1)
                 if (m_awvalid[p] && m_awready[p]) begin
                     m_awvalid[p]                 <= 0;
-                    q_word[p][q_wp[p][1:0]]      <= aw_word[p];
-                    q_lane[p][q_wp[p][1:0]]      <= aw_lane[p];
-                    q_beats[p][q_wp[p][1:0]]     <= aw_beats[p];
+                    q_word[p][q_wp[p][2:0]]      <= aw_word[p];
+                    q_lane[p][q_wp[p][2:0]]      <= aw_lane[p];
+                    q_beats[p][q_wp[p][2:0]]     <= aw_beats[p];
                     q_wp[p]                      <= q_wp[p] + 1;
                 end
 
@@ -215,9 +215,9 @@ module sa_st #(
         end
     end
 
-    wire [15:0] h_word  = q_word[w_sel][q_rp[w_sel][1:0]];
-    wire [7:0]  h_lane  = q_lane[w_sel][q_rp[w_sel][1:0]];
-    wire [4:0]  h_beats = q_beats[w_sel][q_rp[w_sel][1:0]];
+    wire [15:0] h_word  = q_word[w_sel][q_rp[w_sel][2:0]];
+    wire [7:0]  h_lane  = q_lane[w_sel][q_rp[w_sel][2:0]];
+    wire [4:0]  h_beats = q_beats[w_sel][q_rp[w_sel][2:0]];
     wire [8:0]  h_sum   = h_lane + beat_idx[w_sel];
     wire        h_last  = beat_idx[w_sel] == h_beats - 1;
 
