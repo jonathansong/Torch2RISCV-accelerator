@@ -20,11 +20,11 @@ set script_folder [_tcl::get_script_folder]
 # PicoRV32 subsystem (hierarchical cell): create_hier_cell_pico_processor
 source [file join $script_folder pico_processor.tcl]
 
-# Matrix unit RTL (<repo>/rtl/matmul), instantiated as a module reference
-set matmul_rtl_dir [file normalize [file join $script_folder .. .. rtl matmul]]
-set matmul_rtl [list [file join $matmul_rtl_dir systolic_array.v] \
-                     [file join $matmul_rtl_dir matmul_pcpi.v] \
-                     [file join $matmul_rtl_dir matmul_unit.v]]
+# Accelerator RTL (<repo>/rtl/sysarray, docs/double_buffer_design.md),
+# instantiated as a module reference (sa_unit). The Phase 2-4 matmul_unit
+# (rtl/matmul) is kept for reference; its bitstreams are in ../bitstreams.
+set matmul_rtl_dir [file normalize [file join $script_folder .. .. rtl sysarray]]
+set matmul_rtl [concat [glob [file join $matmul_rtl_dir *.v]] [glob [file join $matmul_rtl_dir *.vh]]]
 
 ################################################################
 # Check if script is running in correct Vivado version.
@@ -237,11 +237,14 @@ proc create_root_design { parentCell } {
 
   # Create instance: matmul_0 (RTL module reference, <repo>/rtl/matmul)
   variable matmul_rtl
-  if { [get_files -quiet matmul_unit.v] eq "" } {
+  variable matmul_rtl_dir
+  if { [get_files -quiet sa_unit.v] eq "" } {
      add_files -norecurse $matmul_rtl
+     set_property file_type {Verilog Header} [get_files -filter {NAME =~ *.vh}]
+     set_property include_dirs $matmul_rtl_dir [get_filesets sources_1]
      update_compile_order -fileset sources_1
   }
-  set matmul_0 [ create_bd_cell -type module -reference matmul_unit matmul_0 ]
+  set matmul_0 [ create_bd_cell -type module -reference sa_unit matmul_0 ]
 
   # Create instance: matmulHpConverter (AXI4 -> AXI3 for S_AXI_HP2)
   set matmulHpConverter [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_protocol_converter:2.1 matmulHpConverter ]
@@ -1171,7 +1174,7 @@ Flash#unassigned#unassigned#unassigned#unassigned#unassigned#UART 0#UART 0#Enet\
   connect_bd_intf_net -intf_net M_AXI_DDR [get_bd_intf_pins pico_processor_0/M_AXI_DDR] [get_bd_intf_pins processing_system7_0/S_AXI_HP0]
   connect_bd_intf_net -intf_net M_AXI_PERIPH [get_bd_intf_pins pico_processor_0/M_AXI_PERIPH] [get_bd_intf_pins matmul_0/s_axi]
   connect_bd_intf_net -intf_net PCPI [get_bd_intf_pins pico_processor_0/PCPI] [get_bd_intf_pins matmul_0/pcpi]
-  connect_bd_intf_net -intf_net matmul_m_axi [get_bd_intf_pins matmul_0/m_axi] [get_bd_intf_pins matmulHpConverter/S_AXI]
+  connect_bd_intf_net -intf_net matmul_m_axi [get_bd_intf_pins matmul_0/m0_axi] [get_bd_intf_pins matmulHpConverter/S_AXI]
   connect_bd_intf_net -intf_net matmul_hp2 [get_bd_intf_pins matmulHpConverter/M_AXI] [get_bd_intf_pins processing_system7_0/S_AXI_HP2]
   connect_bd_net -net periph_aresetn [get_bd_pins pico_processor_0/periph_aresetn] [get_bd_pins matmul_0/aresetn] [get_bd_pins matmulHpConverter/aresetn]
   connect_bd_intf_net -intf_net S_AXI_PSX [get_bd_intf_pins processing_system7_0/M_AXI_GP0] [get_bd_intf_pins psAxiInterconnect/S00_AXI]
@@ -1193,7 +1196,7 @@ Flash#unassigned#unassigned#unassigned#unassigned#unassigned#UART 0#UART 0#Enet\
   connect_bd_net -net subprocessorClk [get_bd_pins pico_processor_0/riscv_clk] [get_bd_pins processing_system7_0/S_AXI_HP0_ACLK] [get_bd_pins processing_system7_0/S_AXI_HP2_ACLK] [get_bd_pins matmul_0/aclk] [get_bd_pins matmulHpConverter/aclk] [get_bd_pins subprocessorClk/clk_out1]
 
   # Create address segments
-  assign_bd_address -offset 0x40010000 -range 0x00010000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs pico_processor_0/psBramController/S_AXI/Mem0] -force
+  assign_bd_address -offset 0x40010000 -range 0x00002000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs pico_processor_0/psBramController/S_AXI/Mem0] -force
   assign_bd_address -offset 0x40020000 -range 0x00010000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs psInterruptController/S_AXI/Reg] -force
   # RISC-V memory map: DDR identity-mapped to ARM physical addresses
   # (0x00000000-0x1FFFFFFF), program BRAM at 0xC0000000 (reset vector).
@@ -1201,7 +1204,7 @@ Flash#unassigned#unassigned#unassigned#unassigned#unassigned#UART 0#UART 0#Enet\
   assign_bd_address -offset 0xC0000000 -range 0x00002000 -target_address_space [get_bd_addr_spaces pico_processor_0/picorv32/mem_axi] [get_bd_addr_segs pico_processor_0/riscvBramController/S_AXI/Mem0] -force
   # matmul CSRs at 0x80000000 (RISC-V only); matmul DMA identity-mapped to DDR
   assign_bd_address -offset 0x80000000 -range 0x00001000 -target_address_space [get_bd_addr_spaces pico_processor_0/picorv32/mem_axi] [get_bd_addr_segs matmul_0/s_axi/reg0] -force
-  assign_bd_address -offset 0x00000000 -range 0x20000000 -target_address_space [get_bd_addr_spaces matmul_0/m_axi] [get_bd_addr_segs processing_system7_0/S_AXI_HP2/HP2_DDR_LOWOCM] -force
+  assign_bd_address -offset 0x00000000 -range 0x20000000 -target_address_space [get_bd_addr_spaces matmul_0/m0_axi] [get_bd_addr_segs processing_system7_0/S_AXI_HP2/HP2_DDR_LOWOCM] -force
   assign_bd_address -offset 0x40001000 -range 0x00001000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs subprocessorClk/s_axi_lite/Reg] -force
 
 

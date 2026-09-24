@@ -2,7 +2,8 @@
 # A firmware directory sets FW (output name) and SRCS, then includes this:
 #   make        -> $(FW).bin  (load into the program BRAM; see driver/pynq_matmul.py)
 #   make sim    -> sim/tb_system.v: the firmware on picorv32_axi driving the
-#                  real matmul_unit (CSR + PCPI) against a DDR model
+#                  real sa_unit (CSR + PCPI) against a DDR model
+#                  (SIM_DEFINES: GEMM_TEST for the GEMM firmware)
 # clang/lld, rv32imc (matches the overlay's PicoRV32 configuration).
 
 FW_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
@@ -18,9 +19,9 @@ LDFLAGS := -fuse-ld=lld -T $(FW_ROOT)/common/link.ld -Wl,--gc-sections
 VIVADO_SETTINGS ?= /home/jon/Projects/Vivado/Vivado/2024.1/settings64.sh
 PYTHON          ?= python3
 
-RTL := $(ROOT)/RISCV-on-PYNQ-Z1/picorv32/picorv32.v \
-       $(ROOT)/rtl/matmul/systolic_array.v $(ROOT)/rtl/matmul/matmul_pcpi.v \
-       $(ROOT)/rtl/matmul/matmul_unit.v
+SA  := $(ROOT)/rtl/sysarray
+RTL := $(ROOT)/RISCV-on-PYNQ-Z1/picorv32/picorv32.v $(wildcard $(SA)/*.v)
+SIM_DEFINES ?=
 SIM := build/sim
 
 all: $(FW).bin
@@ -42,7 +43,7 @@ $(SIM)/n_cases.vh: $(ROOT)/rtl/matmul/sim/gen_vectors.py
 
 sim: $(SIM)/fw.hex $(SIM)/n_cases.vh
 	cd $(SIM) && bash -c 'source $(VIVADO_SETTINGS) >/dev/null && \
-	  xvlog -i . $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { cat xvlog.out; exit 1; }; \
+	  xvlog -i . -i $(SA) $(addprefix -d ,$(SIM_DEFINES)) $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { grep ERROR xvlog.out; exit 1; }; \
 	  xelab -debug off tb_system -s tb >xelab.out 2>&1 || { cat xelab.out; exit 1; }; \
 	  xsim tb -R' | grep -E "^(TB|ERROR|FATAL)"
 

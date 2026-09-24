@@ -69,4 +69,91 @@ static inline uint32_t mat_cycles(void)
     return rd;
 }
 
+/* ------------------------------------------------------------------------
+ * funct7 = 1: double-buffered accelerator (docs/double_buffer_design.md §8)
+ * Commands are queued and return immediately (they stall only while the
+ * command queue is full); ordering between engines is kept by the
+ * hardware bank scoreboard. DDR is NOT tracked: fence between a store and
+ * a later load of the same DDR bytes.
+ * ---------------------------------------------------------------------- */
+
+#ifndef SA_D
+#define SA_D            8u                          /* array size of the build     */
+#endif
+#define SA_SPAD_WORDS   (131072u / SA_D)            /* per SPAD, D-byte words      */
+#define SA_ACC_WORDS    (262144u / (4u * SA_D))     /* D x int32 words             */
+#define SA_SPAD_BANK    (SA_SPAD_WORDS / 2u)        /* first word of bank 1        */
+#define SA_ACC_BANK     (SA_ACC_WORDS / 2u)
+
+#define SA_MEM_SPAD_A   1u
+#define SA_MEM_SPAD_B   2u
+#define SA_MEM_ACC      3u
+#define SA_LADDR(mem, word)  (((uint32_t)(mem) << 28) | (uint32_t)(word))
+
+/* mat_cfg keys */
+#define SA_CFG_LD_ROWS       0u
+#define SA_CFG_LD_ROW_BYTES  1u
+#define SA_CFG_LD_PITCH      2u
+#define SA_CFG_LD_MODE       3u
+#define SA_CFG_ST_ROWS       4u
+#define SA_CFG_ST_ROW_BYTES  5u
+#define SA_CFG_ST_PITCH      6u
+#define SA_LD_LINEAR         0u
+#define SA_LD_INTERLEAVE     1u
+
+/* mat_fence engine mask / extended status */
+#define SA_ENG_ALL           0u
+#define SA_XST_IDLE          (1u << 0)
+#define SA_XST_ERROR         (1u << 1)
+#define SA_XST_CODE(s)       (((s) >> 8) & 0xFu)
+#define SA_XST_ENGINE(s)     (((s) >> 12) & 0xFu)
+
+static inline void mat_cfg(uint32_t key, uint32_t value)
+{
+    __asm__ volatile (".insn r 0x0B, 0, 1, x0, %0, %1" :: "r"(key), "r"(value));
+}
+
+/* DDR -> local memory, shape from the LD_* configuration */
+static inline void mat_load(uint32_t ddr, uint32_t laddr)
+{
+    __asm__ volatile (".insn r 0x0B, 1, 1, x0, %0, %1" :: "r"(ddr), "r"(laddr) : "memory");
+}
+
+/* local memory -> DDR, shape from the ST_* configuration */
+static inline void mat_store(uint32_t ddr, uint32_t laddr)
+{
+    __asm__ volatile (".insn r 0x0B, 2, 1, x0, %0, %1" :: "r"(ddr), "r"(laddr) : "memory");
+}
+
+/* C (ACC word c) (+)= A strip (SPAD_A word a) x B strip (SPAD_B word b), Kt k-tiles */
+static inline void mat_exec(uint32_t a, uint32_t b, uint32_t c, uint32_t kt, uint32_t accumulate)
+{
+    uint32_t rs1 = (b << 16) | (a & 0xFFFFu);
+    uint32_t rs2 = (accumulate ? (1u << 28) : 0u) | ((kt & 0xFFFu) << 16) | (c & 0xFFFFu);
+    __asm__ volatile (".insn r 0x0B, 3, 1, x0, %0, %1" :: "r"(rs1), "r"(rs2) : "memory");
+}
+
+/* wait until the queue is empty and the engines in `mask` are idle; extended status */
+static inline uint32_t mat_fence(uint32_t mask)
+{
+    uint32_t rd;
+    __asm__ volatile (".insn r 0x0B, 4, 1, %0, %1, x0" : "=r"(rd) : "r"(mask) : "memory");
+    return rd;
+}
+
+static inline void mat_cfg_load(uint32_t rows, uint32_t row_bytes, uint32_t pitch, uint32_t mode)
+{
+    mat_cfg(SA_CFG_LD_ROWS, rows);
+    mat_cfg(SA_CFG_LD_ROW_BYTES, row_bytes);
+    mat_cfg(SA_CFG_LD_PITCH, pitch);
+    mat_cfg(SA_CFG_LD_MODE, mode);
+}
+
+static inline void mat_cfg_store(uint32_t rows, uint32_t row_bytes, uint32_t pitch)
+{
+    mat_cfg(SA_CFG_ST_ROWS, rows);
+    mat_cfg(SA_CFG_ST_ROW_BYTES, row_bytes);
+    mat_cfg(SA_CFG_ST_PITCH, pitch);
+}
+
 #endif

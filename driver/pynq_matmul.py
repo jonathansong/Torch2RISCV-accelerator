@@ -8,6 +8,9 @@ releases it from reset. Two firmwares consume the same mailbox:
                                               CSRs per job and polls STATUS
   matmul_insn_fw.bin  (firmware/matmul_insn)  custom-instruction path:
                                               mat_trigger(desc, C) + mat_wait
+  gemm_fw.bin         (firmware/gemm)         double-buffered accelerator (M1+):
+                                              whole C = A @ B (+ bias) with the
+                                              funct7 = 1 ISA -> MatmulOverlay.gemm()
 
     from pynq_matmul import MatmulOverlay
     mm = MatmulOverlay("picorv32.bit", "matmul_insn_fw.bin")
@@ -36,6 +39,9 @@ MBOX_STATUS, MBOX_N_JOBS, MBOX_A_BASE, MBOX_B_BASE, MBOX_C_BASE = 0x00, 0x04, 0x
 MBOX_JOBS_DONE, MBOX_ERRORS, MBOX_FIRST_ERR = 0x14, 0x18, 0x1C
 MBOX_TOTAL_CYCLES, MBOX_ACCEL_CYCLES, MBOX_UNIT_ID = 0x20, 0x24, 0x28
 MBOX_DESC_BASE = 0x2C
+MBOX_GEMM_M, MBOX_GEMM_N, MBOX_GEMM_K, MBOX_BIAS_BASE, MBOX_EXT_STATUS = 0x30, 0x34, 0x38, 0x3C, 0x40
+SA_D = 8                                 # array size of the overlay build
+SPAD_BYTES = 128 * 1024                  # per SPAD
 MBOX_WORDS = 0x100 // 4
 STATUS_RUNNING, STATUS_DONE = 0x00000001, 0x600D600D
 ERR_NO_UNIT, ERR_TIMEOUT = 0xDEAD0001, 0xDEAD0002
@@ -157,6 +163,67 @@ class MatmulOverlay:
             "wall_s": wall,
         }
         return c, stats
+
+
+    def gemm(self, a, b, bias=None, timeout=5.0):
+        """C = A @ B (+ bias) with gemm_fw.bin: A (M, K) int8, B (K, N) int8,
+        bias (M, N) int32 or None -> C (M, N) int32. M, N, K multiples of 8;
+        B must fit in SPAD_B (K * N <= 128 KB), K <= 8192."""
+        a = np.ascontiguousarray(a, dtype=np.int8)
+        b = np.ascontiguousarray(b, dtype=np.int8)
+        (m, k), (k2, n) = a.shape, b.shape
+        if k != k2 or m % SA_D or n % SA_D or k % SA_D:
+            raise ValueError(f"shapes {a.shape} x {b.shape}: need matching K and multiples of {SA_D}")
+        if k * n > SPAD_BYTES or k > SPAD_BYTES // 16:
+            raise ValueError(f"B ({k} x {n}) does not fit the resident-B schedule")
+        bufs = [allocate(shape=a.shape, dtype=np.int8), allocate(shape=b.shape, dtype=np.int8),
+                allocate(shape=(m, n), dtype=np.int32)]
+        if bias is not None:
+            bufs.append(allocate(shape=(m, n), dtype=np.int32))
+        abuf, bbuf, cbuf = bufs[:3]
+        try:
+            abuf[:] = a
+            bbuf[:] = b
+            cbuf[:] = 0
+            if bias is not None:
+                bufs[3][:] = np.asarray(bias, dtype=np.int32)
+            for buf in bufs:
+                buf.flush()
+
+            self.reset.write(1)
+            for w in range(MBOX_WORDS):
+                self.bram.write(MBOX + 4 * w, 0)
+            for off, val in ((MBOX_A_BASE, abuf.physical_address), (MBOX_B_BASE, bbuf.physical_address),
+                             (MBOX_C_BASE, cbuf.physical_address), (MBOX_GEMM_M, m), (MBOX_GEMM_N, n),
+                             (MBOX_GEMM_K, k),
+                             (MBOX_BIAS_BASE, bufs[3].physical_address if bias is not None else 0)):
+                self.bram.write(MBOX + off, val)
+
+            t0 = time.perf_counter()
+            self.reset.write(0)
+            status = 0
+            while time.perf_counter() - t0 < timeout:
+                status = self._mbox(MBOX_STATUS)
+                if status == STATUS_DONE:
+                    break
+            wall = time.perf_counter() - t0
+            self.reset.write(1)
+            if status != STATUS_DONE:
+                raise TimeoutError(f"gemm firmware {'running' if status == STATUS_RUNNING else 'not started'} "
+                                   f"after {timeout}s")
+            xst = self._mbox(MBOX_EXT_STATUS)
+            if xst & 2:
+                raise RuntimeError(f"accelerator error: code {(xst >> 8) & 0xF}, engine {(xst >> 12) & 0xF} "
+                                   f"(ext status {xst:#x})")
+            cbuf.invalidate()
+            c = np.array(cbuf)
+        finally:
+            for buf in bufs:
+                buf.freebuffer()
+        cycles = self._mbox(MBOX_TOTAL_CYCLES)
+        return c, {"firmware": self.firmware, "shape": (m, n, k), "tiles": self._mbox(MBOX_JOBS_DONE),
+                   "riscv_cycles": cycles, "mac_per_cycle": m * n * k / cycles if cycles else 0,
+                   "us": cycles / RISCV_HZ * 1e6, "wall_s": wall}
 
 
 def golden(a, b):

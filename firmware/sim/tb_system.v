@@ -1,7 +1,9 @@
-// System test: firmware (fw.hex: CSR path firmware/matmul or custom-instruction
-// path firmware/matmul_insn) running on picorv32_axi drives the real
-// matmul_unit through its CSRs or its PCPI port, as wired in the overlay;
-// matmul_unit reads/writes a DDR model.
+// System test: firmware (fw.hex) running on picorv32_axi drives the real
+// sa_unit through its CSRs or its PCPI port, as wired in the overlay; the
+// unit's DMA port 0 reads/writes a DDR model.
+//   default   : 32 independent 8x8x8 jobs (firmware/matmul CSR path or
+//               firmware/matmul_insn mat_trigger path)
+//   GEMM_TEST : firmware/gemm, tiled GEMMs on the funct7 = 1 ISA
 // Mirrors the overlay's RISC-V memory map:
 //   0xC0000000  8 KB program BRAM (+ mailbox at 0xC0001F00)
 //   0x80000000  matmul_unit CSRs
@@ -9,6 +11,7 @@
 // The "ARM" side (initial block) plays driver/pynq_matmul.py.
 `timescale 1ns / 1ps
 
+`include "sa_macros.vh"
 module tb_system;
     `include "n_cases.vh"
 
@@ -16,7 +19,7 @@ module tb_system;
     localparam        BRAM_WORDS = 2048;
     localparam [31:0] CSR_BASE   = 32'h8000_0000;
     localparam [31:0] DDR_BASE   = 32'h1800_0000;
-    localparam        DDR_BYTES  = 32768;
+    localparam        DDR_BYTES  = 131072;
     localparam [31:0] A_BASE     = DDR_BASE;             // NC * 64 B
     localparam [31:0] B_BASE     = DDR_BASE + 32'h1000;  // NC * 64 B
     localparam [31:0] C_BASE     = DDR_BASE + 32'h2000;  // NC * 256 B
@@ -137,24 +140,30 @@ module tb_system;
     reg  [63:0] m_rdata = 0;
     wire        mm_irq;
 
-    matmul_unit mm (
+    sa_unit #(.D(8), .NPORTS(1)) mm (
         .aclk(clk), .aresetn(resetn),
         .s_axi_awaddr(c_awaddr[7:0]), .s_axi_awvalid(c_awvalid & aw_csr), .s_axi_awready(mm_awready),
         .s_axi_wdata(c_wdata), .s_axi_wstrb(c_wstrb), .s_axi_wvalid(c_wvalid & aw_csr), .s_axi_wready(mm_wready),
         .s_axi_bresp(mm_bresp), .s_axi_bvalid(mm_bvalid), .s_axi_bready(c_bready),
         .s_axi_araddr(c_araddr[7:0]), .s_axi_arvalid(c_arvalid & ar_csr), .s_axi_arready(mm_arready),
         .s_axi_rdata(mm_rdata), .s_axi_rresp(mm_rresp), .s_axi_rvalid(mm_rvalid), .s_axi_rready(c_rready),
-        .m_axi_araddr(m_araddr), .m_axi_arlen(m_arlen), .m_axi_arsize(m_arsize),
-        .m_axi_arburst(m_arburst), .m_axi_arcache(m_arcache), .m_axi_arprot(m_arprot),
-        .m_axi_arvalid(m_arvalid), .m_axi_arready(m_arready),
-        .m_axi_rdata(m_rdata), .m_axi_rresp(2'b00), .m_axi_rlast(m_rlast),
-        .m_axi_rvalid(m_rvalid), .m_axi_rready(m_rready),
-        .m_axi_awaddr(m_awaddr), .m_axi_awlen(m_awlen), .m_axi_awsize(m_awsize),
-        .m_axi_awburst(m_awburst), .m_axi_awcache(m_awcache), .m_axi_awprot(m_awprot),
-        .m_axi_awvalid(m_awvalid), .m_axi_awready(m_awready),
-        .m_axi_wdata(m_wdata), .m_axi_wstrb(m_wstrb), .m_axi_wlast(m_wlast),
-        .m_axi_wvalid(m_wvalid), .m_axi_wready(m_wready),
-        .m_axi_bresp(2'b00), .m_axi_bvalid(m_bvalid), .m_axi_bready(m_bready),
+        .m0_axi_araddr(m_araddr), .m0_axi_arlen(m_arlen), .m0_axi_arsize(m_arsize),
+        .m0_axi_arburst(m_arburst), .m0_axi_arcache(m_arcache), .m0_axi_arprot(m_arprot),
+        .m0_axi_arvalid(m_arvalid), .m0_axi_arready(m_arready),
+        .m0_axi_rdata(m_rdata), .m0_axi_rresp(2'b00), .m0_axi_rlast(m_rlast),
+        .m0_axi_rvalid(m_rvalid), .m0_axi_rready(m_rready),
+        .m0_axi_awaddr(m_awaddr), .m0_axi_awlen(m_awlen), .m0_axi_awsize(m_awsize),
+        .m0_axi_awburst(m_awburst), .m0_axi_awcache(m_awcache), .m0_axi_awprot(m_awprot),
+        .m0_axi_awvalid(m_awvalid), .m0_axi_awready(m_awready),
+        .m0_axi_wdata(m_wdata), .m0_axi_wstrb(m_wstrb), .m0_axi_wlast(m_wlast),
+        .m0_axi_wvalid(m_wvalid), .m0_axi_wready(m_wready),
+        .m0_axi_bresp(2'b00), .m0_axi_bvalid(m_bvalid), .m0_axi_bready(m_bready),
+        .m1_axi_arready(1'b0), .m1_axi_rdata(64'd0), .m1_axi_rresp(2'd0), .m1_axi_rlast(1'b0),
+        .m1_axi_rvalid(1'b0), .m1_axi_awready(1'b0), .m1_axi_wready(1'b0), .m1_axi_bresp(2'd0),
+        .m1_axi_bvalid(1'b0),
+        .m2_axi_arready(1'b0), .m2_axi_rdata(64'd0), .m2_axi_rresp(2'd0), .m2_axi_rlast(1'b0),
+        .m2_axi_rvalid(1'b0), .m2_axi_awready(1'b0), .m2_axi_wready(1'b0), .m2_axi_bresp(2'd0),
+        .m2_axi_bvalid(1'b0),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
         .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
         .irq(mm_irq)
@@ -224,6 +233,7 @@ module tb_system;
     integer    i, e, cycles;
     reg [31:0] got;
 
+`ifndef GEMM_TEST
     initial begin
         $readmemh("a.hex", a_vec);
         $readmemh("b.hex", b_vec);
@@ -290,4 +300,84 @@ module tb_system;
                  bram[MBOX + 9], bram[MBOX + 9] / NC, csr_accesses);
         $finish;
     end
+`else
+    // ------------------------------------------------------ GEMM_TEST
+    localparam [31:0] GA_ADDR = DDR_BASE,           GB_ADDR = DDR_BASE + 32'h4000,
+                      GC_ADDR = DDR_BASE + 32'h8000, GBIAS_ADDR = DDR_BASE + 32'h10000;
+    reg signed [7:0]  GA [0:63][0:127];
+    reg signed [7:0]  GB [0:127][0:63];
+    reg signed [31:0] GBIAS [0:63][0:63];
+    integer gi, gj, gk, runs = 0, total_macs, best_mpc;
+    reg signed [31:0] gsum;
+
+    task put32(input [31:0] addr, input [31:0] v);
+        {ddr[addr - DDR_BASE + 3], ddr[addr - DDR_BASE + 2], ddr[addr - DDR_BASE + 1], ddr[addr - DDR_BASE]} = v;
+    endtask
+
+    task run_gemm(input integer M, input integer N, input integer K, input integer use_bias);
+        begin
+            resetn <= 0;
+            repeat (5) @(posedge clk);
+            for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = 8'hA5;
+            for (gi = 0; gi < M; gi = gi + 1) for (gk = 0; gk < K; gk = gk + 1) begin
+                GA[gi][gk] = $random(seed); ddr[GA_ADDR - DDR_BASE + gi*K + gk] = GA[gi][gk];
+            end
+            for (gk = 0; gk < K; gk = gk + 1) for (gj = 0; gj < N; gj = gj + 1) begin
+                GB[gk][gj] = $random(seed); ddr[GB_ADDR - DDR_BASE + gk*N + gj] = GB[gk][gj];
+            end
+            for (gi = 0; gi < M; gi = gi + 1) for (gj = 0; gj < N; gj = gj + 1) begin
+                GBIAS[gi][gj] = use_bias ? $random(seed) >>> 8 : 0;
+                put32(GBIAS_ADDR + 4*(gi*N + gj), GBIAS[gi][gj]);
+            end
+            for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
+            $readmemh("fw.hex", bram);
+            bram[MBOX + 2]  = GA_ADDR;
+            bram[MBOX + 3]  = GB_ADDR;
+            bram[MBOX + 4]  = GC_ADDR;
+            bram[MBOX + 12] = M;
+            bram[MBOX + 13] = N;
+            bram[MBOX + 14] = K;
+            bram[MBOX + 15] = use_bias ? GBIAS_ADDR : 0;
+
+            repeat (5) @(posedge clk);
+            resetn <= 1;
+            cycles = 0;
+            while (!trap && cycles < 3000000) begin @(posedge clk); cycles = cycles + 1; end
+            repeat (5) @(posedge clk);
+
+            if (!trap) begin $display("TB ERROR: GEMM %0dx%0dx%0d no trap", M, N, K); errors = errors + 1; end
+            if (bram[MBOX] !== 32'h600D600D) begin $display("TB ERROR: mailbox status %08x", bram[MBOX]); errors = errors + 1; end
+            if (bram[MBOX + 6] !== 0 || bram[MBOX + 16][1]) begin
+                $display("TB ERROR: GEMM ext status %08x", bram[MBOX + 16]); errors = errors + 1;
+            end
+            if (bram[MBOX + 5] !== (M/8) * (N/8)) begin $display("TB ERROR: tiles %0d", bram[MBOX + 5]); errors = errors + 1; end
+            for (gi = 0; gi < M; gi = gi + 1) for (gj = 0; gj < N; gj = gj + 1) begin
+                gsum = GBIAS[gi][gj];
+                for (gk = 0; gk < K; gk = gk + 1) gsum = gsum + GA[gi][gk] * GB[gk][gj];
+                e = GC_ADDR - DDR_BASE + 4*(gi*N + gj);
+                got = {ddr[e + 3], ddr[e + 2], ddr[e + 1], ddr[e]};
+                if (got !== gsum) begin
+                    errors = errors + 1;
+                    if (errors <= 10) $display("TB ERROR GEMM %0dx%0dx%0d C[%0d][%0d] = %0d, expected %0d",
+                                               M, N, K, gi, gj, $signed(got), gsum);
+                end
+            end
+            if (ddr[GC_ADDR - DDR_BASE + 4*M*N] !== 8'hA5) begin
+                $display("TB ERROR: byte after C overwritten"); errors = errors + 1;
+            end
+            $display("TB GEMM %0dx%0dx%0d%s: %0d RISC-V cycles, %0d MAC/cycle, CPU CSR accesses %0d",
+                     M, N, K, use_bias ? " + bias" : "", bram[MBOX + 8], M*N*K / bram[MBOX + 8], csr_accesses);
+            runs = runs + 1;
+        end
+    endtask
+
+    initial begin
+        run_gemm(32, 32, 64, 0);
+        run_gemm(24, 16, 40, 1);
+        run_gemm(16, 48, 128, 1);
+        run_gemm(8, 8, 8, 0);
+        $display("TB %s: %0d GEMMs, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
+        $finish;
+    end
+`endif
 endmodule

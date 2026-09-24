@@ -1,8 +1,9 @@
 # Double-buffered accelerator design (v2 of the matmul unit)
 
-Status: **design for review** — nothing here is implemented yet. Phase 3/4
-hardware (`rtl/matmul`, bitstreams in `RISCV-on-PYNQ-Z1/bitstreams/`) stays
-the reference until milestone M1 passes on the board.
+Status: **M1 done and verified on the board** (`rtl/sysarray`, D = 8, one
+DMA port; bitstream and results in `RISCV-on-PYNQ-Z1/bitstreams/m1/`:
+256×256×256 at 54.5 MAC/cycle, 85 % of the array peak, 35× Phase 4).
+Notes from the implementation are marked *(M1)*. Next: M2 (three DMA ports).
 
 ## 1. Goals and decisions
 
@@ -199,6 +200,15 @@ Shape comes from configuration (§8.2), captured when the command is queued:
 DDR addresses must be 8-byte aligned. A store reads local words and writes
 `rows × row_bytes` with `pitch` (C tiles: row_bytes = 4D).
 
+*(M1)* Contiguous LINEAR rows (`pitch == row_bytes`, whole local words) are
+handled as one long row, so e.g. an 8×8 tile is one 8-beat burst. An
+INTERLEAVE load of a whole K×N matrix places column strip j at word j·K —
+the resident-B layout used by `firmware/gemm`. In M1 each engine runs one
+command at a time (no overlap of consecutive LD commands), and LD writes
+one 64-bit beat per cycle into local memory (8 B/cycle at D = 8). For M2
+the three ports only pay off if LD commands to different memories run
+concurrently or beats are combined into wider writes.
+
 ### 5.4 Errors
 
 SLVERR/DECERR, a local address out of range or an illegal shape set a
@@ -261,6 +271,10 @@ banks:
 | RAW | reading bank X waits for in-flight writers of X on other engines |
 | WAR | writing X waits for in-flight readers of X on other engines |
 | WAW | writing X waits for in-flight writers of X on other engines |
+
+**DDR is not tracked** *(M1)*: the scoreboard orders accesses to local
+banks only. Software must `mat_fence` between a store and a later load of
+the same DDR bytes (and before the ARM reads results).
 
 Commands on the same engine execute in order, so they are not checked
 against each other (back-to-back `mat_exec` overlap the drain of one tile

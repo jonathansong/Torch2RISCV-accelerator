@@ -26,6 +26,11 @@
 #define MBOX_ACCEL_CYCLES  0x24  /* out: sum of matmul CYCLES over all jobs     */
 #define MBOX_UNIT_ID       0x28  /* out: matmul ID register as read by the core */
 #define MBOX_DESC_BASE     0x2C  /* in:  descriptor table (mat_trigger path)    */
+#define MBOX_GEMM_M        0x30  /* in:  GEMM firmware: C (M x N) = A (M x K) B  */
+#define MBOX_GEMM_N        0x34  /*      (+ bias), all multiples of 8, row-major  */
+#define MBOX_GEMM_K        0x38
+#define MBOX_BIAS_BASE     0x3C  /* in:  int32 M x N bias, 0 = none              */
+#define MBOX_EXT_STATUS    0x40  /* out: mat_fence extended status at the end    */
 
 #define STATUS_RUNNING     0x00000001u
 #define STATUS_DONE        0x600D600Du
