@@ -170,6 +170,11 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
 - [Performance counters and descriptor DMA (中文)](docs/perf_counters_and_desc_dma_plan.md) -
   plan, implementation record and board results of the two M5 additions:
   counter definitions, descriptor format, verification, milestones
+- [LLM inference plan (中文)](docs/llm_inference_plan.md) - the next stage:
+  an industry-style LLM inference system (ARM host runtime, command ring and
+  completion IRQ, resident RISC-V firmware, compiler-facing command
+  extensions for MLIR/IREE, fp32 vector/special-function unit, W8A8 + int8
+  KV cache) built in levels L0-L6, 50 MHz with 75 MHz as a stretch goal
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)
 - [Custom instruction encoding](docs/custom_isa_encoding.md) and
