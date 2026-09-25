@@ -147,11 +147,10 @@ MLIR lowering pass (as an LLVM `InlineAsm` node).
     ├── scripts/             #   build_bitstream.sh/.tcl (one-shot build, -jobs, -sa_d),
     │                        #   pico_bit.tcl / pico_processor.tcl (block design)
     ├── bitstreams/          #   board-verified bit/hwh + results: phase3, phase4, m1-m4
-    ├── ip/, gold_ip/        #   PicoRV32 IP repository used by the build (+ reference copy)
-    ├── picorv32/            #   upstream PicoRV32 sources
-    ├── constrs/             #   PYNQ-Z1 / PYNQ-Z2 XDC constraints
-    ├── tests/ddr_access/    #   RISC-V -> DDR access test (firmware, sim, board script)
-    └── notebooks/           #   upstream tutorial / example notebooks
+    ├── ip/                  #   IP repository used by the build (picorv32_axi, pcpi interface)
+    ├── picorv32/            #   picorv32.v from upstream PicoRV32 (+ license)
+    ├── constrs/             #   PYNQ-Z1 XDC constraints
+    └── tests/ddr_access/    #   RISC-V -> DDR access test (firmware, sim, board script)
 ```
 
 The MLIR lowering (Phase 5) is not in the repository yet. Build output
