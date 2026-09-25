@@ -1,6 +1,41 @@
 # 方案：性能计数器与描述符 DMA
 
-状态：**方案，未实现**。本文给出两项硬件扩展的详细设计、实施步骤和验收标准：
+状态：**第 1 部分（性能计数器，P1–P4）已完成并上板验证**（`RISCV-on-PYNQ-Z1/bitstreams/m4p/`）；
+**D0 决策已完成**（见下）；第 2 部分（描述符 DMA，D1 起）未实现。本文给出两项硬件扩展的详细设计、实施步骤和验收标准：
+
+> **P1 完成情况**（仿真，未上板）：`rtl/sysarray/sa_perf.v` + 各模块事件端口 + `mat_perf`
+> （funct7 = 1，funct3 = 5）+ CSR 镜像 0x40–0xBC / `PERF_CTRL` 0x3C + CAPS bit 20。
+> `tb_sa_unit` 新增 365 项计数器检查（精确不变量、定向 RAW 冲突、冻结 / 清零 / CSR 镜像），
+> D = 8 / 16 与 `PERF = 0` 全部通过；5 个突变全部被发现；`make test`、`make test16` 和
+> 4 个固件系统仿真不回归。OOC（D = 16，50 MHz）：42,819 LUT（+988，`sa_perf` 558）、
+> 29,729 FF（+953）、BRAM / DSP 不变，WNS +1.631 ns（M4 为 +1.864 ns）。
+>
+> **P2 完成情况**（仿真）：intrinsics（`mat_perf_ctl` / `mat_perf_read`、`sa_perf_begin` /
+> `sa_perf_end`，先查 CAPS bit 20，旧硬件上不执行 `mat_perf`）；程序 BRAM 0x1E00–0x1EFF 为
+> 计数器区，`link.ld` 缩到 0x1E00，全部固件重新链接；`gemm_fw` / `vector_fw` 在计时窗口两侧
+> 开关计数器并转存，个数写入 `MBOX_PERF_COUNT`（0x8C）；`tb_system.v` 读回并核对不变量
+> （gemm 178 项、vector 49 项，D = 8 / 16 全部通过），打印周期分解；驱动 `stats["perf"]`、
+> `PERF_NAMES`、`perf_breakdown()` / `format_breakdown()`；板上脚本 `notebooks/m4_perf.py`
+> （假 overlay dry run 通过）。与 1.5 的差别：驱动总是读回计数器（`stats["perf"]`，
+> 旧硬件上为 None），没有单独的 `perf=` 参数；`CYCLES` 与固件 `rdcycle` 窗口的容差为 +128
+> 周期（两端各有几条指令落在计数窗口内）。
+>
+> **P3 完成情况**（上板）：bitstream（D = 16，PERF = 1）WNS +1.904 ns、48,267 LUT（90.7%）；
+> `m4_perf.py` 7 个 GEMM + 4 个向量运算结果全部正确，**69/69 项计数器检查通过**；`m4_demo.py`
+> 回归全部 PASS，性能与 M4 调优后完全相同。板上 `CYCLES` 比固件 `rdcycle` 窗口多一个**固定**
+> 偏移（GEMM 131、向量 175 周期：两端几条指令经 AXI 取指，每条约 10 周期），`m4_perf.py`
+> 因此检查 0 ≤ 偏移 ≤ 512，而不是仿真时的 +128。
+>
+> **P4 完成情况**：实测周期分解写入设计文档 §10.4（替代 §10.3 的估算），bitstream 归档到
+> `bitstreams/m4p/`。
+>
+> **D0 结论：描述符 DMA 只对小运算值得做。**
+> - 大 GEMM（256³ 及以上）：CPU 61–72% 的时间卡在满队列上，队首为空只有 2–4%，前端不是瓶颈，
+>   描述符 DMA 无收益。阵列有效 79–87%，其余主要是结构性填充（每 tile 2(D−1) 步）和等 bank（5–11%）。
+> - 小 GEMM 和短向量运算：队首为空或完全空闲占 60–94%（64³ 86.8%，int8 add 4096 93.9%），
+>   瓶颈是 PicoRV32 发射命令。描述符 DMA 的收益集中在这里；64³ 估计从约 4.2k 降到约 2.5k 周期
+>   （之后受 16 KB 的 C 写回和计算限制），以实测为准。
+> - DMA 忙时 7.4–7.97 B/cycle，接近端口上限，再次确认不需要三端口。
 
 1. **性能计数器**（第 1 部分）：让硬件自己报告周期花在哪里；
 2. **描述符 DMA**（第 2 部分）：软件把命令写成一张表放进 DDR，由硬件自己取指执行。

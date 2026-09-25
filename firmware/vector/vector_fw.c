@@ -94,6 +94,7 @@ int main(void)
     uint32_t groups = len / SA_D, chunks = 0;
 
     mat_reset();
+    sa_perf_begin();                               /* counters: clear + start (if present) */
     uint32_t t0 = rdcycle();
 
     vec_cfg(SA_VCFG_OP, op);
@@ -119,6 +120,7 @@ int main(void)
     }
     uint32_t st = mat_fence(SA_ENG_ALL);
     uint32_t t1 = rdcycle();
+    MBOX(MBOX_PERF_COUNT) = sa_perf_end(PERF_AREA, PERF_AREA_WORDS);   /* freeze + copy */
 
     MBOX(MBOX_TOTAL_CYCLES) = t1 - t0;
     MBOX(MBOX_JOBS_DONE)    = chunks;

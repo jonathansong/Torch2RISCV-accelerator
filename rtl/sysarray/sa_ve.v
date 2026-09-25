@@ -56,7 +56,11 @@ module sa_ve #(
     output reg  [4*D-1:0]       ac_we,
     output reg  [ACC_AW-1:0]    ac_addr,
     output reg  [32*D-1:0]      ac_din,
-    input  wire [32*D-1:0]      ac_dout
+    input  wire [32*D-1:0]      ac_dout,
+
+    // performance events: {group written, out of credits (FIFO full),
+    //                      read lost the port to a write, command active}
+    output wire [3:0]           perf_ev
 );
     `include "sa_defs.vh"
 
@@ -310,4 +314,7 @@ module sa_ve #(
             end
         end
     end
+
+    assign perf_ev = {wr_now && wr_last, active && !reading && rg < ngroups && inflight == OQ,
+                      rd_can && rd_block, active};
 endmodule

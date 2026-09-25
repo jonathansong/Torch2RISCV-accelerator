@@ -52,9 +52,20 @@
 #define MBOX_GEMM_FLAGS    0x88  /* in:  GEMM firmware schedule switches (0 = tuned
                                   *      default): bit 0 no A prefetch, bit 1 no B
                                   *      split, bit 2 B split even for B < 16 KB */
+#define MBOX_PERF_COUNT    0x8C  /* out: counters copied to the perf area (0 = none:
+                                  *      overlay without counters, CAPS bit 20)      */
 #define GEMM_NO_PREFETCH   (1u << 0)
 #define GEMM_NO_BSPLIT     (1u << 1)
 #define GEMM_FORCE_BSPLIT  (1u << 2)
+
+/* Performance counter area: the 256 bytes below the mailbox (program BRAM
+ * 0x1E00-0x1EFF; RISC-V 0xC0001E00, ARM 0x40010000 + 0x1E00). Firmware copies
+ * the counters here after its measurement window (sa_perf_end); firmware
+ * images must stay below 0x1E00 (common/link.ld). */
+#define PERF_AREA_BASE     0xC0001E00u
+#define PERF_AREA_OFFSET   0x1E00u
+#define PERF_AREA_WORDS    64u
+#define PERF_AREA          ((volatile uint32_t *)PERF_AREA_BASE)
 
 #define STATUS_RUNNING     0x00000001u
 #define STATUS_DONE        0x600D600Du

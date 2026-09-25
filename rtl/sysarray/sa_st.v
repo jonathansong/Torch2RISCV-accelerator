@@ -46,7 +46,10 @@ module sa_st #(
     input  wire [NPORTS-1:0]    m_wready,
     input  wire [NPORTS*2-1:0]  m_bresp,
     input  wire [NPORTS-1:0]    m_bvalid,
-    output wire [NPORTS-1:0]    m_bready
+    output wire [NPORTS-1:0]    m_bready,
+
+    // performance events: {W stalled by the port, beat accepted, command active}
+    output wire [2:0]           perf_ev
 );
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
@@ -288,4 +291,6 @@ module sa_st #(
             end
         end
     end
+
+    assign perf_ev = {|(m_wvalid & ~m_wready), |(m_wvalid & m_wready), active};
 endmodule

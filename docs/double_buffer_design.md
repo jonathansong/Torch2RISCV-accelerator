@@ -17,7 +17,10 @@ op/type combination; decisions taken while building it are marked *(M3)*
 (`RISCV-on-PYNQ-Z1/bitstreams/m4/`): 256³ at 180.4 MAC/cycle (3.2× M3),
 512×256×256 at 191.1, all M1–M3 tests bit-exact; the measurements show one
 HP port is not the limit at D = 16, so the three ports are not built (§10.3).
-Changes are marked *(M4)*.
+Changes are marked *(M4)*. **Performance counters** (`sa_perf.v`, `mat_perf`;
+[plan](perf_counters_and_desc_dma_plan.md) P1–P4) are verified on the board
+(`RISCV-on-PYNQ-Z1/bitstreams/m4p/`) and give the measured cycle breakdown in
+§10.4.
 
 ## 1. Goals and decisions
 
@@ -376,8 +379,14 @@ dispatch queue (8 entries) is full.
 | 2 | `mat_store` | DDR address | source LADDR | — |
 | 3 | `mat_exec` | `{B word[31:16], A word[15:0]}` | `{flags[31:28], Kt[27:16], C word[15:0]}` | — |
 | 4 | `mat_fence` | engine mask (bit0 LD, 1 ST, 2 EX, 3 VE; 0 = all) | — | extended status |
+| 5 | `mat_perf` | read: counter index [4:0]; control: bit 31 = 1 | control: [0] clear, [1] enable | read: counter; control: number of counters |
 
 `mat_exec` flags: bit28 accumulate. Kt: 1 .. 4095 k-tiles.
+
+`mat_perf` exists only when CAPS bit 20 is set (`PERF = 1`); on older builds
+the encoding is not answered and the core traps, so firmware checks CAPS
+first (`sa_has_perf()`). The counters are also readable through the CSR
+mirror (0x40 + 4·i, `PERF_CTRL` at 0x3C). Counter list: §10.4.
 
 ### 8.2 `mat_cfg` keys
 
@@ -549,6 +558,9 @@ Decision: no three-port DMA. Small-K shapes (32×256×64: 17 %) are C-write
 bound, which the int8 epilogue addresses (4× less C traffic) rather than
 more ports.
 
+The bullets above were estimates; §10.4 has the measured breakdown from the
+performance counters.
+
 **Firmware schedule tuning** (`firmware/gemm`, `notebooks/m4_sched_tune.py`,
 same bitstream; MAC/cycle on the board, D = 16):
 
@@ -572,6 +584,62 @@ same bitstream; MAC/cycle on the board, D = 16):
   splits only when B >= 16 KB ("default" column; the table's default values
   are the measured cells that rule selects).
 
+### 10.4 Measured cycle breakdown (performance counters)
+
+`rtl/sysarray/sa_perf.v` counts 28 events taken from existing signals of the
+scheduler, the PCPI front end and the four engines (definitions: plan §1.2,
+`PC_*` in `sa_defs.vh`). The firmware opens the counting window around its
+`rdcycle` window and copies the counters to the program BRAM below the
+mailbox; `notebooks/m4_perf.py` checks them against exact invariants (tiles,
+useful steps × D² = M·N·K, bytes stored, commands) and prints the breakdown.
+Board, D = 16, tuned firmware schedule, 69/69 checks passing
+(`RISCV-on-PYNQ-Z1/bitstreams/m4p/`):
+
+| Workload | cycles | EX useful | EX fill | head: EX blocked | head: VE blocked | starve + all idle | CPU on full queue |
+|---|---|---|---|---|---|---|---|
+| 64³ | 4,154 | 23.9 % | 11.2 % | 0.0 % | – | **86.8 %** | 0.0 % |
+| 128³ | 13,383 | 60.6 % | 14.2 % | 4.5 % | – | 23.2 % | 0.0 % |
+| 32×256×64 | 7,409 | 27.2 % | 12.7 % | 6.4 % | – | **61.8 %** | 0.0 % |
+| 256³ | 82,803 | **79.0 %** | 9.3 % | 8.8 % | – | 4.7 % | 61.3 % |
+| 512×256×256 | 156,863 | **83.5 %** | 9.8 % | 4.6 % | – | 2.5 % | 70.0 % |
+| 256×128×1024 | 151,022 | **86.7 %** | 2.5 % | 11.2 % | – | 1.9 % | 71.8 % |
+| 256³ int8 | 92,216 | 71.0 % | 8.3 % | 7.4 % | 80.1 % | 3.4 % | 67.7 % |
+| vector int8 add, 4096 | 3,388 | – | – | – | 0.4 % | **93.9 %** | 0.0 % |
+| vector int16 mul, 4096 | 6,448 | – | – | – | 15.4 % | 68.8 % | 0.0 % |
+| vector int32 add, 16384 | 24,948 | – | – | – | 61.2 % | 26.5 % | 0.0 % |
+
+Percentages are of the counter window (`CYCLES`), which is the firmware's
+`rdcycle` window plus a constant 131 (GEMM) / 175 (vector) cycles: the few
+instructions between `mat_perf` and `rdcycle` at both ends, fetched over the
+AXI interconnect at ~10 cycles each.
+
+What the numbers say:
+
+- **Large GEMMs are array-bound.** The array steps 88–89 % of the time
+  (useful + fill). The fill is structural: every tile spends 2(D−1) = 30 of
+  its K + 30 steps in the operand skew (≈ 10 % at K = 256, 2.5 % at
+  K = 1024). The rest is the array waiting at the head for a bank
+  (`HAZ_EX` 5–11 %). "Head blocked by ST" (86–93 %) is the normal state of the
+  prefetch schedule: ST(i) sits at the head waiting for EX(i) while the
+  commands behind it already run.
+- **The front end is not the limit for large GEMMs.** The CPU spends
+  61–72 % of the window stalled on a full queue; the head is empty only
+  2–4 % of the time.
+- **Small GEMMs and vector operations are front-end bound.** The head is
+  empty (starve) or everything is idle 60–94 % of the time: the hardware
+  waits for PicoRV32 to issue the next command.
+- **The DMA is efficient whenever it runs**: 7.4–7.97 B/cycle while busy,
+  close to the 8 B/cycle port limit (confirms §10.3: no three ports).
+- **int8 GEMM**: the VE command waits at the head 80 % of the time (RAW on the
+  strip's EX) while the VE itself is active only 9 %; the per-strip chain
+  EX → VE → ST costs the ≈ 10 % against int32 output.
+
+**Descriptor DMA decision (plan D0):** worth building for small operations
+only. It would remove most of the 60–94 % front-end time of 64³-class GEMMs
+and short vector operations (estimate for 64³: ≈ 4.2k → ≈ 2.5k cycles, then
+bound by the 16 KB C store and compute), and does nothing for large GEMMs,
+whose front end already runs ahead.
+
 ## 11. Resource estimate
 
 Baseline: Phase 4 board build (6640 LUT, 7421 FF, 64 DSP, 16 BRAM), of which
@@ -593,6 +661,8 @@ port): 47.6k LUT (89.5 %; array 21.3k, VE 14.5k in OOC), 34.2k FF, 184 DSP
 resource: more logic would need 10 DSP columns (≈ 5k LUT freed, 216 DSP).
 The module reference freezes derived parameter defaults, so the block design
 sets `SPAD_WORDS` / `ACC_WORDS` together with `D` (`-sa_d`).
+With the performance counters (`bitstreams/m4p`): 48.3k LUT (90.7 %; +0.65k),
+35.1k FF, same DSP / BRAM, WNS +1.9 ns.
 
 Everything runs at 50 MHz; the Phase 2 LUT-PE array alone reached ≈ 99 MHz,
 so timing margin is large. BRAM has no room for an ILA without shrinking

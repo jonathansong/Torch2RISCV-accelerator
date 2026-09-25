@@ -53,6 +53,17 @@ MBOX_V_SCALE, MBOX_V_SHIFT, MBOX_V_ZP, MBOX_V_LO, MBOX_V_HI = 0x70, 0x74, 0x78, 
 MBOX_GEMM_Q = 0x84
 MBOX_GEMM_FLAGS = 0x88                   # gemm_fw schedule switches (0 = tuned)
 GEMM_NO_PREFETCH, GEMM_NO_BSPLIT, GEMM_FORCE_BSPLIT = 1, 2, 4   # default: B split if B >= 16 KB
+MBOX_PERF_COUNT = 0x8C                   # counters copied to the perf area (0 = none)
+
+# Performance counters (rtl/sysarray/sa_perf.v, docs/perf_counters_and_desc_dma_plan.md):
+# the firmware copies them to the 256 bytes below the mailbox after its
+# measurement window. Order = PC_* in rtl/sysarray/sa_defs.vh.
+PERF_AREA = 0x1E00                       # program BRAM offset; firmware must end below it
+PERF_NAMES = ["CYCLES", "CMD_LD", "CMD_ST", "CMD_EX", "CMD_VE", "PCPI_QFULL", "PCPI_FENCE",
+              "HAZ_LD", "HAZ_ST", "HAZ_EX", "HAZ_VE", "DISP_FULL", "STARVE", "ALL_IDLE",
+              "EX_STEP", "EX_USEFUL", "EX_SWAPWAIT", "EX_TILES", "LD_BUSY", "LD_BEATS",
+              "LD_ARSTALL", "ST_BUSY", "ST_BEATS", "ST_WSTALL", "VE_ACTIVE", "VE_RDBLOCK",
+              "VE_CREDIT", "VE_GROUPS"]  # 28..31 reserved
 BW_TESTS = [  # name, bytes moved (bwtest_fw.c)
     ("LD  DDR -> SPAD_A, 64 KB contiguous", 65536),
     ("ST  SPAD_A -> DDR, 64 KB", 65536),
@@ -130,8 +141,8 @@ class MatmulOverlay:
         self.reset.write(1)
         self.firmware = os.path.basename(path)
         fw = open(path, "rb").read()
-        if len(fw) > MBOX:
-            raise ValueError(f"{path}: {len(fw)} bytes overlaps the mailbox at {MBOX:#x}")
+        if len(fw) > PERF_AREA:
+            raise ValueError(f"{path}: {len(fw)} bytes overlaps the perf area / mailbox at {PERF_AREA:#x}")
         fw += b"\0" * (-len(fw) % 4)
         for off in range(0, BRAM_BYTES, 4):
             self.bram.write(off, 0)
@@ -140,6 +151,14 @@ class MatmulOverlay:
 
     def _mbox(self, off):
         return self.bram.read(MBOX + off)
+
+    def _perf(self):
+        """Counters of the last run ({name: value}), or None when the overlay has
+        none (CAPS bit 20 clear) or the firmware did not copy them."""
+        n = min(self._mbox(MBOX_PERF_COUNT), len(PERF_NAMES))
+        if n == 0:
+            return None
+        return {PERF_NAMES[i]: self.bram.read(PERF_AREA + 4 * i) for i in range(n)}
 
     def _use(self, name):
         """Load firmware `name` (next to this file) unless it is already loaded."""
@@ -312,7 +331,7 @@ class MatmulOverlay:
         cycles = self._mbox(MBOX_TOTAL_CYCLES)
         return c, {"firmware": self.firmware, "shape": (m, n, k), "tiles": self._mbox(MBOX_JOBS_DONE),
                    "riscv_cycles": cycles, "mac_per_cycle": m * n * k / cycles if cycles else 0,
-                   "us": cycles / RISCV_HZ * 1e6, "wall_s": wall}
+                   "us": cycles / RISCV_HZ * 1e6, "wall_s": wall, "perf": self._perf()}
 
     def vector(self, op, x, y=None, out_dtype=None, relu=False, requant=None, timeout=5.0):
         """One vector-engine operation with vector_fw.bin (M3):
@@ -366,7 +385,7 @@ class MatmulOverlay:
         cycles = self._mbox(MBOX_TOTAL_CYCLES)
         return out, {"firmware": self.firmware, "len": n, "chunks": self._mbox(MBOX_JOBS_DONE),
                      "riscv_cycles": cycles, "elem_per_cycle": n / cycles if cycles else 0,
-                     "us": cycles / RISCV_HZ * 1e6, "wall_s": wall}
+                     "us": cycles / RISCV_HZ * 1e6, "wall_s": wall, "perf": self._perf()}
 
     def bandwidth(self, timeout=5.0):
         """DMA bandwidth self-test (bwtest_fw.bin). Returns [(name, bytes, cycles, B/cycle)]
@@ -402,6 +421,45 @@ class MatmulOverlay:
             cyc = self._mbox(MBOX_BW_CYCLES + 4 * i)
             res.append((name, nbytes, cyc, nbytes / cyc if cyc else 0.0))
         return res, copies_ok
+
+
+def perf_breakdown(perf, d):
+    """Derived metrics of a counter dict (stats["perf"]) for array size d:
+    fractions of CYCLES, bandwidth while busy, MACs. Returns a dict."""
+    cyc = perf["CYCLES"] or 1
+    frac = lambda k: perf[k] / cyc
+    per_busy = lambda beats, busy: 8 * perf[beats] / perf[busy] if perf[busy] else 0.0
+    return {
+        "cycles": perf["CYCLES"],
+        "ex_useful": frac("EX_USEFUL"),                                  # array doing new MACs
+        "ex_fill": (perf["EX_STEP"] - perf["EX_USEFUL"]) / cyc,          # skew fill / drain steps
+        "ex_swapwait": frac("EX_SWAPWAIT"),                              # waiting for the ACC drain
+        "head_blocked": {e: frac("HAZ_" + e) for e in ("LD", "ST", "EX", "VE")},
+        "queue_full": frac("DISP_FULL"),
+        "starve": frac("STARVE"),                                        # no command at the head
+        "all_idle": frac("ALL_IDLE"),
+        "cpu_on_full_queue": frac("PCPI_QFULL"),
+        "ld_bytes_per_busy_cycle": per_busy("LD_BEATS", "LD_BUSY"),
+        "st_bytes_per_busy_cycle": per_busy("ST_BEATS", "ST_BUSY"),
+        "ld_busy": frac("LD_BUSY"), "st_busy": frac("ST_BUSY"), "ve_active": frac("VE_ACTIVE"),
+        "macs": perf["EX_USEFUL"] * d * d,
+        "commands": {e: perf["CMD_" + e] for e in ("LD", "ST", "EX", "VE")},
+    }
+
+
+def format_breakdown(b):
+    """One-screen text of perf_breakdown()."""
+    pct = lambda x: f"{100 * x:5.1f}%"
+    hb = b["head_blocked"]
+    return "\n".join([
+        f"  EX   useful {pct(b['ex_useful'])}  fill {pct(b['ex_fill'])}  drain-wait {pct(b['ex_swapwait'])}",
+        f"  head blocked  LD {pct(hb['LD'])}  ST {pct(hb['ST'])}  EX {pct(hb['EX'])}  VE {pct(hb['VE'])}"
+        f"   queue full {pct(b['queue_full'])}",
+        f"  front end     starve {pct(b['starve'])}  all idle {pct(b['all_idle'])}"
+        f"  CPU stalled on a full queue {pct(b['cpu_on_full_queue'])}",
+        f"  DMA           LD busy {pct(b['ld_busy'])} at {b['ld_bytes_per_busy_cycle']:.2f} B/cycle,"
+        f"  ST busy {pct(b['st_busy'])} at {b['st_bytes_per_busy_cycle']:.2f} B/cycle,  VE active {pct(b['ve_active'])}",
+    ])
 
 
 def golden(a, b):

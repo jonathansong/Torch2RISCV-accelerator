@@ -4,7 +4,8 @@
 //   funct7 = 0 (Phase 4, kept): mat_trigger / mat_status / mat_reset /
 //              mat_wait / mat_cycles -> legacy block
 //   funct7 = 1: mat_cfg (0), mat_load (1), mat_store (2), mat_exec (3),
-//              mat_fence (4) -> command queue / scheduler
+//              mat_fence (4) -> command queue / scheduler;
+//              mat_perf (5) -> performance counters (read / control)
 //   funct7 = 2: vec_cfg (0), vec_run (1) -> command queue (M3 vector engine)
 // Load/store/exec capture the current configuration into the packet, so
 // software may reconfigure right after issuing. With a sticky error set,
@@ -15,7 +16,8 @@
 `include "sa_macros.vh"
 
 module sa_pcpi #(
-    parameter integer D = 8                // VL: vec_cfg LEN is in elements
+    parameter integer D    = 8,            // VL: vec_cfg LEN is in elements
+    parameter integer NCNT = 32            // performance counters (0: none), returned by mat_perf control
 ) (
     input  wire                  clk,
     input  wire                  resetn,
@@ -47,7 +49,14 @@ module sa_pcpi #(
     input  wire [31:0]           leg_status,
     input  wire [31:0]           leg_cycles,
     output reg                   leg_reset,       // held until leg_reset_done
-    input  wire                  leg_reset_done
+    input  wire                  leg_reset_done,
+
+    // performance counters (sa_perf): mat_perf
+    output reg                   perf_ctl_we,     // one-cycle pulse
+    output reg  [1:0]            perf_ctl,        // [0] clear, [1] enable
+    output reg  [4:0]            perf_rsel,
+    input  wire [31:0]           perf_rdata,
+    output wire [1:0]            perf_ev          // {waiting in mat_fence, stalled on a full queue}
 );
     `include "sa_defs.vh"
 
@@ -55,7 +64,8 @@ module sa_pcpi #(
     wire [2:0] funct3 = pcpi_insn[14:12];
     wire [6:0] funct7 = pcpi_insn[31:25];
     wire       ours   = opcode == 7'b0001011 &&
-                        (((funct7 == 7'd0 || funct7 == 7'd1) && funct3 <= 3'd4) ||
+                        ((funct7 == 7'd0 && funct3 <= 3'd4) ||
+                         (funct7 == 7'd1 && funct3 <= 3'd5) ||
                          (funct7 == 7'd2 && funct3 <= 3'd1));
 
     assign pcpi_wait = pcpi_valid && ours;
@@ -89,10 +99,13 @@ module sa_pcpi #(
     endtask
 
     always @(posedge clk) begin
-        pcpi_ready <= 0;
-        pcpi_wr    <= 0;
+        pcpi_ready  <= 0;
+        pcpi_wr     <= 0;
+        perf_ctl_we <= 0;
         if (!resetn) begin
             state       <= S_IDLE;
+            perf_ctl    <= 0;
+            perf_rsel   <= 0;
             q_valid     <= 0;
             leg_trigger <= 0;
             leg_reset   <= 0;
@@ -125,6 +138,7 @@ module sa_pcpi #(
                             q_pkt <= {v_hi, v_lo, v_zp, v_shift, v_scale, v_mod, v_types, v_op, v_groups,
                                       v_dst, pcpi_rs2, pcpi_rs1, CMD_VE};
                         fence_mask <= pcpi_rs1[3:0];
+                        perf_rsel  <= pcpi_rs1[4:0];
                     end
                 S_EXEC:
                     if (grp == 2'd2) begin
@@ -198,8 +212,15 @@ module sa_pcpi #(
                                     respond(0, 0);
                                 end else
                                     q_valid <= 1;
-                            default:                        // mat_fence
+                            3'd4:                           // mat_fence
                                 if (fence_ok || sched_err) respond(1, ext_status);
+                            default:                        // mat_perf
+                                if (rs1[31]) begin           // control: rs2[0] clear, rs2[1] enable
+                                    perf_ctl_we <= 1;
+                                    perf_ctl    <= rs2[1:0];
+                                    respond(1, NCNT);
+                                end else                     // read counter rs1[4:0]
+                                    respond(1, perf_rdata);
                         endcase
                     end
                 S_DONE:
@@ -208,4 +229,7 @@ module sa_pcpi #(
             endcase
         end
     end
+
+    assign perf_ev = {state == S_EXEC && grp == 2'd1 && op == 3'd4 && !(fence_ok || sched_err),
+                      state == S_EXEC && q_valid && !q_ready};
 endmodule

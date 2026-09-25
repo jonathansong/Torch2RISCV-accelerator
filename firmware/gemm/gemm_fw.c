@@ -88,6 +88,7 @@ int main(void)
     uint32_t bias_strip = bias && !quant;          /* int32 output: bias rows loaded per strip */
 
     mat_reset();                                   /* clear any sticky error */
+    sa_perf_begin();                               /* counters: clear + start (if present) */
     uint32_t t0 = rdcycle();
 
     /* resident B, then the first A strip (split B: half 0, A(0), half 1) */
@@ -150,6 +151,7 @@ int main(void)
     }
     uint32_t st = mat_fence(SA_ENG_ALL);
     uint32_t t1 = rdcycle();
+    MBOX(MBOX_PERF_COUNT) = sa_perf_end(PERF_AREA, PERF_AREA_WORDS);   /* freeze + copy */
 
     MBOX(MBOX_TOTAL_CYCLES) = t1 - t0;
     MBOX(MBOX_JOBS_DONE)    = tiles;

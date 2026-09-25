@@ -55,7 +55,11 @@ module sa_ex #(
     output reg  [4*D-1:0]       acc_we,
     output reg  [ACC_AW-1:0]    acc_addr,
     output reg  [32*D-1:0]      acc_din,
-    input  wire [32*D-1:0]      acc_dout
+    input  wire [32*D-1:0]      acc_dout,
+
+    // performance events: {tile swap, waiting for the previous drain,
+    //                      step with new K data, array step}
+    output wire [3:0]           perf_ev
 );
     localparam integer LD = $clog2(D);
 
@@ -213,4 +217,6 @@ module sa_ex #(
             end
         end
     end
+
+    assign perf_ev = {swap_now, streaming && c == t_end && drain_active, step && live_new, step};
 endmodule

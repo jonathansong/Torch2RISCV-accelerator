@@ -17,7 +17,8 @@ module sa_unit #(
     parameter integer DSP_COLS   = 8,
     parameter integer NPORTS     = 1,
     parameter integer SPAD_WORDS = 131072 / D,        // 128 KB per SPAD
-    parameter integer ACC_WORDS  = 262144 / (4 * D)   // 256 KB
+    parameter integer ACC_WORDS  = 262144 / (4 * D),  // 256 KB
+    parameter integer PERF       = 1                  // performance counters (0: removed)
 ) (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 aclk CLK", X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m0_axi:m1_axi:m2_axi, ASSOCIATED_RESET aresetn" *)
     input  wire        aclk,
@@ -277,6 +278,15 @@ module sa_unit #(
     assign p_ready  = in_ready && !l_valid;
 
     wire        sched_idle, fence_ok, clear_error;
+    // performance counter events (numbering: PC_* in sa_defs.vh)
+    wire [10:0] sched_ev;
+    wire [1:0]  pcpi_ev;
+    wire [3:0]  ex_ev, ve_ev;
+    wire [2:0]  ld_ev, st_ev;
+    wire        perf_pctl_we, perf_cctl_we, perf_en;
+    wire [1:0]  perf_pctl, perf_cctl;
+    wire [4:0]  perf_prsel, perf_crsel;
+    wire [31:0] perf_prdata, perf_crdata;
     wire [3:0]  fence_mask;
     wire [31:0] ext_status;
 
@@ -294,13 +304,13 @@ module sa_unit #(
         .ld_done(ld_done), .ld_err(ld_err), .st_done(st_done), .st_err(st_err), .ex_done(ex_done),
         .ve_done(ve_done),
         .clear_error(clear_error), .fence_mask(fence_mask), .fence_ok(fence_ok),
-        .idle(sched_idle), .ext_status(ext_status));
+        .idle(sched_idle), .ext_status(ext_status), .perf_ev(sched_ev));
 
     // ------------------------------------------------------------ PCPI
     wire        leg_trigger, leg_accept, leg_busy, leg_reset, leg_reset_done;
     wire [31:0] leg_desc, leg_dst, leg_status, leg_cycles;
 
-    sa_pcpi #(.D(D)) pcpi (
+    sa_pcpi #(.D(D), .NCNT(PERF != 0 ? PERF_NCNT : 0)) pcpi (
         .clk(aclk), .resetn(resetn),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
         .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
@@ -308,7 +318,9 @@ module sa_unit #(
         .sched_err(ext_status[1]), .fence_mask(fence_mask), .fence_ok(fence_ok), .ext_status(ext_status),
         .leg_trigger(leg_trigger), .leg_desc(leg_desc), .leg_dst(leg_dst), .leg_accept(leg_accept),
         .leg_busy(leg_busy), .leg_status(leg_status), .leg_cycles(leg_cycles),
-        .leg_reset(leg_reset), .leg_reset_done(leg_reset_done));
+        .leg_reset(leg_reset), .leg_reset_done(leg_reset_done),
+        .perf_ctl_we(perf_pctl_we), .perf_ctl(perf_pctl), .perf_rsel(perf_prsel),
+        .perf_rdata(perf_prdata), .perf_ev(pcpi_ev));
 
     // ---------------------------------------------------------- legacy
     wire        lw_en;
@@ -317,7 +329,8 @@ module sa_unit #(
     wire [7:0]  lw_lane;
     wire [63:0] lw_data;
 
-    sa_legacy #(.D(D), .NPORTS(NPORTS), .VL(D), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS)) legacy (
+    sa_legacy #(.D(D), .NPORTS(NPORTS), .VL(D), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS),
+                .PERF(PERF)) legacy (
         .clk(aclk), .resetn(resetn),
         .s_axi_awaddr(s_axi_awaddr), .s_axi_awvalid(s_axi_awvalid), .s_axi_awready(s_axi_awready),
         .s_axi_wdata(s_axi_wdata), .s_axi_wvalid(s_axi_wvalid), .s_axi_wready(s_axi_wready),
@@ -330,7 +343,23 @@ module sa_unit #(
         .desc_we(lw_en && lw_mem == MEM_DESC), .desc_word(lw_word), .desc_data(lw_data),
         .leg_trigger(leg_trigger), .leg_desc(leg_desc), .leg_dst(leg_dst), .leg_accept(leg_accept),
         .leg_busy(leg_busy), .leg_status(leg_status), .leg_cycles(leg_cycles),
-        .leg_reset(leg_reset), .leg_reset_done(leg_reset_done), .irq(irq));
+        .leg_reset(leg_reset), .leg_reset_done(leg_reset_done), .irq(irq),
+        .perf_ctl_we(perf_cctl_we), .perf_ctl(perf_cctl), .perf_en(perf_en),
+        .perf_rsel(perf_crsel), .perf_rdata(perf_crdata));
+
+    // ------------------------------------------------ performance counters
+    sa_perf #(.NCNT(PERF_NCNT), .PERF(PERF)) perf (
+        .clk(aclk), .resetn(resetn),
+        .ev({4'd0,                               // 28..31 reserved (descriptor DMA)
+             ve_ev, st_ev, ld_ev, ex_ev,         // 24..27, 21..23, 18..20, 14..17
+             sched_ev[10:8],                     // 13 ALL_IDLE, 12 STARVE, 11 DISP_FULL
+             sched_ev[7:4],                      // 7..10 HAZ_LD/ST/EX/VE
+             pcpi_ev,                            // 6 PCPI_FENCE, 5 PCPI_QFULL
+             sched_ev[3:0],                      // 1..4 CMD_LD/ST/EX/VE
+             1'b1}),                             // 0 CYCLES
+        .ctl_we_a(perf_pctl_we), .ctl_a(perf_pctl), .ctl_we_b(perf_cctl_we), .ctl_b(perf_cctl),
+        .en(perf_en),
+        .rsel_a(perf_prsel), .rdata_a(perf_prdata), .rsel_b(perf_crsel), .rdata_b(perf_crdata));
 
     // ---------------------------------------------------------- engines
     wire [NPORTS*32-1:0] araddr, awaddr;
@@ -347,7 +376,8 @@ module sa_unit #(
         .cmd_mode(ld_pkt[131:130]), .done(ld_done), .err(ld_err), .busy(),
         .lw_en(lw_en), .lw_mem(lw_mem), .lw_word(lw_word), .lw_lane(lw_lane), .lw_data(lw_data),
         .m_araddr(araddr), .m_arlen(arlen), .m_arvalid(arvalid), .m_arready(arready),
-        .m_rdata(rdata), .m_rresp(rresp), .m_rlast(rlast), .m_rvalid(rvalid), .m_rready(rready));
+        .m_rdata(rdata), .m_rresp(rresp), .m_rlast(rlast), .m_rvalid(rvalid), .m_rready(rready),
+        .perf_ev(ld_ev));
 
     wire        lr_en;
     wire [3:0]  lr_mem;
@@ -364,7 +394,8 @@ module sa_unit #(
         .lr_spad_a(lr_a), .lr_spad_b(lr_b), .lr_acc(lr_c),
         .m_awaddr(awaddr), .m_awlen(awlen), .m_awvalid(awvalid), .m_awready(awready),
         .m_wdata(wdata), .m_wlast(wlast), .m_wvalid(wvalid), .m_wready(wready),
-        .m_bresp(bresp), .m_bvalid(bvalid), .m_bready(bready));
+        .m_bresp(bresp), .m_bvalid(bvalid), .m_bready(bready),
+        .perf_ev(st_ev));
 
     wire               sa_en, sb_en, acc_en;
     wire [SAW-1:0]     sa_addr, sb_addr;
@@ -382,7 +413,8 @@ module sa_unit #(
         .done(ex_done), .busy(),
         .sa_en(sa_en), .sa_addr(sa_addr), .sa_dout(sa_dout),
         .sb_en(sb_en), .sb_addr(sb_addr), .sb_dout(sb_dout),
-        .acc_en(acc_en), .acc_we(acc_we), .acc_addr(acc_addr), .acc_din(acc_din), .acc_dout(acc_dout));
+        .acc_en(acc_en), .acc_we(acc_we), .acc_addr(acc_addr), .acc_din(acc_din), .acc_dout(acc_dout),
+        .perf_ev(ex_ev));
 
     wire               vsa_en, vsb_en, vac_en;
     wire [D-1:0]       vsa_we, vsb_we;
@@ -402,7 +434,8 @@ module sa_unit #(
         .done(ve_done), .busy(),
         .sa_en(vsa_en), .sa_we(vsa_we), .sa_addr(vsa_addr), .sa_din(vsa_din), .sa_dout(vsa_dout),
         .sb_en(vsb_en), .sb_we(vsb_we), .sb_addr(vsb_addr), .sb_din(vsb_din), .sb_dout(vsb_dout),
-        .ac_en(vac_en), .ac_we(vac_we), .ac_addr(vac_addr), .ac_din(vac_din), .ac_dout(vac_dout));
+        .ac_en(vac_en), .ac_we(vac_we), .ac_addr(vac_addr), .ac_din(vac_din), .ac_dout(vac_dout),
+        .perf_ev(ve_ev));
 
     // ---------------------------------------------------------- memories
     // SPAD side A: [0] LD write, [1] ST read; side B: [0] EX read, [1] VE.

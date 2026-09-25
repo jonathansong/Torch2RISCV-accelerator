@@ -96,6 +96,7 @@ instruction group and `funct3` the operation:
 | 1 | 2 | `mat_store` | rs1 = DDR, rs2 = local addr | queue SPAD/ACC → DDR |
 | 1 | 3 | `mat_exec` | rs1 = B<<16 \| A, rs2 = acc<<28 \| Kt<<16 \| C | queue C (+)= A strip × B strips |
 | 1 | 4 | `mat_fence` | rs1 = engine mask, rd | stall until the engines are idle, return extended status |
+| 1 | 5 | `mat_perf` | rs1 = counter index (read) or bit 31 + rs2 = clear/enable (control), rd | performance counters (CAPS bit 20; board build `bitstreams/m4p`) |
 | 2 | 0 | `vec_cfg` | rs1 = key, rs2 = value | op, length, types, dst, src2 period, requant, clamp |
 | 2 | 1 | `vec_run` | rs1 = src1, rs2 = src2 | queue one vector command |
 
@@ -202,6 +203,7 @@ board before choosing the next one:
 | M2 | Repeat `mat_exec`, 8 outstanding bursts, DMA bandwidth test (one HP port at 99 %) | 64³ 13.0 → 38.3, 256³ 56.5 |
 | M3 | Vector engine (funct7 = 2): bias/RELU/requant → int8, standalone vector ops | int8 GEMM 256³ at 53.5 |
 | M4 | D = 16 (8 DSP + 8 LUT columns, VL = 16); three HP ports measured as unnecessary; firmware schedule tuning | 256³ at 202.6 (79 % of peak), 256×128×1024 at 222.2 |
+| M4 + perf | Performance counters (28 events, `mat_perf`): measured cycle breakdown | 256³: array useful 79 %, front end idle 5 %; 64³: front end 87 % → descriptor DMA planned for small ops |
 
 **Minimum viable target: Phase 5** — a PyTorch model compiles end to end
 into firmware that issues a custom RISC-V instruction, executed by a

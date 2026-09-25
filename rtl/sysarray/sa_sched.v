@@ -54,7 +54,12 @@ module sa_sched #(
     input  wire [3:0]         fence_mask,     // engines a fence waits for (0 = all)
     output wire               fence_ok,       // queue empty and masked engines idle
     output wire               idle,           // everything idle
-    output wire [31:0]        ext_status
+    output wire [31:0]        ext_status,
+
+    // performance events: [3:0] command dispatched, [7:4] head blocked by a
+    // hazard (both by engine), [8] head blocked by a full engine queue,
+    // [9] starved (no command at the head while an engine is busy), [10] all idle
+    output wire [10:0]        perf_ev
 );
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
@@ -362,4 +367,12 @@ module sa_sched #(
     assign idle     = pipe_empty && m_empty == 4'b1111;
     assign fence_ok = pipe_empty && (eng_busy & fm) == 0;
     assign ext_status = {8'd0, 3'd0, queued, err_eng, err_code, eng_busy, 2'b00, err, idle};
+
+    wire       head_ok = d2_v && !err && h_valid_cmd;
+    wire [3:0] h_onehot = 4'b0001 << h_eng;
+    assign perf_ev = {pipe_empty && eng_busy == 4'd0,
+                      !d2_v && eng_busy != 4'd0,
+                      head_ok && !hazard && (e_full[h_eng] || m_full[h_eng]),
+                      {4{head_ok && hazard}} & h_onehot,
+                      {4{dispatch}} & h_onehot};
 endmodule

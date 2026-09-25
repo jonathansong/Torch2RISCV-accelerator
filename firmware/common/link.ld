@@ -1,8 +1,10 @@
 /* PicoRV32 program BRAM: 8 KB at 0xC0000000 (reset vector = start).
- * The top 256 bytes hold the mailbox (see mailbox.h). */
+ * The top 512 bytes are reserved (see mailbox.h): 0x1E00-0x1EFF the
+ * performance counter area, 0x1F00-0x1FFF the mailbox. Code, data and the
+ * stack (top at 0x1E00) share the first 7.5 KB. */
 MEMORY
 {
-    bram (rwx) : ORIGIN = 0xC0000000, LENGTH = 0x1F00
+    bram (rwx) : ORIGIN = 0xC0000000, LENGTH = 0x1E00
 }
 
 ENTRY(_start)

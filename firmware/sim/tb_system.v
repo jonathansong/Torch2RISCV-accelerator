@@ -268,6 +268,57 @@ module tb_system;
     endfunction
     localparam integer I32MIN = 32'h80000000, I32MAX = 32'h7FFFFFFF;
 
+    // ------------------------------------------------ performance counters
+    // The firmware copies the counters to the perf area (program BRAM 0x1E00,
+    // mailbox.h) and their number to MBOX_PERF_COUNT (0x8C). Indices: PC_* in
+    // rtl/sysarray/sa_defs.vh.
+    localparam integer PERF_W = 32'h1E00 / 4, MBOX_PERF_COUNT = 32'h8C / 4;
+    localparam integer PC_CYCLES = 0, PC_CMD_LD = 1, PC_CMD_ST = 2, PC_CMD_EX = 3, PC_CMD_VE = 4,
+                       PC_PCPI_QFULL = 5, PC_HAZ_LD = 7, PC_HAZ_ST = 8, PC_HAZ_EX = 9, PC_HAZ_VE = 10,
+                       PC_STARVE = 12, PC_ALL_IDLE = 13, PC_EX_STEP = 14, PC_EX_USEFUL = 15,
+                       PC_EX_TILES = 17, PC_LD_BUSY = 18, PC_LD_BEATS = 19, PC_ST_BUSY = 21,
+                       PC_ST_BEATS = 22, PC_VE_ACTIVE = 24, PC_VE_GROUPS = 27;
+    reg [31:0] pcv [0:31];
+    integer    pci, perf_checks = 0;
+    // x / total in per mille, printed as "12.3%"
+    function integer pm(input [31:0] x, input [31:0] total); pm = total ? x * 1000 / total : 0; endfunction
+    task perf_expect(input [31:0] got, input [31:0] want, input [8*24-1:0] what);
+        begin
+            perf_checks = perf_checks + 1;
+            if (got !== want) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("TB ERROR perf %0s = %0d, expected %0d", what, got, want);
+            end
+        end
+    endtask
+    // load the counters, check the count and the measurement window, print a breakdown
+    task perf_load_report;
+        reg [31:0] cyc, total;
+        begin
+            perf_expect(bram[MBOX + MBOX_PERF_COUNT], 32, "MBOX_PERF_COUNT");
+            for (pci = 0; pci < 32; pci = pci + 1) pcv[pci] = bram[PERF_W + pci];
+            cyc = pcv[PC_CYCLES]; total = bram[MBOX + 8];
+            perf_checks = perf_checks + 1;
+            // the counter window also covers the few instructions between mat_perf
+            // and rdcycle on both ends (compiler-scheduled, tens of cycles)
+            if (!(cyc >= total && cyc <= total + 128)) begin
+                errors = errors + 1;
+                $display("TB ERROR perf CYCLES = %0d outside the firmware window %0d .. +128", cyc, total);
+            end
+            $display("TB   perf: EX useful %0d.%0d%% fill %0d.%0d%% | head blocked LD %0d.%0d%% ST %0d.%0d%% EX %0d.%0d%% VE %0d.%0d%% | starve %0d.%0d%% idle %0d.%0d%% | CPU on full queue %0d.%0d%% | LD %0d B/%0d cyc, ST %0d B/%0d cyc",
+                     pm(pcv[PC_EX_USEFUL], cyc) / 10, pm(pcv[PC_EX_USEFUL], cyc) % 10,
+                     pm(pcv[PC_EX_STEP] - pcv[PC_EX_USEFUL], cyc) / 10, pm(pcv[PC_EX_STEP] - pcv[PC_EX_USEFUL], cyc) % 10,
+                     pm(pcv[PC_HAZ_LD], cyc) / 10, pm(pcv[PC_HAZ_LD], cyc) % 10,
+                     pm(pcv[PC_HAZ_ST], cyc) / 10, pm(pcv[PC_HAZ_ST], cyc) % 10,
+                     pm(pcv[PC_HAZ_EX], cyc) / 10, pm(pcv[PC_HAZ_EX], cyc) % 10,
+                     pm(pcv[PC_HAZ_VE], cyc) / 10, pm(pcv[PC_HAZ_VE], cyc) % 10,
+                     pm(pcv[PC_STARVE], cyc) / 10, pm(pcv[PC_STARVE], cyc) % 10,
+                     pm(pcv[PC_ALL_IDLE], cyc) / 10, pm(pcv[PC_ALL_IDLE], cyc) % 10,
+                     pm(pcv[PC_PCPI_QFULL], cyc) / 10, pm(pcv[PC_PCPI_QFULL], cyc) % 10,
+                     8 * pcv[PC_LD_BEATS], pcv[PC_LD_BUSY], 8 * pcv[PC_ST_BEATS], pcv[PC_ST_BUSY]);
+        end
+    endtask
+
 `ifdef BW_TEST
     // -------------------------------------------------------- BW_TEST
     localparam [31:0] BW_SRC = DDR_BASE, BW_DST = DDR_BASE + 32'h10000;
@@ -376,6 +427,14 @@ module tb_system;
                      op[2:0], op[4] ? " relu" : "", op[5] ? " requant" : "",
                      it == 0 ? "i8" : it == 1 ? "i16" : "i32", ot == 0 ? "i8" : ot == 1 ? "i16" : "i32",
                      len, period, bram[MBOX + 8], len / bram[MBOX + 8], (len * 100 / bram[MBOX + 8]) % 100);
+            // counters: VE groups / commands, DMA bytes (a periodic src2 is loaded into both banks)
+            perf_load_report;
+            perf_expect(pcv[PC_VE_GROUPS], len / D, "VE_GROUPS");
+            perf_expect(pcv[PC_CMD_VE], bram[MBOX + 5], "CMD_VE (= chunks)");
+            perf_expect(pcv[PC_EX_TILES], 0, "EX_TILES");
+            perf_expect(8 * pcv[PC_ST_BEATS], len * esz(ot), "ST bytes");
+            perf_expect(8 * pcv[PC_LD_BEATS], len * esz(it) +
+                        (op[2:0] == 3'd5 ? 0 : period == 0 ? len * esz(it) : 2 * D * period * esz(it)), "LD bytes");
             runs = runs + 1;
         end
     endtask
@@ -389,7 +448,7 @@ module tb_system;
         run_vec(4112, 8'h15, 2, 2, 0, 1, 0, 0, I32MIN, I32MAX);        // relu copy i32 -> i32 (D = 8: 514 groups)
         run_vec(5600, 8'h01, 0, 2, 3, 1, 0, 0, I32MIN, I32MAX);        // i8 - i8(period 3) -> i32
         run_vec(2048, 8'h22, 1, 2, 0, -300, 7, 1000, -500000, 500000); // i16 * i16, requant, clamp -> i32
-        $display("TB %s: %0d vector operations, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
+        $display("TB %s: %0d vector operations, %0d errors, %0d performance-counter checks", errors ? "FAIL" : "PASS", runs, errors, perf_checks);
         $finish;
     end
 `elsif GEMM_TEST
@@ -481,6 +540,16 @@ module tb_system;
                      gemm_flags == 3 ? " [M4 schedule]" : gemm_flags == 1 ? " [no prefetch]" : gemm_flags == 2 ? " [no B split]" :
                      gemm_flags == 4 ? " [B split forced]" : "",
                      bram[MBOX + 8], M*N*K / bram[MBOX + 8], csr_accesses);
+            // counters: tiles, useful steps, DMA bytes, commands
+            perf_load_report;
+            perf_expect(pcv[PC_EX_TILES], (M/D) * (N/D), "EX_TILES");
+            perf_expect(pcv[PC_EX_USEFUL], (M/D) * (N/D) * K, "EX_USEFUL");
+            perf_expect(pcv[PC_EX_USEFUL] * D * D, M * N * K, "EX_USEFUL x D^2");
+            perf_expect(8 * pcv[PC_ST_BEATS], (quant ? 1 : 4) * M * N, "ST bytes");
+            perf_expect(8 * pcv[PC_LD_BEATS], K * N + M * K + (use_bias ? (quant ? 8 * N : 4 * M * N) : 0), "LD bytes");
+            perf_expect(pcv[PC_CMD_ST], M / D, "CMD_ST");
+            perf_expect(pcv[PC_CMD_VE], quant ? M / D : 0, "CMD_VE");
+            if (quant) perf_expect(pcv[PC_VE_GROUPS], (M / D) * N, "VE_GROUPS");
             runs = runs + 1;
         end
     endtask
@@ -507,7 +576,7 @@ module tb_system;
         run_gemm(3*D, 2*D, 5*D, 1, 0, 0, 1, 0, 0);
         run_gemm(4*D, 4*D, 8*D, 1, 1, 1, 181, 15, -3);
         gemm_flags = 0;
-        $display("TB %s: %0d GEMMs, %0d errors", errors ? "FAIL" : "PASS", runs, errors);
+        $display("TB %s: %0d GEMMs, %0d errors, %0d performance-counter checks", errors ? "FAIL" : "PASS", runs, errors, perf_checks);
         $finish;
     end
 `else

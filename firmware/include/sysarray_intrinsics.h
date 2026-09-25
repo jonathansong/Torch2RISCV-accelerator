@@ -79,22 +79,35 @@ static inline uint32_t mat_cycles(void)
  * ---------------------------------------------------------------------- */
 
 /*
- * Array size D (8 or 16) of the loaded overlay. By default it is read at run
- * time from the CAPS CSR ([7:0], RISC-V address 0x80000024) by sa_init(), so
- * one firmware image runs on every build; -DSA_D=<n> fixes it at compile time.
+ * Capabilities of the loaded overlay, from the CAPS CSR (RISC-V address
+ * 0x80000024): [7:0] D, [15:8] VL, [19:16] DMA ports, [20] performance
+ * counters. sa_init() reads it once. The array size D (8 or 16) is taken
+ * from it at run time, so one firmware image runs on every build;
+ * -DSA_D=<n> fixes D at compile time.
  */
+#define SA_CAPS_ADDR    0x80000024u
+#define SA_CAPS_PERF    (1u << 20)
+static uint32_t sa_caps_runtime = 0u;
 #ifndef SA_D
 static uint32_t sa_d_runtime = 8u;
 #define SA_D            sa_d_runtime
 static inline uint32_t sa_init(void)
 {
-    uint32_t d = *(volatile uint32_t *)0x80000024u & 0xFFu;
+    uint32_t caps = *(volatile uint32_t *)SA_CAPS_ADDR;
+    uint32_t d = caps & 0xFFu;
+    sa_caps_runtime = caps;
     sa_d_runtime = (d == 8u || d == 16u) ? d : 8u;
     return sa_d_runtime;
 }
 #else
-static inline uint32_t sa_init(void) { return SA_D; }
+static inline uint32_t sa_init(void)
+{
+    sa_caps_runtime = *(volatile uint32_t *)SA_CAPS_ADDR;
+    return SA_D;
+}
 #endif
+/* the overlay has performance counters (mat_perf would trap without them) */
+static inline int sa_has_perf(void) { return (sa_caps_runtime & SA_CAPS_PERF) != 0; }
 #define SA_SPAD_WORDS   (131072u / SA_D)            /* per SPAD, D-byte words      */
 #define SA_ACC_WORDS    (262144u / (4u * SA_D))     /* D x int32 words             */
 #define SA_SPAD_BANK    (SA_SPAD_WORDS / 2u)        /* first word of bank 1        */
@@ -226,6 +239,59 @@ static inline void vec_cfg(uint32_t key, uint32_t value)
 static inline void vec_run(uint32_t src1, uint32_t src2)
 {
     __asm__ volatile (".insn r 0x0B, 1, 2, x0, %0, %1" :: "r"(src1), "r"(src2) : "memory");
+}
+
+/* ------------------------------------------------------------------------
+ * Performance counters (funct7 = 1, funct3 = 5; rtl/sysarray/sa_perf.v,
+ * docs/perf_counters_and_desc_dma_plan.md part 1). Only when sa_has_perf():
+ * on an overlay without counters the instruction is not answered and the
+ * core traps.
+ * ---------------------------------------------------------------------- */
+#define SA_PERF_CLEAR        (1u << 0)
+#define SA_PERF_ENABLE       (1u << 1)
+enum {
+    SA_PC_CYCLES = 0, SA_PC_CMD_LD, SA_PC_CMD_ST, SA_PC_CMD_EX, SA_PC_CMD_VE,
+    SA_PC_PCPI_QFULL, SA_PC_PCPI_FENCE, SA_PC_HAZ_LD, SA_PC_HAZ_ST, SA_PC_HAZ_EX,
+    SA_PC_HAZ_VE, SA_PC_DISP_FULL, SA_PC_STARVE, SA_PC_ALL_IDLE, SA_PC_EX_STEP,
+    SA_PC_EX_USEFUL, SA_PC_EX_SWAPWAIT, SA_PC_EX_TILES, SA_PC_LD_BUSY, SA_PC_LD_BEATS,
+    SA_PC_LD_ARSTALL, SA_PC_ST_BUSY, SA_PC_ST_BEATS, SA_PC_ST_WSTALL, SA_PC_VE_ACTIVE,
+    SA_PC_VE_RDBLOCK, SA_PC_VE_CREDIT, SA_PC_VE_GROUPS,
+    SA_PC_NUM = 32                              /* 28..31 reserved */
+};
+
+/* control: SA_PERF_CLEAR / SA_PERF_ENABLE (0 = freeze); returns the counter count */
+static inline uint32_t mat_perf_ctl(uint32_t flags)
+{
+    uint32_t rd;
+    __asm__ volatile (".insn r 0x0B, 5, 1, %0, %1, %2" : "=r"(rd) : "r"(1u << 31), "r"(flags) : "memory");
+    return rd;
+}
+
+/* read counter idx */
+static inline uint32_t mat_perf_read(uint32_t idx)
+{
+    uint32_t rd;
+    __asm__ volatile (".insn r 0x0B, 5, 1, %0, %1, x0" : "=r"(rd) : "r"(idx));
+    return rd;
+}
+
+/* measurement window: clear + start (returns the counter count, 0 without counters) */
+static inline uint32_t sa_perf_begin(void)
+{
+    return sa_has_perf() ? mat_perf_ctl(SA_PERF_CLEAR | SA_PERF_ENABLE) : 0u;
+}
+
+/* freeze and copy up to max counters to dst; returns how many were copied */
+static inline uint32_t sa_perf_end(volatile uint32_t *dst, uint32_t max)
+{
+    if (!sa_has_perf())
+        return 0u;
+    uint32_t n = mat_perf_ctl(0);
+    if (n > max)
+        n = max;
+    for (uint32_t i = 0; i < n; i++)
+        dst[i] = mat_perf_read(i);
+    return n;
 }
 
 /* REQUANT parameters and output clamp window */

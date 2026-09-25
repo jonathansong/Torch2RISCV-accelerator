@@ -13,6 +13,7 @@
 module tb_sa_unit;
     `include "n_cases.vh"
     parameter  integer D  = 8;                    // make sim TB=tb_sa_unit GEN=D=16
+    parameter  integer PERF = 1;                  // GEN="PERF=0": build without counters
     localparam integer AW = 32 * D;               // widest local word (ACC)
 
     localparam [31:0] MEM_BASE  = 32'h1000_0000;
@@ -51,7 +52,7 @@ module tb_sa_unit;
     wire        pcpi_wr, pcpi_wait, pcpi_ready;
     wire [31:0] pcpi_rd;
 
-    sa_unit #(.D(D), .NPORTS(1)) dut (
+    sa_unit #(.D(D), .NPORTS(1), .PERF(PERF)) dut (
         .aclk(aclk), .aresetn(aresetn),
         .s_axi_awaddr(s_awaddr), .s_axi_awvalid(s_awvalid), .s_axi_awready(s_awready),
         .s_axi_wdata(s_wdata), .s_axi_wstrb(4'hF), .s_axi_wvalid(s_wvalid), .s_axi_wready(s_wready),
@@ -407,7 +408,7 @@ module tb_sa_unit;
     reg signed [31:0] GBIAS [0:127][0:127];
     integer gi, gj, gk, gt, gbk, gti, gtj;
     reg signed [31:0] gsum, ggot;
-    integer gemm_cycles;
+    integer gemm_cycles, gemm_cycles_main;
     task gemm(input integer M, input integer N, input integer K, input [31:0] aa, input [31:0] ba,
               input [31:0] ca, input integer use_bias, input [31:0] biasa);
         integer t0;
@@ -796,6 +797,182 @@ module tb_sa_unit;
         end
     endtask
 
+    // ============================================ performance counters (P1)
+    // docs/perf_counters_and_desc_dma_plan.md §1.6: exact invariants after
+    // GEMMs with known command / tile / byte counts
+    localparam integer NPC = 32;
+    localparam integer PC_CYCLES = 0, PC_CMD_LD = 1, PC_CMD_ST = 2, PC_CMD_EX = 3, PC_CMD_VE = 4,
+                       PC_HAZ_LD = 7, PC_HAZ_ST = 8, PC_HAZ_EX = 9, PC_HAZ_VE = 10,
+                       PC_STARVE = 12, PC_ALL_IDLE = 13,
+                       PC_EX_STEP = 14, PC_EX_USEFUL = 15, PC_EX_TILES = 17,
+                       PC_LD_BUSY = 18, PC_LD_BEATS = 19, PC_ST_BUSY = 21, PC_ST_BEATS = 22,
+                       PC_VE_ACTIVE = 24, PC_VE_GROUPS = 27;
+    reg  [31:0] pc_a [0:NPC-1];
+    reg  [31:0] pc_b [0:NPC-1];
+    reg  [31:0] pc_csr;
+    integer     perf_t0, perf_win, pi, perf_checks = 0;
+
+    task perf_ctl(input [1:0] f);                    // mat_perf control: [0] clear, [1] enable
+        begin
+            pcpi_exec(custom0(3'd5, 7'd1), 32'h8000_0000, {30'd0, f});
+            if (pc_cycles < 0) fail("mat_perf control timed out (would trap)");
+            if (pc_rd !== (PERF != 0 ? NPC : 0)) fail("mat_perf control: wrong counter count");
+        end
+    endtask
+    task perf_snap;                                   // all counters through mat_perf
+        for (pi = 0; pi < NPC; pi = pi + 1) begin
+            pcpi_exec(custom0(3'd5, 7'd1), pi, 0);
+            if (pc_cycles < 0) fail("mat_perf read timed out (would trap)");
+            pc_a[pi] = pc_rd;
+        end
+    endtask
+    task perf_expect(input integer idx, input [31:0] want, input [8*24-1:0] what);
+        begin
+            perf_checks = perf_checks + 1;
+            if (pc_a[idx] !== want) begin
+                errors = errors + 1;
+                if (errors <= 20) $display("TB ERROR perf %0s = %0d, expected %0d", what, pc_a[idx], want);
+            end
+        end
+    endtask
+    task perf_true(input cond, input [8*48-1:0] what);
+        begin
+            perf_checks = perf_checks + 1;
+            if (!cond) fail(what);
+        end
+    endtask
+    // checks common to every measured window: counters frozen, mirror == PCPI,
+    // reserved slots zero, sane relations, CYCLES == the window seen by the testbench
+    task perf_common;
+        begin
+            for (pi = 0; pi < NPC; pi = pi + 1) pc_b[pi] = pc_a[pi];
+            repeat (50) @(posedge aclk);
+            perf_snap;                                            // frozen: unchanged
+            for (pi = 0; pi < NPC; pi = pi + 1)
+                perf_true(pc_a[pi] === pc_b[pi], "perf: counter changed while frozen");
+            for (pi = 0; pi < NPC; pi = pi + 1) begin              // CSR mirror
+                csr_read(8'h40 + 4 * pi, pc_csr);
+                perf_true(pc_csr === pc_a[pi], "perf: CSR mirror differs from mat_perf");
+            end
+            if (PERF == 0) begin
+                for (pi = 0; pi < NPC; pi = pi + 1) perf_true(pc_a[pi] === 0, "perf: PERF=0 counter not zero");
+            end else begin
+                for (pi = 28; pi < NPC; pi = pi + 1) perf_true(pc_a[pi] === 0, "perf: reserved counter not zero");
+                perf_true(pc_a[PC_CYCLES] + 12 >= perf_win && pc_a[PC_CYCLES] <= perf_win + 12,
+                          "perf: CYCLES differs from the measured window");
+                perf_true(pc_a[PC_LD_BUSY] >= pc_a[PC_LD_BEATS], "perf: LD_BUSY < LD_BEATS");
+                perf_true(pc_a[PC_ST_BUSY] >= pc_a[PC_ST_BEATS], "perf: ST_BUSY < ST_BEATS");
+                perf_true(pc_a[PC_CYCLES] >= pc_a[PC_EX_STEP], "perf: CYCLES < EX_STEP");
+                perf_true(pc_a[PC_HAZ_LD] + pc_a[PC_HAZ_ST] + pc_a[PC_HAZ_EX] + pc_a[PC_HAZ_VE] +
+                          pc_a[PC_STARVE] + pc_a[PC_ALL_IDLE] <= pc_a[PC_CYCLES],
+                          "perf: head states exceed CYCLES");
+            end
+        end
+    endtask
+
+    // int32 GEMM: LD B + per strip {LD A, [LD bias], EX (N/D tiles), ST}
+    task perf_gemm(input integer M, input integer N, input integer K, input integer use_bias);
+        integer strips, tiles;
+        begin
+            strips = M / D; tiles = strips * (N / D);
+            perf_ctl(2'b11);                                      // clear + enable
+            perf_t0 = $time;
+            gemm(M, N, K, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000,
+                 use_bias, MEM_BASE + 32'h28000);
+            perf_win = ($time - perf_t0) / 10;
+            perf_ctl(2'b00);                                      // freeze
+            perf_snap;
+            if (PERF != 0) begin
+                perf_expect(PC_EX_TILES,  tiles,                       "EX_TILES");
+                perf_expect(PC_EX_USEFUL, tiles * K,                   "EX_USEFUL");
+                perf_expect(PC_EX_STEP,   tiles * (K + 2 * (D - 1)),   "EX_STEP");
+                perf_expect(PC_LD_BEATS,  (K * N + M * K + (use_bias ? 4 * M * N : 0)) / 8, "LD_BEATS");
+                perf_expect(PC_ST_BEATS,  4 * M * N / 8,               "ST_BEATS");
+                perf_expect(PC_CMD_LD,    1 + strips * (use_bias ? 2 : 1), "CMD_LD");
+                perf_expect(PC_CMD_EX,    strips,                      "CMD_EX");
+                perf_expect(PC_CMD_ST,    strips,                      "CMD_ST");
+                perf_expect(PC_CMD_VE,    0,                           "CMD_VE");
+                perf_expect(PC_VE_ACTIVE, 0,                           "VE_ACTIVE");
+                perf_true(pc_a[PC_EX_USEFUL] * D * D == M * N * K, "perf: EX_USEFUL x D^2 != M*N*K");
+            end
+            perf_common;
+        end
+    endtask
+
+    // int8 GEMM, mode 0: LD B, LD bias vector, per strip {LD A, EX, VE (N groups), ST (int8)}
+    task perf_qgemm(input integer M, input integer N, input integer K);
+        integer strips, tiles;
+        begin
+            strips = M / D; tiles = strips * (N / D);
+            perf_ctl(2'b11);
+            perf_t0 = $time;
+            qgemm(M, N, K, 0, 181, 15, -3);
+            perf_win = ($time - perf_t0) / 10;
+            perf_ctl(2'b00);
+            perf_snap;
+            if (PERF != 0) begin
+                perf_expect(PC_EX_TILES,  tiles,                       "EX_TILES");
+                perf_expect(PC_EX_USEFUL, tiles * K,                   "EX_USEFUL");
+                perf_expect(PC_CMD_VE,    strips,                      "CMD_VE");
+                perf_expect(PC_VE_GROUPS, strips * N,                  "VE_GROUPS");
+                perf_expect(PC_CMD_LD,    2 + strips,                  "CMD_LD");
+                perf_expect(PC_LD_BEATS,  (K * N + 4 * N + M * K) / 8, "LD_BEATS");
+                perf_expect(PC_ST_BEATS,  M * N / 8,                   "ST_BEATS");
+                perf_true(pc_a[PC_VE_ACTIVE] >= pc_a[PC_VE_GROUPS], "perf: VE_ACTIVE < VE_GROUPS");
+            end
+            perf_common;
+        end
+    endtask
+
+    // directed hazard: an EX that reads the bank a preceding LD writes waits
+    // at the head (RAW) - only HAZ_EX may count; one LD and one EX dispatched
+    task perf_hazard;
+        begin
+            fence(0);
+            cfg_ex(1, 0, 0, 1);
+            perf_ctl(2'b11);
+            perf_t0 = $time;
+            cfg_ld(D, 64 * D, 64 * D, 1);                          // A strip, K = 64 D
+            ld(RS, M_A, 0);
+            ex(0, 0, 0, 64, 0);                                    // reads SPAD_A bank 0
+            fence(0);
+            perf_win = ($time - perf_t0) / 10;
+            perf_ctl(2'b00);
+            perf_snap;
+            if (PERF != 0) begin
+                perf_true(pc_a[PC_HAZ_EX] > 0, "perf: HAZ_EX not counted for a RAW on SPAD_A");
+                perf_expect(PC_HAZ_LD, 0, "HAZ_LD");
+                perf_expect(PC_HAZ_ST, 0, "HAZ_ST");
+                perf_expect(PC_HAZ_VE, 0, "HAZ_VE");
+                perf_expect(PC_CMD_LD, 1, "CMD_LD");
+                perf_expect(PC_CMD_EX, 1, "CMD_EX");
+                perf_expect(PC_EX_TILES, 1, "EX_TILES");
+                perf_expect(PC_LD_BEATS, 64 * D * D / 8, "LD_BEATS");
+            end
+            perf_common;
+        end
+    endtask
+
+    // control paths: mat_perf clear, CSR PERF_CTRL enable / clear / readback
+    task perf_ctl_tests;
+        begin
+            perf_ctl(2'b01);                                      // clear only
+            perf_snap;
+            for (pi = 0; pi < NPC; pi = pi + 1) perf_true(pc_a[pi] === 0, "perf: clear left a counter non-zero");
+            csr_write(8'h3C, 32'd2);                              // CSR: enable
+            csr_read(8'h3C, pc_csr);
+            perf_true(pc_csr === (PERF != 0 ? 32'd2 : 32'd0), "perf: PERF_CTRL readback (enabled)");
+            repeat (100) @(posedge aclk);
+            csr_write(8'h3C, 32'd0);                              // CSR: freeze
+            csr_read(8'h40, pc_csr);
+            if (PERF != 0) perf_true(pc_csr >= 100 && pc_csr < 200, "perf: CSR-enabled CYCLES out of range");
+            else           perf_true(pc_csr === 0, "perf: PERF=0 CYCLES not zero");
+            csr_write(8'h3C, 32'd1);                              // CSR: clear
+            csr_read(8'h40, pc_csr);
+            perf_true(pc_csr === 0, "perf: CSR clear did not clear CYCLES");
+        end
+    endtask
+
     // ---------------------------------------------------------- tests
     integer    cs, total_cycles, min_cycles, max_cycles, bursts_before;
     reg [31:0] a_addr, b_addr, c_addr, cyc;
@@ -993,6 +1170,7 @@ module tb_sa_unit;
         gemm(2*D, 4*D, 128, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
         gemm(D, D, D,       MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
         gemm(4*D, 4*D, 8*D, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 0, 0);
+        gemm_cycles_main = gemm_cycles;                     // (the perf tests run more GEMMs)
 
         // ======================================= M3: quantized GEMMs
         // D = 8: 32x32x64, 16x48x40, 24x16x128
@@ -1002,6 +1180,13 @@ module tb_sa_unit;
         qgemm(3*D, 2*D, 128, 0, 1, 0, 0);
 
         // ===================================== scoreboard: random stream
+        // ============================= performance counters (P1)
+        perf_gemm(4*D, 4*D, 8*D, 0);
+        perf_gemm(3*D, 2*D, 5*D, 1);
+        perf_qgemm(4*D, 4*D, 8*D);
+        perf_hazard;
+        perf_ctl_tests;
+
         random_stream(120);
 
         // ================================================ new-ISA errors
@@ -1032,16 +1217,17 @@ module tb_sa_unit;
         fence(0);
         if (xst[11:8] !== 4'd2) fail("bad memory id: wrong ext status");
         mat_op(F_RESET, 0, 0);
-        pcpi_exec(custom0(3'd5, 7'd1), 0, 0);
-        if (pc_cycles >= 0) fail("funct7=1 funct3=5 was answered");
-        expect_csr(8'h24, 32'h0001_0000 + D * 256 + D, "CAPS");      // 1 port, VL = D, D
+        pcpi_exec(custom0(3'd7, 7'd1), 0, 0);                  // 5 is mat_perf (P1), 6 reserved
+        if (pc_cycles >= 0) fail("funct7=1 funct3=7 was answered");
+        expect_csr(8'h24, (PERF != 0 ? 32'h0010_0000 : 32'd0) + 32'h0001_0000 + D * 256 + D,
+                   "CAPS");                                             // [20] perf, 1 port, VL = D, D
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");
 
         repeat (20) @(posedge aclk);
-        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | error paths",
-                 errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, D, 4*D, 4*D, 8*D, gemm_cycles, 4*D*4*D*8*D / gemm_cycles,
-                 n_ld, n_ex, n_st, n_ve, 4*D, 4*D, 8*D, qgemm_cycles_first);
+        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | error paths",
+                 errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, D, 4*D, 4*D, 8*D, gemm_cycles_main, 4*D*4*D*8*D / gemm_cycles_main,
+                 n_ld, n_ex, n_st, n_ve, 4*D, 4*D, 8*D, qgemm_cycles_first, perf_checks);
         $finish;
     end
 

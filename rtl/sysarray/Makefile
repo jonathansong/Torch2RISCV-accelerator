@@ -39,6 +39,7 @@ test:
 	@$(MAKE) -s sim TB=tb_sa_dma GEN=NP=1
 	@$(MAKE) -s sim TB=tb_sa_dma GEN=NP=3
 	@$(MAKE) -s sim TB=tb_sa_unit
+	@$(MAKE) -s sim TB=tb_sa_unit GEN=PERF=0
 	@$(MAKE) -s sim TB=tb_sa_ve
 
 test16:                   # the same at D = 16 (M4)

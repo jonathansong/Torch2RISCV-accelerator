@@ -79,3 +79,16 @@ localparam [3:0] XERR_BRESP = 4'd4;   // DMA write response SLVERR/DECERR
 //   (tile r: B strip at B + r*Bstep, C row i at C + r*Cstep + i*Crow; a zero C row
 //    stride means 1, so a zero-filled extension is the M1 single-tile command)
 localparam integer PKT_W = `SA_PKT_W;   // sa_macros.vh
+
+// Performance counters (sa_perf.v; docs/perf_counters_and_desc_dma_plan.md §1.2).
+// Read with mat_perf (funct7 = 1, funct3 = 5) or the CSR mirror at 0x40 + 4*i.
+localparam integer PERF_NCNT = 32;
+localparam integer PC_CYCLES = 0,  PC_CMD_LD = 1,  PC_CMD_ST = 2,  PC_CMD_EX = 3,  PC_CMD_VE = 4,
+                   PC_PCPI_QFULL = 5, PC_PCPI_FENCE = 6,
+                   PC_HAZ_LD = 7,  PC_HAZ_ST = 8,  PC_HAZ_EX = 9,  PC_HAZ_VE = 10,
+                   PC_DISP_FULL = 11, PC_STARVE = 12, PC_ALL_IDLE = 13,
+                   PC_EX_STEP = 14, PC_EX_USEFUL = 15, PC_EX_SWAPWAIT = 16, PC_EX_TILES = 17,
+                   PC_LD_BUSY = 18, PC_LD_BEATS = 19, PC_LD_ARSTALL = 20,
+                   PC_ST_BUSY = 21, PC_ST_BEATS = 22, PC_ST_WSTALL = 23,
+                   PC_VE_ACTIVE = 24, PC_VE_RDBLOCK = 25, PC_VE_CREDIT = 26, PC_VE_GROUPS = 27;
+                   // 28..31 reserved (descriptor DMA)

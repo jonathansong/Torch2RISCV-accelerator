@@ -50,7 +50,10 @@ module sa_ld #(
     input  wire [NPORTS*2-1:0]  m_rresp,
     input  wire [NPORTS-1:0]    m_rlast,
     input  wire [NPORTS-1:0]    m_rvalid,
-    output wire [NPORTS-1:0]    m_rready
+    output wire [NPORTS-1:0]    m_rready,
+
+    // performance events: {AR stalled by the port, beat written, command active}
+    output wire [2:0]           perf_ev
 );
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
@@ -252,4 +255,6 @@ module sa_ld #(
             end
         end
     end
+
+    assign perf_ev = {|(m_arvalid & ~m_arready), lw_en, active};
 endmodule

@@ -58,8 +58,8 @@ EMIO GPIO[0]（RISC-V 复位）。数据全部经 DDR 交换。
 | `load_firmware()` | BRAM 清零，再把 `gemm_fw.bin` 按 32 位逐字写入 | **AXI GP0 → `psBramController` → `riscvBram` A 口** |
 
 `riscvBram` 是一块双口 BRAM：A 口给 ARM，B 口就是 PicoRV32 在
-0xC0000000 看到的程序存储器。固件不能超过 0x1F00 字节，最后 256 字节
-是 mailbox（`load_firmware` 会检查）。
+0xC0000000 看到的程序存储器。最后 512 字节是保留区：0x1E00–0x1EFF 是性能
+计数器区，0x1F00–0x1FFF 是 mailbox。固件不能超过 0x1E00 字节（`load_firmware` 会检查）。
 
 ### 1.2 `mm.gemm(a, b)`
 
@@ -90,7 +90,7 @@ EMIO GPIO[0]（RISC-V 复位）。数据全部经 DDR 交换。
 ### 2.1 启动：`firmware/common/start.S` + `link.ld`
 
 - 复位向量 `PROGADDR_RESET = 0xC0000000`（`pico_processor.tcl`）。
-- 设置栈顶 `__stack_top = 0xC0001F00`，紧贴在 mailbox 下面。
+- 设置栈顶 `__stack_top = 0xC0001E00`，紧贴在性能计数器区下面。
 - 清零 `.bss`，然后 `call main`。
 - `main` 返回后执行 `ebreak`：PicoRV32 进入 trap 停机，直到 ARM 再次复位它。
 
@@ -354,7 +354,7 @@ tn+1     valid=0，执行下一条            S_DONE → S_IDLE
 
 | 现象 | 先查哪一层 | 怎么查 |
 |---|---|---|
-| `TimeoutError: ... not started` | 固件没跑起来 | 固件是否已加载（`load_firmware`）；复位 GPIO；固件是否超过 0x1F00 |
+| `TimeoutError: ... not started` | 固件没跑起来 | 固件是否已加载（`load_firmware`）；复位 GPIO；固件是否超过 0x1E00 |
 | `TimeoutError: ... running` | 固件卡在某条指令 | 多半卡在 `mat_fence`：看是否有命令永远派发不了（冲突不会解除）或引擎没发 `done`；用 `make sim` 复现 |
 | `RuntimeError: accelerator error` | 调度器 / DMA | 错误码 [11:8]：1 = 形状 / 对齐非法，2 = 本地地址越界或存储器编号错，3 = AXI 读响应错，4 = AXI 写响应错；引擎号 [15:12]：0 = LD，1 = ST，2 = EX，3 = VE |
 | 结果部分错误 | 数据布局 / 缓存 / DDR 顺序 | 是否 flush / invalidate；同一段 DDR 先 ST 后 LD 是否加了 `mat_fence`；A / B 的 INTERLEAVE 布局 |
