@@ -163,6 +163,9 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
 - [Hardware learning path](docs/hardware_learning_path.md) - a staged guide
   from digital design fundamentals to the accelerator RTL, verification,
   timing closure and board measurements, with labs on this repository
+- [Execution walkthrough (中文)](docs/execution_walkthrough.md) - one GEMM
+  traced from `m4_demo.py` through the driver, firmware, PCPI, scheduler and
+  engines down to BRAM/DDR, with a per-layer debugging checklist
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M4)
 - [Custom instruction encoding](docs/custom_isa_encoding.md) and
