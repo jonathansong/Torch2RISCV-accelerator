@@ -167,13 +167,15 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
 - [Execution walkthrough (中文)](docs/execution_walkthrough.md) - one GEMM
   traced from `m4_demo.py` through the driver, firmware, PCPI, scheduler and
   engines down to BRAM/DDR, with a per-layer debugging checklist
-- [Plan: performance counters and descriptor DMA (中文)](docs/perf_counters_and_desc_dma_plan.md) -
-  proposed next hardware steps: counter definitions, descriptor format,
-  RTL/software changes, verification and milestones (not implemented yet)
+- [Performance counters and descriptor DMA (中文)](docs/perf_counters_and_desc_dma_plan.md) -
+  plan, implementation record and board results of the two M5 additions:
+  counter definitions, descriptor format, verification, milestones
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
-  `rtl/sysarray` architecture, ISA and board results (M1-M4)
+  `rtl/sysarray` architecture, ISA and board results (M1-M5)
 - [Custom instruction encoding](docs/custom_isa_encoding.md) and
-  [memory model](docs/memory_model.md) - Phase 4 ISA and address maps
+  [memory model](docs/memory_model.md) - the Phase 4 instructions with an
+  overview of all three instruction groups; address maps, coherency, DDR
+  ordering and alignment rules
 
 ---
 

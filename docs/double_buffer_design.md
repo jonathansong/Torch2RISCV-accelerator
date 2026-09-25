@@ -70,7 +70,22 @@ not DDR latency or the CPU, the limit.
 - All four engines run concurrently on different banks; the scoreboard only
   serializes commands that touch the same bank from different engines.
 - Legacy paths (CSRs, funct7 = 0 instructions) become a small sequencer that
-  issues LD/EX/ST commands (§8.4).
+  issues LD/EX/ST commands (§8.5).
+
+*(As built, M1–M5.)* One AXI port (`NPORTS = 1`, HP2) — §10.1/§10.3 showed
+more ports are not needed — and two additions around the scheduler:
+
+```
+  PicoRV32 ──PCPI──► sa_pcpi ─────────────┐
+  DDR list ──(port 0 reads)──► sa_cmdfetch ┼─► dispatch queue ─► scoreboard ─► LD / ST / EX / VE
+  legacy sequencer (CSRs, funct7 = 0) ─────┘      (priority: legacy > list > PCPI)
+  sa_perf: 32 event counters fed by the scheduler, PCPI and the engines (§10.4)
+```
+
+- **Descriptor fetch unit** (`sa_cmdfetch.v`, §8.6): runs lists of 64-byte
+  commands the ARM built in DDR after one `mat_submit`; it shares port 0's
+  read channel with LD.
+- **Performance counters** (`sa_perf.v`, `mat_perf`, CSR mirror).
 
 ## 3. On-chip memories
 
@@ -768,10 +783,12 @@ regression, then the tested bitstream is committed under
 
 | | Scope | Acceptance |
 |---|---|---|
-| **M1** | D = 8: SPAD/ACC, LD/ST with one port (HP2), K-streaming EX, scoreboard, funct7 = 1 ISA, legacy sequencer, 8 KB program BRAM | NumPy-exact GEMMs (several shapes incl. non-square, K ≫ D) with double-buffered firmware; legacy tests pass; cycles measured |
-| **M2** *(redefined)* | DMA bandwidth self-test (§10.1); repeat `mat_exec` + strip-wide `mat_store`; 8 outstanding bursts per port | Measured HP efficiency; same tests incl. repeat commands; GEMM command overhead reduced on the board |
+| **M1** | D = 8: SPAD/ACC, LD/ST with one port (HP2), K-streaming EX, scoreboard, funct7 = 1 ISA, legacy sequencer, 8 KB program BRAM | NumPy-exact GEMMs (several shapes incl. non-square, K ≫ D) with double-buffered firmware; legacy tests pass; cycles measured *(done, board-verified)* |
+| **M2** *(redefined)* | DMA bandwidth self-test (§10.1); repeat `mat_exec` + strip-wide `mat_store`; 8 outstanding bursts per port | Measured HP efficiency; same tests incl. repeat commands; GEMM command overhead reduced on the board *(done, board-verified)* |
 | **M3** | Vector engine VL = D, funct7 = 2 | Fused GEMM + bias + ReLU + requant and standalone elementwise ops exact vs NumPy *(done, board-verified)* |
 | **M4** | D = 16 build (8 DSP columns, VL = 16); three HP ports with striping if the D = 16 measurements need them (§10.1) | All of the above at D = 16; resource/timing report *(done, board-verified; three ports not needed, §10.3)* |
+| **M4 + perf** | Performance counters (`sa_perf.v`, `mat_perf`); firmware schedule tuning | Counters checked against exact invariants on the board; measured cycle breakdown (§10.4) *(done, `bitstreams/m4p`)* |
+| **M5** | Descriptor DMA (`sa_cmdfetch.v`, `mat_submit`, ARM-built lists) | Same results as the PCPI path; front-end-bound work faster, nothing slower (§10.5) *(done, `bitstreams/m5`)* |
 
 ## 13. Verification
 
@@ -784,14 +801,31 @@ regression, then the tested bitstream is committed under
 - System: firmware on `picorv32_axi` against the full unit (as today).
 - Board: GEMM, fused and vector demos vs NumPy; DMA bandwidth self-test;
   Phase 3/4 demo scripts unchanged.
+- *(As built.)* Every testbench runs at D = 8 and 16 (`make test`,
+  `make test16`). Performance counters: exact invariants (tiles, useful
+  steps × D² = M·N·K, bytes stored, commands) in `tb_sa_unit`, `tb_system`
+  and on the board (`m4_perf.py`). Descriptor lists: a GEMM and the random
+  stream as lists against the same reference model, directed tests
+  (ordering, FENCE, JUMP, END, count, relocation, errors), and a
+  co-simulation in which lists built by the Python driver run on the RTL
+  (`firmware/desc_run/gen_desc_cases.py`). Mutation checks confirm the
+  tests catch deliberately broken scoreboard, VE, counter and fetch logic
+  (`rtl/sysarray/README.md`).
 
 ## 14. Risks and open points
 
-- **HP efficiency and DDR sharing**: the model assumes 75 % per port;
-  Linux traffic on the shared 16-bit DDR3 lowers it. M2 measures it.
+- **HP efficiency and DDR sharing**: the model assumed 75 % per port; M2
+  measured 99 % (7.94 B/cycle) on an idle board. Heavy Linux traffic on
+  the shared 16-bit DDR3 would lower it.
 - **BRAM at 93 %**: placement is fine at 50 MHz, but debugging with an ILA
   needs a reduced-memory build.
-- **Complexity**: the scoreboard and multi-port DMA are the risky parts;
-  both get randomized tests against reference models before integration.
+- **LUT at 92 %** (M5 build): further logic needs `DSP_COLS = 10` (≈ 5k LUT
+  freed, 216 of 220 DSP) or a slimmer VE.
+- **Complexity**: the scoreboard and multi-port DMA were the risky parts;
+  both got randomized tests against reference models before integration
+  (the multi-port DMA is tested at `NPORTS = 3` but not built).
+- **DDR is not tracked**: software must fence between a store and a later
+  load of the same bytes (`mat_fence`, FENCE descriptor); a future compiler
+  has to emit these.
 - **Legacy sequencer** reserves one tile slot per memory; mixing legacy and
   new commands is allowed but documented as sequential (it fences first).

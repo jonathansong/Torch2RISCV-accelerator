@@ -24,6 +24,7 @@
 7. [各层之间的数据契约](#7-各层之间的数据契约)
 8. [按层调试清单](#8-按层调试清单)
 9. [亲眼看这个过程](#9-亲眼看这个过程)
+10. [另一条路径：描述符列表](#10-另一条路径描述符列表)
 
 ---
 
@@ -103,7 +104,9 @@ EMIO GPIO[0]（RISC-V 复位）。数据全部经 DDR 交换。
 3. 读取 mailbox 参数，**在计时前**算好所有和 D 有关的除法：
    `nt = N/16 = 16`（每个条带的 C tile 数）、`kt = K/16 = 16`、各 bank 的大小。
    PicoRV32 的除法指令要几十个周期，放进循环会拖慢命令发射。
-4. `mat_reset()` 清除可能残留的粘滞错误；`t0 = rdcycle`。
+4. `mat_reset()` 清除可能残留的粘滞错误。
+5. `sa_perf_begin()`：CAPS bit 20 为 1（硬件带性能计数器）时，用 `mat_perf` 清零并启动计数器；
+   旧硬件上什么都不做（否则 `mat_perf` 会触发非法指令异常）。然后 `t0 = rdcycle`。
 
 ### 2.3 发射命令
 
@@ -134,9 +137,10 @@ mat_fence(全部引擎)                      ← 唯一真正等待的地方
 
 ### 2.4 收尾
 
-`st = mat_fence(0)`（等全部命令执行完）→ `t1 = rdcycle` → 写
-`TOTAL_CYCLES`、`JOBS_DONE`、`EXT_STATUS`、`ERRORS`，最后写
-`STATUS_DONE`。
+`st = mat_fence(0)`（等全部命令执行完）→ `t1 = rdcycle` →
+`sa_perf_end()`：冻结计数器，把 32 个计数值复制到程序 BRAM 的计数器区（0x1E00），个数写进
+`MBOX_PERF_COUNT` → 写 `TOTAL_CYCLES`、`JOBS_DONE`、`EXT_STATUS`、`ERRORS`，最后写
+`STATUS_DONE`。驱动读回计数器，放进 `stats["perf"]`。
 
 ### 2.5 指令长什么样
 
@@ -325,14 +329,19 @@ tn+1     valid=0，执行下一条            S_DONE → S_IDLE
 4. Python 轮询到 DONE → `invalidate()` → 读出 C → 与 NumPy 比对：
    **PASS，82,813 周期，202.6 MAC/cycle**（`m4_sched_tune.py` 板上实测）。
 
-### 周期大致花在哪（估算，未 profile）
+### 周期花在哪（性能计数器实测，`notebooks/m4_perf.py`）
 
-| 部分 | 周期 |
-|---|---|
-| 阵列计算：16 条带 × 16 tile × 287 | ≈ 73.5k |
-| 开头的 B 左半加载（32 KB ÷ 7.9 B/cycle），无法重叠 | ≈ 4.1k |
-| 每个条带的流水填充 / 排空和剩余等待 | 其余 ≈ 5k |
-| A 加载、C 写回 | 基本藏在计算后面 |
+| 部分 | 占计数窗口 | 含义 |
+|---|---|---|
+| EX 有效计算（`EX_USEFUL`） | **79.0%** | 阵列在读入新的 K 数据：16 × 16 tile × 256 步 = 65,536 周期 |
+| EX 填充（`EX_STEP − EX_USEFUL`） | 9.3% | 每个 tile 的 2(D−1) = 30 步错位，结构性开销 |
+| 队首 EX 被冲突卡住（`HAZ_EX`） | 8.8% | EX 在等 bank（B 右半加载、上一轮 ST 读完 ACC 等） |
+| 前端饥饿 + 完全空闲 | 4.3% + 0.4% | 队首没有命令：固件发射跟不上的时间，很少 |
+| CPU 卡在满队列上（`PCPI_QFULL`） | 61.3% | 固件远远领先硬件，前端不是瓶颈 |
+| LD / ST 忙 | 20.1% / 39.8% | 忙时 7.85 / 7.93 B/cycle，接近端口上限 |
+
+“队首被 ST 卡住”占 86% 是预取顺序下的正常状态：ST(i) 在队首等 EX(i) 算完，后面的命令已经在引擎里执行。
+详细分析见设计文档 §10.4。
 
 ---
 
@@ -347,6 +356,8 @@ tn+1     valid=0，执行下一条            S_DONE → S_IDLE
 | 调度器 ↔ 引擎 | `cmd_valid/ready` + 命令字段；`done`（+ `err`） | `sa_unit.v` 的例化连线 |
 | 引擎 ↔ 存储器 | 本地字地址、字节写使能；bank = 地址高半部分 | `sa_bankmem.v` |
 | 引擎 ↔ DDR | AXI4 INCR 突发，≤ 16 拍，不跨 4 KB，经 AXI3 转换到 HP2 | `sa_ld.v` / `sa_st.v`，`pico_bit.tcl` |
+| 固件 ↔ ARM（计数器） | 程序 BRAM 0x1E00–0x1EFF 的计数器区，个数在 `MBOX_PERF_COUNT`（0x8C） | `mailbox.h`，`sa_defs.vh` 的 `PC_*` |
+| ARM ↔ 取指单元（列表） | 64 字节描述符，64 字节对齐，放在 DDR；地址、条数、BASE0–3 经 mailbox（0x90–0xA4）传给 `desc_run` 固件 | 设计文档 §8.6，驱动 `DescList` |
 
 ---
 
@@ -360,7 +371,10 @@ tn+1     valid=0，执行下一条            S_DONE → S_IDLE
 | 结果部分错误 | 数据布局 / 缓存 / DDR 顺序 | 是否 flush / invalidate；同一段 DDR 先 ST 后 LD 是否加了 `mat_fence`；A / B 的 INTERLEAVE 布局 |
 | 结果全错但仿真正确 | 构建配置 | `.hwh` 里 `sa_unit` 的 D、SPAD_WORDS、ACC_WORDS 是否一致；固件读到的 CAPS |
 | 性能比预期低 | 固件命令顺序 | 顺序派发下，一条命令在等什么（见 §4.3）；`GEMM_FLAGS` 对比各调度方案 |
-| CPU 报非法指令 | 指令编码 | funct7 / funct3 是否在 `sa_pcpi` 的 `ours` 范围内 |
+| CPU 报非法指令 | 指令编码 | funct7 / funct3 是否在 `sa_pcpi` 的 `ours` 范围内；`mat_perf` / `mat_submit` 只在 CAPS bit 20 / 21 为 1 的 overlay 上可用 |
+| 不知道时间花在哪 | 性能计数器 | `stats["perf"]` + `perf_breakdown()`，或 `m4_perf.py`：阵列有效率、哪个引擎在等冲突、前端是否饥饿、DMA 忙时带宽 |
+| 列表执行出错（引擎号 4） | 描述符 | 错误码 1 = opcode 非法 / header 保留位非零 / 地址没对齐，3 = 取指时读错误；CSR 0xCC 是出错描述符的序号，0xC0 / 0xD0 是最后译码的地址和条数 |
+| 列表里的 LD 读到旧数据 | DDR 顺序 | 同一段 DDR 先 ST 后 LD，中间要有 FENCE 描述符或给 LD 置 FENCE_BEFORE（硬件不跟踪 DDR） |
 
 ---
 
@@ -387,3 +401,32 @@ xsim tb_dbg -gui
 
 **单独看一个引擎**：`rtl/sysarray` 里 `make sim TB=tb_sa_ex GEN=D=16`
 （或 `tb_sa_dma`、`tb_sa_ve`），方法同上，只是在对应的 build 目录里 elaborate。
+
+---
+
+## 10. 另一条路径：描述符列表
+
+同一个 GEMM 也可以不由 PicoRV32 逐条发射，而是由 ARM 建一张描述符列表，
+PicoRV32 只执行一条 `mat_submit`（M5，设计文档 §8.6）。从调度器开始，后面的路径和第 4–6 节完全相同；
+不同的是命令从哪里来：
+
+1. **Python**：`mm.gemm_list(a, b)` 调用 `build_gemm_list()`，按和 `gemm_fw.c` 完全相同的调度
+   （常驻 B、B 拆分、A 预取）生成 `DescList`：每条命令一个 64 字节描述符，自带全部配置，
+   末尾是 END。列表写进 `allocate()` 的 DDR 缓冲区并 `flush()`。
+2. **固件**：`firmware/desc_run/desc_run_fw.c` 从 mailbox 读列表地址、条数和 BASE0–3，
+   用 `mat_cfg` 设好 BASE，然后 `mat_submit(list, count)`（立即返回）和 `mat_fence`。
+3. **PCPI**：funct3 = 6 发出一个启动脉冲给取指单元；列表执行期间，PCPI 上新的排队命令
+   会被 `pcpi_wait` 挡住，`mat_fence` 也要等列表结束，程序顺序因此保持不变。
+4. **取指单元**（`rtl/sysarray/sa_cmdfetch.v`）：从列表地址开始，每条描述符一个 8 拍突发，
+   最多 4 个在途，数据进 32 × 64 位的 LUTRAM FIFO；凑满 8 个字后译码：
+   - LD / ST / EX / VE：用和 PCPI 相同的 `pkt_*` 函数打包成 261 位命令包，送进调度器输入
+     （优先级：legacy > 取指单元 > PCPI）；
+   - FENCE：等调度器队列空、掩码内的引擎空闲；
+   - JUMP：换到新地址继续，先丢掉已经在路上的预取数据（DRAIN）；
+   - END：记录状态值，列表结束。
+5. **读端口**：取指单元和 LD 引擎共用端口 0 的读通道。AR 请求被授权后锁定到握手完成；
+   一个按 AR 顺序记录“这个突发属于谁”的归属 FIFO 把返回的 R 数据拍分给 LD 或取指单元。
+
+实测（`notebooks/m5_desc_demo.py`，设计文档 §10.5）：本来受前端限制的小运算明显变快
+（16³ 4.19×、64³ 1.23×、int8 64³ 1.52×、广播向量运算 2.60×），256³ 这类大 GEMM 不变，
+因为它们的前端本来就跑在硬件前面。

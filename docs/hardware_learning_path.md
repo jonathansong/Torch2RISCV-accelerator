@@ -9,8 +9,11 @@ board scripts, and questions to check yourself.
 
 The project history is itself a curriculum: Phase 2 → Phase 4 built a
 simple 8×8 unit, M1 → M4 rebuilt it as a double-buffered 16×16 accelerator
-with a vector engine. Reading the commits in order (`git log --reverse`)
-shows each idea arriving on its own.
+with a vector engine, and M5 made it observable (performance counters) and
+added a descriptor DMA once the counters showed where time was lost.
+Reading the commits in order (`git log --reverse`) shows each idea arriving
+on its own. To follow one operation through every layer first, read
+[`execution_walkthrough.md`](execution_walkthrough.md) (Chinese).
 
 ---
 
@@ -41,8 +44,10 @@ shows each idea arriving on its own.
    │ allocate() DDR buffers                            │ firmware: firmware/{gemm,vector,...}
    │ writes firmware + mailbox ── AXI GP ──► BRAM ────►│ custom-0 instructions (.insn)
    │ GPIO EMIO[0] = RISC-V reset                        ▼ PCPI
-   │                                                 sa_pcpi ─► sa_sched (queue, decode, bank scoreboard)
-   ▼                                                               │ in-order dispatch to 4 engines
+   │ builds descriptor lists in DDR              sa_pcpi ─────┐
+   │  (fetched after mat_submit)                 sa_cmdfetch ─┴► sa_sched (queue, decode, scoreboard)
+   │                                                               │ in-order dispatch to 4 engines
+   ▼                                                               │   (sa_perf counts events everywhere)
  DDR3 (512 MB) ◄── HP0 ── PicoRV32 data (DDR access)               ├─► LD  (DDR → SPAD/ACC)  ┐
       ▲                                                            ├─► ST  (SPAD/ACC → DDR)  ├─ AXI4 ─► HP2
       └────────── HP2 ◄── axi_protocol_converter ◄─────────────────┤                         ┘
@@ -51,9 +56,10 @@ shows each idea arriving on its own.
                                                      SPAD_A, SPAD_B (128 KB each), ACC (256 KB): 2 banks each
 ```
 
-Numbers to keep in mind (M4 build, board-measured): D = 16, 256 MAC/cycle
-peak at 50 MHz, 202.6 MAC/cycle on a 256³ GEMM, one HP port at 7.9 B/cycle
-(99 % of 8 B/cycle), 128 of 140 BRAM36 in the accelerator, 89.5 % of LUTs.
+Numbers to keep in mind (M5 build, board-measured): D = 16, 256 MAC/cycle
+peak at 50 MHz, 202.6 MAC/cycle on a 256³ GEMM (the array does useful work
+79 % of the time), one HP port at 7.9 B/cycle (99 % of 8 B/cycle), 128 of
+140 BRAM36 in the accelerator, 92 % of LUTs.
 
 ---
 
@@ -161,13 +167,20 @@ custom instructions, and how bare-metal firmware is built and loaded.
 1. `docs/custom_isa_encoding.md` - the Phase 4 instructions (funct7 = 0).
 2. `firmware/include/sysarray_intrinsics.h` - every instruction as a C
    inline function (`.insn r 0x0B, funct3, funct7, rd, rs1, rs2`): funct7 = 0
-   legacy, 1 matrix/DMA, 2 vector; `sa_init()` reads D from CAPS.
+   legacy, 1 matrix/DMA (incl. `mat_perf`, `mat_submit`), 2 vector;
+   `sa_init()` reads D and the capability bits from CAPS (`sa_has_perf()`,
+   `sa_has_desc()`: firmware must not issue an instruction the loaded
+   overlay does not answer, or the core traps).
 3. `firmware/common/start.S`, `firmware/common/link.ld`, `firmware/common.mk`
-   - reset vector, stack, 8 KB BRAM layout, clang flags (`rv32imc`).
-4. `firmware/include/mailbox.h` - the ARM ↔ RISC-V contract in the last
-   256 bytes of the program BRAM.
+   - reset vector, stack, BRAM layout (code + data + stack below 0x1E00),
+   clang flags (`rv32imc`).
+4. `firmware/include/mailbox.h` - the ARM ↔ RISC-V contract: the mailbox in
+   the last 256 bytes of the program BRAM and the performance counter area
+   below it (0x1E00).
 5. `rtl/matmul/matmul_pcpi.v`, then `rtl/sysarray/sa_pcpi.v` - the PCPI
-   decoders (Phase 4, then M1-M4).
+   decoders (Phase 4, then M1-M5).
+6. `docs/execution_walkthrough.md` - one GEMM traced from Python through the
+   firmware, PCPI and scheduler to the engines (Chinese).
 
 **Lab.**
 1. `cd firmware/gemm && make` then
@@ -311,7 +324,11 @@ memory ids, keys, error codes) open next to it.
 
 ### 5.5 PCPI front end - `sa_pcpi.v`
 - funct7 = 0/1/2 decode; `mat_cfg` / `vec_cfg` registers captured into the
-  command at queue time; `wait` held while the queue is full.
+  command at queue time (the `pkt_*` functions of `sa_defs.vh`); `wait` held
+  while the queue is full.
+- `mat_perf` (funct3 = 5) reads / controls the counters; `mat_submit`
+  (funct3 = 6) starts a descriptor list, after which queued PCPI commands
+  wait until the list is done (program order).
 
 ### 5.6 Vector engine - `sa_ve.v`
 - Read unit (src1 words, then src2 words; broadcast read once), four
@@ -331,15 +348,42 @@ memory ids, keys, error codes) open next to it.
 - `L_ERRW`: wait for idle engines before clearing a job's error (M4 fix).
 
 ### 5.8 Top level - `sa_unit.v`
-- Parameters (`D`, `DSP_COLS`, `NPORTS`, `SPAD_WORDS`, `ACC_WORDS`), the
-  three AXI master ports (NPORTS used), `X_INTERFACE_INFO` attributes that
-  make Vivado see proper AXI interfaces, memory port wiring per engine.
+- Parameters (`D`, `DSP_COLS`, `NPORTS`, `SPAD_WORDS`, `ACC_WORDS`, `PERF`),
+  the three AXI master ports (NPORTS used), `X_INTERFACE_INFO` attributes
+  that make Vivado see proper AXI interfaces, memory port wiring per engine.
+- Command-source priority into the scheduler: legacy > descriptor fetch >
+  PCPI. Port 0's read channel is shared by LD and the fetch unit: the AR
+  grant is locked until its handshake, and an owner FIFO in AR order routes
+  the returning beats (no AXI IDs, so bursts return in order).
+
+### 5.9 Performance counters - `sa_perf.v`
+- 32 counters fed by `perf_ev` ports of the scheduler, PCPI and engines -
+  existing signals only, registered once so no engine path gets longer.
+  Two combinational read ports (PCPI, CSR mirror 0x40–0xBC), control from
+  either; `PERF = 0` removes the block.
+- Read the definitions in
+  [`perf_counters_and_desc_dma_plan.md`](perf_counters_and_desc_dma_plan.md)
+  §1.2: which signal means "the head is blocked by a hazard", "the front end
+  starves", "the array does useful work".
+- *Check:* why does `EX_USEFUL × D²` have to equal M·N·K exactly, and why is
+  that a better test than "the numbers look plausible"?
+
+### 5.10 Descriptor fetch unit - `sa_cmdfetch.v`
+- `mat_submit(list, count)`: 64-byte descriptors fetched with 8-beat bursts
+  (4 in flight, LUTRAM FIFO), assembled, decoded with the same `pkt_*`
+  functions as PCPI; FENCE / JUMP / END handled inside; DRAIN drops bursts
+  still in flight after JUMP, END or an error.
+- Format and semantics: `docs/double_buffer_design.md` §8.6.
+- *Check:* why must JUMP drain the prefetched bursts instead of just
+  changing the fetch address? Why is opcode 0x00 invalid on purpose?
 
 **Lab (Stage 5).** Pick one change and carry it through simulation:
 - make `sa_ld` issue at most 4 outstanding bursts (`QD`) and measure
   `tb_sa_dma` burst counts / cycles;
 - add a new VE op (e.g. absolute value) end to end: `sa_defs.vh` op code,
-  `sa_ve.v` stage 1, `sa_sched.v` validation, `tb_sa_ve.v` reference model.
+  `sa_ve.v` stage 1, `sa_sched.v` validation, `tb_sa_ve.v` reference model;
+- add a performance counter for "EX idle while its next command waits in the
+  engine queue" and an invariant that checks it.
 
 ---
 
@@ -359,8 +403,9 @@ models, randomized streams, and tests that are proven to catch bugs.
 | `tb_sa_ex.v` | behavioral golden model per command; commands issued back to back |
 | `tb_sa_dma.v` | AXI memory model with random stalls, SLVERR injection and protocol checks (length, 4 KB, WLAST); byte-level reference incl. neighbours |
 | `tb_sa_ve.v` | reference model of every op/type; per-command check, then 60 back-to-back commands and a full compare |
-| `tb_sa_unit.v` | the whole unit: NumPy golden vectors (legacy), GEMM golden model, **random command stream vs a sequential reference** (checks the scoreboard), error paths |
-| `firmware/sim/tb_system.v` | real firmware on PicoRV32 + the unit + DDR model (`GEMM_TEST`, `VEC_TEST`, `BW_TEST`) |
+| `tb_sa_unit.v` | the whole unit: NumPy golden vectors (legacy), GEMM golden model, **random command stream vs a sequential reference** (checks the scoreboard), error paths; performance counters against **exact invariants**; the same GEMM and random stream **as descriptor lists** (same reference model) plus directed ordering / FENCE / JUMP / error tests |
+| `firmware/sim/tb_system.v` | real firmware on PicoRV32 + the unit + DDR model (`GEMM_TEST`, `VEC_TEST`, `BW_TEST`, `DESC_TEST`); counters read back and checked |
+| `firmware/desc_run/gen_desc_cases.py` | **co-simulation**: lists built by the Python driver (`DescList`, `build_gemm_list`) are executed by the RTL and compared byte by byte with NumPy - the driver's encoding is verified before it reaches the board |
 
 **Lab.**
 1. `cd rtl/sysarray && make test PYTHON=<python with numpy>` and
@@ -381,6 +426,10 @@ models, randomized streams, and tests that are proven to catch bugs.
 - The `Makefile` filters simulator output to lines starting with `TB` - a
   `$display("DBG ...")` is invisible there; run `xsim tb -R` in the build
   directory to see everything.
+- Simulation timing is not board timing: the testbench memories answer
+  faster (instruction fetch) or slower (the DDR model) than the board. A
+  check derived from simulated cycle counts (the counter window tolerance)
+  failed only on the board - check invariants, not simulated timings.
 
 **Check yourself.**
 - Why does the random stream compare *final* memory contents against a
@@ -411,6 +460,9 @@ fix it by pipelining or restructuring; trade DSPs, LUTs and BRAMs.
      VE; the board build sits at 89.5 % LUT, 84 % DSP, 93 % BRAM.
    - M4: the block-design module reference froze `SPAD_WORDS`/`ACC_WORDS`
      at their D = 8 defaults → 258 RAMB36 → the build sets them with D.
+   - M5: the counters cost +0.65k LUT, the descriptor fetch unit +0.66k
+     (its FIFO is LUTRAM, 44 LUTs, so the last free BRAMs stay free); the
+     build is at 92 % LUT - the next feature needs `DSP_COLS = 10`.
 3. `docs/double_buffer_design.md` §11 - estimates vs measured resources.
 
 **Lab.**
@@ -436,7 +488,10 @@ schedule in firmware matters as much as the RTL.
 **In this repo.**
 1. `driver/pynq_matmul.py` - `MatmulOverlay`: loading firmware into the
    BRAM, the mailbox protocol (`_run`), `gemm()`, `vector()`, `bandwidth()`,
-   NumPy golden models (`golden`, `vector_golden`, `qgemm_golden`).
+   NumPy golden models (`golden`, `vector_golden`, `qgemm_golden`); counters
+   in `stats["perf"]` with `perf_breakdown()`; descriptor lists: `DescList`,
+   `build_gemm_list` / `build_vector_list` (the firmware schedules as data),
+   `run_list`, `gemm_list`, `vector_list`.
 2. `firmware/gemm/gemm_fw.c` - the GEMM schedule: resident B, A strips
    alternating banks, one repeat `mat_exec` per strip, the int8 epilogue on
    the VE, **A prefetch** and **B split** (M4 tuning; `MBOX_GEMM_FLAGS`).
@@ -444,17 +499,25 @@ schedule in firmware matters as much as the RTL.
    memories in chunks that alternate banks.
 4. `firmware/bwtest/bwtest_fw.c` + `notebooks/m2_bw_test.py` - measuring the
    HP port.
-5. `notebooks/m4_demo.py`, `notebooks/m4_sched_tune.py`, and each
+5. `firmware/desc_run/desc_run_fw.c` - the whole firmware side of a
+   descriptor list: load the bases, one `mat_submit`, one `mat_fence`.
+6. `notebooks/m4_demo.py`, `m4_sched_tune.py`, `m4_perf.py` (cycle
+   breakdown), `m5_desc_demo.py` (PCPI vs list), and each
    `RISCV-on-PYNQ-Z1/bitstreams/<milestone>/README.md` for board results.
 
 **Lab.**
-1. Copy `build/deploy_m4/*` to the board and run `m4_demo.py` (command line
-   in its docstring). Compare with `bitstreams/m4/README.md`.
+1. Copy `build/deploy_m5/*` (or `bitstreams/m5/` + the firmware and driver)
+   to the board and run `m4_demo.py` and `m4_perf.py` (command lines in
+   their docstrings). Compare with `bitstreams/m5/README.md`.
 2. Run `m4_sched_tune.py` and explain each column with the two schedule
    changes described in `gemm_fw.c`.
 3. Change one schedule decision in `gemm_fw.c` (e.g. the B-split threshold
    or the order of the epilogue store), rebuild with `make`, verify with
    `make sim SIM_D=16`, then measure on the board. No new bitstream needed.
+4. Build a `DescList` by hand for an operation the firmware does not have
+   (e.g. two chained vector ops with a FENCE between a store and a reload),
+   run it with `run_list`, and check it against NumPy. Then reuse it on new
+   buffers through the relocation bases.
 
 **Check yourself.**
 - Why does in-order dispatch make the *order in which firmware queues
@@ -462,6 +525,7 @@ schedule in firmware matters as much as the RTL.
 - Why did splitting B help 256³ but hurt 64³?
 - `m4_demo.py` shows 32×256×64 at 17 % of peak. Which resource bounds it,
   and why does the int8 epilogue help there more than extra HP ports would?
+- Why are descriptor lists built by the ARM and not by PicoRV32?
 
 ---
 
@@ -472,42 +536,56 @@ between prediction and measurement.
 
 **Material.** `docs/double_buffer_design.md` §10 (model), §10.1 (measured
 bandwidth), §10.2 (M2 results), §10.3 (M4 results and the three-port
-decision, schedule tuning table).
+decision, schedule tuning table), §10.4 (the **measured** cycle breakdown
+from the counters), §10.5 (descriptor lists vs PCPI).
 
 **Exercises.**
 1. Build a spreadsheet roofline for this board: compute ceiling D² MAC/cycle
    (D = 8, 16), bandwidth ceilings 7.9 B/cycle (one port, one direction) and
    15.8 B/cycle (LD + ST together). Place the measured GEMMs on it.
-2. For 256³ at D = 16, account for the 82.8k cycles after tuning: array
-   time, the non-overlapped part of the B load, per-strip fill/drain,
-   command issue. Which remaining item would a finer-grained scoreboard
-   remove?
+2. For 256³ at D = 16, estimate how the 82.8k cycles split into array
+   time, skew fill, waiting for banks and front end - then compare with the
+   counters in §10.4 (useful 79 %, fill 9.3 %, EX blocked 8.8 %). Which
+   remaining item would a finer-grained scoreboard remove?
 3. Estimate what three HP ports would give for 256³ and for 32×256×64 and
    compare with the decision in §10.3.
+4. The counters predicted ≈ 1.6× for 64³ with descriptor lists; the board
+   gave 1.23× (§10.5). With a list the head is still empty 24 % of the
+   time: work out the fetch unit's minimum cycles per descriptor and what a
+   deeper prefetch or a faster decoder would change.
 
 ---
 
 ## Stage 10 - Where to go next (capstone ideas)
 
-Each is a self-contained project on top of M4; they are listed roughly by
-difficulty.
+Each is a self-contained project on top of M5; they are listed roughly by
+difficulty. (Already done in this repository, as worked examples: the
+performance counters and the descriptor DMA - see
+[`perf_counters_and_desc_dma_plan.md`](perf_counters_and_desc_dma_plan.md)
+for how such a project is planned, verified and measured.)
 
-1. **Board stress test**: port the `tb_sa_unit` random command stream to
-   firmware + a Python reference model and run millions of commands on the
+1. **Board stress test**: run the random command stream as descriptor lists
+   (`DescList`) with a Python reference model - millions of commands on the
    board.
-2. **Profile the int8 epilogue** (≈ 8 % at 256³): cycle counters per engine
-   (busy/idle/stalled on hazard) exposed through a CSR.
-3. **Finer-grained scoreboard**: track address ranges (or sub-banks)
+2. **Fix the int8 epilogue** (≈ 10 % at 256³; the counters show the VE
+   command waiting at the head 80 % of the time): overlap strip i's VE with
+   strip i+1's EX.
+3. **Faster descriptor fetch**: decode while the next descriptor arrives,
+   deeper prefetch - close the gap between 1.23× and the ≈ 1.6× the counters
+   predicted for 64³.
+4. **Event trace buffer**: log dispatch / done events with timestamps into
+   a BRAM FIFO and render an engine timeline (Perfetto).
+5. **ARM direct submission**: a doorbell register on the AXI GP port so the
+   ARM submits lists without PicoRV32 (block design change).
+6. **Finer-grained scoreboard**: track address ranges (or sub-banks)
    instead of whole banks; removes the need for the B split.
-4. **DDR hazard tracking** in hardware so software needs fewer fences.
-5. **10 DSP columns** to free LUTs, then spend them (e.g. a wider VE).
-6. **Three HP ports** with burst striping (the RTL already has `NPORTS`)
-   and measure small-K shapes and standalone vector ops.
-7. **A weight-stationary variant** of the array and a comparison on
+7. **DDR hazard tracking** in hardware so software needs fewer fences.
+8. **10 DSP columns** to free LUTs, then spend them (e.g. a wider VE).
+9. **A weight-stationary variant** of the array and a comparison on
    convolution-shaped GEMMs.
-8. **Phase 5 hand-off**: read `firmware/include/sysarray_intrinsics.h` as
-   the target of the MLIR lowering - which constraints (alignment, D
-   multiples, fences, reserved slot) must the compiler guarantee?
+10. **Phase 5 hand-off**: the MLIR lowering can emit descriptor lists (data)
+    instead of `.insn` code - which constraints (alignment, D multiples,
+    fences, reserved slot, list format) must the compiler guarantee?
 
 ---
 
@@ -526,6 +604,11 @@ difficulty.
 | Next legacy job fails after an AXI error (D = 16) | error cleared while another engine of the job was still running | `L_ERRW` waits for idle engines (`sa_legacy.v`, M4) |
 | D = 16 build needs 258 RAMB36 | module reference froze derived parameters at D = 8 | set `SPAD_WORDS`/`ACC_WORDS` with `D` (`pico_bit.tcl`, `-sa_d`) |
 | `make` warns "overriding recipe" | inline comment left trailing spaces in a variable | comments on their own line (`firmware/common.mk`) |
+| `xelab` runs for minutes and takes 13 GB | two generics passed as one `-generic_top "NP=1 D=16"` | one `-generic_top` per generic (`rtl/sysarray/Makefile`) |
+| Firmware slower after reading D at run time | divisions by the run-time D inside the strip loop (PicoRV32 `div`) | hoist them before the timed region (`gemm_fw.c`) |
+| Counter check passed in simulation, failed on the board | the counting window includes a few instructions, fetched much slower on the board | check a constant offset range, not a simulated tolerance (`m4_perf.py`) |
+| Read error of a descriptor fetch lost (found in review) | a non-blocking assignment before a `case` was overwritten by one inside it | apply the error after the `case` (`sa_cmdfetch.v`) |
+| `xvlog`: redeclaration of ANSI port | a new port had the name of an existing internal register | rename the port (`sa_legacy.v`) |
 
 ## Appendix B - Glossary
 
@@ -547,6 +630,12 @@ difficulty.
   RISC-V (`firmware/include/mailbox.h`).
 - **HP port** - Zynq high-performance AXI slave port into the DDR
   controller (64-bit, AXI3).
+- **Performance counter area** - the 256 bytes below the mailbox
+  (0x1E00) where firmware copies the counters after a measurement window.
+- **Front end starve** - the scheduler has no command at its head while an
+  engine is busy: the hardware waits for the next command.
+- **Descriptor list** - 64-byte commands in DDR built by the ARM and run by
+  the fetch unit after one `mat_submit`; FENCE / JUMP / END control it.
 
 ## Appendix C - References
 
@@ -569,7 +658,9 @@ Specifications and vendor guides
 - PYNQ documentation: pynq.readthedocs.io.
 
 In this repository
-- `docs/double_buffer_design.md` - the accelerator design (M1-M4).
+- `docs/double_buffer_design.md` - the accelerator design (M1-M5), incl. §8.6 descriptor lists and §10.4 / §10.5 measurements.
+- `docs/perf_counters_and_desc_dma_plan.md` - plan, verification and results of the counters and the descriptor DMA (Chinese).
+- `docs/execution_walkthrough.md` - one GEMM through every layer (Chinese).
 - `docs/custom_isa_encoding.md`, `docs/memory_model.md` - Phase 4 ISA and address maps.
 - `rtl/matmul/README.md`, `rtl/sysarray/README.md` - the two RTL units.
 - `RISCV-on-PYNQ-Z1/bitstreams/*/README.md` - board results per milestone.
