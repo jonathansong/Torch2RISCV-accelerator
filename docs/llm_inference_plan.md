@@ -828,6 +828,48 @@ KV cache 每层两块，都是行主序：位置 t 对应 `Smax × dim` 中的�
   - 覆盖 pos = 0、pos = D−1、pos = D，**只改参数块，列表不变**。
 - **板上** `l4_layer_demo.py`：stories15M 的第 0 层，多个 pos，与功能模拟器逐位一致。
 
+### 8.7 实现记录与结果
+
+**实现**（`llm/compile_model.py`，`ModelCompiler.build()`）
+- 一张静态列表：嵌入 → 各层 → final RMSNorm → 分类层（循环形式）→ END。
+- 每个 token 只改两样东西：
+  - ARM 的参数块 P0–P5：pos+1、pos_pad、pos_pad/D、scratch、pos_pad·hs、pos_pad·D；
+  - DDR 中的两字参数块（pos、token）。
+- 其余的地址由设备自己用 LDPARAM（读数 × mul）算出：KV 行偏移、RoPE 行偏移、嵌入行偏移；
+  嵌入的 scale 读进 PARAM，再通过动态槽替换 VE 的 A 字段。
+- 注意力按头用 LOOP_END 循环：P6 是 K/V 的字节偏移，P7 是 q/att 的字偏移。
+  - 每个头：K_h 读入后用 TRANSPOSE 得到 Kᵀ 条带；q_h 量化；EX 算分数；分数乘 s_q·a_k；
+  - softmax 用 VALID 掩码；(e·r)·127 量化成 int8 的 P 条带；V_h 用 INTERLEAVE 读入；EX 算 P·V；乘 a_v。
+- 与 §8.4 的差异：
+  - 各层**依次展开**，每层的常数（1/s_k、a_k 等）和权重偏移写成立即数，而不是按层 LOOP。
+    按层 LOOP 需要用 LDPARAM 把这些常数读进动态槽，留到 L5 决定；
+  - stories15M：列表 953 条描述符，每个 token 实际执行 2,477 条。
+- `B = −0.0`：y + (−0) = y 对所有 y 成立，保持零的符号，从而与 DeviceModel 逐位一致。
+- `DeviceModel.forward(n_layers=…)` 可以只跑前 N 层。
+
+**验证**
+- 主机（`llm/test_l4.py`），功能模拟器 vs `DeviceModel(sfu=SfuExact)`：
+  - tiny 模型（dim 32、2 个头、2 层、vocab 64、seq 16）：16 个位置在 D=8 和 16 时，logits 和 KV cache 都逐位一致；
+  - stories15M：12 个 token 逐位一致。
+- RTL 联合仿真（`desc_run`）：tiny 解码器，token 在 pos 0、D−1、D 时，logits 和 KV cache 都逐位一致（D=8 和 16）。
+  每个 token 约 221 条描述符、约 3 万周期。
+- 变异测试：去掉 SWAPNEG，或去掉 V 的 bstep 动态参数，都被检出。
+  去掉 softmax max 的 VALID 没有被检出：填充位置的分数正好是 0，而且 p 的 int8 量化吸收了舍入差异。
+  只有全部有效分数都很负时（exp 下溢，结果为 NaN）掩码才起作用，这个测试没有覆盖到。
+
+**板上结果**（`notebooks/llm/l4_decoder_demo.py`，`bitstreams/l2`，stories15M，D=8，50 MHz）
+- 16 个 token 的提示加 20 个贪心 token，**36 个 token 的 logits 都与 DeviceModel 逐位一致**；
+  前 2 个 token 的 logits 和 KV cache 也与板上运行的功能模拟器逐位一致。
+- 设备生成的文本：“Once upon a time, there was a little girl named Lily. She loved to play outside in the
+  sunshine. One day, she saw a big, red ball in”。
+- **每个 token 约 2.48M 周期 = 49.6 ms，即 20.2 tok/s**；加上提交和等待是 51.1 ms。
+  - pos 每增加 D 个位置，多约 18.5k 周期（注意力）；
+  - 对比：ARM 上 llama2.c 的 int8 版本，2 线程 22.9 tok/s。
+- 最后一个 token 的计数器：
+  - EX useful 76.1%，LD 忙碌 78.2%，VE active 15.4%；
+  - 队首阻塞中 VE 占 80.0%：后处理和注意力的 VE 步骤等着前面的 EX 完成；
+  - 每个 token 执行的命令：LD 634 条、ST 172 条、EX 340 条、VE 1,187 条。
+
 ---
 
 ## 9. L5：ARM 运行时与端到端生成
@@ -1058,6 +1100,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | `llm/sfu_tables.py`、`llm/gen_ve_fp_vectors.py` | L2 | SFU 表格，fp32 VE 测试向量 |
 | `llm/export_w8a8.py` | L3 | 模型导出 |
 | `llm/compile_layer.py`、`llm/test_l3.py` | L3、L4 | 手写列表生成器（LOOP、PARAM）及其主机测试 |
+| `llm/compile_model.py`、`llm/test_l4.py` | L4 | 整个解码器的静态列表（每个 token 只改参数）及其主机测试 |
 | `llm/runtime.py`、`llm/tokenizer.py` | L5 | Python 运行时 |
 | `firmware/rt/` | L1 | 常驻固件 `rt_fw` |
 | `firmware/include/mailbox.h`、`sysarray_intrinsics.h` | L1、L2 | 命令环字段、`mat_notify`、新的 `mat_cfg` / `vec_cfg` key |

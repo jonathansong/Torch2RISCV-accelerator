@@ -213,11 +213,13 @@ class DeviceModel:
         sw[0::2], sw[1::2] = -v[1::2], v[0::2]                       # SWAPNEG
         return ((v * c).astype(F) + (sw * s).astype(F)).astype(F)
 
-    def forward(self, token, pos):
+    def forward(self, token, pos, n_layers=None):
+        """Logits of token at pos; with n_layers, the residual stream x after
+        that many layers instead (the rest of the network is not run)."""
         c, sfu = self.cfg, self.sfu
         hs, rep = c.head_size, c.heads // c.kv_heads
         x = (self.emb_q[token].astype(F) * self.emb_s[token]).astype(F)
-        for l in range(c.layers):
+        for l in range(c.layers if n_layers is None else n_layers):
             s_k, s_v = self.kv_scales[l]
             xq, s_x = self.quant_act(self.rmsnorm(x, self.rms_att[l]))
             q = self.rope(self.linear(xq, s_x, self.lin["wq"][l]), pos)
@@ -247,6 +249,8 @@ class DeviceModel:
             sig = sfu.recip(F(1) + sfu.exp((h1 * F(-1)).astype(F)))
             hq, s_h = self.quant_act((((h1 * sig).astype(F)) * h3).astype(F))
             x = (x + self.linear(hq, s_h, self.lin["w2"][l])).astype(F)
+        if n_layers is not None:
+            return x
         xq, s_x = self.quant_act(self.rmsnorm(x, self.rms_final))
         return self.linear(xq, s_x, self.cls)
 

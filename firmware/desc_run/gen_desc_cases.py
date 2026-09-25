@@ -244,6 +244,54 @@ def build_cases(d, seed=11):
             [(W_OFF, pack_b(wq, d).tobytes()), (SW_OFF, sw.tobytes()), (XL_OFF, xl.tobytes())],
             YL_OFF, 4 * n_out, lin_ok)
 
+    # ---- L4: the whole tiny decoder (2 layers, 2 heads) as one static list, one token per case
+    # at pos 0, D - 1 and D (the KV cache of the earlier tokens comes from the functional
+    # simulator); a SETREG prologue stands in for the ARM's parameter block
+    import tempfile
+    import compile_model as CM
+    from export_w8a8 import W8A8, export
+    from ref_model import DeviceModel, SfuExact
+    from test_l4 import tiny_model
+    tcfg, tw, tkv = tiny_model()
+    with tempfile.TemporaryDirectory() as tmp:
+        export(tcfg, tw, tkv, d, os.path.join(tmp, "t.w8a8"))
+        tm = W8A8(os.path.join(tmp, "t.w8a8"))
+    M4, IO4, KV4 = 0x0, 0x20000, 0x30100                        # logits at IO4 + 0x10000, just before the KV cache
+    assert tm.raw.size <= IO4 and IO4 + CM.IO_LOGITS + 4 * tcfg.vocab <= KV4
+    mc = CM.ModelCompiler(tm, model=CM.Region(0, DDR_BASE + M4), io=CM.Region(1, DDR_BASE + IO4),
+                          kv=CM.Region(2, DDR_BASE + KV4))
+    body = mc.build()
+    dm = DeviceModel(tcfg, tw, tkv, d=d, sfu=SfuExact)
+    trng = np.random.default_rng(5)
+    toks = [int(t) for t in trng.integers(0, tcfg.vocab, tcfg.seq_len)]
+    sim = SaFuncSim(d, DDR_BASE, DDR_BYTES)
+    sim.ddr_write(DDR_BASE + M4, tm.raw.tobytes())
+    sim.ddr_write(DDR_BASE + LIST_OFF, body.array().tobytes())
+    want_pos = [0, d - 1, d] if d < tcfg.seq_len else [0, d - 1]
+    kvb = CM.kv_bytes(tcfg)
+    for pos in range(max(want_pos) + 1):
+        want = dm.forward(toks[pos], pos)
+        if pos in want_pos:
+            kv_state = sim.ddr_read(DDR_BASE + KV4, kvb).tobytes()
+            dl = pm.DescList()
+            prm = CM.token_params(pos, d, tcfg.head_size)
+            dl.setreg(*[(pm.DescList.REG_PARAM + i, prm[i]) for i in range(3)])
+            dl.setreg(*[(pm.DescList.REG_PARAM + i, prm[i]) for i in range(3, 6)])
+            dl.rows += body.rows
+
+            def l4_ok(out, want=want, pos=pos):
+                lg = np.frombuffer(out[:4 * tcfg.vocab], f32)
+                kc = np.frombuffer(out[KV4 - IO4 - CM.IO_LOGITS:], np.int8)
+                kc = kc.reshape(tcfg.layers, 2, tcfg.seq_len, tcfg.kv_dim)
+                return (lg.tobytes() == want.astype(f32).tobytes() and
+                        all(np.array_equal(kc[l, 0, :pos + 1], dm.kc[l, :pos + 1]) and
+                            np.array_equal(kc[l, 1, :pos + 1], dm.vc[l, :pos + 1]) for l in range(tcfg.layers)))
+            l2_case(f"L4 tiny decoder, 2 layers x 2 heads, token at pos {pos}: logits + KV cache", dl,
+                    [(M4, tm.raw.tobytes()), (KV4, kv_state), (IO4, CM.arg_block(pos, toks[pos]))],
+                    IO4 + CM.IO_LOGITS, KV4 + kvb - IO4 - CM.IO_LOGITS, l4_ok)
+        sim.ddr_write(DDR_BASE + IO4, CM.arg_block(pos, toks[pos]))
+        sim.run_list(DDR_BASE + LIST_OFF, params=CM.token_params(pos, d, tcfg.head_size))
+
     return cases
 
 

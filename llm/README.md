@@ -14,6 +14,8 @@ This directory implements level L0 of
 | `export_w8a8.py` | L3: exports a checkpoint as a `.w8a8` device file. Weights are int8 per channel, pre-packed as B tiles for D. The file also holds the KV parameter blocks and the RoPE tables. |
 | `compile_layer.py` | L3: builds descriptor lists for activation quantization and W8A8 linear layers. It uses chunked, double-buffered weights, BASE relocation, and LOOP_END + PARAM for long layers. |
 | `test_l3.py` | L3: runs real stories15M layer inputs through the lists in the functional simulator. The results must be bit-exact with `DeviceModel(sfu=SfuExact)` and close to fp32. `--save` writes the cases for the board test. |
+| `compile_model.py` | L4: emits the whole decoder as one static list. Per token only the PARAM block and a (pos, token) argument block change; the device derives its own addresses with LDPARAM. Attention runs as a head loop. |
+| `test_l4.py` | L4: runs the list token after token in the functional simulator. Logits and KV cache must be bit-exact with `DeviceModel(sfu=SfuExact)`. Models: a random tiny model and stories15M. `--save` writes the golden run for the board. |
 | `test_funcsim.py` | Checks the functional simulator against the RTL co-simulation cases, the driver's golden models, control flow and error codes. |
 
 All scripts run on the host and need only NumPy. The checkpoints and
@@ -74,3 +76,16 @@ On the board (`notebooks/llm/l3_linear_demo.py`, L2 bitstream):
 - The 9 linear layers tested are Wqkv, Wo, W13 and W2 of layers 0 and 5, plus the classifier. All are bit-exact with the functional simulator and with `DeviceModel`, and 0.37–3.27% from fp32.
 - The classifier (288 → 32000) takes 1.26 M cycles and moves 7.32 weight bytes per cycle, with LD busy 93.9% (the plan requires ≥ 90%).
 - See plan §7.3 for the per-layer table.
+
+## L4 results
+
+```sh
+python3 llm/test_l4.py --d 8                    # tiny random model, 16 positions
+python3 llm/test_l4.py --checkpoint build/llm_cache/stories15M.bin --kv build/llm_cache/kv/stories15M_kv_p99.99.npy --tokens 12 --save l4_golden.npz
+```
+
+On the board (`notebooks/llm/l4_decoder_demo.py`, L2 bitstream), stories15M runs entirely on the device:
+
+- All 36 tokens (16 prompt + 20 greedy) are bit-exact with `DeviceModel`, and the text matches.
+- Each token takes 2.48 M cycles: 49.6 ms, or 20.2 tok/s. For comparison, the ARM llama2.c int8 build runs at 22.9 tok/s with 2 threads.
+- See plan §8.7 for the details.
