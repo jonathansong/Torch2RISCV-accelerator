@@ -398,9 +398,76 @@ module tb_sa_unit;
 
     // direct views of the unit's memories (bank = upper half)
     reg [AW-1:0] cmp_h, cmp_r;
+    task hw_a_set(input integer w, input [8*D-1:0] v);
+        if (w < SW/2) dut.spad_a.bank[0].ram.ram_block[w] = v; else dut.spad_a.bank[1].ram.ram_block[w - SW/2] = v;
+    endtask
     function [8*D-1:0] hw_a(input integer w); hw_a = w < SW/2 ? dut.spad_a.bank[0].ram.ram_block[w] : dut.spad_a.bank[1].ram.ram_block[w - SW/2]; endfunction
     function [8*D-1:0] hw_b(input integer w); hw_b = w < SW/2 ? dut.spad_b.bank[0].ram.ram_block[w] : dut.spad_b.bank[1].ram.ram_block[w - SW/2]; endfunction
     function [AW-1:0]  hw_c(input integer w); hw_c = w < CW/2 ? dut.accm.bank[0].ram.ram_block[w]   : dut.accm.bank[1].ram.ram_block[w - CW/2];   endfunction
+
+    // ================================================ descriptor lists (D2)
+    // 64-byte descriptors (sa_defs.vh DESC_*, docs/double_buffer_design.md §8.6)
+    // written into the memory model; submitted with mat_submit (funct3 = 6)
+    localparam [31:0] DL = MEM_BASE + 32'h19000;           // list area 0x19000 .. 0x1FFFF
+    localparam [7:0]  DS_LD = 8'h01, DS_ST = 8'h02, DS_EX = 8'h03, DS_VE = 8'h04,
+                      DS_FENCE = 8'h10, DS_JUMP = 8'h11, DS_END = 8'h12;
+    reg        gemm_via_list = 0, rs_via_list = 0;
+    reg [31:0] dl_base;
+    integer    dl_n, desc_checks = 0;
+    function [31:0] la(input [3:0] m, input integer w); la = {m, 12'd0, w[15:0]}; endfunction
+    task put64(input [31:0] a, input [63:0] v);
+        integer j;
+        for (j = 0; j < 8; j = j + 1) mem[a - MEM_BASE + j] = v[8*j +: 8];
+    endtask
+    task dl_begin(input [31:0] base); begin dl_base = base; dl_n = 0; end endtask
+    // append a descriptor: header {tag, flags, opcode}, words 1..5 (6, 7 = 0)
+    task d_put(input [7:0] op, input [7:0] fl, input [63:0] w1, input [63:0] w2, input [63:0] w3,
+               input [63:0] w4, input [63:0] w5);
+        begin
+            put64(dl_base + 64 * dl_n,      {dl_n[31:0], 16'd0, fl, op});
+            put64(dl_base + 64 * dl_n + 8,  w1);
+            put64(dl_base + 64 * dl_n + 16, w2);
+            put64(dl_base + 64 * dl_n + 24, w3);
+            put64(dl_base + 64 * dl_n + 32, w4);
+            put64(dl_base + 64 * dl_n + 40, w5);
+            put64(dl_base + 64 * dl_n + 48, 0);
+            put64(dl_base + 64 * dl_n + 56, 0);
+            dl_n = dl_n + 1;
+        end
+    endtask
+    // fl: [0] RELOC, [2:1] BASESEL, [3] FENCE_BEFORE
+    task d_ld(input [31:0] ddr, input [31:0] laddr, input [15:0] rows, input [15:0] rb,
+              input [31:0] pitch, input [1:0] mode, input [7:0] fl);
+        d_put(DS_LD, fl, {32'd0, ddr}, {rb, rows, laddr}, {30'd0, mode, pitch}, 0, 0);
+    endtask
+    task d_st(input [31:0] ddr, input [31:0] laddr, input [15:0] rows, input [15:0] rb,
+              input [31:0] pitch, input [7:0] fl);
+        d_put(DS_ST, fl, {32'd0, ddr}, {rb, rows, laddr}, {32'd0, pitch}, 0, 0);
+    endtask
+    task d_ex(input [15:0] a, input [15:0] b, input [15:0] c, input [11:0] kt, input acc,
+              input [11:0] rep, input [15:0] bstep, input [15:0] cstep, input [15:0] crow);
+        d_put(DS_EX, 8'd0, {3'd0, acc, kt, c, b, a}, {crow, cstep, bstep, 4'd0, rep}, 0, 0, 0);
+    endtask
+    task d_ve(input [31:0] src1, input [31:0] src2, input [31:0] dst, input [31:0] len,
+              input [7:0] op, input [5:0] types, input [15:0] period, input [15:0] scale,
+              input [4:0] shift, input [31:0] zp, input [31:0] lo, input [31:0] hi);
+        d_put(DS_VE, 8'd0, {src2, src1}, {len, dst},
+              {11'd0, shift, scale, period, 2'd0, types, op}, {lo, zp}, {32'd0, hi});
+    endtask
+    task d_fence(input [3:0] mask);      d_put(DS_FENCE, 8'd0, {60'd0, mask}, 0, 0, 0, 0); endtask
+    task d_jump(input [31:0] target);    d_put(DS_JUMP, 8'd0, {32'd0, target}, 0, 0, 0, 0); endtask
+    task d_end(input [31:0] status);     d_put(DS_END, 8'd0, {32'd0, status}, 0, 0, 0, 0); endtask
+    task submit(input [31:0] list, input [31:0] count);
+        begin
+            n_op(3'd6, list, count);
+        end
+    endtask
+    task desc_true(input cond, input [8*56-1:0] what);
+        begin
+            desc_checks = desc_checks + 1;
+            if (!cond) fail(what);
+        end
+    endtask
 
     // --------------------------------------------------- tiled GEMM test
     reg signed [7:0]  GA [0:127][0:127];
@@ -408,7 +475,7 @@ module tb_sa_unit;
     reg signed [31:0] GBIAS [0:127][0:127];
     integer gi, gj, gk, gt, gbk, gti, gtj;
     reg signed [31:0] gsum, ggot;
-    integer gemm_cycles, gemm_cycles_main;
+    integer gemm_cycles, gemm_cycles_main, gemm_cycles_list;
     task gemm(input integer M, input integer N, input integer K, input [31:0] aa, input [31:0] ba,
               input [31:0] ca, input integer use_bias, input [31:0] biasa);
         integer t0;
@@ -428,6 +495,19 @@ module tb_sa_unit;
             t0 = $time;
             // B resident: one INTERLEAVE load of the whole K x N matrix puts
             // column strip jt at SPAD_B word jt*K (word k = B[k][D*jt .. D*jt+D-1])
+            if (gemm_via_list) begin                                       // the same commands as a list
+                dl_begin(DL);
+                d_ld(ba, la(M_B, 0), K, N, N, 1, 0);
+                for (gti = 0; gti < M/D; gti = gti + 1) begin
+                    gbk = gti % 2;
+                    d_ld(aa + gti*D*K, la(M_A, gbk * SW/2), D, K, K, 1, 0);
+                    if (use_bias) d_ld(biasa + gti*D*4*N, la(M_C, gbk * CW/2), D, 4*N, 4*N, 0, 0);
+                    d_ex(gbk * SW/2, 0, gbk * CW/2, K/D, use_bias, N/D, K, 1, N/D);
+                    d_st(ca + gti*D*4*N, la(M_C, gbk * CW/2), D, 4*N, 4*N, 0);
+                end
+                d_end(32'h600D_0000 + M);
+                submit(DL, 0);
+            end else begin
             cfg_ld(K, N, N, 1);
             ld(ba, M_B, 0);
             // M2: one mat_exec per A strip computes its N/D C tiles, laid out
@@ -445,6 +525,7 @@ module tb_sa_unit;
                 end
                 ex(gbk * SW/2, 0, gbk * CW/2, K/D, use_bias);
                 st(ca + gti*D*4*N, M_C, gbk * CW/2);
+            end
             end
             fence(0);
             gemm_cycles = ($time - t0) / 10;
@@ -544,6 +625,7 @@ module tb_sa_unit;
     task random_stream(input integer ncmd);
         integer c, typ, m, mode, rows, rb, pitch, w, span, d, kt, a, b, cc, acc, er, ebs, ecs, ecr;
         integer vit, vot, vgr, vop, vm1, vm2, vmd, vw1, vw2, vwd, vper;
+        integer vrelu, vrq, vsc, vsh, vzp;
         begin
             n_ld = 0; n_ex = 0; n_st = 0; n_ve = 0;
             for (ri = 0; ri < SW; ri = ri + 1) begin
@@ -563,6 +645,7 @@ module tb_sa_unit;
                 mem[RD - MEM_BASE + ri] = $random(seed);
                 rd_sh[ri] = mem[RD - MEM_BASE + ri];
             end
+            if (rs_via_list) dl_begin(DL);
             for (c = 0; c < ncmd; c = c + 1) begin
                 typ = rnd(12);
                 if (typ <= 3) begin                                   // LD
@@ -575,8 +658,8 @@ module tb_sa_unit;
                     span = mode ? ((rb + D - 1) / D) * rows : rows * ((rb + (m == M_C ? 4*D : D) - 1) / (m == M_C ? 4*D : D));
                     w = pick(m == M_C ? CW : SW, span);
                     d = RS + 8 * rnd((32768 - rows * pitch) / 8 - 1);
-                    cfg_ld(rows, rb, pitch, mode);
-                    ld(d, m, w);
+                    if (rs_via_list) d_ld(d, la(m, w), rows, rb, pitch, mode, 0);
+                    else begin cfg_ld(rows, rb, pitch, mode); ld(d, m, w); end
                     ref_ld(d, m, w, rows, rb, pitch, mode);
                     n_ld = n_ld + 1;
                 end else if (typ <= 6) begin                          // EX (M2: 1-4 tiles, random strides)
@@ -584,8 +667,8 @@ module tb_sa_unit;
                     er = 1 + rnd(3); ebs = rnd(40); ecs = 1 + rnd(9); ecr = 1 + rnd(9);
                     a = pick(SW, kt*D); b = pick(SW, (er - 1)*ebs + kt*D);
                     cc = pick(CW, (er - 1)*ecs + (D-1)*ecr + 1); acc = rnd(1);
-                    cfg_ex(er, ebs, ecs, ecr);
-                    ex(a, b, cc, kt, acc);
+                    if (rs_via_list) d_ex(a, b, cc, kt, acc, er, ebs, ecs, ecr);
+                    else begin cfg_ex(er, ebs, ecs, ecr); ex(a, b, cc, kt, acc); end
                     ref_ex(a, b, cc, kt, acc, er, ebs, ecs, ecr);
                     n_ex = n_ex + 1;
                 end else if (typ >= 10) begin                         // VE (M3)
@@ -599,12 +682,16 @@ module tb_sa_unit;
                     // destination away from the sources (partial overlap is undefined)
                     vwd = (vmd == M_C ? CW : SW) / 4 + rnd(200);
                     vper = rnd(3);
-                    vrun(vm1, vw1, vm2, vw2, vmd, vwd, vgr, vop, rnd(1), rnd(1), vit, vot, vper,
-                         $signed(rnd(4000)) - 2000, rnd(20), $signed(rnd(200)) - 100,
-                         -32'sd2147483648, 32'sd2147483647);
-                    ref_ve(vm1, vw1, vm2, vw2, vmd, vwd, vgr, vop, dut.pcpi.v_op[4], dut.pcpi.v_op[5], vit, vot,
-                           vper, $signed(dut.pcpi.v_scale), dut.pcpi.v_shift, $signed(dut.pcpi.v_zp),
-                           -32'sd2147483648, 32'sd2147483647);
+                    vrelu = rnd(1); vrq = rnd(1);
+                    vsc = $signed(rnd(4000)) - 2000; vsh = rnd(20); vzp = $signed(rnd(200)) - 100;
+                    if (rs_via_list)
+                        d_ve(la(vm1, vw1), la(vm2, vw2), la(vmd, vwd), vgr * D, {2'b00, vrq[0], vrelu[0], 1'b0, vop[2:0]},
+                             {vot[1:0], vit[1:0]}, vper, vsc, vsh, vzp, 32'h8000_0000, 32'h7FFF_FFFF);
+                    else
+                        vrun(vm1, vw1, vm2, vw2, vmd, vwd, vgr, vop, vrelu, vrq, vit, vot, vper,
+                             vsc, vsh, vzp, -32'sd2147483648, 32'sd2147483647);
+                    ref_ve(vm1, vw1, vm2, vw2, vmd, vwd, vgr, vop, vrelu[0], vrq[0], vit, vot,
+                           vper, vsc, vsh, vzp, -32'sd2147483648, 32'sd2147483647);
                     n_ve = n_ve + 1;
                 end else begin                                        // ST
                     m = 1 + rnd(2);
@@ -612,11 +699,15 @@ module tb_sa_unit;
                     span = rows * ((rb + (m == M_C ? 4*D : D) - 1) / (m == M_C ? 4*D : D));
                     w = pick(m == M_C ? CW : SW, span);
                     d = RD + 8 * rnd((32768 - rows * pitch) / 8 - 1);
-                    cfg_st(rows, rb, pitch);
-                    st(d, m, w);
+                    if (rs_via_list) d_st(d, la(m, w), rows, rb, pitch, 0);
+                    else begin cfg_st(rows, rb, pitch); st(d, m, w); end
                     ref_st(d, m, w, rows, rb, pitch);
                     n_st = n_st + 1;
                 end
+            end
+            if (rs_via_list) begin                                 // the whole stream as one list
+                d_end(32'h5EED);
+                submit(DL, 0);
             end
             fence(0);
             cfg_ex(1, 0, 0, 1);
@@ -857,7 +948,7 @@ module tb_sa_unit;
             if (PERF == 0) begin
                 for (pi = 0; pi < NPC; pi = pi + 1) perf_true(pc_a[pi] === 0, "perf: PERF=0 counter not zero");
             end else begin
-                for (pi = 28; pi < NPC; pi = pi + 1) perf_true(pc_a[pi] === 0, "perf: reserved counter not zero");
+                for (pi = 28; pi < NPC; pi = pi + 1) perf_true(pc_a[pi] === 0, "perf: fetch counter not zero without a list");
                 perf_true(pc_a[PC_CYCLES] + 12 >= perf_win && pc_a[PC_CYCLES] <= perf_win + 12,
                           "perf: CYCLES differs from the measured window");
                 perf_true(pc_a[PC_LD_BUSY] >= pc_a[PC_LD_BEATS], "perf: LD_BUSY < LD_BEATS");
@@ -970,6 +1061,180 @@ module tb_sa_unit;
             csr_write(8'h3C, 32'd1);                              // CSR: clear
             csr_read(8'h40, pc_csr);
             perf_true(pc_csr === 0, "perf: CSR clear did not clear CYCLES");
+        end
+    endtask
+
+    // ------------------------------------------ descriptor-specific tests
+    reg [31:0] dcsr, done0;
+    reg [63:0] dv0, dv1;
+    task desc_status(output [31:0] addr_, output [31:0] done_, output [31:0] stat_,
+                     output [31:0] err_idx_, output [31:0] exec_);
+        begin
+            csr_read(8'hC0, addr_); csr_read(8'hC4, done_); csr_read(8'hC8, stat_);
+            csr_read(8'hCC, err_idx_); csr_read(8'hD0, exec_);
+        end
+    endtask
+    reg [31:0] ds_addr, ds_done, ds_stat, ds_err, ds_exec;
+    function [63:0] mem64(input [31:0] a);
+        integer j;
+        for (j = 0; j < 8; j = j + 1) mem64[8*j +: 8] = mem[a - MEM_BASE + j];
+    endfunction
+    function [63:0] spad_a64(input integer w); reg [8*D-1:0] x; begin x = hw_a(w); spad_a64 = x[63:0]; end endfunction
+    function [63:0] spad_b64(input integer w); reg [8*D-1:0] x; begin x = hw_b(w); spad_b64 = x[63:0]; end endfunction
+    // expect a sticky error (code, engine) after a list, then recover with mat_reset
+    task desc_expect_err(input [3:0] code, input [3:0] eng, input [8*40-1:0] what);
+        begin
+            fence(0);
+            desc_true(xst[1] === 1'b1 && xst[11:8] === code && xst[15:12] === eng, what);
+            if (!(xst[1] === 1'b1 && xst[11:8] === code && xst[15:12] === eng))
+                $display("TB   (%0s: ext status %08x)", what, xst);
+            mat_op(F_RESET, 0, 0);
+            fence(0);
+            desc_true(xst[1] === 1'b0 && xst[24] === 1'b0, "desc: mat_reset did not recover");
+        end
+    endtask
+
+    task desc_tests;
+        integer i;
+        begin
+            cfg_ex(1, 0, 0, 1);
+            // ---- ordering: PCPI commands after a submit wait for the list
+            //      list: LD RS -> SPAD_A 100, ST SPAD_A 100 -> RD; then PCPI LD
+            //      RS+0x100 -> SPAD_A 100 must not overtake the list's ST
+            dl_begin(DL);
+            d_ld(RS, la(M_A, 100), 1, 8, 8, 0, 0);
+            d_st(RD, la(M_A, 100), 1, 8, 8, 0);
+            d_end(32'hA11);
+            desc_status(ds_addr, done0, ds_stat, ds_err, ds_exec);
+            submit(DL, 0);
+            cfg_ld(1, 8, 8, 0);
+            ld(RS + 32'h100, M_A, 100);
+            fence(0);
+            desc_true(!xst[1], "desc order: sticky error");
+            desc_true(mem64(RD) === mem64(RS), "desc order: PCPI LD overtook the list's ST");
+            desc_true(spad_a64(100) === mem64(RS + 32'h100), "desc order: PCPI LD lost");
+            desc_status(ds_addr, ds_done, ds_stat, ds_err, ds_exec);
+            desc_true(ds_done === done0 + 1 && ds_stat === 32'hA11 && ds_exec === 3 && ds_addr === DL + 128,
+                      "desc: END status / counters");
+
+            // ---- DDR dependency: ST 4 KB then LD of its last 8 bytes, with and without FENCE
+            for (i = 0; i < 4104; i = i + 1) mem[RD + 32'h1000 - MEM_BASE + i] = 8'hA5;
+            dl_begin(DL);
+            d_st(RD + 32'h1000, la(M_A, 0), 1, 4096, 4096, 0);
+            d_fence(0);
+            d_ld(RD + 32'h1000 + 4088, la(M_B, 200), 1, 8, 8, 0, 0);
+            d_end(0);
+            submit(DL, 0);
+            fence(0);
+            desc_true(spad_b64(200) === mem64(RD + 32'h1000 + 4088) &&
+                      mem64(RD + 32'h1000 + 4088) !== 64'hA5A5A5A5A5A5A5A5, "desc FENCE: LD saw stale DDR");
+            for (i = 0; i < 4104; i = i + 1) mem[RD + 32'h1000 - MEM_BASE + i] = 8'hA5;
+            dl_begin(DL);
+            d_st(RD + 32'h1000, la(M_A, 0), 1, 4096, 4096, 0);
+            d_ld(RD + 32'h1000 + 4088, la(M_B, 201), 1, 8, 8, 0, 0);   // no FENCE: DDR is not tracked
+            d_end(0);
+            submit(DL, 0);
+            fence(0);
+            desc_true(spad_b64(201) === 64'hA5A5A5A5A5A5A5A5,
+                      "desc no-FENCE: expected the stale DDR value (test would not detect a missing FENCE)");
+            // the same with FENCE_BEFORE on the LD
+            for (i = 0; i < 4104; i = i + 1) mem[RD + 32'h1000 - MEM_BASE + i] = 8'hA5;
+            dl_begin(DL);
+            d_st(RD + 32'h1000, la(M_A, 0), 1, 4096, 4096, 0);
+            d_ld(RD + 32'h1000 + 4088, la(M_B, 202), 1, 8, 8, 0, 8'h08);
+            d_end(0);
+            submit(DL, 0);
+            fence(0);
+            desc_true(spad_b64(202) === mem64(RD + 32'h1000 + 4088), "desc FENCE_BEFORE: LD saw stale DDR");
+
+            // ---- JUMP across three segments, END status
+            dl_begin(DL);             d_ld(RS + 8,  la(M_A, 300), 1, 8, 8, 0, 0); d_jump(DL + 32'h2000);
+            dl_begin(DL + 32'h2000);  d_ld(RS + 16, la(M_A, 301), 1, 8, 8, 0, 0); d_jump(DL + 32'h4000);
+            dl_begin(DL + 32'h4000);  d_ld(RS + 24, la(M_A, 302), 1, 8, 8, 0, 0); d_end(32'h1234);
+            desc_status(ds_addr, done0, ds_stat, ds_err, ds_exec);
+            submit(DL, 0);
+            fence(0);
+            desc_status(ds_addr, ds_done, ds_stat, ds_err, ds_exec);
+            desc_true(spad_a64(300) === mem64(RS + 8) && spad_a64(301) === mem64(RS + 16) &&
+                      spad_a64(302) === mem64(RS + 24), "desc JUMP: a segment was not executed");
+            desc_true(ds_done === done0 + 1 && ds_stat === 32'h1234 && ds_exec === 6 &&
+                      ds_addr === DL + 32'h4000 + 64, "desc JUMP: status / counters");
+
+            // ---- count: 2 of 3 commands, no END reached
+            hw_a_set(310, 0); hw_a_set(311, 0); hw_a_set(312, 0);
+            dl_begin(DL);
+            d_ld(RS + 32, la(M_A, 310), 1, 8, 8, 0, 0);
+            d_ld(RS + 40, la(M_A, 311), 1, 8, 8, 0, 0);
+            d_ld(RS + 48, la(M_A, 312), 1, 8, 8, 0, 0);
+            d_end(32'hBAD);
+            desc_status(ds_addr, done0, ds_stat, ds_err, ds_exec);
+            submit(DL, 2);
+            fence(0);
+            desc_status(ds_addr, ds_done, ds_stat, ds_err, ds_exec);
+            desc_true(spad_a64(310) === mem64(RS + 32) && spad_a64(311) === mem64(RS + 40) &&
+                      spad_a64(312) === 64'd0, "desc count: wrong commands executed");
+            desc_true(ds_exec === 2 && ds_done === done0, "desc count: status");
+
+            // ---- RELOC: DDR address = BASE1 + offset
+            cfg(8'd12, RS + 32'h800);                              // BASE1
+            dl_begin(DL);
+            d_ld(32'h40, la(M_A, 320), 1, 8, 8, 0, 8'h03);         // RELOC, BASESEL = 1
+            d_end(0);
+            submit(DL, 0);
+            fence(0);
+            desc_true(spad_a64(320) === mem64(RS + 32'h840), "desc RELOC: wrong address");
+
+            // ---- errors
+            dl_begin(DL);
+            d_ld(RS, la(M_A, 330), 1, 8, 8, 0, 0);
+            put64(DL + 64, 0);                                     // an all-zero descriptor (opcode 0)
+            submit(DL, 0);
+            desc_expect_err(4'd1, 4'd4, "desc error: zero descriptor");
+            desc_status(ds_addr, ds_done, ds_stat, ds_err, ds_exec);
+            desc_true(ds_err === 1, "desc error: DESC_ERR_IDX");
+            dl_begin(DL);
+            d_put(DS_LD, 8'h00, {32'd0, RS}, {16'd8, 16'd1, la(M_A, 331)}, 64'd8, 0, 0);
+            put64(DL, {32'd0, 12'h001, 4'd0, 8'h00, DS_LD});          // header reserved bit 20 set
+            submit(DL, 0);
+            desc_expect_err(4'd1, 4'd4, "desc error: reserved header bit");
+            submit(DL + 8, 0);                                     // misaligned list
+            desc_expect_err(4'd1, 4'd4, "desc error: misaligned list address");
+            dl_begin(DL);
+            d_ld(RS, la(M_A, 332), 1, 12, 16, 0, 0);               // row_bytes 12: rejected by the scheduler
+            d_end(0);
+            submit(DL, 0);
+            desc_expect_err(4'd1, 4'd0, "desc error: invalid LD shape (scheduler)");
+            dl_begin(DL);
+            d_end(0);
+            inject_rresp = 1;                                      // SLVERR on the descriptor fetch
+            submit(DL, 0);
+            fence(0);
+            inject_rresp = 0;
+            desc_true(xst[1] === 1'b1 && xst[11:8] === 4'd3 && xst[15:12] === 4'd4, "desc error: fetch SLVERR");
+            mat_op(F_RESET, 0, 0);
+            fence(0);
+            desc_true(!xst[1], "desc error: no recovery after SLVERR");
+            // recovery: a good list runs
+            dl_begin(DL);
+            d_ld(RS + 56, la(M_A, 333), 1, 8, 8, 0, 0);
+            d_end(32'h600D);
+            submit(DL, 0);
+            fence(0);
+            desc_true(!xst[1] && spad_a64(333) === mem64(RS + 56), "desc: list after recovery");
+
+            // ---- performance counter FETCH_DESC (28) counts decoded descriptors
+            if (PERF != 0) begin
+                dl_begin(DL);
+                for (i = 0; i < 9; i = i + 1) d_ld(RS + 8 * i, la(M_A, 340 + i), 1, 8, 8, 0, 0);
+                d_end(0);
+                perf_ctl(2'b11);
+                submit(DL, 0);
+                fence(0);
+                perf_ctl(2'b00);
+                perf_snap;
+                desc_true(pc_a[28] === 10, "desc perf: FETCH_DESC != decoded descriptors");
+                desc_true(pc_a[PC_CMD_LD] === 9, "desc perf: CMD_LD");
+            end
         end
     endtask
 
@@ -1189,6 +1454,17 @@ module tb_sa_unit;
 
         random_stream(120);
 
+        // ============================= descriptor lists (D2)
+        gemm_via_list = 1;
+        gemm(4*D, 4*D, 8*D, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 0, 0);
+        gemm_cycles_list = gemm_cycles;
+        gemm(3*D, 2*D, 5*D, MEM_BASE + 32'h20000, MEM_BASE + 32'h22000, MEM_BASE + 32'h24000, 1, MEM_BASE + 32'h28000);
+        gemm_via_list = 0;
+        rs_via_list = 1;
+        random_stream(120);
+        rs_via_list = 0;
+        desc_tests;
+
         // ================================================ new-ISA errors
         cfg_ld(2, 12, 16, 0);                                 // row_bytes not a multiple of 8
         ld(MEM_BASE + 32'h30000, M_A, 100);
@@ -1217,17 +1493,18 @@ module tb_sa_unit;
         fence(0);
         if (xst[11:8] !== 4'd2) fail("bad memory id: wrong ext status");
         mat_op(F_RESET, 0, 0);
-        pcpi_exec(custom0(3'd7, 7'd1), 0, 0);                  // 5 is mat_perf (P1), 6 reserved
+        pcpi_exec(custom0(3'd7, 7'd1), 0, 0);                  // 5 mat_perf, 6 mat_submit
         if (pc_cycles >= 0) fail("funct7=1 funct3=7 was answered");
-        expect_csr(8'h24, (PERF != 0 ? 32'h0010_0000 : 32'd0) + 32'h0001_0000 + D * 256 + D,
-                   "CAPS");                                             // [20] perf, 1 port, VL = D, D
+        expect_csr(8'h24, 32'h0020_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + 32'h0001_0000 + D * 256 + D,
+                   "CAPS");                                             // [21] desc, [20] perf, 1 port, VL = D, D
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");
 
         repeat (20) @(posedge aclk);
-        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | error paths",
+        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | descriptors: list GEMM %0d cycles, %0d checks | error paths",
                  errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, D, 4*D, 4*D, 8*D, gemm_cycles_main, 4*D*4*D*8*D / gemm_cycles_main,
-                 n_ld, n_ex, n_st, n_ve, 4*D, 4*D, 8*D, qgemm_cycles_first, perf_checks);
+                 n_ld, n_ex, n_st, n_ve, 4*D, 4*D, 8*D, qgemm_cycles_first, perf_checks,
+                 gemm_cycles_list, desc_checks);
         $finish;
     end
 

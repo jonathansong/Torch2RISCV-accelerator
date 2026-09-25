@@ -268,14 +268,26 @@ module sa_unit #(
     wire resetn = aresetn;
 
     // --------------------------------------------------- command sources
-    wire                 p_valid, p_ready, l_valid;
-    wire [PKT_W-1:0]     p_pkt, l_pkt;
+    wire                 p_valid, p_ready, l_valid, f_valid, f_ready;
+    wire [PKT_W-1:0]     p_pkt, l_pkt, f_pkt;
     wire                 in_valid, in_ready;
     wire [PKT_W-1:0]     in_pkt;
-    // legacy sequencer has priority
-    assign in_valid = l_valid || p_valid;
-    assign in_pkt   = l_valid ? l_pkt : p_pkt;
-    assign p_ready  = in_ready && !l_valid;
+    // priority: legacy sequencer > descriptor fetch unit > PCPI (the PCPI
+    // decoder also holds its queued commands back while a list runs)
+    assign in_valid = l_valid || f_valid || p_valid;
+    assign in_pkt   = l_valid ? l_pkt : f_valid ? f_pkt : p_pkt;
+    assign f_ready  = in_ready && !l_valid;
+    assign p_ready  = in_ready && !l_valid && !f_valid;
+
+    // descriptor fetch unit
+    wire         fetch_busy, fetch_submit, fetch_err;
+    wire [3:0]   fetch_err_code;
+    wire [31:0]  fetch_addr, fetch_count;
+    wire [127:0] fetch_bases;
+    wire [31:0]  desc_addr, desc_done, desc_status, desc_err_idx, desc_exec;
+    wire [31:0]  f_araddr;
+    wire         f_arvalid, f_arready, f_rvalid, f_rready;
+    wire [3:0]   fetch_ev;
 
     wire        sched_idle, fence_ok, clear_error;
     // performance counter events (numbering: PC_* in sa_defs.vh)
@@ -288,7 +300,9 @@ module sa_unit #(
     wire [4:0]  perf_prsel, perf_crsel;
     wire [31:0] perf_prdata, perf_crdata;
     wire [3:0]  fence_mask;
-    wire [31:0] ext_status;
+    wire [31:0] ext_status_s;                              // from the scheduler
+    // + [24] a descriptor list is running
+    wire [31:0] ext_status = ext_status_s | {7'd0, fetch_busy, 24'd0};
 
     wire        ld_v, ld_r, st_v, st_r, ex_v, ex_r, ve_v, ve_r;
     wire [PKT_W-1:0] ld_pkt, st_pkt, ex_pkt, ve_pkt;
@@ -303,8 +317,9 @@ module sa_unit #(
         .ve_valid(ve_v), .ve_ready(ve_r), .ve_pkt(ve_pkt),
         .ld_done(ld_done), .ld_err(ld_err), .st_done(st_done), .st_err(st_err), .ex_done(ex_done),
         .ve_done(ve_done),
-        .clear_error(clear_error), .fence_mask(fence_mask), .fence_ok(fence_ok),
-        .idle(sched_idle), .ext_status(ext_status), .perf_ev(sched_ev));
+        .clear_error(clear_error), .fetch_err(fetch_err), .fetch_err_code(fetch_err_code),
+        .fence_mask(fence_mask), .fence_ok(fence_ok),
+        .idle(sched_idle), .ext_status(ext_status_s), .perf_ev(sched_ev));
 
     // ------------------------------------------------------------ PCPI
     wire        leg_trigger, leg_accept, leg_busy, leg_reset, leg_reset_done;
@@ -320,7 +335,25 @@ module sa_unit #(
         .leg_busy(leg_busy), .leg_status(leg_status), .leg_cycles(leg_cycles),
         .leg_reset(leg_reset), .leg_reset_done(leg_reset_done),
         .perf_ctl_we(perf_pctl_we), .perf_ctl(perf_pctl), .perf_rsel(perf_prsel),
-        .perf_rdata(perf_prdata), .perf_ev(pcpi_ev));
+        .perf_rdata(perf_prdata), .perf_ev(pcpi_ev),
+        .fetch_busy(fetch_busy), .submit(fetch_submit), .submit_addr(fetch_addr),
+        .submit_count(fetch_count), .bases(fetch_bases));
+
+    // ------------------------------------------------ descriptor fetch unit
+    sa_cmdfetch #(.D(D)) fetch (
+        .clk(aclk), .resetn(resetn),
+        .submit(fetch_submit), .submit_addr(fetch_addr), .submit_count(fetch_count),
+        .busy(fetch_busy), .bases(fetch_bases),
+        .out_valid(f_valid), .out_ready(f_ready), .out_pkt(f_pkt),
+        .sched_err(ext_status_s[1]), .clear_error(clear_error),
+        .q_empty(ext_status_s[20:16] == 5'd0), .eng_busy(ext_status_s[7:4]),
+        .err_set(fetch_err), .err_code(fetch_err_code),
+        .st_addr(desc_addr), .st_done(desc_done), .st_status(desc_status),
+        .st_err_idx(desc_err_idx), .st_exec(desc_exec),
+        .ar_addr(f_araddr), .ar_valid(f_arvalid), .ar_ready(f_arready),
+        .r_data(m0_axi_rdata), .r_resp(m0_axi_rresp), .r_last(m0_axi_rlast),
+        .r_valid(f_rvalid), .r_ready(f_rready),
+        .perf_ev(fetch_ev));
 
     // ---------------------------------------------------------- legacy
     wire        lw_en;
@@ -345,12 +378,14 @@ module sa_unit #(
         .leg_busy(leg_busy), .leg_status(leg_status), .leg_cycles(leg_cycles),
         .leg_reset(leg_reset), .leg_reset_done(leg_reset_done), .irq(irq),
         .perf_ctl_we(perf_cctl_we), .perf_ctl(perf_cctl), .perf_en(perf_en),
-        .perf_rsel(perf_crsel), .perf_rdata(perf_crdata));
+        .perf_rsel(perf_crsel), .perf_rdata(perf_crdata),
+        .fst_addr(desc_addr), .fst_done(desc_done), .fst_status(desc_status),
+        .fst_err_idx(desc_err_idx), .fst_exec(desc_exec));
 
     // ------------------------------------------------ performance counters
     sa_perf #(.NCNT(PERF_NCNT), .PERF(PERF)) perf (
         .clk(aclk), .resetn(resetn),
-        .ev({4'd0,                               // 28..31 reserved (descriptor DMA)
+        .ev({fetch_ev,                           // 28..31 FETCH_DESC / WAIT / EMPTY / ARSTALL
              ve_ev, st_ev, ld_ev, ex_ev,         // 24..27, 21..23, 18..20, 14..17
              sched_ev[10:8],                     // 13 ALL_IDLE, 12 STARVE, 11 DISP_FULL
              sched_ev[7:4],                      // 7..10 HAZ_LD/ST/EX/VE
@@ -471,16 +506,41 @@ module sa_unit #(
 
     // ------------------------------------------------------ AXI masters
     // Port p of the engines -> m<p>_axi; ports >= NPORTS are tied off.
+    // Port 0 read channel is shared by the LD engine and the descriptor fetch
+    // unit: an AR grant is held until its handshake (the fetch unit wins a
+    // new grant), and an owner FIFO in AR order routes the returning R beats
+    // (no AXI IDs, so bursts return in order).
+    reg        ar_lock, ar_lock_f;
+    wire       ar_f = ar_lock ? ar_lock_f : f_arvalid;     // grant to the fetch unit
+    reg  [15:0] own;                                       // owner of each burst in flight (1 = fetch)
+    reg  [4:0]  own_wp, own_rp;
+    wire        own_f = own[own_rp[3:0]];
+    always @(posedge aclk) begin
+        if (!resetn) begin
+            ar_lock <= 0; own_wp <= 0; own_rp <= 0;
+        end else begin
+            if (m0_axi_arvalid && !m0_axi_arready) begin ar_lock <= 1; ar_lock_f <= ar_f; end
+            else                                         ar_lock <= 0;
+            if (m0_axi_arvalid && m0_axi_arready) begin
+                own[own_wp[3:0]] <= ar_f;
+                own_wp <= own_wp + 1;
+            end
+            if (m0_axi_rvalid && m0_axi_rready && m0_axi_rlast) own_rp <= own_rp + 1;
+        end
+    end
+    assign f_arready = ar_f && m0_axi_arready;
+    assign f_rvalid  = m0_axi_rvalid && own_f;
+
     generate if (NPORTS > 0) begin : port0
-        assign m0_axi_araddr  = araddr[32*0 +: 32];
-        assign m0_axi_arlen   = arlen[8*0 +: 8];
-        assign m0_axi_arvalid = arvalid[0];
-        assign arready[0]     = m0_axi_arready;
+        assign m0_axi_araddr  = ar_f ? f_araddr : araddr[32*0 +: 32];
+        assign m0_axi_arlen   = ar_f ? 8'd7     : arlen[8*0 +: 8];
+        assign m0_axi_arvalid = ar_f ? f_arvalid : arvalid[0];
+        assign arready[0]     = !ar_f && m0_axi_arready;
         assign rdata[64*0 +: 64] = m0_axi_rdata;
         assign rresp[2*0 +: 2]   = m0_axi_rresp;
         assign rlast[0]       = m0_axi_rlast;
-        assign rvalid[0]      = m0_axi_rvalid;
-        assign m0_axi_rready  = rready[0];
+        assign rvalid[0]      = m0_axi_rvalid && !own_f;
+        assign m0_axi_rready  = own_f ? f_rready : rready[0];
         assign m0_axi_awaddr  = awaddr[32*0 +: 32];
         assign m0_axi_awlen   = awlen[8*0 +: 8];
         assign m0_axi_awvalid = awvalid[0];

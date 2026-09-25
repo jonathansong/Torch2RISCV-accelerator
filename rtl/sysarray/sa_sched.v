@@ -51,6 +51,8 @@ module sa_sched #(
     input  wire               ve_done,
 
     input  wire               clear_error,
+    input  wire               fetch_err,      // descriptor fetch unit error (one-cycle pulse)
+    input  wire [3:0]         fetch_err_code,
     input  wire [3:0]         fence_mask,     // engines a fence waits for (0 = all)
     output wire               fence_ok,       // queue empty and masked engines idle
     output wire               idle,           // everything idle
@@ -350,6 +352,7 @@ module sa_sched #(
             end
             if (ld_done && ld_err && !err) begin err <= 1; err_code <= XERR_RRESP; err_eng <= ENG_LD; end
             if (st_done && st_err && !err) begin err <= 1; err_code <= XERR_BRESP; err_eng <= ENG_ST; end
+            if (fetch_err && !err) begin err <= 1; err_code <= fetch_err_code; err_eng <= ENG_FETCH; end
             if (clear_error) begin                           // flush everything not dispatched
                 err   <= 0;
                 in_rp <= in_wp + (in_valid && in_ready);     // (keep a push of this cycle)

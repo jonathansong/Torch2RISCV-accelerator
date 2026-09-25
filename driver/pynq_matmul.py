@@ -16,6 +16,9 @@ releases it from reset. Two firmwares consume the same mailbox:
   vector_fw.bin       (firmware/vector)       M3 vector engine alone, funct7 = 2
                                               -> MatmulOverlay.vector()
   bwtest_fw.bin       (firmware/bwtest)       DMA bandwidth -> MatmulOverlay.bandwidth()
+  desc_run_fw.bin     (firmware/desc_run)     runs a descriptor list the ARM built
+                                              (DescList) with one mat_submit ->
+                                              MatmulOverlay.run_list / gemm_list / vector_list
 
     from pynq_matmul import MatmulOverlay
     mm = MatmulOverlay("picorv32.bit", "matmul_insn_fw.bin")
@@ -30,7 +33,10 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-from pynq import GPIO, MMIO, Overlay, allocate
+try:                                     # off the board only the pure parts (goldens,
+    from pynq import GPIO, MMIO, Overlay, allocate   # DescList, list builders) are usable
+except ImportError:
+    GPIO = MMIO = Overlay = allocate = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,6 +60,9 @@ MBOX_GEMM_Q = 0x84
 MBOX_GEMM_FLAGS = 0x88                   # gemm_fw schedule switches (0 = tuned)
 GEMM_NO_PREFETCH, GEMM_NO_BSPLIT, GEMM_FORCE_BSPLIT = 1, 2, 4   # default: B split if B >= 16 KB
 MBOX_PERF_COUNT = 0x8C                   # counters copied to the perf area (0 = none)
+MBOX_DL_ADDR, MBOX_DL_COUNT, MBOX_DL_BASE0 = 0x90, 0x94, 0x98   # desc_run_fw inputs
+MBOX_DL_STATUS, MBOX_DL_EXEC = 0xA8, 0xAC                       #             outputs
+ERR_NO_DESC = 0xDEAD0003
 
 # Performance counters (rtl/sysarray/sa_perf.v, docs/perf_counters_and_desc_dma_plan.md):
 # the firmware copies them to the 256 bytes below the mailbox after its
@@ -100,6 +109,181 @@ class Requant:
 
 MATMUL_ERR_CODES = {1: "bad DIM", 2: "bad address", 3: "read SLVERR/DECERR",
                     4: "write SLVERR/DECERR"}
+
+
+# ------------------------------------------------------------------ descriptors
+MEM_SPAD_A, MEM_SPAD_B, MEM_ACC = 1, 2, 3
+LD_LINEAR, LD_INTERLEAVE = 0, 1
+_M32, _M64 = 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF
+
+
+def laddr(mem, word):
+    """Local address of a word in SPAD_A / SPAD_B / ACC."""
+    return (mem << 28) | word
+
+
+class DescList:
+    """A list of 64-byte descriptors (docs/double_buffer_design.md §8.6):
+    8 little-endian 64-bit words each, w0 = {tag = index, flags, opcode}.
+    Every command carries its whole configuration (no mat_cfg state).
+    DDR addresses are physical; base=n makes one relative to BASE n (0..3),
+    fence_before waits for all engines first (use it, or fence(), between a
+    store and a later load of the same DDR bytes: DDR is not tracked)."""
+    LD, ST, EX, VE, FENCE, JUMP, END = 0x01, 0x02, 0x03, 0x04, 0x10, 0x11, 0x12
+    RELOC, FENCE_BEFORE = 1 << 8, 1 << 11
+
+    def __init__(self):
+        self.rows = []
+
+    def _put(self, op, flags, *words):
+        w = [(len(self.rows) << 32) | flags | op] + [x & _M64 for x in words]
+        self.rows.append(w + [0] * (8 - len(w)))
+        return self
+
+    @classmethod
+    def _flags(cls, base, fence_before):
+        return (cls.RELOC | (base << 9) if base is not None else 0) | (cls.FENCE_BEFORE if fence_before else 0)
+
+    def ld(self, ddr, la, rows, row_bytes, pitch, mode=LD_LINEAR, base=None, fence_before=False):
+        return self._put(self.LD, self._flags(base, fence_before), ddr & _M32,
+                         la | rows << 32 | row_bytes << 48, pitch | mode << 32)
+
+    def st(self, ddr, la, rows, row_bytes, pitch, base=None, fence_before=False):
+        return self._put(self.ST, self._flags(base, fence_before), ddr & _M32,
+                         la | rows << 32 | row_bytes << 48, pitch)
+
+    def ex(self, a, b, c, kt, acc=False, repeat=1, bstep=0, cstep=0, crow=1, fence_before=False):
+        return self._put(self.EX, self._flags(None, fence_before),
+                         a | b << 16 | c << 32 | kt << 48 | int(acc) << 60,
+                         repeat | bstep << 16 | cstep << 32 | crow << 48)
+
+    def ve(self, src1, src2, dst, length, op, types, period=0, scale=1, shift=0, zp=0,
+           lo=-2**31, hi=2**31 - 1, fence_before=False):
+        return self._put(self.VE, self._flags(None, fence_before), src1 | src2 << 32, dst | length << 32,
+                         op | types << 8 | period << 16 | (scale & 0xFFFF) << 32 | shift << 48,
+                         (zp & _M32) | (lo & _M32) << 32, hi & _M32)
+
+    def fence(self, mask=0):
+        return self._put(self.FENCE, 0, mask)
+
+    def jump(self, addr):
+        return self._put(self.JUMP, 0, addr)
+
+    def end(self, status=0):
+        return self._put(self.END, 0, status & _M32)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def array(self):
+        return np.array(self.rows, dtype=np.uint64)
+
+
+def _banks(d):
+    """(SPAD bank words, ACC bank words) of array size d."""
+    return SPAD_BYTES // d // 2, 262144 // (4 * d) // 2
+
+
+def build_gemm_list(d, m, n, k, a_addr, b_addr, c_addr, bias_addr=None, quant=None, relu=False,
+                    prefetch=True, bsplit="auto"):
+    """The gemm_fw schedule as a descriptor list (same commands, same order):
+    resident B (split over the two SPAD_B banks when B >= 16 KB), A strips
+    alternating banks with the next strip prefetched before the current
+    store, int32 C (+ bias rows) or int8 C through the VE epilogue (quant,
+    bias = vector of n)."""
+    sbank, cbank = _banks(d)
+    nt, kt = n // d, k // d
+    cbytes = n if quant is not None else 4 * n
+    vbias, qout = cbank - nt, sbank // 2
+    nt0 = (nt + 1) // 2
+    nt1 = nt - nt0
+    split = nt1 != 0 and nt0 * k <= sbank and (k * n >= 16384 if bsplit == "auto" else bool(bsplit))
+    bias_strip = bias_addr is not None and quant is None
+    dl = DescList()
+
+    def load_strip(i, ab, cb):
+        dl.ld(a_addr + i * k, laddr(MEM_SPAD_A, ab), d, k, k, LD_INTERLEAVE)
+        if bias_strip:
+            dl.ld(bias_addr + i * 4 * n, laddr(MEM_ACC, cb), d, 4 * n, 4 * n)
+
+    if split:
+        dl.ld(b_addr, laddr(MEM_SPAD_B, 0), k, nt0 * d, n, LD_INTERLEAVE)
+    else:
+        dl.ld(b_addr, laddr(MEM_SPAD_B, 0), k, n, n, LD_INTERLEAVE)
+    load_strip(0, 0, 0)
+    if split:
+        dl.ld(b_addr + nt0 * d, laddr(MEM_SPAD_B, sbank), k, nt1 * d, n, LD_INTERLEAVE)
+    if quant is not None and bias_addr is not None:
+        for cb in (0, cbank):
+            dl.ld(bias_addr, laddr(MEM_ACC, cb + vbias), 1, 4 * n, 4 * n)
+    vop = (V_REQUANT | (V_RELU if relu else 0) |
+           (VOPS["add"] if bias_addr is not None else VOPS["copy"])) if quant is not None else 0
+    for s_, i in enumerate(range(0, m, d)):
+        odd = s_ & 1
+        ab, cb = (sbank if odd else 0), (cbank if odd else 0)
+        if i != 0 and not prefetch:
+            load_strip(i, ab, cb)
+        if split:
+            dl.ex(ab, 0, cb, kt, bias_strip, nt0, k, 1, nt)
+            dl.ex(ab, sbank, cb + nt0, kt, bias_strip, nt1, k, 1, nt)
+        else:
+            dl.ex(ab, 0, cb, kt, bias_strip, nt, k, 1, nt)
+        if quant is not None:
+            dl.ve(laddr(MEM_ACC, cb), laddr(MEM_ACC, cb + vbias), laddr(MEM_SPAD_A, ab + qout), d * n,
+                  vop, 2 | 0 << 2, nt, quant.scale, quant.shift, quant.zp, quant.lo, quant.hi)
+        if prefetch and i + d < m:
+            load_strip(i + d, sbank if not odd else 0, cbank if not odd else 0)
+        if quant is not None:
+            dl.st(c_addr + i * n, laddr(MEM_SPAD_A, ab + qout), d, cbytes, cbytes)
+        else:
+            dl.st(c_addr + i * 4 * n, laddr(MEM_ACC, cb), d, cbytes, cbytes)
+    return dl.end(0x600D)
+
+
+def build_vector_list(d, op, it, ot, n, ny, x_addr, y_addr, o_addr, relu=False, requant=None):
+    """The vector_fw schedule as a descriptor list: chunks of up to 512
+    groups alternating banks, 256-byte DMA rows plus a tail, a periodic src2
+    resident in both banks. it / ot: 0 int8, 1 int16, 2 int32; ny = elements
+    of y (n, or d * period)."""
+    esize = {0: 1, 1: 2, 2: 4}
+    sbank, cbank = _banks(d)
+    code = VOPS[op]
+    unary = op == "copy"
+    period = 0 if unary or ny == n else ny // d
+    m1 = MEM_ACC if it == 2 else MEM_SPAD_A
+    m2 = MEM_ACC if it == 2 else MEM_SPAD_B
+    w2 = cbank // 4 if it == 2 else 0
+    md = MEM_ACC if ot == 2 else MEM_SPAD_B
+    wd = cbank // 2 if ot == 2 else sbank // 2
+    gin, gout = d * esize[it], d * esize[ot]
+    bank = lambda mem, b: b * (cbank if mem == MEM_ACC else sbank)
+    wbytes = lambda mem: 4 * d if mem == MEM_ACC else d
+    cg = (512 // period) * period if period > 1 else 512
+    rq = requant or Requant()
+    vop = code | (V_RELU if relu else 0) | (V_REQUANT if requant is not None else 0)
+    dl = DescList()
+
+    def xfer(store, ddr, mem, word, nbytes):
+        rows, tail = divmod(nbytes, 256)
+        f = dl.st if store else dl.ld
+        if rows:
+            f(ddr, laddr(mem, word), rows, 256, 256)
+        if tail:
+            f(ddr + rows * 256, laddr(mem, word + rows * 256 // wbytes(mem)), 1, tail, tail)
+
+    if not unary and period:
+        for b in (0, 1):
+            xfer(False, y_addr, m2, bank(m2, b) + w2, period * gin)
+    groups = n // d
+    for chunk, g in enumerate(range(0, groups, cg)):
+        cnt, b = min(cg, groups - g), chunk & 1
+        xfer(False, x_addr + g * gin, m1, bank(m1, b), cnt * gin)
+        if not unary and not period:
+            xfer(False, y_addr + g * gin, m2, bank(m2, b) + w2, cnt * gin)
+        dl.ve(laddr(m1, bank(m1, b)), laddr(m2, bank(m2, b) + w2), laddr(md, bank(md, b) + wd), cnt * d,
+              vop, it | ot << 2, period, rq.scale, rq.shift, rq.zp, rq.lo, rq.hi)
+        xfer(True, o_addr + g * gout, md, bank(md, b) + wd, cnt * gout)
+    return dl.end(0x5EC)
 
 
 def overlay_params(bitfile):
@@ -386,6 +570,92 @@ class MatmulOverlay:
         return out, {"firmware": self.firmware, "len": n, "chunks": self._mbox(MBOX_JOBS_DONE),
                      "riscv_cycles": cycles, "elem_per_cycle": n / cycles if cycles else 0,
                      "us": cycles / RISCV_HZ * 1e6, "wall_s": wall, "perf": self._perf()}
+
+    # ------------------------------------------------------ descriptor lists
+    def run_list(self, dl, bases=(0, 0, 0, 0), count=0, timeout=5.0):
+        """Run a DescList with desc_run_fw.bin: one mat_submit, then mat_fence.
+        bases: BASE0..BASE3 for descriptors built with base=n. Returns stats."""
+        self._use("desc_run_fw.bin")
+        rows = dl.array()
+        buf = allocate(shape=rows.shape, dtype=np.uint64)     # page aligned (>= 64 B)
+        try:
+            buf[:] = rows
+            buf.flush()
+            params = {MBOX_DL_ADDR: buf.physical_address, MBOX_DL_COUNT: count}
+            for i, b in enumerate(bases):
+                params[MBOX_DL_BASE0 + 4 * i] = b
+            wall = self._run(params, timeout)
+        finally:
+            buf.freebuffer()
+        if self._mbox(MBOX_ERRORS) and self._mbox(MBOX_FIRST_ERR) == ERR_NO_DESC:
+            raise RuntimeError("this overlay has no descriptor fetch unit (CAPS bit 21)")
+        cycles = self._mbox(MBOX_TOTAL_CYCLES)
+        return {"firmware": self.firmware, "descriptors": len(dl), "riscv_cycles": cycles,
+                "us": cycles / RISCV_HZ * 1e6, "wall_s": wall, "dl_status": self._mbox(MBOX_DL_STATUS),
+                "dl_exec": self._mbox(MBOX_DL_EXEC), "perf": self._perf()}
+
+    def gemm_list(self, a, b, bias=None, quant=None, relu=False, timeout=5.0):
+        """gemm() as one descriptor list built here (build_gemm_list) and run
+        with a single mat_submit; same arguments, results and limits."""
+        a = np.ascontiguousarray(a, dtype=np.int8)
+        b = np.ascontiguousarray(b, dtype=np.int8)
+        (m, k), (k2, n) = a.shape, b.shape
+        d = self.d
+        if k != k2 or m % d or n % d or k % d or k * n > SPAD_BYTES:
+            raise ValueError(f"shapes {a.shape} x {b.shape}: need matching K, multiples of {d}, K*N <= 128 KB")
+        bshape = (n,) if quant is not None else (m, n)
+        bufs = [allocate(shape=a.shape, dtype=np.int8), allocate(shape=b.shape, dtype=np.int8),
+                allocate(shape=(m, n), dtype=np.int8 if quant is not None else np.int32)]
+        if bias is not None:
+            bufs.append(allocate(shape=bshape, dtype=np.int32))
+        try:
+            bufs[0][:] = a
+            bufs[1][:] = b
+            bufs[2][:] = 0
+            if bias is not None:
+                bufs[3][:] = np.asarray(bias, dtype=np.int32).reshape(bshape)
+            for buf in bufs:
+                buf.flush()
+            dl = build_gemm_list(d, m, n, k, bufs[0].physical_address, bufs[1].physical_address,
+                                 bufs[2].physical_address, bufs[3].physical_address if bias is not None else None,
+                                 quant, relu)
+            st = self.run_list(dl, timeout=timeout)
+            bufs[2].invalidate()
+            c = np.array(bufs[2])
+        finally:
+            for buf in bufs:
+                buf.freebuffer()
+        st.update(shape=(m, n, k), mac_per_cycle=m * n * k / st["riscv_cycles"] if st["riscv_cycles"] else 0)
+        return c, st
+
+    def vector_list(self, op, x, y=None, out_dtype=None, relu=False, requant=None, timeout=5.0):
+        """vector() as one descriptor list (build_vector_list); same arguments."""
+        x = np.ascontiguousarray(x).ravel()
+        out_dtype = np.dtype(out_dtype or x.dtype)
+        it, ot, n, d = VTYPES[x.dtype], VTYPES[out_dtype], x.size, self.d
+        if n % d or n == 0:
+            raise ValueError(f"length {n}: need a positive multiple of {d}")
+        y = x[:d] if op == "copy" else np.ascontiguousarray(y, dtype=x.dtype).ravel()
+        if op != "copy" and y.size != n and (y.size % d or not 0 < y.size // d <= 512):
+            raise ValueError(f"y: {y.size} elements, need {n} or {d} * period (period <= 512)")
+        bufs = [allocate(shape=(n,), dtype=x.dtype), allocate(shape=(y.size,), dtype=x.dtype),
+                allocate(shape=(n,), dtype=out_dtype)]
+        try:
+            bufs[0][:] = x
+            bufs[1][:] = y
+            bufs[2][:] = 0
+            for buf in bufs:
+                buf.flush()
+            dl = build_vector_list(d, op, it, ot, n, y.size, bufs[0].physical_address,
+                                   bufs[1].physical_address, bufs[2].physical_address, relu, requant)
+            st = self.run_list(dl, timeout=timeout)
+            bufs[2].invalidate()
+            out = np.array(bufs[2])
+        finally:
+            for buf in bufs:
+                buf.freebuffer()
+        st.update(len=n, elem_per_cycle=n / st["riscv_cycles"] if st["riscv_cycles"] else 0)
+        return out, st
 
     def bandwidth(self, timeout=5.0):
         """DMA bandwidth self-test (bwtest_fw.bin). Returns [(name, bytes, cycles, B/cycle)]

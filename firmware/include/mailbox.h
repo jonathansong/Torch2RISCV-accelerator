@@ -54,6 +54,11 @@
                                   *      split, bit 2 B split even for B < 16 KB */
 #define MBOX_PERF_COUNT    0x8C  /* out: counters copied to the perf area (0 = none:
                                   *      overlay without counters, CAPS bit 20)      */
+#define MBOX_DL_ADDR       0x90  /* in:  desc_run firmware: descriptor list (DDR, 64-B aligned) */
+#define MBOX_DL_COUNT      0x94  /* in:  descriptors to run (0 = until END)          */
+#define MBOX_DL_BASE0      0x98  /* in:  relocation bases BASE0..BASE3 (0x98..0xA4)   */
+#define MBOX_DL_STATUS     0xA8  /* out: value of the last END descriptor            */
+#define MBOX_DL_EXEC       0xAC  /* out: descriptors decoded                         */
 #define GEMM_NO_PREFETCH   (1u << 0)
 #define GEMM_NO_BSPLIT     (1u << 1)
 #define GEMM_FORCE_BSPLIT  (1u << 2)
@@ -71,6 +76,7 @@
 #define STATUS_DONE        0x600D600Du
 
 #define ERR_NO_UNIT        0xDEAD0001u   /* FIRST_ERR: ID register mismatch  */
+#define ERR_NO_DESC        0xDEAD0003u   /* FIRST_ERR: overlay without descriptor unit */
 #define ERR_TIMEOUT        0xDEAD0002u   /* FIRST_ERR: job never set done    */
 
 #endif

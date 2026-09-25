@@ -1,7 +1,7 @@
 # 方案：性能计数器与描述符 DMA
 
 状态：**第 1 部分（性能计数器，P1–P4）已完成并上板验证**（`RISCV-on-PYNQ-Z1/bitstreams/m4p/`）；
-**D0 决策已完成**（见下）；第 2 部分（描述符 DMA，D1 起）未实现。本文给出两项硬件扩展的详细设计、实施步骤和验收标准：
+**D0 决策已完成**（见下）；第 2 部分（描述符 DMA）**D1–D5 已完成并上板验证**（`RISCV-on-PYNQ-Z1/bitstreams/m5/`）；D6（ARM 直接提交）未做。本文给出两项硬件扩展的详细设计、实施步骤和验收标准：
 
 > **P1 完成情况**（仿真，未上板）：`rtl/sysarray/sa_perf.v` + 各模块事件端口 + `mat_perf`
 > （funct7 = 1，funct3 = 5）+ CSR 镜像 0x40–0xBC / `PERF_CTRL` 0x3C + CAPS bit 20。
@@ -36,6 +36,27 @@
 >   瓶颈是 PicoRV32 发射命令。描述符 DMA 的收益集中在这里；64³ 估计从约 4.2k 降到约 2.5k 周期
 >   （之后受 16 KB 的 C 写回和计算限制），以实测为准。
 > - DMA 忙时 7.4–7.97 B/cycle，接近端口上限，再次确认不需要三端口。
+>
+> **D1–D3 完成情况**（仿真）：格式与语义写入设计文档 §8.6；`pkt_*` 公共函数（`sa_defs.vh`）；
+> `sa_cmdfetch.v` + 端口 0 读仲裁（归属 FIFO）+ `mat_submit`（funct3 = 6）+ BASE0–3 + 状态 CSR 0xC0–0xD0 +
+> `ext_status` bit 24 + CAPS bit 21 + 计数器 28–31。`tb_sa_unit`：列表 GEMM、列表随机命令流（与顺序参考模型比对）、
+> 26 项定向检查（混合顺序、FENCE / 无 FENCE / FENCE_BEFORE、JUMP、END、count、RELOC、5 类错误与恢复、FETCH_DESC），
+> 4 个突变全部被发现；`make test` / `test16` / `PERF = 0` 与全部固件系统仿真不回归。软件：`firmware/desc_run`、
+> 驱动 `DescList` / `build_gemm_list` / `build_vector_list` / `run_list` / `gemm_list` / `vector_list`，
+> **联合仿真**：驱动建的 7 个列表（GEMM、B 拆分、int8、向量）在 `tb_system` 上由 RTL 执行，D = 8 / 16 逐字节正确；
+> 板上脚本 `notebooks/m5_desc_demo.py`。OOC（D = 16）：43,540 LUT（+721，`sa_cmdfetch` 816）、30,970 FF、
+> BRAM / DSP 不变，WNS +2.108 ns。
+>
+> 与 2.x 计划的差别：描述符 FIFO 用 LUTRAM（32 × 64 位，4 条预取），不占 BRAM；只检查 header 的保留位和 opcode；
+> END 的 IRQ 标志保留未实现；FENCE 用调度器的队列占用和引擎忙位判断；**列表由 ARM 建**（PicoRV32 写一条
+> 描述符要约 160 周期，比直接发 PCPI 还慢），因此没有做 `gemm_fw` / `vector_fw` 的列表模式，改为 `desc_run`
+> 固件 + 驱动建表。
+>
+> **D4 / D5 完成情况**（上板）：bitstream WNS +2.460 ns、48,928 LUT（92.0%）。`m5_desc_demo.py` 全部正确：
+> GEMM 16³ **4.19×**、64³ 1.23×、int8 64³ 1.52×、128³ 及以上 1.00×；向量 int8 add 1.52×、广播 max **2.60×**、
+> int32→int8 1.27×；同一张表经 BASE 重定位复用三次全部正确。`m4_perf.py` 69/69、`m4_demo.py` 不变。
+> 结果写入设计文档 §10.5。64³ 的收益（1.23×）低于 D0 估计的约 1.6×：用列表时队首仍有 24% 为空，
+> 取指单元每条描述符至少 9 个周期，且每条都要等自己的 8 拍读取。
 
 1. **性能计数器**（第 1 部分）：让硬件自己报告周期花在哪里；
 2. **描述符 DMA**（第 2 部分）：软件把命令写成一张表放进 DDR，由硬件自己取指执行。

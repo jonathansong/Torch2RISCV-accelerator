@@ -44,7 +44,9 @@ $(SIM)/n_cases.vh: $(ROOT)/rtl/matmul/sim/gen_vectors.py
 	mkdir -p $(SIM)
 	$(PYTHON) $< --out $(SIM)
 
+# SIM_PREP: optional command run before compiling (e.g. generating test data)
 sim: $(SIM)/fw.hex $(SIM)/n_cases.vh
+	$(SIM_PREP)
 	cd $(SIM) && bash -c 'source $(VIVADO_SETTINGS) >/dev/null && \
 	  xvlog -i . -i $(SA) $(addprefix -d ,$(SIM_DEFINES)) -d SIM_D=$(strip $(SIM_D)) $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { grep ERROR xvlog.out; exit 1; }; \
 	  xelab -debug off tb_system -s tb >xelab.out 2>&1 || { cat xelab.out; exit 1; }; \

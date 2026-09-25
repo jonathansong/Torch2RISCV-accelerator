@@ -13,6 +13,7 @@ behavior (CSRs, funct7 = 0 instructions) is kept by `sa_legacy`.
 | `sa_ld.v`, `sa_st.v` | DMA engines: 2D shapes (LINEAR / INTERLEAVE), ≤ 16-beat 4 KB-safe bursts striped over NPORTS |
 | `sa_ex.v` | EX engine: K-streaming feed (one SPAD_A + one SPAD_B word per cycle), shadow drain, accumulate, repeat (M2: several C tiles per command with B / C strides) |
 | `sa_perf.v` | performance counters: 32 × 32-bit event counters (28 defined, `PC_*` in `sa_defs.vh`), read by `mat_perf` (funct7 = 1, funct3 = 5) or the CSR mirror 0x40 + 4·i, control via `mat_perf` or `PERF_CTRL` (0x3C); `PERF = 0` removes them ([plan](../../docs/perf_counters_and_desc_dma_plan.md), P1) |
+| `sa_cmdfetch.v` | descriptor fetch unit: `mat_submit(list, count)` reads 64-byte descriptors from DDR (shares DMA port 0 with LD), decodes LD/ST/EX/VE into the same packets as PCPI (`pkt_*` in `sa_defs.vh`), handles FENCE / JUMP / END, relocation bases, errors (engine 4), status CSRs 0xC0–0xD0 ([design §8.6](../../docs/double_buffer_design.md)) |
 | `sa_ve.v` | M3 vector engine: VL = D lanes, ADD/SUB/MUL/MAX/MIN/COPY + RELU/REQUANT/clamp, int8/int16 (SPAD) and int32 (ACC), src2 period (broadcast / bias vector) |
 | `sa_array.v` | D×D PEs (`sa_pe_dsp` / `sa_pe_lut` per column), shadow accumulators |
 | `sa_bankmem.v`, `sa_tdpram.v` | double-banked byte-write TDP memories (UG901 template → RAMB36) |
@@ -34,14 +35,16 @@ boundaries or scaled with the memory depth.
 |---|---|
 | `tb_sa_ex` | K-streaming vs golden model: Kt 1–64, strips across banks, back-to-back commands, accumulate, extremes, repeat commands (row-major C strip, gapped B strips, bank crossing) |
 | `tb_sa_dma` (NP = 1, 3) | LD/ST shapes, INTERLEAVE, 4 KB splitting, bank crossing, partial ACC words, SLVERR; byte-exact vs reference incl. neighbours |
-| `tb_sa_unit` | Phase 2–4 tests (CSR + mat_trigger, 32 NumPy vectors, errors, irq); tiled GEMMs on the new ISA (repeat exec, strip-wide store); quantized GEMMs with the VE epilogue (bias vector or preloaded bias rows, RELU, REQUANT → int8); 120-command random stream incl. repeat EX and VE commands vs a sequential reference (scoreboard); new-ISA error paths; performance counters: exact invariants after GEMMs / an int8 GEMM (tiles, useful steps, beats, commands), a directed RAW hazard, frozen / cleared / CSR-mirror reads, `GEN=PERF=0` |
+| `tb_sa_unit` | Phase 2–4 tests (CSR + mat_trigger, 32 NumPy vectors, errors, irq); tiled GEMMs on the new ISA (repeat exec, strip-wide store); quantized GEMMs with the VE epilogue (bias vector or preloaded bias rows, RELU, REQUANT → int8); 120-command random stream incl. repeat EX and VE commands vs a sequential reference (scoreboard); new-ISA error paths; performance counters: exact invariants after GEMMs / an int8 GEMM (tiles, useful steps, beats, commands), a directed RAW hazard, frozen / cleared / CSR-mirror reads, `GEN=PERF=0`; descriptor lists: a GEMM and the whole random stream as lists (same reference model), PCPI/list ordering, FENCE / no FENCE / FENCE_BEFORE on a DDR dependency, JUMP, END, count, RELOC, error paths and recovery, FETCH_DESC |
 | `tb_sa_ve` | VE alone: every op × type, RELU/REQUANT/clamp/saturation edges, broadcast and periodic src2, in-place, bank crossing, all operands in one memory; 200 random commands checked one by one, then 60 issued back to back |
 
 Mutation checks (B byte off by one, accumulate dropped, extra k step, no
 4 KB split, lane mapping, dropped SLVERR, scoreboard without hazard check or
 without WAR, VE without RAW/WAR/WAW hazards, REQUANT without rounding; counters: EX_USEFUL wired to the array step, hazards
 on the wrong engine, LD beats wired to busy, PCPI read index off by one, CSR
-clear ignored) all make the testbenches fail.
+clear ignored; descriptors: PCPI not held back during a list, FENCE not
+waiting, count off by one, read beats not routed by owner) all make the
+testbenches fail.
 
 xsim note: compare function results through a `reg` (`x = f(..); if (x !== y)`).
 Two calls of the same static function in one expression, or `f(..) !== g(..)`

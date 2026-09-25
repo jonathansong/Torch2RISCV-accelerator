@@ -87,6 +87,7 @@ static inline uint32_t mat_cycles(void)
  */
 #define SA_CAPS_ADDR    0x80000024u
 #define SA_CAPS_PERF    (1u << 20)
+#define SA_CAPS_DESC    (1u << 21)
 static uint32_t sa_caps_runtime = 0u;
 #ifndef SA_D
 static uint32_t sa_d_runtime = 8u;
@@ -108,6 +109,8 @@ static inline uint32_t sa_init(void)
 #endif
 /* the overlay has performance counters (mat_perf would trap without them) */
 static inline int sa_has_perf(void) { return (sa_caps_runtime & SA_CAPS_PERF) != 0; }
+/* the overlay has the descriptor fetch unit (mat_submit would trap without it) */
+static inline int sa_has_desc(void) { return (sa_caps_runtime & SA_CAPS_DESC) != 0; }
 #define SA_SPAD_WORDS   (131072u / SA_D)            /* per SPAD, D-byte words      */
 #define SA_ACC_WORDS    (262144u / (4u * SA_D))     /* D x int32 words             */
 #define SA_SPAD_BANK    (SA_SPAD_WORDS / 2u)        /* first word of bank 1        */
@@ -130,6 +133,7 @@ static inline int sa_has_perf(void) { return (sa_caps_runtime & SA_CAPS_PERF) !=
 #define SA_CFG_EX_B_STEP     8u      /*     SPAD_B words between B strips */
 #define SA_CFG_EX_C_STEP     9u      /*     ACC words between tiles       */
 #define SA_CFG_EX_C_ROW      10u     /*     ACC words between tile rows   */
+#define SA_CFG_BASE(n)       (11u + (n))  /* descriptor relocation bases BASE0..BASE3 */
 #define SA_LD_LINEAR         0u
 #define SA_LD_INTERLEAVE     1u
 
@@ -292,6 +296,28 @@ static inline uint32_t sa_perf_end(volatile uint32_t *dst, uint32_t max)
     for (uint32_t i = 0; i < n; i++)
         dst[i] = mat_perf_read(i);
     return n;
+}
+
+/* ------------------------------------------------------------------------
+ * Descriptor lists (funct7 = 1, funct3 = 6; rtl/sysarray/sa_cmdfetch.v,
+ * docs/double_buffer_design.md §8.6). Only when sa_has_desc().
+ * mat_submit starts the fetch unit on a 64-byte aligned list in DDR and
+ * returns at once; queued PCPI commands issued afterwards wait for the list,
+ * and mat_fence waits for it to finish. count 0 = run until END.
+ * Status CSRs (RISC-V 0x80000000 + offset): 0xC0 last descriptor address,
+ * 0xC4 lists finished, 0xC8 last END value, 0xCC failing index, 0xD0
+ * descriptors decoded in the current list.
+ * ---------------------------------------------------------------------- */
+#define SA_CSR(off)          (*(volatile uint32_t *)(0x80000000u + (off)))
+#define SA_CSR_DESC_ADDR     0xC0u
+#define SA_CSR_DESC_DONE     0xC4u
+#define SA_CSR_DESC_STATUS   0xC8u
+#define SA_CSR_DESC_ERR_IDX  0xCCu
+#define SA_CSR_DESC_EXEC     0xD0u
+
+static inline void mat_submit(uint32_t list, uint32_t count)
+{
+    __asm__ volatile (".insn r 0x0B, 6, 1, x0, %0, %1" :: "r"(list), "r"(count) : "memory");
 }
 
 /* REQUANT parameters and output clamp window */

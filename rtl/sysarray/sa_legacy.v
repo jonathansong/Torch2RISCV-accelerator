@@ -20,7 +20,8 @@ module sa_legacy #(
     parameter integer VL         = 0,
     parameter integer SPAD_WORDS = 16384,
     parameter integer ACC_WORDS  = 8192,
-    parameter integer PERF       = 1          // performance counters present (CAPS bit 20)
+    parameter integer PERF       = 1,         // performance counters present (CAPS bit 20)
+    parameter integer DESC       = 1          // descriptor fetch unit present (CAPS bit 21)
 ) (
     input  wire                  clk,
     input  wire                  resetn,
@@ -74,17 +75,28 @@ module sa_legacy #(
     output wire [1:0]            perf_ctl,
     input  wire                  perf_en,
     output wire [4:0]            perf_rsel,
-    input  wire [31:0]           perf_rdata
+    input  wire [31:0]           perf_rdata,
+
+    // descriptor fetch unit status (read-only CSRs 0xC0 .. 0xD0)
+    input  wire [31:0]           fst_addr,
+    input  wire [31:0]           fst_done,
+    input  wire [31:0]           fst_status,
+    input  wire [31:0]           fst_err_idx,
+    input  wire [31:0]           fst_exec
 );
     `include "sa_defs.vh"
 
     localparam [5:0] R_CTRL = 0, R_STATUS = 1, R_SRC_A = 2, R_SRC_B = 3, R_DST = 4, R_DIM = 5,
                      R_IRQ_STATUS = 6, R_CYCLES = 7, R_ID = 8, R_CAPS = 9, R_EXT = 10,
-                     R_PERF_CTRL = 15, R_PERF0 = 16;             // counters at 0x40 .. 0xBC
+                     R_PERF_CTRL = 15, R_PERF0 = 16,             // counters at 0x40 .. 0xBC
+                     R_DESC_ADDR = 48, R_DESC_DONE = 49, R_DESC_STATUS = 50,
+                     R_DESC_ERR_IDX = 51, R_DESC_EXEC = 52;       // 0xC0 .. 0xD0
     localparam [31:0] ID_VALUE = 32'h4D4D_3038;                 // "MM08"
     localparam [31:0] DIM_888  = {2'b0, 10'd8, 10'd8, 10'd8};
-    localparam [31:0] CAPS     = (PERF != 0 ? 32'h0010_0000 : 32'd0) + NPORTS * 65536 + VL * 256 + D;
-                                  // [7:0] D, [15:8] VL, [19:16] ports, [20] performance counters
+    localparam [31:0] CAPS     = (DESC != 0 ? 32'h0020_0000 : 32'd0) + (PERF != 0 ? 32'h0010_0000 : 32'd0) +
+                                 NPORTS * 65536 + VL * 256 + D;
+                                  // [7:0] D, [15:8] VL, [19:16] ports, [20] performance counters,
+                                  // [21] descriptor fetch unit
     localparam [3:0]  ERR_NONE = 0, ERR_DIM = 1, ERR_ADDR = 2, ERR_RRESP = 3, ERR_BRESP = 4;
 
     // reserved tile slots (last D words of each memory)
@@ -160,6 +172,11 @@ module sa_legacy #(
                     R_CAPS:       s_axi_rdata <= CAPS;
                     R_EXT:        s_axi_rdata <= ext_status;
                     R_PERF_CTRL:  s_axi_rdata <= {30'd0, perf_en, 1'b0};
+                    R_DESC_ADDR:    s_axi_rdata <= fst_addr;
+                    R_DESC_DONE:    s_axi_rdata <= fst_done;
+                    R_DESC_STATUS:  s_axi_rdata <= fst_status;
+                    R_DESC_ERR_IDX: s_axi_rdata <= fst_err_idx;
+                    R_DESC_EXEC:    s_axi_rdata <= fst_exec;
                     default:      s_axi_rdata <= s_axi_araddr[7:2] >= R_PERF0 &&
                                                  s_axi_araddr[7:2] < R_PERF0 + 32 ? perf_rdata : 32'd0;
                 endcase

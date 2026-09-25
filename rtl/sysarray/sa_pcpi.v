@@ -5,7 +5,10 @@
 //              mat_wait / mat_cycles -> legacy block
 //   funct7 = 1: mat_cfg (0), mat_load (1), mat_store (2), mat_exec (3),
 //              mat_fence (4) -> command queue / scheduler;
-//              mat_perf (5) -> performance counters (read / control)
+//              mat_perf (5) -> performance counters (read / control);
+//              mat_submit (6) -> descriptor fetch unit (list, count). While a
+//              list runs, queued PCPI commands wait (program order) and
+//              mat_fence also waits for the list to finish.
 //   funct7 = 2: vec_cfg (0), vec_run (1) -> command queue (M3 vector engine)
 // Load/store/exec capture the current configuration into the packet, so
 // software may reconfigure right after issuing. With a sticky error set,
@@ -56,7 +59,14 @@ module sa_pcpi #(
     output reg  [1:0]            perf_ctl,        // [0] clear, [1] enable
     output reg  [4:0]            perf_rsel,
     input  wire [31:0]           perf_rdata,
-    output wire [1:0]            perf_ev          // {waiting in mat_fence, stalled on a full queue}
+    output wire [1:0]            perf_ev,         // {waiting in mat_fence, stalled on a full queue}
+
+    // descriptor fetch unit (sa_cmdfetch): mat_submit, relocation bases
+    input  wire                  fetch_busy,
+    output reg                   submit,          // one-cycle pulse
+    output reg  [31:0]           submit_addr,
+    output reg  [31:0]           submit_count,
+    output reg  [127:0]          bases            // BASE3 .. BASE0 (mat_cfg keys 11..14)
 );
     `include "sa_defs.vh"
 
@@ -65,7 +75,7 @@ module sa_pcpi #(
     wire [6:0] funct7 = pcpi_insn[31:25];
     wire       ours   = opcode == 7'b0001011 &&
                         ((funct7 == 7'd0 && funct3 <= 3'd4) ||
-                         (funct7 == 7'd1 && funct3 <= 3'd5) ||
+                         (funct7 == 7'd1 && funct3 <= 3'd6) ||
                          (funct7 == 7'd2 && funct3 <= 3'd1));
 
     assign pcpi_wait = pcpi_valid && ours;
@@ -102,10 +112,12 @@ module sa_pcpi #(
         pcpi_ready  <= 0;
         pcpi_wr     <= 0;
         perf_ctl_we <= 0;
+        submit      <= 0;
         if (!resetn) begin
             state       <= S_IDLE;
             perf_ctl    <= 0;
             perf_rsel   <= 0;
+            bases       <= 0;
             q_valid     <= 0;
             leg_trigger <= 0;
             leg_reset   <= 0;
@@ -127,16 +139,15 @@ module sa_pcpi #(
                         // build the packet now, from the configuration current at issue
                         q_pkt <= 0;
                         if (funct7[0] && funct3 == 3'd1)
-                            q_pkt <= {1'b0, ld_mode, ld_pitch, ld_rb, ld_rows, pcpi_rs2, pcpi_rs1, CMD_LD};
+                            q_pkt <= pkt_ld(pcpi_rs1, pcpi_rs2, ld_rows, ld_rb, ld_pitch, ld_mode);
                         if (funct7[0] && funct3 == 3'd2)
-                            q_pkt <= {1'b0, 2'b00, st_pitch, st_rb, st_rows, pcpi_rs2, pcpi_rs1, CMD_ST};
+                            q_pkt <= pkt_st(pcpi_rs1, pcpi_rs2, st_rows, st_rb, st_pitch);
                         if (funct7[0] && funct3 == 3'd3)       // {acc, Kt, C} {B, A} + EX config
-                            q_pkt <= {10'd0, ex_crow, ex_cstep, ex_bstep, ex_rep_m1,
-                                      pcpi_rs2[28], pcpi_rs2[27:16], pcpi_rs2[15:0],
-                                      pcpi_rs1[31:16], pcpi_rs1[15:0], CMD_EX};
+                            q_pkt <= pkt_ex(pcpi_rs1[15:0], pcpi_rs1[31:16], pcpi_rs2[15:0], pcpi_rs2[27:16],
+                                            pcpi_rs2[28], ex_rep_m1, ex_bstep, ex_cstep, ex_crow);
                         if (funct7 == 7'd2 && funct3 == 3'd1)  // vec_run: src1, src2 + VE config
-                            q_pkt <= {v_hi, v_lo, v_zp, v_shift, v_scale, v_mod, v_types, v_op, v_groups,
-                                      v_dst, pcpi_rs2, pcpi_rs1, CMD_VE};
+                            q_pkt <= pkt_ve(pcpi_rs1, pcpi_rs2, v_dst, v_groups, v_op, v_types, v_mod,
+                                            v_scale, v_shift, v_zp, v_lo, v_hi);
                         fence_mask <= pcpi_rs1[3:0];
                         perf_rsel  <= pcpi_rs1[4:0];
                     end
@@ -163,7 +174,7 @@ module sa_pcpi #(
                         end else if (sched_err) begin
                             q_valid <= 0;
                             respond(0, 0);
-                        end else
+                        end else if (!fetch_busy)            // after a running list
                             q_valid <= 1;
                     end else if (grp == 2'd0) begin
                         case (op)
@@ -199,6 +210,10 @@ module sa_pcpi #(
                                     CFG_EX_B_STEP:    ex_bstep <= rs2[15:0];
                                     CFG_EX_C_STEP:    ex_cstep <= rs2[15:0];
                                     CFG_EX_C_ROW:     ex_crow  <= rs2[15:0];
+                                    CFG_BASE0:        bases[31:0]   <= rs2;
+                                    CFG_BASE0 + 1:    bases[63:32]  <= rs2;
+                                    CFG_BASE0 + 2:    bases[95:64]  <= rs2;
+                                    CFG_BASE0 + 3:    bases[127:96] <= rs2;
                                     default: ;
                                 endcase
                                 respond(0, 0);
@@ -210,10 +225,19 @@ module sa_pcpi #(
                                 end else if (sched_err) begin
                                     q_valid <= 0;           // halted: drop the command
                                     respond(0, 0);
-                                end else
+                                end else if (!fetch_busy)   // after a running list
                                     q_valid <= 1;
-                            3'd4:                           // mat_fence
-                                if (fence_ok || sched_err) respond(1, ext_status);
+                            3'd4:                           // mat_fence (also waits for a list)
+                                if ((fence_ok && !fetch_busy) || sched_err) respond(1, ext_status);
+                            3'd6:                           // mat_submit(list, count)
+                                if (sched_err)
+                                    respond(0, 0);          // halted: dropped like any command
+                                else if (!fetch_busy) begin // one list at a time
+                                    submit       <= 1;
+                                    submit_addr  <= rs1;
+                                    submit_count <= rs2;
+                                    respond(0, 0);
+                                end
                             default:                        // mat_perf
                                 if (rs1[31]) begin           // control: rs2[0] clear, rs2[1] enable
                                     perf_ctl_we <= 1;

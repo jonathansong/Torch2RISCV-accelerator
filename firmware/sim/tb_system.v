@@ -7,6 +7,8 @@
 //               (M3) int8 output through the vector-engine epilogue
 //   VEC_TEST  : firmware/vector, standalone vector operations (funct7 = 2)
 //   BW_TEST   : firmware/bwtest, DMA bandwidth (simulated DDR model)
+//   DESC_TEST : firmware/desc_run, GEMMs as descriptor lists built here (the
+//               "ARM" side), one mat_submit each
 // Mirrors the overlay's RISC-V memory map:
 //   0xC0000000  8 KB program BRAM (+ mailbox at 0xC0001F00)
 //   0x80000000  matmul_unit CSRs
@@ -351,6 +353,172 @@ module tb_system;
         end
         $display("TB %s: bandwidth test, %0d errors (simulated DDR model, not board numbers)",
                  errors ? "FAIL" : "PASS", errors);
+        $finish;
+    end
+`elsif DESC_TEST
+    // ------------------------------------------------------ DESC_TEST
+    // Descriptor lists written into the DDR model like driver/pynq_matmul.py
+    // DescList does; the desc_run firmware submits them.
+    localparam [31:0] DA_ADDR = DDR_BASE, DB_ADDR = DDR_BASE + 32'h4000, DC_ADDR = DDR_BASE + 32'h8000,
+                      DBIAS_ADDR = DDR_BASE + 32'h10000, DL_ADDR = DDR_BASE + 32'h40000;
+    localparam integer SWD = 131072 / D, CWD = 262144 / (4 * D);   // SPAD / ACC words
+    reg signed [7:0]  QA [0:63][0:127];
+    reg signed [7:0]  QB [0:127][0:127];
+    reg signed [31:0] QBIAS [0:63][0:127];
+    integer di, dj, dk, runs = 0, dl_n;
+    reg signed [31:0] dsum;
+    task put64(input [31:0] a, input [63:0] v);
+        integer j;
+        for (j = 0; j < 8; j = j + 1) ddr[a - DDR_BASE + j] = v[8*j +: 8];
+    endtask
+    task d_put(input [7:0] op, input [7:0] fl, input [63:0] w1, input [63:0] w2, input [63:0] w3);
+        begin
+            put64(DL_ADDR + 64 * dl_n,      {dl_n[31:0], 16'd0, fl, op});
+            put64(DL_ADDR + 64 * dl_n + 8,  w1);
+            put64(DL_ADDR + 64 * dl_n + 16, w2);
+            put64(DL_ADDR + 64 * dl_n + 24, w3);
+            put64(DL_ADDR + 64 * dl_n + 32, 0); put64(DL_ADDR + 64 * dl_n + 40, 0);
+            put64(DL_ADDR + 64 * dl_n + 48, 0); put64(DL_ADDR + 64 * dl_n + 56, 0);
+            dl_n = dl_n + 1;
+        end
+    endtask
+    function [31:0] la(input [3:0] m, input integer w); la = {m, 12'd0, w[15:0]}; endfunction
+    task d_ld(input [31:0] ddr_a, input [31:0] laddr, input [15:0] rows, input [15:0] rb,
+              input [31:0] pitch, input [1:0] mode, input [7:0] fl);
+        d_put(8'h01, fl, {32'd0, ddr_a}, {rb, rows, laddr}, {30'd0, mode, pitch});
+    endtask
+    task d_st(input [31:0] ddr_a, input [31:0] laddr, input [15:0] rows, input [15:0] rb, input [31:0] pitch);
+        d_put(8'h02, 8'd0, {32'd0, ddr_a}, {rb, rows, laddr}, {32'd0, pitch});
+    endtask
+    task d_ex(input [15:0] a, input [15:0] b, input [15:0] c, input [11:0] kt, input acc,
+              input [11:0] rep, input [15:0] bstep, input [15:0] cstep, input [15:0] crow);
+        d_put(8'h03, 8'd0, {3'd0, acc, kt, c, b, a}, {crow, cstep, bstep, 4'd0, rep}, 0);
+    endtask
+
+    // C = A x B (+ bias rows) as one list; reloc: A addressed as BASE0 + offset
+    task run_desc_gemm(input integer M, input integer N, input integer K, input integer use_bias,
+                       input integer reloc);
+        integer t, bk;
+        begin
+            resetn <= 0;
+            repeat (5) @(posedge clk);
+            for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = 8'hA5;
+            for (di = 0; di < M; di = di + 1) for (dk = 0; dk < K; dk = dk + 1) begin
+                QA[di][dk] = $random(seed); ddr[DA_ADDR - DDR_BASE + di*K + dk] = QA[di][dk];
+            end
+            for (dk = 0; dk < K; dk = dk + 1) for (dj = 0; dj < N; dj = dj + 1) begin
+                QB[dk][dj] = $random(seed); ddr[DB_ADDR - DDR_BASE + dk*N + dj] = QB[dk][dj];
+            end
+            for (di = 0; di < M; di = di + 1) for (dj = 0; dj < N; dj = dj + 1) begin
+                QBIAS[di][dj] = use_bias ? $random(seed) >>> 8 : 0;
+                put64(DBIAS_ADDR + 4*(di*N + dj), {32'd0, QBIAS[di][dj]});   // (next word overwrites the top)
+            end
+            // the list: resident B, per strip {LD A, [LD bias], EX, ST}, END
+            dl_n = 0;
+            d_ld(DB_ADDR, la(2, 0), K, N, N, 1, 0);
+            for (t = 0; t < M/D; t = t + 1) begin
+                bk = t % 2;
+                if (reloc) d_ld(t*D*K, la(1, bk * SWD/2), D, K, K, 1, 8'h01);      // BASE0 + offset
+                else       d_ld(DA_ADDR + t*D*K, la(1, bk * SWD/2), D, K, K, 1, 0);
+                if (use_bias) d_ld(DBIAS_ADDR + t*D*4*N, la(3, bk * CWD/2), D, 4*N, 4*N, 0, 0);
+                d_ex(bk * SWD/2, 0, bk * CWD/2, K/D, use_bias, N/D, K, 1, N/D);
+                d_st(DC_ADDR + t*D*4*N, la(3, bk * CWD/2), D, 4*N, 4*N);
+            end
+            d_put(8'h12, 8'd0, {32'd0, 32'hC0DE0000 + runs}, 0, 0);                 // END
+            for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
+            $readmemh("fw.hex", bram);
+            bram[MBOX + 32'h90/4] = DL_ADDR;
+            bram[MBOX + 32'h94/4] = 0;
+            bram[MBOX + 32'h98/4] = reloc ? DA_ADDR : 0;                          // BASE0
+            repeat (5) @(posedge clk);
+            resetn <= 1;
+            cycles = 0;
+            while (!trap && cycles < 3000000) begin @(posedge clk); cycles = cycles + 1; end
+            repeat (5) @(posedge clk);
+            if (!trap) begin $display("TB ERROR: desc GEMM no trap"); errors = errors + 1; end
+            if (bram[MBOX] !== 32'h600D600D) begin $display("TB ERROR: mailbox status %08x", bram[MBOX]); errors = errors + 1; end
+            if (bram[MBOX + 6] !== 0) begin $display("TB ERROR: desc ext status %08x", bram[MBOX + 16]); errors = errors + 1; end
+            if (bram[MBOX + 32'hA8/4] !== 32'hC0DE0000 + runs) begin
+                $display("TB ERROR: DL_STATUS %08x", bram[MBOX + 32'hA8/4]); errors = errors + 1;
+            end
+            if (bram[MBOX + 32'hAC/4] !== dl_n) begin
+                $display("TB ERROR: DL_EXEC %0d, expected %0d", bram[MBOX + 32'hAC/4], dl_n); errors = errors + 1;
+            end
+            if (bram[MBOX + MBOX_PERF_COUNT] == 32) begin
+                for (pci = 0; pci < 32; pci = pci + 1) pcv[pci] = bram[PERF_W + pci];
+                perf_expect(pcv[28], dl_n, "FETCH_DESC");
+                perf_expect(pcv[PC_EX_USEFUL] * D * D, M * N * K, "EX_USEFUL x D^2");
+            end
+            for (di = 0; di < M; di = di + 1) for (dj = 0; dj < N; dj = dj + 1) begin
+                dsum = QBIAS[di][dj];
+                for (dk = 0; dk < K; dk = dk + 1) dsum = dsum + QA[di][dk] * QB[dk][dj];
+                e = DC_ADDR - DDR_BASE + 4*(di*N + dj);
+                got = {ddr[e + 3], ddr[e + 2], ddr[e + 1], ddr[e]};
+                if (got !== dsum) begin
+                    errors = errors + 1;
+                    if (errors <= 10) $display("TB ERROR desc GEMM %0dx%0dx%0d C[%0d][%0d] = %0d, expected %0d",
+                                               M, N, K, di, dj, $signed(got), dsum);
+                end
+            end
+            $display("TB desc GEMM %0dx%0dx%0d%0s%0s: %0d descriptors, %0d RISC-V cycles, %0d MAC/cycle",
+                     M, N, K, use_bias ? " + bias" : "", reloc ? " (A relocated)" : "", dl_n,
+                     bram[MBOX + 8], M*N*K / bram[MBOX + 8]);
+            runs = runs + 1;
+        end
+    endtask
+
+    // ---- co-simulation: lists built by the Python driver (gen_desc_cases.py)
+    reg [7:0] dexp [0:32'h17FFF];
+    `include "desc_cases.vh"
+    integer dc, dj2, dbad;
+    reg [31:0] dnd, doff, dnb;
+    task run_py_case(input integer c);
+        begin
+            resetn <= 0;
+            repeat (5) @(posedge clk);
+            for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = 8'hA5;
+            load_dcase(c, dnd, doff, dnb);
+            for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
+            $readmemh("fw.hex", bram);
+            bram[MBOX + 32'h90/4] = DDR_BASE + 32'h40000;
+            bram[MBOX + 32'h94/4] = 0;
+            repeat (5) @(posedge clk);
+            resetn <= 1;
+            cycles = 0;
+            while (!trap && cycles < 3000000) begin @(posedge clk); cycles = cycles + 1; end
+            repeat (5) @(posedge clk);
+            if (!trap || bram[MBOX] !== 32'h600D600D || bram[MBOX + 6] !== 0) begin
+                $display("TB ERROR: py case %0d did not finish cleanly (status %08x, ext %08x)",
+                         c, bram[MBOX], bram[MBOX + 16]);
+                errors = errors + 1;
+            end
+            if (bram[MBOX + 32'hAC/4] !== dnd) begin
+                $display("TB ERROR: py case %0d DL_EXEC %0d, expected %0d", c, bram[MBOX + 32'hAC/4], dnd);
+                errors = errors + 1;
+            end
+            dbad = 0;
+            for (dj2 = 0; dj2 < dnb; dj2 = dj2 + 1)
+                if (ddr[doff + dj2] !== dexp[dj2]) begin
+                    dbad = dbad + 1;
+                    if (dbad <= 3) $display("TB ERROR: py case %0d out byte %0d = %02x, expected %02x",
+                                            c, dj2, ddr[doff + dj2], dexp[dj2]);
+                end
+            for (dj2 = 0; dj2 < 8; dj2 = dj2 + 1)
+                if (ddr[doff + dnb + dj2] !== 8'hA5) dbad = dbad + 1;          // nothing written past it
+            errors = errors + dbad;
+            $display("TB   -> %0d descriptors, %0d RISC-V cycles, %0s", dnd, bram[MBOX + 8], dbad ? "MISMATCH" : "ok");
+            runs = runs + 1;
+        end
+    endtask
+
+    initial begin
+        run_desc_gemm(4*D, 4*D, 8*D, 0, 0);
+        run_desc_gemm(3*D, 2*D, 5*D, 1, 0);
+        run_desc_gemm(2*D, 6*D, 128, 0, 1);
+        run_desc_gemm(D, D, D, 1, 1);
+        for (dc = 0; dc < NDCASE; dc = dc + 1) run_py_case(dc);
+        $display("TB %s: %0d descriptor-list runs (incl. Python-built lists), %0d errors, %0d performance-counter checks",
+                 errors ? "FAIL" : "PASS", runs, errors, perf_checks);
         $finish;
     end
 `elsif VEC_TEST

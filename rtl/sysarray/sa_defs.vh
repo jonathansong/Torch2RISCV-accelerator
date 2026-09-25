@@ -14,6 +14,7 @@ localparam integer ENG_LD = 0;
 localparam integer ENG_ST = 1;
 localparam integer ENG_EX = 2;
 localparam integer ENG_VE = 3;        // M3 vector engine
+localparam integer ENG_FETCH = 4;     // descriptor fetch unit (error reports only)
 
 // Command types in the dispatch queue
 localparam [1:0] CMD_LD = 2'd0;
@@ -37,6 +38,7 @@ localparam [7:0] CFG_EX_REPEAT    = 8'd7;    // M2: output tiles per mat_exec (1
 localparam [7:0] CFG_EX_B_STEP    = 8'd8;    //     SPAD_B words between tiles' B strips
 localparam [7:0] CFG_EX_C_STEP    = 8'd9;    //     ACC words between tiles
 localparam [7:0] CFG_EX_C_ROW     = 8'd10;   //     ACC words between rows of a tile
+localparam [7:0] CFG_BASE0        = 8'd11;   // descriptor relocation bases BASE0..BASE3 (keys 11..14)
 
 // vec_cfg keys (funct7 = 2, funct3 = 0), M3
 localparam [7:0] VCFG_OP       = 8'd0;   // [2:0] op, [4] RELU, [5] REQUANT
@@ -92,3 +94,34 @@ localparam integer PC_CYCLES = 0,  PC_CMD_LD = 1,  PC_CMD_ST = 2,  PC_CMD_EX = 3
                    PC_ST_BUSY = 21, PC_ST_BEATS = 22, PC_ST_WSTALL = 23,
                    PC_VE_ACTIVE = 24, PC_VE_RDBLOCK = 25, PC_VE_CREDIT = 26, PC_VE_GROUPS = 27;
                    // 28..31 reserved (descriptor DMA)
+
+// Command packets (layout above). One definition for every producer: the
+// PCPI decoder (sa_pcpi.v) and the descriptor fetch unit (sa_cmdfetch.v).
+function [PKT_W-1:0] pkt_ld(input [31:0] ddr, input [31:0] laddr, input [15:0] rows,
+                            input [15:0] rb, input [31:0] pitch, input [1:0] mode);
+    pkt_ld = {1'b0, mode, pitch, rb, rows, laddr, ddr, CMD_LD};
+endfunction
+function [PKT_W-1:0] pkt_st(input [31:0] ddr, input [31:0] laddr, input [15:0] rows,
+                            input [15:0] rb, input [31:0] pitch);
+    pkt_st = {1'b0, 2'b00, pitch, rb, rows, laddr, ddr, CMD_ST};
+endfunction
+function [PKT_W-1:0] pkt_ex(input [15:0] a, input [15:0] b, input [15:0] c, input [11:0] kt,
+                            input acc, input [11:0] rep_m1, input [15:0] bstep,
+                            input [15:0] cstep, input [15:0] crow);
+    pkt_ex = {10'd0, crow, cstep, bstep, rep_m1, acc, kt, c, b, a, CMD_EX};
+endfunction
+function [PKT_W-1:0] pkt_ve(input [31:0] src1, input [31:0] src2, input [31:0] dst,
+                            input [15:0] groups, input [7:0] op, input [5:0] types,
+                            input [15:0] period, input [15:0] scale, input [4:0] shift,
+                            input [31:0] zp, input [31:0] lo, input [31:0] hi);
+    pkt_ve = {hi, lo, zp, shift, scale, period, types, op, groups, dst, src2, src1, CMD_VE};
+endfunction
+
+// Descriptors (sa_cmdfetch.v; docs/double_buffer_design.md §8.6): 64 bytes =
+// 8 little-endian 64-bit words w0..w7, 64-byte aligned. w0 = header.
+localparam [7:0] DESC_LD = 8'h01, DESC_ST = 8'h02, DESC_EX = 8'h03, DESC_VE = 8'h04,
+                 DESC_FENCE = 8'h10, DESC_JUMP = 8'h11, DESC_END = 8'h12;   // 0x00 is invalid
+localparam integer DF_RELOC = 8;          // w0 flags: DDR address += BASE[BASESEL]
+localparam integer DF_BASESEL = 9;        //           [10:9]
+localparam integer DF_FENCE_BEFORE = 11;  //           wait for idle engines first
+localparam integer DF_IRQ = 12;           //           END: reserved (ignored)

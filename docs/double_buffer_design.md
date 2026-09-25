@@ -20,7 +20,9 @@ HP port is not the limit at D = 16, so the three ports are not built (§10.3).
 Changes are marked *(M4)*. **Performance counters** (`sa_perf.v`, `mat_perf`;
 [plan](perf_counters_and_desc_dma_plan.md) P1–P4) are verified on the board
 (`RISCV-on-PYNQ-Z1/bitstreams/m4p/`) and give the measured cycle breakdown in
-§10.4.
+§10.4. **Descriptor lists** (`sa_cmdfetch.v`, `mat_submit`, §8.6) are verified on
+the board (`RISCV-on-PYNQ-Z1/bitstreams/m5/`): front-end-bound work runs 1.2–4.2×
+faster, large GEMMs unchanged (§10.5).
 
 ## 1. Goals and decisions
 
@@ -380,6 +382,7 @@ dispatch queue (8 entries) is full.
 | 3 | `mat_exec` | `{B word[31:16], A word[15:0]}` | `{flags[31:28], Kt[27:16], C word[15:0]}` | — |
 | 4 | `mat_fence` | engine mask (bit0 LD, 1 ST, 2 EX, 3 VE; 0 = all) | — | extended status |
 | 5 | `mat_perf` | read: counter index [4:0]; control: bit 31 = 1 | control: [0] clear, [1] enable | read: counter; control: number of counters |
+| 6 | `mat_submit` | descriptor list address (64-byte aligned) | count (0 = until END) | — (§8.6) |
 
 `mat_exec` flags: bit28 accumulate. Kt: 1 .. 4095 k-tiles.
 
@@ -416,7 +419,8 @@ may change it immediately after issuing.
 | 7:4 | engine busy (LD, ST, EX, VE) |
 | 11:8 | error code (1 address/shape, 2 local range, 3 read response, 4 write response) |
 | 15:12 | engine that raised the error |
-| 23:16 | dispatch queue occupancy |
+| 20:16 | dispatch queue occupancy |
+| 24 | a descriptor list is running (§8.6) |
 
 ### 8.4 funct7 = 2: vector
 
@@ -461,6 +465,66 @@ of its memory. The queue packet is 261 bits wide (`SA_PKT_W`).
 - *(M4)* After a failed job command the sequencer waits for all engines to go
   idle before clearing the sticky error (another command of the same job
   could still be running and set it again; seen at D = 16).
+
+### 8.6 Descriptor lists *(descriptor DMA)*
+
+`rtl/sysarray/sa_cmdfetch.v`; plan and rationale in
+[`perf_counters_and_desc_dma_plan.md`](perf_counters_and_desc_dma_plan.md) part 2,
+decided by the counters of §10.4 (small operations are front-end bound).
+The ARM builds a list in DDR (`driver/pynq_matmul.py` `DescList`,
+`build_gemm_list`, `build_vector_list`); `firmware/desc_run` submits it with one
+`mat_submit`; the fetch unit reads, decodes and feeds the commands to the
+scheduler in list order, exactly like PCPI-issued commands (both use the
+`pkt_*` functions of `sa_defs.vh`).
+
+**Format**: 64 bytes = 8 little-endian 64-bit words `w0..w7`, 64-byte aligned.
+
+| Word | LD / ST | EX | VE | FENCE / JUMP / END |
+|---|---|---|---|---|
+| w0 | header | header | header | header |
+| w1 | [31:0] DDR address (or offset, RELOC) | [15:0] A, [31:16] B, [47:32] C, [59:48] Kt, [60] accumulate | [31:0] src1, [63:32] src2 (LADDR) | [3:0] engine mask / [31:0] target / [31:0] status |
+| w2 | [31:0] LADDR, [47:32] rows, [63:48] row bytes | [11:0] repeat (0 = 1), [31:16] B step, [47:32] C step, [63:48] C row (0 = 1) | [31:0] dst LADDR, [63:32] length (elements) | — |
+| w3 | [31:0] pitch, [33:32] mode (LD) | — | [7:0] op byte, [13:8] types, [31:16] period, [47:32] scale, [52:48] shift | — |
+| w4 | — | — | [31:0] zero point, [63:32] clamp lo | — |
+| w5 | — | — | [31:0] clamp hi | — |
+
+Header `w0`: [7:0] opcode (0x01 LD, 0x02 ST, 0x03 EX, 0x04 VE, 0x10 FENCE,
+0x11 JUMP, 0x12 END; **0x00 is invalid**, so zeroed memory stops the list),
+[8] RELOC (DDR address += BASE[[10:9]], `mat_cfg` keys 11..14), [11]
+FENCE_BEFORE, [12] IRQ (reserved, ignored), [31:13] must be 0, [63:32] tag
+(free; the builders store the index). Every command carries its whole
+configuration, no `mat_cfg` state is used.
+
+**Semantics**
+
+- One list at a time; `mat_submit` returns at once (it waits only while a
+  previous list runs). Queued PCPI commands issued after it wait until the
+  list is done, so mixed programs keep their program order; `mat_fence`
+  also waits for the list.
+- FENCE: no further command is fed until the scheduler queue is empty and
+  the engines in the mask (0 = all) are idle. FENCE_BEFORE does the same
+  for all engines before its command. DDR is still not tracked: a store and
+  a later load of the same bytes need one of the two.
+- JUMP continues at another list address; END records its status value and
+  counts a finished list; a list also ends after `count` descriptors.
+- Errors (sticky, engine 4): misaligned list or jump address, invalid
+  opcode or reserved header bits → code 1; read response error on a fetch
+  → code 3. A decoded command that the scheduler rejects reports as usual
+  (its own engine). `mat_reset` recovers; the unit drops the bursts still
+  in flight before it goes idle.
+- Status CSRs (read-only, RISC-V 0x80000000 +): 0xC0 last decoded
+  descriptor address, 0xC4 lists finished (END), 0xC8 last END value, 0xCC
+  index of a failing descriptor, 0xD0 descriptors decoded in the current
+  list. CAPS bit 21 = present.
+
+**Implementation**: descriptors are prefetched with one 8-beat burst each,
+up to four in flight, into a 32 × 64-bit LUTRAM FIFO (no BRAM), assembled
+and decoded one at a time. The fetch unit shares DMA port 0 with the LD
+engine: an AR grant is held until its handshake (the fetch unit wins a new
+grant), and an owner FIFO in AR order routes the returning beats (no AXI
+IDs, bursts return in order). Performance counters 28–31: descriptors
+decoded, command waiting for the scheduler, waiting for descriptor words,
+fetch AR stalled.
 
 ## 9. Block design changes
 
@@ -640,6 +704,32 @@ and short vector operations (estimate for 64³: ≈ 4.2k → ≈ 2.5k cycles, th
 bound by the 16 KB C store and compute), and does nothing for large GEMMs,
 whose front end already runs ahead.
 
+### 10.5 Descriptor lists on the board *(descriptor DMA)*
+
+The same commands issued by the PCPI firmware and as one ARM-built list
+(`notebooks/m5_desc_demo.py`, `RISCV-on-PYNQ-Z1/bitstreams/m5/`; D = 16, cycles
+from the first command / `mat_submit` to the end of `mat_fence`, all
+bit-exact):
+
+| Work | PCPI | list | speedup | front end idle (PCPI → list) |
+|---|---|---|---|---|
+| GEMM 16³ | 1,801 | 430 | **4.19×** | 99.4 % → 62.9 % |
+| GEMM 64³ | 4,154 | 3,383 | 1.23× | 86.8 % → 24.3 % |
+| int8 GEMM 64³ | 4,984 | 3,288 | 1.52× | 68.3 % → 10.6 % |
+| GEMM 128³ / 256³ | 13,384 / 82,798 | 13,366 / 82,784 | 1.00× | 23 % / 5 % → 9 % / 3 % |
+| vector int8 add, 4096 | 3,376 | 2,224 | 1.52× | |
+| vector int16 max (broadcast), 2048 | 3,801 | 1,460 | **2.60×** | |
+| vector int32 → int8 + bias, 8192 | 8,163 | 6,449 | 1.27× | |
+| vector int32 add, 16384 | 24,952 | 23,806 | 1.05× | |
+
+This matches the decision of §10.4: work whose head was empty most of the
+time gains, large GEMMs (front end already ahead) do not. The gain for 64³
+(1.23×) is smaller than the ≈ 1.6× estimated from the counters: with a list
+the head is still empty 24 % of the time — the fetch unit decodes one
+descriptor per ≥ 9 cycles and each descriptor waits for its 8-beat fetch.
+The list cycles exclude building the list on the ARM, which is done once
+and can be reused with the relocation bases.
+
 ## 11. Resource estimate
 
 Baseline: Phase 4 board build (6640 LUT, 7421 FF, 64 DSP, 16 BRAM), of which
@@ -662,7 +752,9 @@ resource: more logic would need 10 DSP columns (≈ 5k LUT freed, 216 DSP).
 The module reference freezes derived parameter defaults, so the block design
 sets `SPAD_WORDS` / `ACC_WORDS` together with `D` (`-sa_d`).
 With the performance counters (`bitstreams/m4p`): 48.3k LUT (90.7 %; +0.65k),
-35.1k FF, same DSP / BRAM, WNS +1.9 ns.
+35.1k FF, same DSP / BRAM, WNS +1.9 ns. With the descriptor fetch unit as
+well (`bitstreams/m5`): 48.9k LUT (92.0 %; +0.66k), 36.4k FF, same DSP / BRAM,
+WNS +2.5 ns.
 
 Everything runs at 50 MHz; the Phase 2 LUT-PE array alone reached ≈ 99 MHz,
 so timing margin is large. BRAM has no room for an ILA without shrinking
