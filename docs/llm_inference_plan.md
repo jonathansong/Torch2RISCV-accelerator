@@ -539,7 +539,7 @@ REDUCE ∈ {NONE, SUM, MAX}，按行进行：一行 = `ROWLEN` 个组。行内�
 |---|---|---|
 | w1 | src1、src2 LADDR | — |
 | w2 | dst LADDR、LEN | — |
-| w3 | [7:0] op（op 6 = TRANSPOSE），[13:8] types，[31:16] P2（period），[47:32] scale，[52:48] shift | [53] FP，[56:54] FUNC，[58:57] M1，[60:59] M2（3 = IMM），[62:61] REDUCE，[63] SWAPNEG |
+| w3 | [7:0] op（op 6 = TRANSPOSE），[13:8] types（[1:0] 输入，[3:2] 输出，[5:4] src2 类型，见 §6.9），[31:16] P2（period），[47:32] scale，[52:48] shift | [53] FP，[56:54] FUNC，[58:57] M1，[60:59] M2（3 = IMM），[62:61] REDUCE，[63] SWAPNEG |
 | w4 | [31:0] zp，[63:32] lo | — |
 | w5 | [31:0] hi | [63:32] IMM（fp32） |
 | w6 | 保留 | [31:0] A（fp32），[63:32] B（fp32） |
@@ -600,6 +600,62 @@ cvt(src2)/IMM ────────┘                                       
 - **系统级**：`gen_desc_cases.py` 增加 softmax、RMSNorm、RoPE、转置等列表，在 `tb_system` 上做联合仿真。
 - **板上** `notebooks/llm/l2_vpu_demo.py`：同样这些算子，板上结果与功能模拟器逐位一致。
 - 所有现有测试不回归：D=8 和 16，`PERF = 0`。
+
+### 6.9 实现记录（与上文设计的差异）
+
+**编码补充**
+- **src2 类型**：types[5:4] 单独给出 src2 的类型：0 与 src1 相同，1 I8，2 I32，3 F32。
+  例如反量化时 src1 是 I32 累加结果，src2 是 F32 的每通道 scale。只在 FP=1 时有效。
+  驱动写作 `DescList.ve(..., t2=...)`，固件用 `SA_VT2(t)`。
+- **PCPI 路径**：`sa_pcpi` 保存 key 10–15 的值，A 的复位值是 1.0。
+  - 只有 FP 命令才把这些字段放进命令包；S 只随 TRANSPOSE 发送；
+  - 所以整数 VE 命令不受之前 `vec_cfg` 设置的影响。
+
+**范围规则**（调度器与功能模拟器相同，都是保守的规则）
+- DIV 模式的源、以及 REDUCE 的输出，都按 G 个字做范围检查，而不是按 §6.7 的精确公式。
+- 记分板仍按 bank 跟踪，这样做不影响正确性，只是少数合法命令会被拒绝，编译器必须遵守。
+- TRANSPOSE 要求 (G/D) mod S = 0。功能模拟器检查这一条，RTL 不检查（结果未定义）。
+- LEN 必须是 ROWLEN 的整数倍。功能模拟器报 SHAPE 错误，RTL 不检查。
+
+**结构**（`rtl/sysarray/sa_vefp.v`）
+- 整数的 `sa_ve.v` 保持原样，fp32 部分是并列的新模块 `sa_vefp`：
+  - `sa_unit` 按 FP 位和 op=6 把命令分给两者之一；
+  - 两者不会同时忙，存储口和事件按位或；
+  - 计数器事件复用现有的 VE 事件，没有新增编号。
+- **lane 折叠**：`sa_vefp` 只有 FL = D/2 个物理 fp lane（参数，也可以设成 FL = D）。
+  - 一组 D 个元素分成两半，在相邻的两个周期依次进入流水，输出时再拼回一个字；
+  - 原因：D 个 lane 的版本在 D=8 时 sa_unit 综合后约 51k LUT，加上 PicoRV32 装不进 xc7z020（布局失败）；
+    折叠后 sa_vefp 从 28.9k 降到 17.6k LUT，sa_unit 约 40k；
+  - 代价：二元运算本来每组就要读两次，所以速度不变；一元运算和多拍模式慢一半；
+  - 指令集、数值和功能模拟器都不变，结果仍然逐位一致。
+- **流水模式**：FUNC 为 NONE 或 ABS，且没有 REDUCE。
+  - 每 lane 一条固定延迟的流水：i2f ×2 → SWAPNEG → A1/M1/比较 → M2（×A）→ A2（+B）→ RELU/VALID → f2i；
+  - 每周期发出半组，输出 FIFO 32 项。
+- **多拍模式**：EXP、RECIP、RSQRT 或 REDUCE。
+  - 一次只处理一组；A2 之后由微程序控制器复用各 lane 的 M2、A2、i2f、f2i，按 `llm/sfu.py` 的步骤逐个半组执行；
+  - 查表只有一个 ROM，按 lane 依次读取；
+  - 之后做 RELU/VALID，再归约（A2 或比较器，最后是 lane 二叉树）或输出转换。
+- **TRANSPOSE**：一个状态机，把 D 个字按步长 S 读进 D×D 寄存器缓冲，再写出 D 个转置后的字。
+  支持 I8（SPAD）和 I32/F32（ACC）。
+- **基本单元**：`sa_fp32_add.v` 4 级，`sa_fp32_mul.v` 4 级（DSP），`sa_fp32_cvt.v` 的 i2f 和 f2i 各 2 级。
+- **SFU 表格**：`rtl/sysarray/gen_sfu_tables.py` 从 `llm/sfu.py` 生成 `sa_sfu_tables.vh`，一张 256 项的 ROM。
+- **SFU 实测精度**（对照 float64）：EXP 1.84e-5，RECIP 1.18e-7，RSQRT 1.17e-7。
+
+**验证**
+- `tb_fp32`：56 万组以上向量，含 RNE 恰好在中点的情况；变异测试能检出错误。
+- `tb_sa_vefp`：31 个用例，D=8 和 16，FL = D/2 和 FL = D 都测；折叠逻辑的变异测试能检出错误。
+- `tb_sa_unit`：CAPS 检查，以及经 PCPI `vec_cfg` 的 fp32 与 TRANSPOSE 定向测试。
+- 系统级 `desc_run` 联合仿真：
+  - 4 个 L2 列表：softmax、GEMM + 反量化、RMSNorm + 量化、带 TRANSPOSE 的注意力分数；
+  - 12 个随机 fp32 列表：输入含 NaN、inf、非规格化数；
+  - 预期值由功能模拟器给出，与 RTL 逐位一致。
+- 板上 `notebooks/llm/l2_vpu_demo.py`：
+  - 同样这些列表，外加每次运行几百个随机 fp32 列表；
+  - 功能模拟器拒绝的命令，设备也必须报错。
+- **板上结果**（`bitstreams/l2`：44,005 LUT，82.7%；WNS +1.836 ns，50 MHz）：
+  - 13 个描述符列表全部通过：softmax 4,235 周期，GEMM + 反量化 783，RMSNorm + 量化 997，注意力分数 524；
+  - 300 个随机 fp32 列表与功能模拟器逐位一致；错误隔离通过；
+  - L1、M5、M4 的回归测试全部通过。
 
 ---
 
@@ -880,8 +936,8 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | D=8 基线（M3 实测 21.7k，加 PERF 和 DESC） | ~24k | 96 | 130 | M3 报告；D=16 时计数器与取指合计约 +1.8k |
 | L1 命令环、中断、`mat_notify` | < 0.3k | 0 | 0 | 几个寄存器 |
 | L1 命令处理扩展（16 个 BASE、PARAM、动态字段、SETREG、LOOP、CALL/RET、LDPARAM） | 1.5–2.5k（**实测约 3.6k**） | 1（实测 2） | 0 | **OOC 实测**（D=8，50 MHz）：取指单元 4,408 LUT、2,106 FF、2 DSP，整个 `sa_unit` 21,787 LUT，WNS +2.37 ns。多出的主要是寄存器组的多个读写口和字段改写逻辑 |
-| L2 fp32 lane × 8（2 个乘法器、2 个加法器、转换、比较、表格） | 11–14k | 32 | 0 | 每个 lane 约 1.4–1.7k LUT、4 DSP；表格用 LUTRAM |
-| L2 微程序控制、转置缓冲、归约、下标生成、加宽的命令包、精确访问范围 | 2–3k | 0 | 0 | 8×8×32 的转置缓冲约 2k FF |
+| L2 fp32 lane × 8（2 个乘法器、2 个加法器、转换、比较、表格） | 11–14k（**实测：8 lane 约 18.6k，放不下；折叠成 4 lane 后约 9.7k**） | 32（实测 16） | 0 | 每个 lane 实测约 2.3k LUT、2 DSP（i2f ×2、f2i 占了一半）；表格是一张 256 项的 ROM。折叠见 §6.9 |
+| L2 微程序控制、转置缓冲、归约、下标生成、加宽的命令包、精确访问范围 | 2–3k（**实测约 7.5k + 调度器 / 取指 +1.2k**） | 0（实测 2） | 0 | **OOC 实测**（D=8，FL=4，50 MHz）：`sa_vefp` 17,197 LUT、11,696 FF、18 DSP；整个 `sa_unit` 39,062 LUT（73.4%）、28,232 FF、116 DSP、128 BRAM36，WNS +1.62 ns。整体估计约 44.4k（83%） |
 | **合计** | **~39–44k（73–83%）** | **~129** | **130** | D=16 在 92% 时仍能满足 50 MHz |
 
 - **BRAM** 是最紧张的资源，只剩 10 个。新增存储全部用 LUTRAM 或 FF。

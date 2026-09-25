@@ -100,9 +100,10 @@ module sa_legacy #(
     localparam [31:0] ID_VALUE = 32'h4D4D_3038;                 // "MM08"
     localparam [31:0] DIM_888  = {2'b0, 10'd8, 10'd8, 10'd8};
     localparam [31:0] CAPS     = (DESC != 0 ? 32'h0120_0000 : 32'd0) + (PERF != 0 ? 32'h0010_0000 : 32'd0) +
-                                 32'h0040_0000 + NPORTS * 65536 + VL * 256 + D;
+                                 32'h00C0_0000 + NPORTS * 65536 + VL * 256 + D;
                                   // [7:0] D, [15:8] VL, [19:16] ports, [20] performance counters,
                                   // [21] descriptor fetch unit, [22] mat_notify / notify_irq (L1),
+                                  // [23] fp32 vector engine + TRANSPOSE (L2),
                                   // [24] command extensions (L1: BASE0-15, PARAM, dynamic fields,
                                   //      SETREG, LOOP_END, CALL / RET, LDPARAM)
     localparam [3:0]  ERR_NONE = 0, ERR_DIM = 1, ERR_ADDR = 2, ERR_RRESP = 3, ERR_BRESP = 4;

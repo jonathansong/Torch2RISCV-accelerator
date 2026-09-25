@@ -101,6 +101,17 @@ DIM_888 = 8 | (8 << 10) | (8 << 20)     # descriptor/CSR DIM_M_N_K
 VOPS = {"add": 0, "sub": 1, "mul": 2, "max": 3, "min": 4, "copy": 5}
 V_RELU, V_REQUANT = 0x10, 0x20
 VTYPES = {np.dtype(np.int8): 0, np.dtype(np.int16): 1, np.dtype(np.int32): 2}
+# L2 fp32 vector engine (docs/llm_inference_plan.md §6)
+VT_F32 = 3
+VOP_TRANSPOSE = 6
+VFUNC = {"none": 0, "exp": 1, "recip": 2, "rsqrt": 3, "abs": 4}
+VIDX = {"lin": 0, "mod": 1, "div": 2, "imm": 3}
+VRED = {"none": 0, "sum": 1, "max": 2}
+
+
+def f32bits(x):
+    """float -> fp32 bit pattern (int)"""
+    return int(np.asarray(x, np.float32).view(np.uint32))
 I32_MIN, I32_MAX = -2**31, 2**31 - 1
 
 
@@ -191,10 +202,31 @@ class DescList:
                          repeat | bstep << 16 | cstep << 32 | crow << 48, dyn=dyn)
 
     def ve(self, src1, src2, dst, length, op, types, period=0, scale=1, shift=0, zp=0,
-           lo=-2**31, hi=2**31 - 1, fence_before=False, dyn=()):
+           lo=-2**31, hi=2**31 - 1, fence_before=False, dyn=(), fp=False, func="none", m1="lin", m2="lin",
+           reduce="none", swapneg=False, imm=0.0, A=1.0, B=0.0, rowlen=0, valid=0, p1=0, t2=None):
+        """Integer VE (fp=False: as M3), or the L2 fp32 pipeline (fp=True):
+        src1 (index mode m1 with period p1), [SWAPNEG], op with src2 (m2
+        with `period`, or the immediate imm), y * A + B, func, RELU (op
+        flag), output type, or a row reduction (rowlen groups per row, the
+        first `valid` elements of each row count; 0 = all). t2: type of src2
+        when it differs from src1's (0 int8, 2 int32, 3 fp32; fp only)."""
+        if t2 is not None:
+            types |= {0: 1, 2: 2, 3: 3}[t2] << 4
+        w3 = op | types << 8 | period << 16 | (scale & 0xFFFF) << 32 | shift << 48
+        w5, w6, w7 = hi & _M32, 0, 0
+        if fp:
+            flags = 1 | VFUNC[func] << 1 | VIDX[m1] << 4 | VIDX[m2] << 6 | VRED[reduce] << 8 | int(swapneg) << 10
+            w3 |= flags << 53
+            w5 |= f32bits(imm) << 32
+            w6 = f32bits(A) | f32bits(B) << 32
+            w7 = rowlen | valid << 16 | p1 << 32
         return self._put(self.VE, self._flags(None, fence_before), src1 | src2 << 32, dst | length << 32,
-                         op | types << 8 | period << 16 | (scale & 0xFFFF) << 32 | shift << 48,
-                         (zp & _M32) | (lo & _M32) << 32, hi & _M32, dyn=dyn)
+                         w3, (zp & _M32) | (lo & _M32) << 32, w5, w6, w7, dyn=dyn)
+
+    def transpose(self, src, dst, length, types, stride, fence_before=False, dyn=()):
+        """D x D block transpose of an R x `stride`-word matrix (length elements)."""
+        return self._put(self.VE, self._flags(None, fence_before), src, dst | length << 32,
+                         VOP_TRANSPOSE | types << 8, 0, 0, 0, stride << 48, dyn=dyn)
 
     def fence(self, mask=0):
         return self._put(self.FENCE, 0, mask)

@@ -91,6 +91,7 @@ static inline uint32_t mat_cycles(void)
 #define SA_CAPS_NOTIFY  (1u << 22)    /* L1: mat_notify + notify_irq                  */
 #define SA_CAPS_CMDX    (1u << 24)    /* L1: BASE0-15, PARAM0-7, dynamic fields,
                                        *     SETREG, LOOP_END, CALL / RET, LDPARAM   */
+#define SA_CAPS_FPVE    (1u << 23)    /* L2: fp32 vector engine, SFU, TRANSPOSE       */
 static uint32_t sa_caps_runtime = 0u;
 #ifndef SA_D
 static uint32_t sa_d_runtime = 8u;
@@ -117,6 +118,8 @@ static inline int sa_has_desc(void) { return (sa_caps_runtime & SA_CAPS_DESC) !=
 /* L1: mat_notify (host interrupt) and the command extensions */
 static inline int sa_has_notify(void) { return (sa_caps_runtime & SA_CAPS_NOTIFY) != 0; }
 static inline int sa_has_cmdx(void) { return (sa_caps_runtime & SA_CAPS_CMDX) != 0; }
+/* L2: fp32 vector engine (docs/llm_inference_plan.md §3.2) */
+static inline int sa_has_fpve(void) { return (sa_caps_runtime & SA_CAPS_FPVE) != 0; }
 #define SA_SPAD_WORDS   (131072u / SA_D)            /* per SPAD, D-byte words      */
 #define SA_ACC_WORDS    (262144u / (4u * SA_D))     /* D x int32 words             */
 #define SA_SPAD_BANK    (SA_SPAD_WORDS / 2u)        /* first word of bank 1        */
@@ -228,6 +231,20 @@ static inline void mat_cfg_store(uint32_t rows, uint32_t row_bytes, uint32_t pit
 #define SA_VCFG_ZP           7u
 #define SA_VCFG_CLAMP_LO     8u
 #define SA_VCFG_CLAMP_HI     9u
+/* L2 (SA_CAPS_FPVE); only read by fp commands (FLAGS bit 0) and TRANSPOSE */
+#define SA_VCFG_FLAGS       10u      /* [0] FP [3:1] FUNC [5:4] M1 [7:6] M2        */
+                                     /* [9:8] REDUCE [10] SWAPNEG                  */
+#define SA_VCFG_IMM         11u      /* fp32 bits: src2 immediate (M2 = IMM)       */
+#define SA_VCFG_A           12u      /* fp32 bits: y = op(...) * A + B             */
+#define SA_VCFG_B           13u
+#define SA_VCFG_ROW         14u      /* [15:0] ROWLEN, [31:16] VALID               */
+#define SA_VCFG_P1S         15u      /* [15:0] P1, [31:16] S (TRANSPOSE)           */
+#define SA_VF_FP             1u
+#define SA_VFUNC(f)          ((uint32_t)(f) << 1)   /* 0 none 1 EXP 2 RECIP 3 RSQRT 4 ABS */
+#define SA_VM1(m)            ((uint32_t)(m) << 4)   /* 0 LIN 1 MOD 2 DIV 3 IMM             */
+#define SA_VM2(m)            ((uint32_t)(m) << 6)
+#define SA_VRED(r)           ((uint32_t)(r) << 8)   /* 0 none 1 SUM 2 MAX                  */
+#define SA_VF_SWAPNEG        (1u << 10)
 
 #define SA_VOP_ADD           0u      /* int32 saturating                           */
 #define SA_VOP_SUB           1u
@@ -240,6 +257,9 @@ static inline void mat_cfg_store(uint32_t rows, uint32_t row_bytes, uint32_t pit
 #define SA_VT_I8             0u
 #define SA_VT_I16            1u
 #define SA_VT_I32            2u
+#define SA_VT_F32            3u      /* L2: ACC only                               */
+#define SA_VT2(t)            ((uint32_t)(t) << 4)   /* L2 src2 type: 0 = as src1, 1 I8, 2 I32, 3 F32 */
+#define SA_VOP_TRANSPOSE     6u      /* L2: int8 D x D blocks, S from SA_VCFG_P1S  */
 #define SA_VTYPES(in, out)   ((uint32_t)(in) | ((uint32_t)(out) << 2))
 
 static inline void vec_cfg(uint32_t key, uint32_t value)

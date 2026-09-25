@@ -52,10 +52,17 @@ localparam [7:0] VCFG_SHIFT    = 8'd6;   // REQUANT right shift (0 .. 31)
 localparam [7:0] VCFG_ZP       = 8'd7;   // REQUANT zero point (int32)
 localparam [7:0] VCFG_CLAMP_LO = 8'd8;   // result clamp (int32), then saturation to the type
 localparam [7:0] VCFG_CLAMP_HI = 8'd9;
+localparam [7:0] VCFG_FLAGS    = 8'd10;  // L2: [0] FP [3:1] FUNC [5:4] M1 [7:6] M2 [9:8] REDUCE [10] SWAPNEG
+localparam [7:0] VCFG_IMM      = 8'd11;  // L2: fp32 src2 immediate
+localparam [7:0] VCFG_A        = 8'd12;  // L2: fp32 affine scale
+localparam [7:0] VCFG_B        = 8'd13;  // L2: fp32 affine offset
+localparam [7:0] VCFG_ROW      = 8'd14;  // L2: [15:0] ROWLEN, [31:16] VALID
+localparam [7:0] VCFG_P1S      = 8'd15;  // L2: [15:0] P1, [31:16] S (TRANSPOSE)
 
 localparam [2:0] VOP_ADD = 3'd0, VOP_SUB = 3'd1, VOP_MUL = 3'd2, VOP_MAX = 3'd3,
                  VOP_MIN = 3'd4, VOP_COPY = 3'd5;
-localparam [1:0] VT_I8 = 2'd0, VT_I16 = 2'd1, VT_I32 = 2'd2;   // I32 in ACC, I8/I16 in SPAD
+localparam [1:0] VT_I8 = 2'd0, VT_I16 = 2'd1, VT_I32 = 2'd2, VT_F32 = 2'd3;   // I32 / F32 (L2) in ACC, I8 / I16 in SPAD
+localparam [2:0] VOP_TRANSPOSE = 3'd6;                              // L2: D x D block transpose
 
 // Sticky error codes (extended status bits 11:8)
 localparam [3:0] XERR_SHAPE = 4'd1;   // bad address / shape / alignment
@@ -76,6 +83,9 @@ localparam [3:0] XERR_BRESP = 4'd4;   // DMA write response SLVERR/DECERR
 //   [33:2] src1 LADDR  [65:34] src2 LADDR  [97:66] dst LADDR  [113:98] groups (of VL elements)
 //   [121:114] op byte  [127:122] types {out[3:2], in[1:0]}  [143:128] src2 period
 //   [159:144] scale  [164:160] shift  [196:165] zp  [228:197] clamp lo  [260:229] clamp hi
+// VE (L2, fp32 / TRANSPOSE; all zero for integer VE commands):
+//   [271:261] flags {SWAPNEG, REDUCE[1:0], M2[1:0], M1[1:0], FUNC[2:0], FP}  [303:272] IMM
+//   [335:304] A  [367:336] B  [383:368] ROWLEN  [399:384] VALID  [415:400] P1  [431:416] S
 // EX reuses the fields:
 //   [17:2]    A word   [33:18] B word   [49:34] C word   [61:50] Kt   [62] accumulate
 //   [74:63]   repeat - 1 (tiles)   [90:75] B step   [106:91] C step   [122:107] C row stride
@@ -114,8 +124,11 @@ endfunction
 function [PKT_W-1:0] pkt_ve(input [31:0] src1, input [31:0] src2, input [31:0] dst,
                             input [15:0] groups, input [7:0] op, input [5:0] types,
                             input [15:0] period, input [15:0] scale, input [4:0] shift,
-                            input [31:0] zp, input [31:0] lo, input [31:0] hi);
-    pkt_ve = {hi, lo, zp, shift, scale, period, types, op, groups, dst, src2, src1, CMD_VE};
+                            input [31:0] zp, input [31:0] lo, input [31:0] hi,
+                            input [10:0] flags, input [31:0] imm, input [31:0] a, input [31:0] b,
+                            input [15:0] rowlen, input [15:0] vld, input [15:0] p1, input [15:0] s);
+    pkt_ve = {s, p1, vld, rowlen, b, a, imm, flags,
+              hi, lo, zp, shift, scale, period, types, op, groups, dst, src2, src1, CMD_VE};
 endfunction
 
 // Descriptors (sa_cmdfetch.v; docs/double_buffer_design.md §8.6): 64 bytes =

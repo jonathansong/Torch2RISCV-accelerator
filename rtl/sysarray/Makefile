@@ -16,10 +16,14 @@ space := $(empty) $(empty)
 SIM := build/$(TB)$(subst $(space),_,$(subst =,,$(strip $(GEN))))
 
 VECTORS := $(abspath ../matmul/sim/gen_vectors.py)
+# L2 fp32 units: vectors from the bit-exact model llm/fp32.py (NumPy in PYTHON)
+FPVEC   := $(abspath sim/gen_fp32_vectors.py)
 
 sim:
 	mkdir -p $(SIM)
 	$(if $(filter tb_sa_unit,$(TB)),$(PYTHON) $(VECTORS) --out $(SIM) >/dev/null)
+	$(if $(filter tb_fp32,$(TB)),$(PYTHON) $(FPVEC) --out $(SIM) >/dev/null)
+	$(if $(filter tb_sa_vefp,$(TB)),$(PYTHON) $(abspath sim/gen_vefp_cases.py) --d $(if $(filter D=16,$(GEN)),16,8) --out $(SIM) >/dev/null)
 	cd $(SIM) && bash -c 'source $(VIVADO_SETTINGS) >/dev/null && \
 	  xvlog -i $(CURDIR) $(RTL) $(abspath sim/$(TB).v) >xvlog.out 2>&1 || { grep -E "ERROR|WARNING: \[VRFC" xvlog.out; exit 1; }; \
 	  xelab -debug off $(foreach g,$(GEN),-generic_top $(g)) $(TB) -s tb >xelab.out 2>&1 || { grep ERROR xelab.out; exit 1; }; \

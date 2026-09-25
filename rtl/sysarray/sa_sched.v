@@ -169,6 +169,40 @@ module sa_sched #(
                              v_last1 < depth_of(v_m1) && (v_unary || v_last2 < depth_of(v_m2)) &&
                              v_lastd < depth_of(v_md);
 
+    // L2: fp32 VE and TRANSPOSE (docs/llm_inference_plan.md §6). Ranges of DIV
+    // sources and REDUCE outputs are taken as G words (conservative; exact
+    // would need a divider); MOD sources min(P, G) words.
+    wire [10:0] v_fl   = d1[271:261];
+    wire        v_fp   = v_fl[0];
+    wire        v_tr   = v_op == VOP_TRANSPOSE;
+    wire        v_ext0 = d1[431:261] == 0;            // no L2 field set
+    wire [2:0]  v_func = v_fl[3:1];
+    wire [1:0]  v_mo1  = v_fl[5:4], v_mo2 = v_fl[7:6], v_red = v_fl[9:8];
+    wire [15:0] v_p1   = d1[415:400], v_s = d1[431:416];
+    wire        v_rq   = d1[119];                     // REQUANT flag of the op byte
+    wire [1:0]  v_t2c  = d1[127:126];                 // src2 type: 0 = as src1, 1 I8, 2 I32, 3 F32
+    wire [1:0]  v_t2   = v_t2c == 2'd0 ? v_it : v_t2c == 2'd1 ? VT_I8 : v_t2c == 2'd2 ? VT_I32 : VT_F32;
+    function fmem(input [1:0] t, input [3:0] m);      // I8 in SPAD, I32 / F32 in ACC
+        fmem = t == VT_I8 ? (m == MEM_SPAD_A || m == MEM_SPAD_B) : (t == VT_I32 || t == VT_F32) && m == MEM_ACC;
+    endfunction
+    wire [31:0] f_n1   = v_mo1 == 2'd1 ? (v_p1 < v_groups ? v_p1 : v_groups) : v_groups;
+    wire [31:0] f_n2   = v_mo2 == 2'd1 ? (v_mod < v_groups ? v_mod : v_groups) : v_groups;
+    wire        f_use2 = !v_unary && v_mo2 != 2'd3;
+    wire [31:0] f_last1 = v_w1 + f_n1 - 1, f_last2 = v_w2 + f_n2 - 1, f_lastd = v_wd + v_groups - 1;
+    wire        fp_shape_ok = v_groups != 0 && v_op <= VOP_COPY && v_func <= 3'd4 && v_mo1 != 2'd3 &&
+                              v_red != 2'd3 && !v_rq && v_it != VT_I16 && v_ot != VT_I16 &&
+                              (v_red == 0 || v_ot == VT_F32) &&
+                              !(v_mo1 != 0 && v_p1 == 0) && !((v_mo2 == 2'd1 || v_mo2 == 2'd2) && v_mod == 0);
+    wire        fp_range_ok = fmem(v_it, v_m1) && (!f_use2 || fmem(v_t2, v_m2)) && fmem(v_ot, v_md) &&
+                              f_last1 < depth_of(v_m1) && (!f_use2 || f_last2 < depth_of(v_m2)) &&
+                              f_lastd < depth_of(v_md);
+    wire        tr_shape_ok = d1[121:117] == 0 && d1[415:261] == 0 && v_s != 0 && v_it == v_ot &&
+                              v_it != VT_I16 && v_groups != 0 && v_groups[LOGD-1:0] == 0;
+    wire        tr_range_ok = (v_it == VT_I8 ? (v_m1 == MEM_SPAD_A || v_m1 == MEM_SPAD_B) &&
+                                               (v_md == MEM_SPAD_A || v_md == MEM_SPAD_B)
+                                             : v_m1 == MEM_ACC && v_md == MEM_ACC) &&
+                              f_lastd < depth_of(v_md) && v_w1 + v_groups - 1 < depth_of(v_m1);
+
     reg         c_valid_cmd;
     reg  [3:0]  c_err_code;
     reg  [1:0]  c_eng;
@@ -209,7 +243,25 @@ module sa_sched #(
                     c_w = banks(MEM_ACC, h_c, c_last);
                 end
             CMD_VE:
-                if (!v_shape_ok) begin
+                if (v_tr) begin                                         // L2 TRANSPOSE
+                    if (!tr_shape_ok) begin
+                        c_valid_cmd = 0; c_err_code = XERR_SHAPE;
+                    end else if (!tr_range_ok) begin
+                        c_valid_cmd = 0; c_err_code = XERR_RANGE;
+                    end else begin
+                        c_r = banks(v_m1, v_w1, v_w1 + v_groups - 1);
+                        c_w = banks(v_md, v_wd, f_lastd);
+                    end
+                end else if (v_fp) begin                                // L2 fp32
+                    if (!fp_shape_ok) begin
+                        c_valid_cmd = 0; c_err_code = XERR_SHAPE;
+                    end else if (!fp_range_ok) begin
+                        c_valid_cmd = 0; c_err_code = XERR_RANGE;
+                    end else begin
+                        c_r = banks(v_m1, v_w1, f_last1) | (f_use2 ? banks(v_m2, v_w2, f_last2) : 6'd0);
+                        c_w = banks(v_md, v_wd, f_lastd);
+                    end
+                end else if (!v_shape_ok || !v_ext0) begin
                     c_valid_cmd = 0; c_err_code = XERR_SHAPE;
                 end else if (!v_range_ok) begin
                     c_valid_cmd = 0; c_err_code = XERR_RANGE;

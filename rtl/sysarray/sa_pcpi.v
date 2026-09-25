@@ -101,6 +101,9 @@ module sa_pcpi #(
     reg [15:0] v_mod, v_scale;
     reg [4:0]  v_shift;
     reg [31:0] v_zp, v_lo, v_hi;
+    reg [10:0] v_flags;                // L2 fp32 VE fields (vec_cfg keys 10..15)
+    reg [31:0] v_imm, v_a, v_b, v_row, v_p1s;
+    wire       v_fp_cmd = v_flags[0] && v_op[2:0] != VOP_TRANSPOSE;
     wire [11:0] ex_rep_m1 = ex_rep == 0 ? 12'd0 : ex_rep - 12'd1;
 
     localparam [1:0] S_IDLE = 0, S_EXEC = 1, S_DONE = 2;
@@ -135,6 +138,7 @@ module sa_pcpi #(
             ex_rep <= 1; ex_bstep <= 0; ex_cstep <= 0; ex_crow <= 1;
             v_op <= 0; v_groups <= 1; v_dst <= 0; v_types <= {2'd2, 2'd2}; v_mod <= 0;
             v_scale <= 1; v_shift <= 0; v_zp <= 0; v_lo <= 32'h80000000; v_hi <= 32'h7FFFFFFF;
+            v_flags <= 0; v_imm <= 0; v_a <= 32'h3F80_0000; v_b <= 0; v_row <= 0; v_p1s <= 0;
         end else begin
             case (state)
                 S_IDLE:
@@ -155,7 +159,13 @@ module sa_pcpi #(
                                             pcpi_rs2[28], ex_rep_m1, ex_bstep, ex_cstep, ex_crow);
                         if (funct7 == 7'd2 && funct3 == 3'd1)  // vec_run: src1, src2 + VE config
                             q_pkt <= pkt_ve(pcpi_rs1, pcpi_rs2, v_dst, v_groups, v_op, v_types, v_mod,
-                                            v_scale, v_shift, v_zp, v_lo, v_hi);
+                                            v_scale, v_shift, v_zp, v_lo, v_hi,
+                                            // L2 fields only for fp32 commands; TRANSPOSE takes S alone
+                                            v_fp_cmd ? v_flags : 11'd0, v_fp_cmd ? v_imm : 32'd0,
+                                            v_fp_cmd ? v_a : 32'd0, v_fp_cmd ? v_b : 32'd0,
+                                            v_fp_cmd ? v_row[15:0] : 16'd0, v_fp_cmd ? v_row[31:16] : 16'd0,
+                                            v_fp_cmd ? v_p1s[15:0] : 16'd0,
+                                            v_op[2:0] == VOP_TRANSPOSE ? v_p1s[31:16] : 16'd0);
                         fence_mask <= pcpi_rs1[3:0];
                         perf_rsel  <= pcpi_rs1[4:0];
                     end
@@ -173,6 +183,12 @@ module sa_pcpi #(
                                 VCFG_ZP:       v_zp     <= rs2;
                                 VCFG_CLAMP_LO: v_lo     <= rs2;
                                 VCFG_CLAMP_HI: v_hi     <= rs2;
+                                VCFG_FLAGS:    v_flags  <= rs2[10:0];
+                                VCFG_IMM:      v_imm    <= rs2;
+                                VCFG_A:        v_a      <= rs2;
+                                VCFG_B:        v_b      <= rs2;
+                                VCFG_ROW:      v_row    <= rs2;
+                                VCFG_P1S:      v_p1s    <= rs2;
                                 default: ;
                             endcase
                             respond(0, 0);

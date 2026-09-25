@@ -1305,6 +1305,76 @@ module tb_sa_unit;
         end
     endtask
 
+    // ============================ L2 through PCPI: vec_cfg keys 10..15, TRANSPOSE
+    integer l2_checks = 0;
+    function [31:0] i2f_exact(input integer v);                 // |v| < 2^24
+        integer a, pp, q;
+        reg [31:0] mm;
+        reg [22:0] m23;
+        begin
+            a = v < 0 ? -v : v;
+            pp = 0;
+            for (q = 0; q < 24; q = q + 1) if (a >= (1 << q)) pp = q;
+            mm = a << (23 - pp);
+            m23 = mm[22:0];
+            i2f_exact = v == 0 ? 32'd0 : {v < 0, 8'd127 + pp[7:0], m23};
+        end
+    endfunction
+    task l2_pcpi_tests;
+        integer w, ln, bad;
+        reg [AW-1:0] word;
+        reg [31:0] want;
+        begin
+            // fp32: (int32 x + IMM 0.5) * A 2.0 + B 0 -> F32 = 2x + 1 (exact)
+            for (w = 0; w < 4; w = w + 1) begin
+                word = 0;
+                for (ln = 0; ln < D; ln = ln + 1) word[32*ln +: 32] = ln * 3 - 7 + w * 100;
+                dut.accm.bank[0].ram.ram_block[200 + w] = word;
+            end
+            vcfg(V_OP, 0); vcfg(V_LEN, 4 * D); vcfg(V_DST, {M_C, 12'd0, 16'd400});
+            vcfg(V_TYPES, {2'd3, 2'd2}); vcfg(8'd10, 11'h0C1);           // FP, src2 IMM
+            vcfg(8'd11, 32'h3F00_0000); vcfg(8'd12, 32'h4000_0000); vcfg(8'd13, 0);
+            vcfg(8'd14, 0); vcfg(8'd15, 0);
+            v_op(3'd1, {M_C, 12'd0, 16'd200}, 0);
+            fence(0);
+            bad = xst[1];
+            for (w = 0; w < 4; w = w + 1) begin
+                word = hw_c(400 + w);
+                for (ln = 0; ln < D; ln = ln + 1) begin
+                    want = i2f_exact(2 * (ln * 3 - 7 + w * 100) + 1);
+                    if (word[32*ln +: 32] !== want) bad = bad + 1;
+                end
+            end
+            l2_checks = l2_checks + 1;
+            if (bad) fail("L2 PCPI: fp32 (x + IMM) * A through vec_cfg keys 10..13");
+            // TRANSPOSE of one D x D byte block (S = 1) through vec_cfg key 15
+            for (w = 0; w < D; w = w + 1) begin
+                word = 0;
+                for (ln = 0; ln < D; ln = ln + 1) word[8*ln +: 8] = w * 16 + ln;
+                hw_a_set(700 + w, word[8*D-1:0]);
+            end
+            vcfg(8'd10, 0);
+            vcfg(V_OP, 6); vcfg(V_LEN, D * D); vcfg(V_DST, {M_B, 12'd0, 16'd700}); vcfg(V_TYPES, 0);
+            vcfg(8'd15, 32'h0001_0000);
+            v_op(3'd1, {M_A, 12'd0, 16'd700}, 0);
+            fence(0);
+            bad = xst[1];
+            for (w = 0; w < D; w = w + 1) begin
+                word = hw_b(700 + w);
+                for (ln = 0; ln < D; ln = ln + 1) if (word[8*ln +: 8] !== ln * 16 + w) bad = bad + 1;
+            end
+            l2_checks = l2_checks + 1;
+            if (bad) fail("L2 PCPI: TRANSPOSE (op 6, S from key 15)");
+            vcfg(8'd15, 0);
+            // an integer VE command right after: the L2 registers do not leak into it
+            vrun(M_C, 400, M_C, 400, M_C, 600, 2, 3'd5, 1'b0, 1'b0, 2'd2, 2'd2,
+                 0, 1, 0, 0, 32'h80000000, 32'h7FFFFFFF);
+            fence(0);
+            l2_checks = l2_checks + 1;
+            if (xst[1] || hw_c(600) !== hw_c(400)) fail("L2 PCPI: integer COPY after fp commands");
+        end
+    endtask
+
     task desc_tests;
         integer i;
         begin
@@ -1676,6 +1746,7 @@ module tb_sa_unit;
         rs_via_list = 0;
         desc_tests;
         l1_tests;
+        l2_pcpi_tests;
 
         // ================================================ new-ISA errors
         cfg_ld(2, 12, 16, 0);                                 // row_bytes not a multiple of 8
@@ -1706,16 +1777,16 @@ module tb_sa_unit;
         if (xst[11:8] !== 4'd2) fail("bad memory id: wrong ext status");
         mat_op(F_RESET, 0, 0);
         // (funct7 = 1 uses all funct3 values: 5 mat_perf, 6 mat_submit, 7 mat_notify)
-        expect_csr(8'h24, 32'h0160_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + 32'h0001_0000 + D * 256 + D,
-                   "CAPS");     // [24] command ext., [22] notify, [21] desc, [20] perf, 1 port, VL = D, D
+        expect_csr(8'h24, 32'h01E0_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + 32'h0001_0000 + D * 256 + D,
+                   "CAPS");     // [24] command ext., [23] fp32 VE, [22] notify, [21] desc, [20] perf, 1 port, VL = D, D
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");
 
         repeat (20) @(posedge aclk);
-        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | descriptors: list GEMM %0d cycles, %0d checks | L1: %0d checks | error paths",
+        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | descriptors: list GEMM %0d cycles, %0d checks | L1: %0d checks | L2 PCPI: %0d checks | error paths",
                  errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, D, 4*D, 4*D, 8*D, gemm_cycles_main, 4*D*4*D*8*D / gemm_cycles_main,
                  n_ld, n_ex, n_st, n_ve, 4*D, 4*D, 8*D, qgemm_cycles_first, perf_checks,
-                 gemm_cycles_list, desc_checks, l1_checks);
+                 gemm_cycles_list, desc_checks, l1_checks, l2_checks);
         $finish;
     end
 

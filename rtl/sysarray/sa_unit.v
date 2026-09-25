@@ -465,18 +465,56 @@ module sa_unit #(
     wire [8*D-1:0]     vsa_din, vsb_din, vsa_dout, vsb_dout;
     wire [32*D-1:0]    vac_din, vac_dout;
 
+    // VE: the integer engine (sa_ve, M3) and the fp32 / TRANSPOSE engine (sa_vefp, L2)
+    // share the VE command queue and memory ports; a command goes to one of
+    // them (FP flag or op TRANSPOSE) and only when both are idle, so VE
+    // commands still run one at a time in order.
+    wire ve_to_fp = ve_pkt[261] || ve_pkt[116:114] == VOP_TRANSPOSE;
+    wire vi_ready, vf_ready, vi_busy, vf_busy, vi_done, vf_done;
+    wire [3:0] vi_ev, vf_ev;
+    assign ve_r    = !vi_busy && !vf_busy && (ve_to_fp ? vf_ready : vi_ready);
+    assign ve_done = vi_done | vf_done;
+    assign ve_ev   = vi_ev | vf_ev;
+    wire               isa_en, isb_en, iac_en, fsa_en, fsb_en, fac_en;
+    wire [D-1:0]       isa_we, isb_we, fsa_we, fsb_we;
+    wire [4*D-1:0]     iac_we, fac_we;
+    wire [SAW-1:0]     isa_addr, isb_addr, fsa_addr, fsb_addr;
+    wire [CAW-1:0]     iac_addr, fac_addr;
+    wire [8*D-1:0]     isa_din, isb_din, fsa_din, fsb_din;
+    wire [32*D-1:0]    iac_din, fac_din;
+    assign vsa_en = isa_en | fsa_en;  assign vsa_we = isa_we | fsa_we;
+    assign vsa_addr = isa_addr | fsa_addr;  assign vsa_din = isa_din | fsa_din;
+    assign vsb_en = isb_en | fsb_en;  assign vsb_we = isb_we | fsb_we;
+    assign vsb_addr = isb_addr | fsb_addr;  assign vsb_din = isb_din | fsb_din;
+    assign vac_en = iac_en | fac_en;  assign vac_we = iac_we | fac_we;
+    assign vac_addr = iac_addr | fac_addr;  assign vac_din = iac_din | fac_din;
+
     sa_ve #(.D(D), .SPAD_AW(SAW), .ACC_AW(CAW)) ve (
         .clk(aclk), .resetn(resetn),
-        .cmd_valid(ve_v), .cmd_ready(ve_r),
+        .cmd_valid(ve_v && !ve_to_fp && !vf_busy), .cmd_ready(vi_ready),
         .cmd_src1(ve_pkt[33:2]), .cmd_src2(ve_pkt[65:34]), .cmd_dst(ve_pkt[97:66]),
         .cmd_groups(ve_pkt[113:98]), .cmd_op(ve_pkt[121:114]), .cmd_types(ve_pkt[127:122]),
         .cmd_mod(ve_pkt[143:128]), .cmd_scale(ve_pkt[159:144]), .cmd_shift(ve_pkt[164:160]),
         .cmd_zp(ve_pkt[196:165]), .cmd_lo(ve_pkt[228:197]), .cmd_hi(ve_pkt[260:229]),
-        .done(ve_done), .busy(),
-        .sa_en(vsa_en), .sa_we(vsa_we), .sa_addr(vsa_addr), .sa_din(vsa_din), .sa_dout(vsa_dout),
-        .sb_en(vsb_en), .sb_we(vsb_we), .sb_addr(vsb_addr), .sb_din(vsb_din), .sb_dout(vsb_dout),
-        .ac_en(vac_en), .ac_we(vac_we), .ac_addr(vac_addr), .ac_din(vac_din), .ac_dout(vac_dout),
-        .perf_ev(ve_ev));
+        .done(vi_done), .busy(vi_busy),
+        .sa_en(isa_en), .sa_we(isa_we), .sa_addr(isa_addr), .sa_din(isa_din), .sa_dout(vsa_dout),
+        .sb_en(isb_en), .sb_we(isb_we), .sb_addr(isb_addr), .sb_din(isb_din), .sb_dout(vsb_dout),
+        .ac_en(iac_en), .ac_we(iac_we), .ac_addr(iac_addr), .ac_din(iac_din), .ac_dout(vac_dout),
+        .perf_ev(vi_ev));
+
+    sa_vefp #(.D(D), .SPAD_AW(SAW), .ACC_AW(CAW)) vefp (
+        .clk(aclk), .resetn(resetn),
+        .cmd_valid(ve_v && ve_to_fp && !vi_busy), .cmd_ready(vf_ready),
+        .cmd_src1(ve_pkt[33:2]), .cmd_src2(ve_pkt[65:34]), .cmd_dst(ve_pkt[97:66]),
+        .cmd_groups(ve_pkt[113:98]), .cmd_op(ve_pkt[121:114]), .cmd_types(ve_pkt[127:122]),
+        .cmd_mod(ve_pkt[143:128]), .cmd_flags(ve_pkt[271:261]), .cmd_imm(ve_pkt[303:272]),
+        .cmd_a(ve_pkt[335:304]), .cmd_b(ve_pkt[367:336]), .cmd_rowlen(ve_pkt[383:368]),
+        .cmd_vld(ve_pkt[399:384]), .cmd_p1(ve_pkt[415:400]), .cmd_s(ve_pkt[431:416]),
+        .done(vf_done), .busy(vf_busy),
+        .sa_en(fsa_en), .sa_we(fsa_we), .sa_addr(fsa_addr), .sa_din(fsa_din), .sa_dout(vsa_dout),
+        .sb_en(fsb_en), .sb_we(fsb_we), .sb_addr(fsb_addr), .sb_din(fsb_din), .sb_dout(vsb_dout),
+        .ac_en(fac_en), .ac_we(fac_we), .ac_addr(fac_addr), .ac_din(fac_din), .ac_dout(vac_dout),
+        .perf_ev(vf_ev));
 
     // ---------------------------------------------------------- memories
     // SPAD side A: [0] LD write, [1] ST read; side B: [0] EX read, [1] VE.

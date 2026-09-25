@@ -11,6 +11,10 @@
 5. L1 command extensions (plan §5.3): BASE4-15, dynamic fields, SETREG,
    LOOP_END (nested), relative JUMP, CALL / RET, LDPARAM, and their errors;
    expected values are computed independently of the simulator.
+6. L2 fp32 vector engine (plan §6): every op / type / conversion, affine,
+   RELU, FUNC, SWAPNEG, index modes (LIN / MOD / DIV / IMM), VALID, row
+   reductions, TRANSPOSE, softmax and RMSNorm as command sequences, errors;
+   references in NumPy float32 (normal-range data: IEEE = the FTZ model).
 
     python3 llm/test_funcsim.py        (exit status 0 = all passed)
 """
@@ -313,6 +317,198 @@ def l1_extensions(d):
     expect("LDPARAM not 4-byte aligned", DL().ldparam(BASE + 0x5002, 0).end())
 
 
+def l2_fp(d, rng):
+    import sfu
+    DL = pm.DescList
+    F32, I32, I8 = 3, 2, 0
+    ACC, SA, SB = pm.MEM_ACC, pm.MEM_SPAD_A, pm.MEM_SPAD_B
+    X, Y, O, L = BASE, BASE + 0x40000, BASE + 0x80000, 0xC0000
+    f32 = np.float32
+
+    def place(sim, t, data, addr, mem, word):
+        """write data (flat, element type t) to DDR and a LD into mem/word"""
+        arr = {F32: data.astype(f32), I32: data.astype(np.int32), I8: data.astype(np.int8)}[t]
+        sim.ddr_write(addr, arr.tobytes())
+        return lambda dl: dl.ld(addr, pm.laddr(mem, word), 1, arr.nbytes, arr.nbytes)
+
+    def run(t_in, t_out, x, y, n_out, **ve):
+        sim = SaFuncSim(d, BASE, 1 << 21)
+        m_in = ACC if t_in in (F32, I32) else SA
+        m_in2 = ACC if t_in in (F32, I32) else SB
+        m_out = ACC if t_out in (F32, I32) else SB
+        w2 = 1024 if m_in2 == ACC else 0
+        w_out = 2048
+        dl = DL()
+        place(sim, t_in, x, X, m_in, 0)(dl)
+        if y is not None:
+            place(sim, t_in, y, Y, m_in2, w2)(dl)
+        dl.ve(pm.laddr(m_in, 0), pm.laddr(m_in2, w2), pm.laddr(m_out, w_out), ve.pop("length", x.size),
+              ve.pop("op", 5), t_in | t_out << 2, fp=True, **ve)
+        esz = 1 if t_out == I8 else 4
+        dl.st(O, pm.laddr(m_out, w_out), 1, n_out * esz, n_out * esz).end()
+        sim.run_list(put_list(sim, dl, L))
+        raw = sim.ddr_read(O, n_out * esz)
+        return raw.view({F32: f32, I32: np.int32, I8: np.int8}[t_out])
+
+    def same(got, want):
+        return np.array_equal(got.view(np.uint32) if got.dtype == f32 else got,
+                              np.asarray(want).astype(got.dtype).view(np.uint32) if got.dtype == f32 else want)
+
+    n = 32 * d
+    x = rng.standard_normal(n).astype(f32) * 3
+    y = rng.standard_normal(n).astype(f32) * 3
+    ops = {"add": (0, x + y), "sub": (1, x - y), "mul": (2, x * y), "max": (3, np.maximum(x, y)),
+           "min": (4, np.minimum(x, y)), "copy": (5, x)}
+    for name, (op, want) in ops.items():
+        got = run(F32, F32, x, None if op == 5 else y, n, op=op)
+        check(f"D={d} L2 fp {name} F32->F32", same(got, want))
+    A, Bc = f32(0.37), f32(-1.25)
+    got = run(F32, F32, x, y, n, op=2, A=A, B=Bc)
+    check(f"D={d} L2 fp affine (x*y)*A+B", same(got, (x * y) * A + Bc))
+    got = run(F32, F32, x, y, n, op=0 | 0x10)
+    check(f"D={d} L2 fp ADD + RELU", same(got, np.where(x + y < 0, f32(0), x + y)))
+    for fname, fn in (("exp", sfu.exp), ("recip", sfu.recip), ("rsqrt", sfu.rsqrt), ("abs", sfu.fabs)):
+        xin = np.abs(x) + f32(0.1) if fname == "rsqrt" else x
+        got = run(F32, F32, xin, None, n, op=5, func=fname)
+        check(f"D={d} L2 fp FUNC {fname}", np.array_equal(got.view(np.uint32), fn(xin.view(np.uint32))))
+    xi = rng.integers(-2**30, 2**30, n)
+    got = run(I32, F32, xi, None, n, op=5)
+    check(f"D={d} L2 fp I32 -> F32 (RNE)", same(got, xi.astype(f32)))
+    xb = rng.integers(-128, 128, n)
+    yb = rng.integers(-128, 128, n)
+    got = run(I8, F32, xb, yb, n, op=2)
+    check(f"D={d} L2 fp I8 x I8 -> F32 (SPAD inputs)", same(got, (xb * yb).astype(f32)))
+    got = run(F32, I8, x * 40, None, n, op=5)
+    check(f"D={d} L2 fp F32 -> I8 (RNE, +-127)", np.array_equal(got, np.clip(np.rint(x * 40), -127, 127)))
+    got = run(F32, I32, x * 1e5, None, n, op=5)
+    check(f"D={d} L2 fp F32 -> I32 (RNE)", np.array_equal(got, np.rint(x * 1e5).astype(np.int64)))
+    # SWAPNEG (RoPE): (x0, x1) -> (-x1, x0), times src2
+    sw = np.empty_like(x)
+    sw[0::2], sw[1::2] = -x[1::2], x[0::2]
+    got = run(F32, F32, x, y, n, op=2, swapneg=True)
+    check(f"D={d} L2 fp SWAPNEG", same(got, sw * y))
+    # index modes: src2 MOD 4 groups, DIV 8 groups, IMM; src1 DIV D (replicate)
+    g = np.arange(n // d)
+    ymod = y[: 4 * d].reshape(4, d)[g % 4].ravel()
+    got = run(F32, F32, x, y[: 4 * d], n, op=2, m2="mod", period=4)
+    check(f"D={d} L2 fp src2 MOD 4", same(got, x * ymod))
+    ydiv = y[: (n // d // 8) * d].reshape(-1, d)[g // 8].ravel()
+    got = run(F32, F32, x, y[: (n // d // 8) * d], n, op=2, m2="div", period=8)
+    check(f"D={d} L2 fp src2 DIV 8", same(got, x * ydiv))
+    got = run(F32, F32, x, None, n, op=1, m2="imm", imm=2.5)
+    check(f"D={d} L2 fp src2 IMM", same(got, x - f32(2.5)))
+    got = run(F32, F32, x[: 4 * d], None, 4 * d * d, op=5, m1="div", p1=d, length=4 * d * d)
+    check(f"D={d} L2 fp src1 DIV D (replicated rows)",
+          same(got, x[: 4 * d].reshape(4, d)[np.arange(4 * d) // d].ravel()))
+    # VALID: rows of 4 groups, first 3*d - 1 elements valid, others written as 0
+    got = run(F32, F32, x, None, n, op=5, rowlen=4, valid=3 * d - 1)
+    e = np.arange(n) % (4 * d)
+    check(f"D={d} L2 fp VALID masking", same(got, np.where(e < 3 * d - 1, x, f32(0))))
+
+    # reductions: order = per lane sequentially over the groups of a row, then a pairwise lane tree
+    def ref_reduce(v, rowlen, valid, kind):
+        ident = f32(0) if kind == "sum" else f32(-np.inf)
+        fn = (lambda a, b: (a + b).astype(f32)) if kind == "sum" else np.maximum
+        v = v.reshape(-1, rowlen, d).copy()
+        if valid:
+            ee = np.arange(rowlen)[:, None] * d + np.arange(d)[None, :]
+            v = np.where(ee[None] < valid, v, ident)
+        acc = v[:, 0, :]
+        for gi in range(1, rowlen):
+            acc = fn(acc, v[:, gi, :])
+        while acc.shape[1] > 1:
+            acc = fn(acc[:, 0::2], acc[:, 1::2])
+        return np.repeat(acc, d, axis=1).ravel()
+
+    for kind in ("sum", "max"):
+        for rowlen, valid in ((32, 0), (8, 0), (8, 5 * d + 3)):
+            got = run(F32, F32, x, None, (n // d // rowlen) * d, op=5, reduce=kind, rowlen=rowlen, valid=valid)
+            check(f"D={d} L2 fp REDUCE {kind} rowlen {rowlen} valid {valid}",
+                  same(got, ref_reduce(x, rowlen, valid, kind)))
+    got = run(F32, F32, x, x, (n // d // 8) * d, op=2, reduce="sum", rowlen=8)
+    check(f"D={d} L2 fp REDUCE sum of x*x", same(got, ref_reduce((x * x).astype(f32), 8, 0, "sum")))
+
+    # TRANSPOSE: rows of S words (K = pos x hs, S = hs / d) -> B strips
+    for t, mem in ((I8, SA), (F32, ACC)):
+        R, S = 3 * d, 3
+        sim = SaFuncSim(d, BASE, 1 << 21)
+        data = (rng.integers(-128, 128, (R, S * d)) if t == I8 else rng.standard_normal((R, S * d))).astype(
+            np.int8 if t == I8 else f32)
+        sim.ddr_write(X, data.tobytes())
+        dst = SB if t == I8 else ACC
+        wd = 0 if t == I8 else 2048
+        dl = DL().ld(X, pm.laddr(mem, 0), 1, data.nbytes, data.nbytes)
+        dl.transpose(pm.laddr(mem, 0), pm.laddr(dst, wd), R * S * d, t | t << 2, S)
+        dl.st(O, pm.laddr(dst, wd), 1, data.nbytes, data.nbytes).end()
+        sim.run_list(put_list(sim, dl, L))
+        got = sim.ddr_read(O, data.nbytes).view(data.dtype).reshape(-1, d)
+        # block (kb, ks): positions kb*d.., dims ks*d..; output word kb*S*d + ks*d + i = data[kb*d:(kb+1)*d, ks*d + i]
+        want = np.concatenate([data[kb * d:(kb + 1) * d, ks * d + i][None]
+                               for kb in range(R // d) for ks in range(S) for i in range(d)])
+        check(f"D={d} L2 TRANSPOSE {'I8 SPAD' if t == I8 else 'F32 ACC'} ({R} x {S} words)",
+              np.array_equal(got, want))
+
+    # softmax of rows of 4*d with VALID = 3*d + 1: max, exp(x - max), sum, recip, multiply
+    rows, rl = 4, 4
+    xs = (rng.standard_normal(rows * rl * d) * 4).astype(f32)
+    valid = 3 * d + 1
+    sim = SaFuncSim(d, BASE, 1 << 21)
+    sim.ddr_write(X, xs.tobytes())
+    a0, m, e, s_, r = 0, 1024, 2048, 3072, 3200
+    la = lambda w: pm.laddr(ACC, w)
+    dl = DL().ld(X, la(a0), 1, xs.nbytes, xs.nbytes)
+    dl.ve(la(a0), 0, la(m), xs.size, 5, F32 | F32 << 2, fp=True, reduce="max", rowlen=rl, valid=valid)
+    dl.ve(la(a0), la(m), la(e), xs.size, 1, F32 | F32 << 2, fp=True, m2="div", period=rl, func="exp",
+          rowlen=rl, valid=valid)
+    dl.ve(la(e), 0, la(s_), xs.size, 5, F32 | F32 << 2, fp=True, reduce="sum", rowlen=rl)
+    dl.ve(la(s_), 0, la(r), rows * d, 5, F32 | F32 << 2, fp=True, func="recip")
+    dl.ve(la(e), la(r), la(e), xs.size, 2, F32 | F32 << 2, fp=True, m2="div", period=rl)
+    dl.st(O, la(e), 1, xs.nbytes, xs.nbytes).end()
+    sim.run_list(put_list(sim, dl, L))
+    got = sim.ddr_read(O, xs.nbytes).view(f32).reshape(rows, -1).astype(np.float64)
+    xv = xs.reshape(rows, -1).astype(np.float64)[:, :valid]
+    want = np.exp(xv - xv.max(1, keepdims=True))
+    want /= want.sum(1, keepdims=True)
+    check(f"D={d} L2 softmax as 5 VE commands (VALID {valid} of {rl * d}): max error "
+          f"{np.abs(got[:, :valid] - want).max():.1e}",
+          np.abs(got[:, :valid] - want).max() < 1e-5 and not got[:, valid:].any())
+    # RMSNorm: sum(x*x), rsqrt(ss / n + eps), x * r, * g
+    nn = 8 * d
+    xr = rng.standard_normal(nn).astype(f32)
+    gw = rng.uniform(0.5, 1.5, nn).astype(f32)
+    sim = SaFuncSim(d, BASE, 1 << 21)
+    sim.ddr_write(X, xr.tobytes())
+    sim.ddr_write(Y, gw.tobytes())
+    dl = DL().ld(X, la(0), 1, xr.nbytes, xr.nbytes).ld(Y, la(512), 1, gw.nbytes, gw.nbytes)
+    dl.ve(la(0), la(0), la(1024), nn, 2, F32 | F32 << 2, fp=True, reduce="sum", rowlen=nn // d)
+    dl.ve(la(1024), 0, la(1025), d, 5, F32 | F32 << 2, fp=True, func="rsqrt", A=1.0 / nn, B=1e-5)
+    dl.ve(la(0), la(1025), la(1100), nn, 2, F32 | F32 << 2, fp=True, m2="div", period=nn // d)
+    dl.ve(la(1100), la(512), la(1100), nn, 2, F32 | F32 << 2, fp=True)
+    dl.st(O, la(1100), 1, xr.nbytes, xr.nbytes).end()
+    sim.run_list(put_list(sim, dl, L))
+    got = sim.ddr_read(O, xr.nbytes).view(f32).astype(np.float64)
+    want = xr.astype(np.float64) / np.sqrt((xr.astype(np.float64) ** 2).mean() + 1e-5) * gw
+    check(f"D={d} L2 RMSNorm as 4 VE commands: max rel error {np.abs(got / want - 1).max():.1e}",
+          np.abs(got / want - 1).max() < 2e-6)
+
+    def expect(name, fn):
+        try:
+            fn()
+        except SaError as e_:
+            check(f"D={d} L2 error: {name}", e_.engine == ENG_VE, f"engine {e_.engine}")
+            return
+        check(f"D={d} L2 error: {name}", False, "no error")
+
+    sim = SaFuncSim(d, BASE, 1 << 20)
+    expect("F32 in SPAD", lambda: sim.ve(pm.laddr(SA, 0), 0, pm.laddr(ACC, 0), 1, 5, F32 | F32 << 2, flags=1))
+    expect("REQUANT with FP", lambda: sim.ve(pm.laddr(ACC, 0), 0, pm.laddr(ACC, 8), 1, 0x25, F32 | F32 << 2, flags=1))
+    expect("REDUCE to I8", lambda: sim.ve(pm.laddr(ACC, 0), 0, pm.laddr(SB, 0), 1, 5, F32, flags=1 | 1 << 8))
+    expect("DIV with period 0", lambda: sim.ve(pm.laddr(ACC, 0), pm.laddr(ACC, 8), pm.laddr(ACC, 16), 1, 0,
+                                               F32 | F32 << 2, flags=1 | 2 << 6))
+    expect("L2 field without FP", lambda: sim.ve(pm.laddr(ACC, 0), 0, pm.laddr(ACC, 8), 1, 5, 2 | 2 << 2, a=1))
+    expect("TRANSPOSE with stride 0", lambda: sim.ve(pm.laddr(ACC, 0), 0, pm.laddr(ACC, 64), d, 6, F32 | F32 << 2))
+
+
 def main():
     rng = np.random.default_rng(2026)
     for d in (8, 16):
@@ -323,6 +519,7 @@ def main():
         control_flow(d)
         errors(d)
         l1_extensions(d)
+        l2_fp(d, rng)
     print("PASS" if not fails else f"FAIL: {len(fails)}")
     return 0 if not fails else 1
 
