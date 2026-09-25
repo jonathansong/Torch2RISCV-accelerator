@@ -17,6 +17,7 @@ route_design
 report_utilization    -file utilization.rpt
 report_utilization    -hierarchical -hierarchical_depth 2 -file utilization_hier.rpt
 report_timing_summary -file timing_summary.rpt
+report_timing -max_paths 20 -nworst 1 -unique_pins -sort_by slack -file timing_paths.rpt
 
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -setup]]
 puts "RESULT: target [expr {1000.0 / $clock_ns}] MHz, WNS = $wns ns, est. fmax = [format %.1f [expr {1000.0 / ($clock_ns - $wns)}]] MHz"
