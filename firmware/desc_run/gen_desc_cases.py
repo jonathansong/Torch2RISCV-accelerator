@@ -219,6 +219,31 @@ def build_cases(d, seed=11):
     l2_case("L2 attention scores: TRANSPOSE K, replicate q, EX, I32 -> F32 x 1/8", dl,
             [(A_OFF, K.tobytes()), (B_OFF, q.tobytes())], O_OFF, 4 * pos, at_ok)
 
+    # ---- L3: a W8A8 linear layer as compile_layer builds it (quantize x, chunked GEMM over
+    # double-buffered weight chunks in a LOOP_END with PARAM-stepped DDR addresses, fp32 dequant)
+    import compile_layer as CL
+    from export_w8a8 import pack_b
+    from ref_model import quantize_rows
+    k, n_out = 64, 2880
+    wf = rng.standard_normal((n_out, k)).astype(f32) * f32(0.05)
+    wq, sw = quantize_rows(wf)
+    xl = (rng.standard_normal(k) * 2).astype(f32)
+    W_OFF, SW_OFF, XL_OFF, YL_OFF = 0x0, 0x2D000, 0x30000, 0x31000
+    lay = CL.Layout(d)
+    dl = pm.DescList().ld(DDR_BASE + XL_OFF, la(ACC, lay.acc0), 1, 4 * k, 4 * k)
+    s_x = CL.quant_act(dl, lay, lay.acc0, k, lay.acc0 + 128)
+    CL.linear(dl, lay, k, n_out, DDR_BASE + W_OFF, DDR_BASE + SW_OFF, s_x, out_ddr=DDR_BASE + YL_OFF, loop=True)
+    dl.end(0x55)
+
+    def lin_ok(out):
+        got = np.frombuffer(out, f32).astype(np.float64)
+        s = np.abs(xl).max() / 127
+        want = (wq.astype(np.float64) @ np.clip(np.rint(xl / s), -127, 127)) * sw * s
+        return np.allclose(got, want, rtol=1e-5, atol=1e-6)
+    l2_case(f"L3 linear {k} -> {n_out}: quantize, looped double-buffered GEMM, dequant", dl,
+            [(W_OFF, pack_b(wq, d).tobytes()), (SW_OFF, sw.tobytes()), (XL_OFF, xl.tobytes())],
+            YL_OFF, 4 * n_out, lin_ok)
+
     return cases
 
 

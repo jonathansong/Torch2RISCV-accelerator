@@ -10,6 +10,10 @@ This directory implements level L0 of
 | `ref_model.py` | Reference models. `Fp32Model` is `run.c` in NumPy float32. `DeviceModel` uses the plan §3 numerics: per-channel W8A8, a static int8 KV cache, fp32 VE steps and the fixed reduction order. |
 | `eval_quant.py` | Measures the accuracy of `DeviceModel` against fp32. It calibrates the KV scales, then reports teacher-forced top-1 and top-5 agreement, KL divergence, and where free-running greedy text first diverges. |
 | `sa_funcsim.py` | Functional simulator of `rtl/sysarray`. It runs descriptor lists bit-exactly (M5 hardware) and is the golden reference for the later levels. |
+| `fp32.py`, `sfu.py`, `test_fp32.py` | L2: bit-exact models of the fp32 arithmetic and the special functions (EXP, RECIP, RSQRT). |
+| `export_w8a8.py` | L3: exports a checkpoint as a `.w8a8` device file. Weights are int8 per channel, pre-packed as B tiles for D. The file also holds the KV parameter blocks and the RoPE tables. |
+| `compile_layer.py` | L3: builds descriptor lists for activation quantization and W8A8 linear layers. It uses chunked, double-buffered weights, BASE relocation, and LOOP_END + PARAM for long layers. |
+| `test_l3.py` | L3: runs real stories15M layer inputs through the lists in the functional simulator. The results must be bit-exact with `DeviceModel(sfu=SfuExact)` and close to fp32. `--save` writes the cases for the board test. |
 | `test_funcsim.py` | Checks the functional simulator against the RTL co-simulation cases, the driver's golden models, control flow and error codes. |
 
 All scripts run on the host and need only NumPy. The checkpoints and
@@ -57,3 +61,16 @@ All models pass the 95% gate. Every device argmax is in the fp32 top 5.
 Accuracy improves with model size. The two KV calibrations differ by less
 than 1 point. stories15M with p99.99 KV scales (96.3%) is the baseline for
 the later levels.
+
+## L3 results
+
+```sh
+python3 llm/export_w8a8.py build/llm_cache/stories15M.bin --kv build/llm_cache/kv/stories15M_kv_p99.99.npy --d 8 -o build/llm_cache/stories15M_d8.w8a8
+python3 llm/test_l3.py build/llm_cache/stories15M.bin build/llm_cache/stories15M_d8.w8a8 --kv build/llm_cache/kv/stories15M_kv_p99.99.npy --save l3_cases.npz
+```
+
+On the board (`notebooks/llm/l3_linear_demo.py`, L2 bitstream):
+
+- The 9 linear layers tested are Wqkv, Wo, W13 and W2 of layers 0 and 5, plus the classifier. All are bit-exact with the functional simulator and with `DeviceModel`, and 0.37–3.27% from fp32.
+- The classifier (288 → 32000) takes 1.26 M cycles and moves 7.32 weight bytes per cycle, with LD busy 93.9% (the plan requires ≥ 90%).
+- See plan §7.3 for the per-layer table.

@@ -112,6 +112,27 @@ class Sfu64:
             return (1.0 / np.sqrt(np.asarray(x, np.float64))).astype(F)
 
 
+class SfuExact:
+    """EXP / RECIP / RSQRT as the device computes them (llm/sfu.py, bit-exact
+    with the L2 hardware)."""
+    @staticmethod
+    def _run(name, x):
+        import sfu
+        return getattr(sfu, name)(np.asarray(x, F).view(np.uint32)).view(F)
+
+    @classmethod
+    def exp(cls, x):
+        return cls._run("exp", x)
+
+    @classmethod
+    def recip(cls, x):
+        return cls._run("recip", x)
+
+    @classmethod
+    def rsqrt(cls, x):
+        return cls._run("rsqrt", x)
+
+
 def to_i8(x):
     """fp32 -> int8: round to nearest even, saturate to [-127, 127], NaN -> 0."""
     y = np.rint(np.asarray(x, F))

@@ -696,6 +696,47 @@ y = x·Wᵀ：
   与功能模拟器逐位一致，与 fp32 参考的误差在 L0 标定的范围内；
 - **计数器指标**：分类层 GEMV 的 LD 忙碌 ≥ 90%，说明 LD 与 EX 确实重叠了。
 
+### 7.3 实现记录与结果
+
+**文件**
+- `llm/export_w8a8.py`：导出与读取 `.w8a8`。头部之后是张量表（名字、偏移、字节数、是否按层）。
+  - 线性层权重按 B 条带**预先打包**：第 t 块是输出通道 [tD, (t+1)D) 的 (in × D) 行主序 int8；
+  - 所以任意连续的几块在 DDR 中是连续的，一次 LINEAR LD 就能装进 SPAD_B，不需要跨步 DMA；
+  - 打包与 D 有关，头部记录 D。stories15M 在 D=8 时是 24.2 MB。
+- `llm/compile_layer.py`：手写的列表生成器。
+  - `quant_act`：4 条 VE，依次算 amax、s_x、1/s_x，最后用 src1 DIV D 输出复制行的 int8 A 条带；
+  - `linear`：每块 NC 个输出块。NC 取能整除输出块数的最大值，同时要放得下 SPAD_B 一个 bank 和 ACC 的暂存区；
+  - DDR 地址都通过 BASE 重定位（BASE0 = 模型，BASE1 = 输入输出）；
+  - 输出到 DDR 且块数多（分类层）时，用 LOOP_END 循环一对块，PARAM0/1 按步长递增 DDR 地址：
+    列表只有 32 条描述符，实际执行 1046 条。
+- `ref_model.SfuExact`：DeviceModel 用上与硬件逐位一致的 SFU。
+- `llm/test_l3.py`：主机测试。用真实输入跑第 0、5 层和分类层，与 DeviceModel 逐位比对；
+  `--save` 输出板上测试用的用例文件。
+- `notebooks/llm/l3_linear_demo.py`：板上测试。L3 不改硬件，用的是 `bitstreams/l2`。
+
+**验证**
+- 主机上，D=8 和 16 时各层都与 DeviceModel 逐位一致，与 fp32 参考的相对误差为 0.37–3.27%（W2 最大）。
+  循环形式与展开形式的结果完全相同。
+- 变异测试：把反量化顺序改成先乘 s_x 再乘 s_w，每一层都被检出不一致。
+- RTL 联合仿真：`desc_run` 增加一个合成的 L3 线性层（64 → 2880，强制使用循环形式），D=8 和 16 都通过。
+
+**板上结果**（stories15M，D=8，50 MHz）
+
+| 层 | in → out | 周期 | 权重 B/周期 | EX useful | LD 忙碌 |
+|---|---|---|---|---|---|
+| Wqkv | 288 → 864 | 42,121 | 5.91 | 73.7% | 75.9% |
+| Wo | 288 → 288 | 16,997 | 4.88 | 60.7% | 63.5% |
+| W13 | 288 → 1536 | 67,517 | 6.55 | 81.8% | 84.0% |
+| W2 | 768 → 288 | 36,319 | 6.09 | 75.9% | 78.4% |
+| 分类层 | 288 → 32000 | 1,258,768 | 7.32 | 91.5% | **93.9%** |
+
+- 9 个线性层的板上结果与板上运行的功能模拟器、主机的 DeviceModel 都逐位一致。
+- **分类层 LD 忙碌 93.9%，验收（≥ 90%）通过**。LD 每个忙碌周期 7.91 B，接近一个 HP 口的上限。
+- 小的层 LD 忙碌只有 64–84%：第一块的加载和最后一块的后处理无法重叠，块数少时占比大。
+  L4 把一层的多个线性层串成一个列表，可以把下一个线性层的第一块提前加载。
+- 一层的 4 个线性层合计约 163k 周期（3.3 ms），6 层约 19.7 ms；加上分类层 25 ms，
+  线性层部分约 45 ms/token（约 22 tok/s 的上限，不含注意力和其他 VE 运算）。
+
 ---
 
 ## 8. L4：一个 decoder 层在设备上执行
@@ -1016,7 +1057,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | `llm/sa_funcsim.py` | L0–L2 | 功能模拟器（逐位黄金参考）与周期估计 |
 | `llm/sfu_tables.py`、`llm/gen_ve_fp_vectors.py` | L2 | SFU 表格，fp32 VE 测试向量 |
 | `llm/export_w8a8.py` | L3 | 模型导出 |
-| `llm/compile_layer.py` | L3、L4 | 手写列表生成器（LOOP、PARAM） |
+| `llm/compile_layer.py`、`llm/test_l3.py` | L3、L4 | 手写列表生成器（LOOP、PARAM）及其主机测试 |
 | `llm/runtime.py`、`llm/tokenizer.py` | L5 | Python 运行时 |
 | `firmware/rt/` | L1 | 常驻固件 `rt_fw` |
 | `firmware/include/mailbox.h`、`sysarray_intrinsics.h` | L1、L2 | 命令环字段、`mat_notify`、新的 `mat_cfg` / `vec_cfg` key |
