@@ -104,7 +104,7 @@ def main():
             print(format_breakdown(b))
 
     arm = arm_baseline(os.path.join(HERE, "arm_baseline.txt"))
-    print(f"\nper token, GEMVs only (attention, norms, softmax, SiLU, RoPE and the ARM side not included)")
+    print("\nper token, GEMVs only (attention, norms, softmax, SiLU, RoPE and the ARM side not included)")
     print(f"{'model':>12} {'weights':>9} {'GEMV ms':>8} {'tok/s':>7} {'batch-' + str(d) + ' tok/s':>14} "
           f"{'@8 B/cyc':>9} {'@16 B/cyc':>9}   ARM llama2.c tok/s (fp32 | int8, 1 / 2 threads)")
     for m in models:

@@ -19,11 +19,14 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "driver"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "llm"))
 import pynq_matmul as pm  # noqa: E402  (pynq itself is optional off the board)
+from sa_funcsim import SaFuncSim  # noqa: E402
 
 DDR_BASE = 0x18000000                  # tb_system.v
 A_OFF, B_OFF, C_OFF, BIAS_OFF = 0x0000, 0x4000, 0x8000, 0x10000
 X_OFF, Y_OFF, O_OFF, LIST_OFF = 0x18000, 0x20000, 0x28000, 0x40000
+IDX_OFF = 0x30000
 DDR_BYTES = 0x50000
 
 
@@ -36,8 +39,11 @@ def write_sparse(path, chunks):
 
 
 def build_cases(d, seed=11):
-    """[(name, DescList, [(DDR offset, bytes)], output offset, expected bytes)]
-    for array size d; DDR offsets are relative to DDR_BASE."""
+    """[(name, DescList, [(DDR offset, bytes)], output offset, expected bytes,
+    descriptors decoded)] for array size d; DDR offsets are relative to
+    DDR_BASE. The last two cases use the L1 command extensions (loops,
+    dynamic fields, SETREG, CALL / RET, LDPARAM); expected bytes always come
+    from NumPy, independently of the lists."""
     rng = np.random.default_rng(seed)
     cases = []   # (name, dl, chunks, out_off, expected bytes)
 
@@ -55,7 +61,7 @@ def build_cases(d, seed=11):
             exp = pm.qgemm_golden(a, b, bias_v, quant, relu)
         else:
             exp = (pm.golden(a, b) + (bias_v if bias else 0)).astype(np.int32)
-        cases.append((name, dl, chunks, C_OFF, exp.tobytes()))
+        cases.append((name, dl, chunks, C_OFF, exp.tobytes(), len(dl)))
 
     def vector_case(name, op, it, ot, n, ny, relu=False, requant=None):
         dt = {0: np.int8, 1: np.int16, 2: np.int32}
@@ -65,7 +71,7 @@ def build_cases(d, seed=11):
         dl = pm.build_vector_list(d, op, it, ot, n, ny, DDR_BASE + X_OFF, DDR_BASE + Y_OFF,
                                   DDR_BASE + O_OFF, relu, requant)
         exp = pm.vector_golden(op, x, y, dt[ot], relu, requant)
-        cases.append((name, dl, [(X_OFF, x.tobytes()), (Y_OFF, y.tobytes())], O_OFF, exp.tobytes()))
+        cases.append((name, dl, [(X_OFF, x.tobytes()), (Y_OFF, y.tobytes())], O_OFF, exp.tobytes(), len(dl)))
 
     gemm_case(f"gemm {4*d}x{4*d}x{8*d}", 4 * d, 4 * d, 8 * d)
     gemm_case(f"gemm {3*d}x{2*d}x{5*d} + bias rows", 3 * d, 2 * d, 5 * d, bias=True)
@@ -73,11 +79,52 @@ def build_cases(d, seed=11):
     gemm_case(f"int8 gemm {4*d}x{4*d}x{8*d} + bias, relu", 4 * d, 4 * d, 8 * d, bias=True,
               quant=pm.Requant(181, 15, -3), relu=True)
     vector_case("vector add i8 n=20000", "add", 0, 0, 20000, 20000)
-    vector_case(f"vector add i32->i8 relu requant, bias period 8", "add", 2, 0, 4096, 8 * d, True,
+    vector_case("vector add i32->i8 relu requant, bias period 8", "add", 2, 0, 4096, 8 * d, True,
                 pm.Requant(300, 16, 5))
     vector_case("vector mul i16->i32 n=4112", "mul", 1, 2, 4112, 4112)
 
+    # ---- L1: int8 add of 8 chunks of 512 by one loop body (PARAM address strides)
+    P = pm.DescList.REG_PARAM
+    x = rng.integers(-128, 128, 4096, dtype=np.int8)
+    y = rng.integers(-128, 128, 4096, dtype=np.int8)
+    sa, sb, so = pm.laddr(pm.MEM_SPAD_A, 0), pm.laddr(pm.MEM_SPAD_B, 0), pm.laddr(pm.MEM_SPAD_B, 1024)
+    dl = pm.DescList().setreg((P + 0, 0), (P + 1, 0))
+    dl.ld(DDR_BASE + X_OFF, sa, 1, 512, 512, dyn=[("ddr", 0, True)])
+    dl.ld(DDR_BASE + Y_OFF, sb, 1, 512, 512, dyn=[("ddr", 0, True)])
+    dl.ve(sa, sb, so, 512, pm.VOPS["add"], 0)
+    dl.st(DDR_BASE + O_OFF, so, 1, 512, 512, dyn=[("ddr", 1, True)])
+    dl.loop_end(-4, 8, k1=0, s1=512, k2=1, s2=512).end(0x11)
+    exp = np.clip(x.astype(int) + y, -128, 127).astype(np.int8)
+    cases.append(("L1 loop: int8 add, 8 x 512 through PARAM strides", dl,
+                  [(X_OFF, x.tobytes()), (Y_OFF, y.tobytes())], O_OFF, exp.tobytes(), 1 + 8 * 5 + 1))
+
+    # ---- L1: gather 4 rows by indices in DDR (LDPARAM), a CALLed body, SETREG add
+    rows = rng.integers(0, 256, (32, 64), dtype=np.uint8)
+    idx = np.array([5, 0, 17, 3], "<u4")
+    dl = pm.DescList().setreg((P + 3, DDR_BASE + IDX_OFF), (P + 4, DDR_BASE + O_OFF))
+    dl.ldparam(0, 2, mul=64, add=DDR_BASE + X_OFF, dyn=[("addr", 3)])      # 1: PARAM2 = row address
+    dl.call(3, rel=True)                                                  # 2: -> 5
+    dl.loop_end(-2, 4, k1=3, s1=4, k2=3, s2=0)                            # 3: next index
+    dl.end(0x22)                                                          # 4
+    dl.ld(0, sa, 1, 64, 64, dyn=[("ddr", 2)])                             # 5
+    dl.st(0, sa, 1, 64, 64, dyn=[("ddr", 4)])                             # 6
+    dl.setreg((P + 4, 64, True))                                          # 7
+    dl.ret()                                                              # 8
+    cases.append(("L1 LDPARAM gather + CALL / RET + SETREG add", dl,
+                  [(X_OFF, rows.tobytes()), (IDX_OFF, idx.tobytes())], O_OFF, rows[idx].tobytes(), 1 + 4 * 7 + 1))
+
     return cases
+
+
+def check_funcsim(d, case):
+    """The functional simulator gives the expected bytes and decode count."""
+    name, dl, chunks, out_off, exp, n_exec = case
+    sim = SaFuncSim(d, DDR_BASE, DDR_BYTES)
+    for off, data in chunks:
+        sim.ddr_write(DDR_BASE + off, data)
+    sim.ddr_write(DDR_BASE + LIST_OFF, dl.array().tobytes())
+    n = sim.run_list(DDR_BASE + LIST_OFF)
+    assert n == n_exec and sim.ddr_read(DDR_BASE + out_off, len(exp)).tobytes() == exp, f"funcsim: {name}"
 
 
 def main():
@@ -93,7 +140,9 @@ def main():
           f"localparam integer NDCASE = {len(cases)};"]
     load = ["task load_dcase(input integer c, output [31:0] n_desc, output [31:0] out_off, output [31:0] out_bytes);",
             "    case (c)"]
-    for i, (name, dl, chunks, out_off, exp) in enumerate(cases):
+    for i, case in enumerate(cases):
+        check_funcsim(d, case)
+        name, dl, chunks, out_off, exp, n_exec = case
         rows = dl.array()
         chunks = chunks + [(LIST_OFF, rows.tobytes())]
         assert all(off + len(data) <= DDR_BYTES for off, data in chunks), name
@@ -101,7 +150,7 @@ def main():
         write_sparse(os.path.join(args.out, f"case{i}_ddr.hex"), chunks)
         write_sparse(os.path.join(args.out, f"case{i}_exp.hex"), [(0, exp)])
         load.append(f'        {i}: begin $readmemh("case{i}_ddr.hex", ddr); $readmemh("case{i}_exp.hex", dexp); '
-                    f'n_desc = {len(dl)}; out_off = 32\'h{out_off:x}; out_bytes = {len(exp)}; '
+                    f'n_desc = {n_exec}; out_off = 32\'h{out_off:x}; out_bytes = {len(exp)}; '
                     f'$display("TB   case {i}: {name}"); end')
     load += ["    endcase", "endtask"]
     with open(os.path.join(args.out, "desc_cases.vh"), "w") as f:

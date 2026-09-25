@@ -45,7 +45,14 @@ module tb_sa_unit;
     reg         m_arready = 0, m_rvalid = 0, m_rlast = 0, m_awready = 0, m_wready = 0, m_bvalid = 0;
     reg  [63:0] m_rdata = 0;
     reg  [1:0]  m_rresp = 0, m_bresp = 0;
-    wire        irq;
+    wire        irq, nirq;
+    integer     nirq_edges = 0, nirq_high = 0;
+    reg         nirq_d = 0;
+    always @(posedge aclk) begin
+        nirq_d <= nirq;
+        if (nirq && !nirq_d) nirq_edges = nirq_edges + 1;
+        if (nirq) nirq_high = nirq_high + 1;
+    end
 
     reg         pcpi_valid = 0;
     reg  [31:0] pcpi_insn = 0, pcpi_rs1 = 0, pcpi_rs2 = 0;
@@ -80,7 +87,7 @@ module tb_sa_unit;
         .m2_axi_bvalid(1'b0),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
         .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
-        .irq(irq)
+        .irq(irq), .notify_irq(nirq)
     );
 
     // ------------------------------------------------------ bookkeeping
@@ -1094,6 +1101,210 @@ module tb_sa_unit;
         end
     endtask
 
+    // ============================ L1 command extensions + mat_notify
+    // (docs/llm_inference_plan.md §5.3; same cases as llm/test_funcsim.py)
+    localparam [7:0] DS_LOOP_END = 8'h13, DS_SETREG = 8'h14, DS_CALL = 8'h15, DS_RET = 8'h16,
+                     DS_LDPARAM = 8'h17;
+    integer l1_checks = 0;
+    // header {tag, dyn slot 1, dyn slot 0, flags, opcode}; flags: [0] RELOC, [2:1] BASESEL[1:0],
+    // [3] FENCE_BEFORE, [6:5] BASESEL[3:2]
+    task d_put8(input [7:0] op, input [15:0] dyn, input [7:0] fl, input [63:0] w1, input [63:0] w2,
+                input [63:0] w3, input [63:0] w4, input [63:0] w5);
+        begin
+            d_put(op, fl, w1, w2, w3, w4, w5);
+            put64(dl_base + 64 * (dl_n - 1), {dl_n[31:0] - 32'd1, dyn, fl, op});
+        end
+    endtask
+    function [7:0] dyn(input [3:0] field, input [2:0] prm, input add); dyn = {add, prm, field}; endfunction
+    function [7:0] rfl(input [3:0] b); rfl = {1'b0, b[3:2], 2'b00, b[1:0], 1'b1}; endfunction   // RELOC, BASE b
+    // SETREG of up to three registers (sel: {valid, 5-bit reg} x 3), add bits
+    task d_setreg(input [5:0] r0, input [31:0] v0, input [5:0] r1, input [31:0] v1,
+                  input [5:0] r2, input [31:0] v2, input [2:0] addb);
+        d_put8(DS_SETREG, 0, 0, {40'd0, 1'b0, r2 == 6'h3F ? 7'd0 : {1'b1, r2}, 1'b0,
+                                 r1 == 6'h3F ? 7'd0 : {1'b1, r1}, 1'b0, {1'b1, r0}},
+               {32'd0, v0}, {32'd0, v1}, {32'd0, v2}, {61'd0, addb});
+    endtask
+    localparam [5:0] NOREG = 6'h3F, PR = 6'd16;              // PARAM n = register 16 + n
+    task d_loop(input [31:0] off, input [15:0] cnt, input [2:0] k1, input [31:0] s1,
+                input [2:0] k2, input [31:0] s2);
+        d_put8(DS_LOOP_END, 0, 0, {32'd0, off}, {42'd0, k2, k1, cnt}, {32'd0, s1}, {32'd0, s2}, 0);
+    endtask
+    task l1_true(input cond, input [8*56-1:0] what);
+        begin
+            l1_checks = l1_checks + 1;
+            if (!cond) fail(what);
+        end
+    endtask
+    function mem_eq(input [31:0] a, input [31:0] b, input integer n);
+        integer j;
+        begin
+            mem_eq = 1;
+            for (j = 0; j < n; j = j + 1)
+                if (mem[a - MEM_BASE + j] !== mem[b - MEM_BASE + j]) mem_eq = 0;
+        end
+    endfunction
+    function [31:0] prm(input integer k); prm = dut.fetch.param[k]; endfunction
+
+    task l1_tests;
+        integer i;
+        reg [31:0] v, c0;
+        begin
+            // ---- mat_cfg keys 11..34 reach BASE0..15 / PARAM0..7; BASE13 / BASE15 relocation
+            cfg(8'd24, RS + 64 * 13);                           // key 11 + 13
+            cfg(8'd26, RD + 32'h1000);                          // key 11 + 15
+            cfg(8'd32, 32'd3);                                  // key 27 + 5
+            l1_true(dut.fetch.base[13] === RS + 64 * 13 && dut.fetch.base[15] === RD + 32'h1000 &&
+                    prm(5) === 3, "L1: mat_cfg keys 24 / 26 / 32");
+            dl_begin(DL);
+            d_put8(DS_LD, 0, rfl(13), 0, {16'd64, 16'd1, la(M_A, 300)}, {32'd0, 32'd64}, 0, 0);
+            d_put8(DS_ST, 0, rfl(15), 0, {16'd64, 16'd1, la(M_A, 300)}, {32'd0, 32'd64}, 0, 0);
+            d_end(0);
+            submit(DL, 0); fence(0);
+            l1_true(!xst[1] && mem_eq(RD + 32'h1000, RS + 64 * 13, 64), "L1: BASE13 / BASE15 relocation");
+
+            // ---- dynamic fields: rows <- PARAM3 (replace), DDR address += PARAM1
+            for (i = 0; i < 448; i = i + 1) mem[RD + 32'h2000 - MEM_BASE + i] = 8'hA5;
+            cfg(8'd30, 32'd5); cfg(8'd28, 32'd128);
+            dl_begin(DL);
+            d_put8(DS_LD, {dyn(1, 1, 1), dyn(3, 3, 0)}, 0, {32'd0, RS}, {16'd64, 16'd1, la(M_A, 400)}, {32'd0, 32'd64}, 0, 0);
+            d_put8(DS_ST, {8'd0, dyn(3, 3, 0)}, 0, {32'd0, RD + 32'h2000}, {16'd64, 16'd1, la(M_A, 400)}, {32'd0, 32'd64}, 0, 0);
+            d_end(0);
+            submit(DL, 0); fence(0);
+            l1_true(!xst[1] && mem_eq(RD + 32'h2000, RS + 128, 320) && mem[RD + 32'h2000 + 320 - MEM_BASE] === 8'hA5 &&
+                    mem[RD + 32'h2000 + 383 - MEM_BASE] === 8'hA5, "L1: dynamic rows (replace) / DDR address (add)");
+
+            // ---- SETREG: replace, add, BASE through SETREG
+            dl_begin(DL);
+            d_setreg(PR + 0, 5, PR + 1, 7, 6'd6, RS + 256, 3'b000);
+            d_setreg(PR + 0, 3, NOREG, 0, NOREG, 0, 3'b001);
+            d_put8(DS_LD, 0, rfl(6), 0, {16'd64, 16'd1, la(M_A, 310)}, {32'd0, 32'd64}, 0, 0);
+            d_st(RD + 32'h3000, la(M_A, 310), 1, 64, 64, 0);
+            d_end(0);
+            submit(DL, 0); fence(0);
+            l1_true(!xst[1] && prm(0) === 8 && prm(1) === 7 && mem_eq(RD + 32'h3000, RS + 256, 64),
+                    "L1: SETREG replace / add / BASE");
+
+            // ---- LOOP_END x8: a 2-descriptor body with PARAM address strides
+            dl_begin(DL);
+            d_setreg(PR + 0, 0, PR + 1, 0, NOREG, 0, 3'b000);
+            d_put8(DS_LD, {8'd0, dyn(1, 0, 1)}, 0, {32'd0, RS}, {16'd256, 16'd1, la(M_A, 0)}, {32'd0, 32'd256}, 0, 0);
+            d_put8(DS_ST, {8'd0, dyn(1, 1, 1)}, 0, {32'd0, RD + 32'h4000}, {16'd256, 16'd1, la(M_A, 0)}, {32'd0, 32'd256}, 0, 0);
+            d_loop(-2, 8, 0, 256, 1, 256);
+            d_end(32'h77);
+            submit(DL, 0); fence(0);
+            desc_status(ds_addr, ds_done, ds_stat, ds_err, ds_exec);
+            l1_true(!xst[1] && mem_eq(RD + 32'h4000, RS, 2048) && prm(0) === 2048 && prm(1) === 2048 &&
+                    ds_stat === 32'h77 && ds_exec === 1 + 8 * 3 + 1, "L1: LOOP_END x8 with PARAM strides");
+
+            // ---- nested loops (3 x 4), count 1, relative JUMP over a descriptor
+            dl_begin(DL);
+            d_setreg(PR + 2, 0, PR + 3, 0, PR + 4, 0, 3'b000);
+            d_setreg(PR + 5, 0, PR + 6, 0, NOREG, 0, 3'b000);
+            d_setreg(PR + 4, 1, NOREG, 0, NOREG, 0, 3'b001);
+            d_loop(-1, 4, 2, 1, 2, 0);
+            d_loop(-2, 3, 3, 1, 3, 0);
+            d_loop(-1, 1, 5, 10, 5, 0);
+            d_put8(DS_JUMP, 0, 0, {32'd0, 32'd2}, 64'd1, 0, 0, 0);   // relative +2
+            d_setreg(PR + 6, 99, NOREG, 0, NOREG, 0, 3'b000);
+            d_end(0);
+            submit(DL, 0); fence(0);
+            l1_true(!xst[1] && prm(4) === 12 && prm(2) === 12 && prm(3) === 3 && prm(5) === 10 && prm(6) === 0,
+                    "L1: nested loops 3x4, count 1, relative JUMP");
+
+            // ---- CALL / RET: a subroutine twice, then nesting to depth 4
+            dl_begin(DL + 32'h1000);
+            d_setreg(PR + 0, 1, NOREG, 0, NOREG, 0, 3'b001);
+            d_put8(DS_RET, 0, 0, 0, 0, 0, 0, 0);
+            dl_begin(DL + 32'h1400);
+            for (i = 0; i < 3; i = i + 1) begin
+                d_put8(DS_CALL, 0, 0, {32'd0, 32'd2}, 64'd1, 0, 0, 0);
+                d_put8(DS_RET, 0, 0, 0, 0, 0, 0, 0);
+            end
+            d_setreg(PR + 1, 1, NOREG, 0, NOREG, 0, 3'b001);
+            d_put8(DS_RET, 0, 0, 0, 0, 0, 0, 0);
+            dl_begin(DL);
+            d_setreg(PR + 0, 0, PR + 1, 0, NOREG, 0, 3'b000);
+            d_put8(DS_CALL, 0, 0, {32'd0, DL + 32'h1000}, 0, 0, 0, 0);
+            d_put8(DS_CALL, 0, 0, {32'd0, DL + 32'h1000}, 0, 0, 0, 0);
+            d_put8(DS_CALL, 0, 0, {32'd0, DL + 32'h1400}, 0, 0, 0, 0);
+            d_end(0);
+            submit(DL, 0); fence(0);
+            l1_true(!xst[1] && prm(0) === 2 && prm(1) === 1, "L1: CALL / RET (twice, depth 4)");
+
+            // ---- LDPARAM: a gather index from DDR (relocated, x mul + add)
+            put64(RD + 32'h6000, {32'd37, 32'd0});              // word at +4 = 37
+            dl_begin(DL);
+            d_setreg(6'd0, RD + 32'h6000, NOREG, 0, NOREG, 0, 3'b000);
+            d_put8(DS_LDPARAM, 0, rfl(0), {32'd0, 32'd4}, 64'd2, 64'd64, {32'd0, RS}, 0);
+            d_put8(DS_LD, {8'd0, dyn(1, 2, 1)}, 0, 0, {16'd64, 16'd1, la(M_B, 320)}, {32'd0, 32'd64}, 0, 0);
+            d_st(RD + 32'h7000, la(M_B, 320), 1, 64, 64, 0);
+            d_end(0);
+            submit(DL, 0); fence(0);
+            l1_true(!xst[1] && prm(2) === RS + 37 * 64 && mem_eq(RD + 32'h7000, RS + 37 * 64, 64),
+                    "L1: LDPARAM gather index");
+            //      ST then LDPARAM of the stored word: FENCE_BEFORE orders them
+            put64(RD + 32'h6100, 64'd21);
+            put64(RD + 32'h6200, 64'd0);
+            dl_begin(DL);
+            d_ld(RD + 32'h6100, la(M_B, 330), 1, 8, 8, 0, 0);
+            d_st(RD + 32'h6200, la(M_B, 330), 1, 8, 8, 0);
+            d_put8(DS_LDPARAM, 0, 8'h08, {32'd0, RD + 32'h6200}, 64'd3, 64'd1, 0, 0);
+            d_end(0);
+            submit(DL, 0); fence(0);
+            l1_true(!xst[1] && prm(3) === 21, "L1: LDPARAM after ST with FENCE_BEFORE");
+
+            // ---- count limit inside a loop
+            dl_begin(DL);
+            d_setreg(PR + 0, 0, NOREG, 0, NOREG, 0, 3'b000);
+            d_setreg(PR + 0, 1, NOREG, 0, NOREG, 0, 3'b001);
+            d_loop(-1, 10, 7, 0, 7, 0);
+            d_end(0);
+            submit(DL, 7); fence(0);
+            desc_status(ds_addr, ds_done, ds_stat, ds_err, ds_exec);
+            l1_true(!xst[1] && prm(0) === 3 && ds_exec === 7, "L1: count limit inside a loop");
+
+            // ---- errors (ENG_FETCH, XERR_SHAPE) and recovery
+            dl_begin(DL); d_put8(DS_FENCE, {8'd0, dyn(1, 0, 0)}, 0, 0, 0, 0, 0, 0); d_end(0);
+            submit(DL, 0); desc_expect_err(4'd1, 4'd4, "L1 err: dynamic field on FENCE");
+            dl_begin(DL); d_loop(-1, 0, 0, 0, 0, 0); d_end(0);
+            submit(DL, 0); desc_expect_err(4'd1, 4'd4, "L1 err: LOOP_END count 0");
+            dl_begin(DL); d_setreg(PR, 1, NOREG, 0, NOREG, 0, 0); d_loop(-1, 2, 0, 0, 0, 0);
+            d_loop(-2, 2, 0, 0, 0, 0); d_loop(-3, 2, 0, 0, 0, 0); d_end(0);
+            submit(DL, 0); desc_expect_err(4'd1, 4'd4, "L1 err: loop stack overflow");
+            dl_begin(DL); d_put8(DS_CALL, 0, 0, 0, 64'd1, 0, 0, 0); d_end(0);
+            submit(DL, 0); desc_expect_err(4'd1, 4'd4, "L1 err: call stack overflow");
+            dl_begin(DL); d_put8(DS_RET, 0, 0, 0, 0, 0, 0, 0); d_end(0);
+            submit(DL, 0); desc_expect_err(4'd1, 4'd4, "L1 err: RET without CALL");
+            dl_begin(DL); d_setreg(6'd24, 1, NOREG, 0, NOREG, 0, 0); d_end(0);
+            submit(DL, 0); desc_expect_err(4'd1, 4'd4, "L1 err: SETREG register 24");
+            dl_begin(DL); d_put8(DS_LDPARAM, 0, 0, {32'd0, RD + 32'h6002}, 0, 64'd1, 0, 0); d_end(0);
+            submit(DL, 0); desc_expect_err(4'd1, 4'd4, "L1 err: LDPARAM misaligned");
+            dl_begin(DL); d_end(0); put64(DL, {32'd0, 16'd0, 8'h80, DS_END});      // header bit 15
+            submit(DL, 0); desc_expect_err(4'd1, 4'd4, "L1 err: reserved header bit 15");
+            inject_rresp = 1;
+            dl_begin(DL + 32'h40); d_end(0);                    // the fetch of this list gets SLVERR
+            submit(DL + 32'h40, 0); desc_expect_err(4'd3, 4'd4, "L1 err: read error on fetch");
+            inject_rresp = 0;
+            dl_begin(DL); d_setreg(PR + 0, 5, NOREG, 0, NOREG, 0, 0); d_end(0);
+            submit(DL, 0); fence(0);
+            l1_true(!xst[1] && prm(0) === 5, "L1: list runs after the error cases");
+
+            // ---- mat_notify: an edge on notify_irq (4-cycle pulse) and NOTIFY_COUNT (0xD4)
+            csr_read(8'hD4, c0);
+            v = nirq_edges; i = nirq_high;
+            n_op(3'd7, 0, 0);
+            repeat (8) @(posedge aclk);
+            l1_true(nirq_edges === v + 1 && nirq_high === i + 4, "notify: one 4-cycle pulse");
+            n_op(3'd7, 0, 0);
+            n_op(3'd7, 0, 0);                                   // back to back: separate edges
+            repeat (8) @(posedge aclk);
+            l1_true(nirq_edges === v + 3, "notify: back-to-back notifies give separate edges");
+            csr_read(8'hD4, v);
+            l1_true(v === c0 + 3, "notify: NOTIFY_COUNT");
+            l1_true(irq === 1'b0, "notify: legacy irq not affected");
+        end
+    endtask
+
     task desc_tests;
         integer i;
         begin
@@ -1464,6 +1675,7 @@ module tb_sa_unit;
         random_stream(120);
         rs_via_list = 0;
         desc_tests;
+        l1_tests;
 
         // ================================================ new-ISA errors
         cfg_ld(2, 12, 16, 0);                                 // row_bytes not a multiple of 8
@@ -1493,18 +1705,17 @@ module tb_sa_unit;
         fence(0);
         if (xst[11:8] !== 4'd2) fail("bad memory id: wrong ext status");
         mat_op(F_RESET, 0, 0);
-        pcpi_exec(custom0(3'd7, 7'd1), 0, 0);                  // 5 mat_perf, 6 mat_submit
-        if (pc_cycles >= 0) fail("funct7=1 funct3=7 was answered");
-        expect_csr(8'h24, 32'h0020_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + 32'h0001_0000 + D * 256 + D,
-                   "CAPS");                                             // [21] desc, [20] perf, 1 port, VL = D, D
+        // (funct7 = 1 uses all funct3 values: 5 mat_perf, 6 mat_submit, 7 mat_notify)
+        expect_csr(8'h24, 32'h0160_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + 32'h0001_0000 + D * 256 + D,
+                   "CAPS");     // [24] command ext., [22] notify, [21] desc, [20] perf, 1 port, VL = D, D
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");
 
         repeat (20) @(posedge aclk);
-        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | descriptors: list GEMM %0d cycles, %0d checks | error paths",
+        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | descriptors: list GEMM %0d cycles, %0d checks | L1: %0d checks | error paths",
                  errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, D, 4*D, 4*D, 8*D, gemm_cycles_main, 4*D*4*D*8*D / gemm_cycles_main,
                  n_ld, n_ex, n_st, n_ve, 4*D, 4*D, 8*D, qgemm_cycles_first, perf_checks,
-                 gemm_cycles_list, desc_checks);
+                 gemm_cycles_list, desc_checks, l1_checks);
         $finish;
     end
 

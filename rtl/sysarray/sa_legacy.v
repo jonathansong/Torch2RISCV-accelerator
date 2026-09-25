@@ -82,7 +82,12 @@ module sa_legacy #(
     input  wire [31:0]           fst_done,
     input  wire [31:0]           fst_status,
     input  wire [31:0]           fst_err_idx,
-    input  wire [31:0]           fst_exec
+    input  wire [31:0]           fst_exec,
+    // host notification (mat_notify, L1): an edge interrupt (4-cycle pulse per
+    // mat_notify, MSI-like: the ARM acknowledges at its interrupt controller,
+    // it cannot reach these CSRs) and NOTIFY_COUNT (0xD4, read-only)
+    input  wire                  notify,
+    output wire                  notify_irq
 );
     `include "sa_defs.vh"
 
@@ -90,13 +95,16 @@ module sa_legacy #(
                      R_IRQ_STATUS = 6, R_CYCLES = 7, R_ID = 8, R_CAPS = 9, R_EXT = 10,
                      R_PERF_CTRL = 15, R_PERF0 = 16,             // counters at 0x40 .. 0xBC
                      R_DESC_ADDR = 48, R_DESC_DONE = 49, R_DESC_STATUS = 50,
-                     R_DESC_ERR_IDX = 51, R_DESC_EXEC = 52;       // 0xC0 .. 0xD0
+                     R_DESC_ERR_IDX = 51, R_DESC_EXEC = 52,       // 0xC0 .. 0xD0
+                     R_NOTIFY_COUNT = 53;                          // 0xD4
     localparam [31:0] ID_VALUE = 32'h4D4D_3038;                 // "MM08"
     localparam [31:0] DIM_888  = {2'b0, 10'd8, 10'd8, 10'd8};
-    localparam [31:0] CAPS     = (DESC != 0 ? 32'h0020_0000 : 32'd0) + (PERF != 0 ? 32'h0010_0000 : 32'd0) +
-                                 NPORTS * 65536 + VL * 256 + D;
+    localparam [31:0] CAPS     = (DESC != 0 ? 32'h0120_0000 : 32'd0) + (PERF != 0 ? 32'h0010_0000 : 32'd0) +
+                                 32'h0040_0000 + NPORTS * 65536 + VL * 256 + D;
                                   // [7:0] D, [15:8] VL, [19:16] ports, [20] performance counters,
-                                  // [21] descriptor fetch unit
+                                  // [21] descriptor fetch unit, [22] mat_notify / notify_irq (L1),
+                                  // [24] command extensions (L1: BASE0-15, PARAM, dynamic fields,
+                                  //      SETREG, LOOP_END, CALL / RET, LDPARAM)
     localparam [3:0]  ERR_NONE = 0, ERR_DIM = 1, ERR_ADDR = 2, ERR_RRESP = 3, ERR_BRESP = 4;
 
     // reserved tile slots (last D words of each memory)
@@ -125,7 +133,11 @@ module sa_legacy #(
     assign leg_busy   = busy;
     assign leg_status = {20'd0, err_code, 5'd0, error, busy, done};
     assign leg_cycles = cycles;
+    reg  [31:0] notify_count;
+    reg  [2:0]  notify_ph;            // 5..2 high, 1 low gap, 0 idle
+    reg  [7:0]  notify_pend;          // notifies not yet signalled (saturating)
     assign irq        = irq_status & irq_en;
+    assign notify_irq = notify_ph >= 3'd2;
 
     // ---------------------------------------------------- CSR slave
     reg        aw_got, w_got;
@@ -177,11 +189,27 @@ module sa_legacy #(
                     R_DESC_STATUS:  s_axi_rdata <= fst_status;
                     R_DESC_ERR_IDX: s_axi_rdata <= fst_err_idx;
                     R_DESC_EXEC:    s_axi_rdata <= fst_exec;
+                    R_NOTIFY_COUNT: s_axi_rdata <= notify_count;
                     default:      s_axi_rdata <= s_axi_araddr[7:2] >= R_PERF0 &&
                                                  s_axi_araddr[7:2] < R_PERF0 + 32 ? perf_rdata : 32'd0;
                 endcase
             end else if (s_axi_rready)
                 s_axi_rvalid <= 0;
+        end
+    end
+
+    // ------------------------------------------- host notification (L1)
+    // Each mat_notify: NOTIFY_COUNT + 1 and one pulse on notify_irq, 4
+    // cycles high then at least 1 low, so back-to-back notifies give
+    // separate rising edges (pending ones are queued).
+    wire notify_start = notify_ph == 0 && (notify_pend != 0 || notify);
+    always @(posedge clk) begin
+        if (!resetn) begin
+            notify_count <= 0; notify_ph <= 0; notify_pend <= 0;
+        end else begin
+            if (notify) notify_count <= notify_count + 1;
+            notify_pend <= notify_pend + (notify && notify_pend != 8'hFF) - notify_start;
+            notify_ph   <= notify_start ? 3'd5 : notify_ph != 0 ? notify_ph - 3'd1 : 3'd0;
         end
     end
 

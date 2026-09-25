@@ -88,6 +88,9 @@ static inline uint32_t mat_cycles(void)
 #define SA_CAPS_ADDR    0x80000024u
 #define SA_CAPS_PERF    (1u << 20)
 #define SA_CAPS_DESC    (1u << 21)
+#define SA_CAPS_NOTIFY  (1u << 22)    /* L1: mat_notify + notify_irq                  */
+#define SA_CAPS_CMDX    (1u << 24)    /* L1: BASE0-15, PARAM0-7, dynamic fields,
+                                       *     SETREG, LOOP_END, CALL / RET, LDPARAM   */
 static uint32_t sa_caps_runtime = 0u;
 #ifndef SA_D
 static uint32_t sa_d_runtime = 8u;
@@ -111,6 +114,9 @@ static inline uint32_t sa_init(void)
 static inline int sa_has_perf(void) { return (sa_caps_runtime & SA_CAPS_PERF) != 0; }
 /* the overlay has the descriptor fetch unit (mat_submit would trap without it) */
 static inline int sa_has_desc(void) { return (sa_caps_runtime & SA_CAPS_DESC) != 0; }
+/* L1: mat_notify (host interrupt) and the command extensions */
+static inline int sa_has_notify(void) { return (sa_caps_runtime & SA_CAPS_NOTIFY) != 0; }
+static inline int sa_has_cmdx(void) { return (sa_caps_runtime & SA_CAPS_CMDX) != 0; }
 #define SA_SPAD_WORDS   (131072u / SA_D)            /* per SPAD, D-byte words      */
 #define SA_ACC_WORDS    (262144u / (4u * SA_D))     /* D x int32 words             */
 #define SA_SPAD_BANK    (SA_SPAD_WORDS / 2u)        /* first word of bank 1        */
@@ -133,7 +139,9 @@ static inline int sa_has_desc(void) { return (sa_caps_runtime & SA_CAPS_DESC) !=
 #define SA_CFG_EX_B_STEP     8u      /*     SPAD_B words between B strips */
 #define SA_CFG_EX_C_STEP     9u      /*     ACC words between tiles       */
 #define SA_CFG_EX_C_ROW      10u     /*     ACC words between tile rows   */
-#define SA_CFG_BASE(n)       (11u + (n))  /* descriptor relocation bases BASE0..BASE3 */
+#define SA_CFG_BASE(n)       (11u + (n))  /* descriptor relocation bases BASE0..BASE3
+                                           *  (BASE0..BASE15 with SA_CAPS_CMDX)   */
+#define SA_CFG_PARAM(n)      (27u + (n))  /* L1: descriptor parameters PARAM0..PARAM7 */
 #define SA_LD_LINEAR         0u
 #define SA_LD_INTERLEAVE     1u
 
@@ -318,6 +326,15 @@ static inline uint32_t sa_perf_end(volatile uint32_t *dst, uint32_t max)
 static inline void mat_submit(uint32_t list, uint32_t count)
 {
     __asm__ volatile (".insn r 0x0B, 6, 1, x0, %0, %1" :: "r"(list), "r"(count) : "memory");
+}
+
+/* L1 (docs/llm_inference_plan.md §5.1): mat_notify = funct7 1, funct3 7.
+ * One pulse on the unit's notify_irq (host interrupt) and NOTIFY_COUNT + 1
+ * (CSR 0xD4). Only when sa_has_notify(). */
+#define SA_CSR_NOTIFY_COUNT  0xD4u
+static inline void mat_notify(void)
+{
+    __asm__ volatile (".insn r 0x0B, 7, 1, x0, x0, x0" ::: "memory");
 }
 
 /* REQUANT parameters and output clamp window */

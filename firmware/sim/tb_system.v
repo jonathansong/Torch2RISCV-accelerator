@@ -9,9 +9,12 @@
 //   BW_TEST   : firmware/bwtest, DMA bandwidth (simulated DDR model)
 //   DESC_TEST : firmware/desc_run, GEMMs as descriptor lists built here (the
 //               "ARM" side), one mat_submit each
+//   RING_TEST : firmware/rt (L1), the resident runtime: submission ring,
+//               completion records, notify_irq edges, errors, wrap-around
 // Mirrors the overlay's RISC-V memory map:
 //   0xC0000000  8 KB program BRAM (+ mailbox at 0xC0001F00)
 //   0x80000000  matmul_unit CSRs
+//   DDR         S_AXI_HP0 (identity-mapped physical addresses; same model)
 // and the matmul DMA view of DDR (identity-mapped physical addresses).
 // The "ARM" side (initial block) plays driver/pynq_matmul.py.
 `timescale 1ns / 1ps
@@ -100,6 +103,7 @@ module tb_system;
 
     // ---------------------------------------------------- BRAM model
     reg [31:0] bram [0:BRAM_WORDS-1];
+    reg [7:0]  ddr [0:DDR_BYTES-1];                          // DDR model (CPU and matmul DMA)
     reg        aw_seen = 0, w_seen = 0;
     reg [31:0] w_data;
     reg [3:0]  w_strb;
@@ -107,6 +111,9 @@ module tb_system;
 
     function in_bram(input [31:0] a);
         in_bram = a >= BRAM_BASE && a < BRAM_BASE + 4 * BRAM_WORDS;
+    endfunction
+    function in_cpu_ddr(input [31:0] a);                  // PicoRV32 -> S_AXI_HP0 -> DDR
+        in_cpu_ddr = a >= DDR_BASE && a + 4 <= DDR_BASE + DDR_BYTES;
     endfunction
 
     always @(posedge clk) begin
@@ -117,7 +124,10 @@ module tb_system;
         if (c_awvalid && !aw_csr && !br_awready && !aw_seen) begin br_awready <= 1; aw_seen <= 1; end
         if (c_wvalid  && !aw_csr && !br_wready  && !w_seen)  begin br_wready  <= 1; w_seen  <= 1; w_data <= c_wdata; w_strb <= c_wstrb; end
         if (aw_seen && w_seen && !br_bvalid) begin
-            if (!in_bram(c_awaddr)) begin
+            if (in_cpu_ddr(c_awaddr)) begin
+                for (q = 0; q < 4; q = q + 1)
+                    if (w_strb[q]) ddr[c_awaddr - DDR_BASE + q] = w_data[8*q +: 8];
+            end else if (!in_bram(c_awaddr)) begin
                 $display("TB ERROR: CPU store to unmapped %08x", c_awaddr); errors = errors + 1;
             end else
                 for (q = 0; q < 4; q = q + 1)
@@ -127,7 +137,10 @@ module tb_system;
 
         if (c_arvalid && !ar_csr && !br_arready && !br_rvalid) begin
             br_arready <= 1;
-            if (!in_bram(c_araddr)) begin
+            if (in_cpu_ddr(c_araddr))
+                br_rdata <= {ddr[c_araddr - DDR_BASE + 3], ddr[c_araddr - DDR_BASE + 2],
+                             ddr[c_araddr - DDR_BASE + 1], ddr[c_araddr - DDR_BASE]};
+            else if (!in_bram(c_araddr)) begin
                 $display("TB ERROR: CPU load from unmapped %08x", c_araddr); errors = errors + 1;
                 br_rdata <= 32'hXXXXXXXX;
             end else
@@ -146,7 +159,7 @@ module tb_system;
     wire [63:0] m_wdata;
     reg         m_arready = 0, m_rvalid = 0, m_rlast = 0, m_awready = 0, m_wready = 0, m_bvalid = 0;
     reg  [63:0] m_rdata = 0;
-    wire        mm_irq;
+    wire        mm_irq, mm_nirq;
 
     localparam integer D = `SIM_D;
     sa_unit #(.D(D), .NPORTS(1)) mm (
@@ -175,11 +188,10 @@ module tb_system;
         .m2_axi_bvalid(1'b0),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
         .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
-        .irq(mm_irq)
+        .irq(mm_irq), .notify_irq(mm_nirq)
     );
 
     // --------------------------------------------- DDR model (matmul DMA)
-    reg [7:0] ddr [0:DDR_BYTES-1];
 
     task ddr_check(input [31:0] addr, input integer bytes);
         if (addr < DDR_BASE || addr + bytes > DDR_BASE + DDR_BYTES) begin
@@ -519,6 +531,186 @@ module tb_system;
         for (dc = 0; dc < NDCASE; dc = dc + 1) run_py_case(dc);
         $display("TB %s: %0d descriptor-list runs (incl. Python-built lists), %0d errors, %0d performance-counter checks",
                  errors ? "FAIL" : "PASS", runs, errors, perf_checks);
+        $finish;
+    end
+`elsif RING_TEST
+    // ------------------------------------------------------- RING_TEST
+    // The "ARM" writes 64-byte ring entries into DDR, rings the doorbell
+    // (mailbox RING_TAIL) and consumes completion records in order; ring of
+    // 4 entries, 9 submissions (wrap-around, at most 4 outstanding).
+    localparam [31:0] RING = DDR_BASE + 32'h48000, CPL = DDR_BASE + 32'h49000, PBLK = DDR_BASE + 32'h4A000,
+                      LISTS = DDR_BASE + 32'h4B000, SRC = DDR_BASE + 32'h10000, DST = DDR_BASE + 32'h20000;
+    localparam [31:0] L_COPY = LISTS, L_PARAM = LISTS + 32'h400, L_BAD = LISTS + 32'h800, L_LOOP = LISTS + 32'hC00;
+    localparam integer RSIZE = 4, NENT = 9;
+    localparam [31:0] MB_RING_BASE = 32'hB0 / 4, MB_RING_SIZE = 32'hB4 / 4, MB_RING_TAIL = 32'hB8 / 4,
+                      MB_RING_HEAD = 32'hBC / 4, MB_CPL_BASE = 32'hC0 / 4, MB_FW_STATE = 32'hC4 / 4,
+                      MB_HEARTBEAT = 32'hCC / 4;
+    localparam [7:0] T_RUN = 1, T_NOP = 2, T_RESET = 3, T_EXIT = 4;
+    localparam [15:0] F_IRQ = 16'h100, F_PERF = 16'h200;
+    integer nirq_edges = 0, runs = 0, ri, rj, rbad;
+    reg     nirq_d = 0;
+    initial begin                                            // a stuck ring must not hang the run
+        #20_000_000;
+        $display("TB FAIL: RING_TEST timeout (head %0d, tail %0d)", bram[MBOX + 32'hBC / 4], bram[MBOX + 32'hB8 / 4]);
+        $finish;
+    end
+    always @(posedge clk) begin
+        nirq_d <= mm_nirq;
+        if (mm_nirq && !nirq_d) nirq_edges = nirq_edges + 1;
+    end
+    task put64(input [31:0] a, input [63:0] v);
+        integer j;
+        for (j = 0; j < 8; j = j + 1) ddr[a - DDR_BASE + j] = v[8*j +: 8];
+    endtask
+    function [31:0] get32(input [31:0] a);
+        get32 = {ddr[a - DDR_BASE + 3], ddr[a - DDR_BASE + 2], ddr[a - DDR_BASE + 1], ddr[a - DDR_BASE]};
+    endfunction
+    // descriptor: header {tag, dyn slots [31:16], flags [15:8], opcode}, w1..w7
+    task wdesc(input [31:0] a, input [7:0] op, input [15:0] dyn, input [7:0] fl, input [63:0] w1,
+               input [63:0] w2, input [63:0] w3, input [63:0] w4);
+        begin
+            put64(a, {32'd0, dyn, fl, op}); put64(a + 8, w1); put64(a + 16, w2); put64(a + 24, w3);
+            put64(a + 32, w4); put64(a + 40, 0); put64(a + 48, 0); put64(a + 56, 0);
+        end
+    endtask
+    function [31:0] la(input [3:0] m, input integer w); la = {m, 12'd0, w[15:0]}; endfunction
+    // ring entry i: type / flags, list, count, BASE0 / BASE1, parameter block
+    reg [7:0]  e_type [0:NENT-1];
+    reg [15:0] e_flags [0:NENT-1];
+    reg [31:0] e_list [0:NENT-1], e_count [0:NENT-1], e_b0 [0:NENT-1], e_b1 [0:NENT-1], e_pb [0:NENT-1];
+    task submit_entry(input integer i);
+        reg [31:0] a;
+        begin
+            a = RING + 64 * (i % RSIZE);
+            put64(a, {i[31:0] + 32'h5E0, 16'd0, e_flags[i] | e_type[i]});
+            put64(a + 8, e_list[i]); put64(a + 16, e_count[i]); put64(a + 24, e_b0[i]); put64(a + 32, e_b1[i]);
+            put64(a + 40, 0); put64(a + 48, 0); put64(a + 56, e_pb[i]);
+            bram[MBOX + MB_RING_TAIL] = i + 1;                   // doorbell
+        end
+    endtask
+    task check_cpl(input integer i, input [31:0] want_status_nz, input [31:0] want_exec, input [31:0] want_end);
+        reg [31:0] a, st;
+        begin
+            a = CPL + 32 * (i % RSIZE);
+            st = get32(a + 4);
+            if (get32(a) !== i + 32'h5E0 || (want_status_nz ? st == 0 : st != 0) ||
+                (want_exec != 32'hFFFFFFFF && get32(a + 12) !== want_exec) ||
+                (want_end != 32'hFFFFFFFF && get32(a + 16) !== want_end)) begin
+                $display("TB ERROR: completion %0d: seq %08x status %08x exec %0d end %08x", i,
+                         get32(a), st, get32(a + 12), get32(a + 16));
+                errors = errors + 1;
+            end
+            runs = runs + 1;
+        end
+    endtask
+
+    initial begin
+        for (ri = 0; ri < DDR_BYTES; ri = ri + 1) ddr[ri] = 8'hA5;
+        for (ri = 0; ri < 8192; ri = ri + 1) ddr[SRC - DDR_BASE + ri] = $random(seed);
+        // lists
+        wdesc(L_COPY,       8'h01, 0, 8'h01, 0, {16'd256, 16'd1, la(1, 0)}, 64'd256, 0);       // LD BASE0 -> SPAD_A
+        wdesc(L_COPY + 64,  8'h02, 0, 8'h03, 0, {16'd256, 16'd1, la(1, 0)}, 64'd256, 0);       // ST SPAD_A -> BASE1
+        wdesc(L_COPY + 128, 8'h12, 0, 0, 64'h100, 0, 0, 0);                                     // END
+        wdesc(L_PARAM,       8'h01, 16'h0001, 0, 0, {16'd256, 16'd1, la(2, 64)}, 64'd256, 0);   // LD ddr <- PARAM0
+        wdesc(L_PARAM + 64,  8'h02, 16'h0011, 0, 0, {16'd256, 16'd1, la(2, 64)}, 64'd256, 0);   // ST ddr <- PARAM1
+        wdesc(L_PARAM + 128, 8'h12, 0, 0, 64'h200, 0, 0, 0);
+        wdesc(L_BAD, 8'h00, 0, 0, 0, 0, 0, 0);                                                  // opcode 0
+        wdesc(L_LOOP,       8'h01, 16'h0081, 8'h01, 0, {16'd256, 16'd1, la(1, 128)}, 64'd256, 0); // LD BASE0 + PARAM0
+        wdesc(L_LOOP + 64,  8'h02, 16'h0081, 8'h03, 0, {16'd256, 16'd1, la(1, 128)}, 64'd256, 0); // ST BASE1 + PARAM0
+        wdesc(L_LOOP + 128, 8'h13, 16'h0021, 0, {32'd0, -32'sd2}, 64'd0, 64'd256, 0);           // LOOP_END, count <- PARAM2
+        wdesc(L_LOOP + 192, 8'h12, 0, 0, 64'h300, 0, 0, 0);
+        put64(PBLK,      {DST + 32'd512, SRC + 32'd512});                                       // P1, P0
+        put64(PBLK + 8,  64'd0);
+        put64(PBLK + 16, 64'd0);
+        put64(PBLK + 24, 64'd0);
+        put64(PBLK + 32, {32'd0, 32'd0});                                                       // loop block: P0 = 0
+        put64(PBLK + 40, {32'd0, 32'd3});                                                       //   P2 = 3
+        put64(PBLK + 48, 64'd0);
+        put64(PBLK + 56, 64'd0);
+        // entries
+        for (ri = 0; ri < NENT; ri = ri + 1) begin
+            e_flags[ri] = F_IRQ; e_count[ri] = 0; e_pb[ri] = 0; e_list[ri] = L_COPY;
+            e_b0[ri] = SRC + 256 * ri; e_b1[ri] = DST + 256 * ri; e_type[ri] = T_RUN;
+        end
+        e_type[1] = T_NOP;
+        e_list[2] = L_BAD;
+        e_type[4] = T_RESET; e_flags[4] = 0;
+        e_list[5] = L_PARAM; e_pb[5] = PBLK;
+        e_list[6] = L_LOOP; e_pb[6] = PBLK + 32; e_b0[6] = SRC + 1024; e_b1[6] = DST + 1024; e_flags[6] = F_IRQ | F_PERF;
+        e_count[7] = 1; e_flags[7] = 0; e_b0[7] = SRC + 2048; e_b1[7] = DST + 2048;       // only the LD runs
+        e_type[8] = T_EXIT;
+        // firmware + mailbox
+        for (ri = 0; ri < BRAM_WORDS; ri = ri + 1) bram[ri] = 0;
+        $readmemh("fw.hex", bram);
+        bram[MBOX + MB_RING_BASE] = RING;
+        bram[MBOX + MB_RING_SIZE] = RSIZE;
+        bram[MBOX + MB_CPL_BASE]  = CPL;
+        repeat (5) @(posedge clk);
+        resetn <= 1;
+        cycles = 0;
+        while (bram[MBOX + MB_FW_STATE] !== 32'h52554E00 && cycles < 20000) begin @(posedge clk); cycles = cycles + 1; end
+        if (bram[MBOX + MB_FW_STATE] !== 32'h52554E00) begin
+            $display("TB ERROR: rt_fw not ready (FW_STATE %08x)", bram[MBOX + MB_FW_STATE]); errors = errors + 1;
+        end
+        // submit with at most RSIZE outstanding; check completions in order
+        rj = 0;
+        for (ri = 0; ri < NENT; ri = ri + 1) begin
+            while (ri - bram[MBOX + MB_RING_HEAD] >= RSIZE) begin
+                @(posedge clk);
+                while (rj < bram[MBOX + MB_RING_HEAD]) begin      // consume finished entries first
+                    case (rj)
+                        0: check_cpl(0, 0, 3, 32'h100);
+                        1: check_cpl(1, 0, 0, 32'hFFFFFFFF);
+                        2: check_cpl(2, 1, 32'hFFFFFFFF, 32'hFFFFFFFF);
+                        3: check_cpl(3, 0, 3, 32'h100);
+                        4: check_cpl(4, 0, 0, 32'hFFFFFFFF);
+                        default: ;
+                    endcase
+                    rj = rj + 1;
+                end
+            end
+            submit_entry(ri);
+            if (ri == 2) repeat (3000) @(posedge clk);         // let the ring drain once
+        end
+        cycles = 0;
+        while (!trap && cycles < 400000) begin @(posedge clk); cycles = cycles + 1; end
+        repeat (20) @(posedge clk);
+        for (; rj < NENT; rj = rj + 1)
+            case (rj)
+                4: check_cpl(4, 0, 0, 32'hFFFFFFFF);
+                5: check_cpl(5, 0, 3, 32'h200);
+                6: check_cpl(6, 0, 1 + 3 * 3, 32'h300);        // LD, ST, LOOP_END x 3 + END
+                7: check_cpl(7, 0, 1, 32'hFFFFFFFF);
+                8: check_cpl(8, 0, 0, 32'hFFFFFFFF);
+                default: ;
+            endcase
+        if (!trap || bram[MBOX] !== 32'h600D600D || bram[MBOX + MB_RING_HEAD] !== NENT) begin
+            $display("TB ERROR: rt_fw did not exit cleanly (status %08x, head %0d)", bram[MBOX], bram[MBOX + MB_RING_HEAD]);
+            errors = errors + 1;
+        end
+        // data: entries 0, 3 (copy), 5 (PARAM block), 6 (loop x 3), 7 (count 1: nothing stored)
+        rbad = 0;
+        for (ri = 0; ri < 256; ri = ri + 1) begin
+            if (ddr[DST - DDR_BASE + ri] !== ddr[SRC - DDR_BASE + ri]) rbad = rbad + 1;
+            if (ddr[DST - DDR_BASE + 768 + ri] !== ddr[SRC - DDR_BASE + 768 + ri]) rbad = rbad + 1;
+            if (ddr[DST - DDR_BASE + 512 + ri] !== ddr[SRC - DDR_BASE + 512 + ri]) rbad = rbad + 1;
+            if (ddr[DST - DDR_BASE + 256 + ri] !== 8'hA5) rbad = rbad + 1;       // NOP entry
+            if (ddr[DST - DDR_BASE + 2048 + ri] !== 8'hA5) rbad = rbad + 1;      // count 1: LD only
+        end
+        for (ri = 0; ri < 768; ri = ri + 1)
+            if (ddr[DST - DDR_BASE + 1024 + ri] !== ddr[SRC - DDR_BASE + 1024 + ri]) rbad = rbad + 1;
+        if (ddr[DST - DDR_BASE + 1024 + 768] !== 8'hA5) rbad = rbad + 1;          // exactly 3 iterations
+        if (rbad) begin
+            $display("TB ERROR: ring data: %0d bytes wrong", rbad); errors = errors + rbad;
+        end
+        if (nirq_edges !== 7) begin
+            $display("TB ERROR: %0d notify_irq edges, expected 7", nirq_edges); errors = errors + 1;
+        end
+        if (bram[MBOX + 32'h8C / 4] !== 32) begin
+            $display("TB ERROR: PERF entry: MBOX_PERF_COUNT %0d", bram[MBOX + 32'h8C / 4]); errors = errors + 1;
+        end
+        $display("TB %s: rt_fw ring: %0d entries (ring of %0d), %0d completions checked, %0d notify edges, heartbeat %0d, %0d errors",
+                 errors ? "FAIL" : "PASS", NENT, RSIZE, runs, nirq_edges, bram[MBOX + MB_HEARTBEAT], errors);
         $finish;
     end
 `elsif VEC_TEST

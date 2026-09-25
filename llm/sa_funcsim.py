@@ -13,8 +13,10 @@ with the RTL engine and error code, and the list stops (sticky error).
 
 Covers the M5 hardware: LD / ST (LINEAR, INTERLEAVE), EX (repeat, bstep,
 cstep, crow, accumulate), integer VE (ADD SUB MUL MAX MIN COPY, RELU,
-REQUANT, clamp, periodic src2), FENCE, JUMP, END, BASE0-3 relocation, count
-limit. L1 / L2 extensions are added here first (plan §4.3).
+REQUANT, clamp, periodic src2), FENCE, JUMP, END, count limit; and the L1
+command extensions (docs/llm_inference_plan.md §5.3): BASE0-15, PARAM0-7,
+two dynamic field slots per descriptor, SETREG, LOOP_END (2 nested levels),
+relative JUMP, CALL / RET (depth 4), LDPARAM. L2 is added here first too.
 """
 import numpy as np
 
@@ -23,6 +25,21 @@ ENG_LD, ENG_ST, ENG_EX, ENG_VE, ENG_FETCH = 0, 1, 2, 3, 4
 XERR_SHAPE, XERR_RANGE, XERR_RRESP, XERR_BRESP = 1, 2, 3, 4
 DESC_LD, DESC_ST, DESC_EX, DESC_VE = 0x01, 0x02, 0x03, 0x04
 DESC_FENCE, DESC_JUMP, DESC_END = 0x10, 0x11, 0x12
+DESC_LOOP_END, DESC_SETREG, DESC_CALL, DESC_RET, DESC_LDPARAM = 0x13, 0x14, 0x15, 0x16, 0x17
+NBASE, NPARAM, LOOP_DEPTH, CALL_DEPTH = 16, 8, 2, 4
+# dynamic field slots (w0[23:16] slot 0, w0[31:24] slot 1): [3:0] field (0 = none),
+# [6:4] PARAM, [7] 0 replace / 1 add. Field -> (word, lsb, width) per opcode.
+_F_DMA = {1: (1, 0, 32), 2: (2, 0, 16), 3: (2, 32, 16), 4: (2, 48, 16), 5: (3, 0, 32)}
+DYN_FIELDS = {
+    0x01: _F_DMA, 0x02: _F_DMA,
+    0x03: {1: (1, 0, 16), 2: (1, 16, 16), 3: (1, 32, 16), 4: (1, 48, 12), 5: (2, 0, 12), 6: (2, 16, 16),
+           7: (2, 32, 16)},
+    0x04: {1: (1, 0, 16), 2: (1, 32, 16), 3: (2, 0, 16), 4: (2, 32, 32), 5: (7, 16, 16), 6: (7, 0, 16),
+           7: (7, 32, 16), 8: (3, 16, 16), 9: (6, 0, 32), 10: (6, 32, 32), 11: (5, 32, 32)},
+    0x11: {1: (1, 0, 32)}, 0x15: {1: (1, 0, 32)}, 0x13: {1: (2, 0, 16)},
+    0x14: {1: (2, 0, 32), 2: (3, 0, 32), 3: (4, 0, 32)}, 0x17: {1: (1, 0, 32)},
+    0x10: {}, 0x12: {}, 0x16: {},
+}
 VOP_ADD, VOP_SUB, VOP_MUL, VOP_MAX, VOP_MIN, VOP_COPY = range(6)
 VT_I8, VT_I16, VT_I32 = 0, 1, 2
 MODE_INTERLEAVE = 1
@@ -55,7 +72,8 @@ class SaFuncSim:
                     MEM_ACC: np.zeros(self.acc_words * 4 * d, np.uint8)}
         self.ddr_base = ddr_base
         self.ddr = np.zeros(ddr_bytes, np.uint8)
-        self.bases = [0, 0, 0, 0]
+        self.bases = [0] * NBASE
+        self.params = [0] * NPARAM
         self.dl_status = 0
         self.dl_exec = 0
         self.cmds = {"LD": 0, "ST": 0, "EX": 0, "VE": 0}
@@ -208,53 +226,124 @@ class SaFuncSim:
         self.cmds["VE"] += 1
 
     # ---------------------------------------------------- descriptor lists
-    def run_list(self, addr, count=0, bases=None, max_desc=1_000_000):
-        """Execute the list at DDR `addr` (mat_submit). Returns the number of
+    def set_reg(self, idx, value):
+        """mat_cfg keys 11-26 (idx 0-15: BASE0-15) and 27-34 (idx 16-23: PARAM0-7)."""
+        if idx < NBASE:
+            self.bases[idx] = value & _M32
+        else:
+            self.params[idx - NBASE] = value & _M32
+
+    def run_list(self, addr, count=0, bases=None, params=None, max_desc=1_000_000):
+        """Execute the list at DDR `addr` (mat_submit). bases / params: initial
+        BASE0.. / PARAM0.. values (default: keep). Returns the number of
         descriptors decoded; the END value is in self.dl_status. Raises
-        SaError (with .index) on an illegal descriptor or command."""
-        if bases is not None:
-            self.bases = [b & _M32 for b in bases]
+        SaError (with .index = descriptor number in the list) on an illegal
+        descriptor or command."""
+        for i, b in enumerate(bases or []):
+            self.bases[i] = b & _M32
+        for i, p in enumerate(params or []):
+            self.params[i] = p & _M32
         if addr & 63:
             raise SaError(ENG_FETCH, XERR_SHAPE, 0, "list address not 64-byte aligned")
+        loops, calls = [], []                    # [[LOOP_END address, remaining]], [return address]
         n = 0
         while n < max_desc:
             w = [int(x) for x in self.ddr[self._ddr(addr, 64, ENG_FETCH):][:64].view("<u8")]
             idx = n
             n += 1
             self.dl_exec = n
+
+            def fail(msg, code=XERR_SHAPE):
+                raise SaError(ENG_FETCH, code, idx, msg)
+
             op, hdr = w[0] & 0xFF, w[0] & _M32
-            is_cmd = op in (DESC_LD, DESC_ST, DESC_EX, DESC_VE)
-            if not (is_cmd or op in (DESC_FENCE, DESC_JUMP, DESC_END)) or hdr >> 13:
-                raise SaError(ENG_FETCH, XERR_SHAPE, idx, f"bad header {hdr:#x}")
+            if op not in DYN_FIELDS or hdr & (1 << 15):
+                fail(f"bad header {hdr:#x}")
+            for slot in ((hdr >> 16) & 0xFF, (hdr >> 24) & 0xFF):
+                f = slot & 0xF
+                if f == 0:
+                    continue
+                if f not in DYN_FIELDS[op]:
+                    fail(f"dynamic field {f} undefined for opcode {op:#x}")
+                wd, lsb, width = DYN_FIELDS[op][f]
+                mask = (1 << width) - 1
+                p = self.params[(slot >> 4) & 7]
+                old = (w[wd] >> lsb) & mask
+                new = ((old + p) if slot & 0x80 else p) & mask
+                w[wd] = (w[wd] & ~(mask << lsb)) | (new << lsb)
             limit = count != 0 and n == count
-            if is_cmd:
+            nxt = addr + 64
+            rel = lambda off: addr + 64 * _s32(off)
+            if op in (DESC_LD, DESC_ST, DESC_EX, DESC_VE):
                 try:
                     self._command(op, hdr, w)
                 except SaError as e:
                     e.index = idx
                     raise
-                if limit:
-                    return n
-                addr += 64
             elif op == DESC_FENCE:
-                if limit:
-                    return n
-                addr += 64
-            elif op == DESC_JUMP:
-                target = w[1] & _M32
+                pass
+            elif op == DESC_JUMP or op == DESC_CALL:
+                target = rel(w[1]) if w[2] & 1 else w[1] & _M32
                 if target & 63:
-                    raise SaError(ENG_FETCH, XERR_SHAPE, idx, "jump target not 64-byte aligned")
-                if limit:
-                    return n
-                addr = target
-            else:
+                    fail("jump target not 64-byte aligned")
+                if op == DESC_CALL:
+                    if len(calls) == CALL_DEPTH:
+                        fail("call stack overflow")
+                    calls.append(nxt)
+                nxt = target
+            elif op == DESC_RET:
+                if not calls:
+                    fail("call stack underflow")
+                nxt = calls.pop()
+            elif op == DESC_END:
                 self.dl_status = w[1] & _M32
                 return n
+            elif op == DESC_SETREG:
+                for i in range(3):
+                    e = (w[1] >> (8 * i)) & 0x7F
+                    if e & 0x40:
+                        r = e & 0x3F
+                        if r >= NBASE + NPARAM:
+                            fail(f"SETREG register {r}")
+                        v = w[2 + i] & _M32
+                        cur = self.bases[r] if r < NBASE else self.params[r - NBASE]
+                        self.set_reg(r, cur + v if (w[5] >> i) & 1 else v)
+            elif op == DESC_LOOP_END:
+                cnt = w[2] & 0xFFFF
+                if cnt == 0:
+                    fail("LOOP_END count 0")
+                if loops and loops[-1][0] == addr:
+                    rem = loops[-1][1]
+                else:
+                    if len(loops) == LOOP_DEPTH:
+                        fail("loop stack overflow")
+                    loops.append([addr, cnt])
+                    rem = cnt
+                for k, stride in (((w[2] >> 16) & 7, w[3]), ((w[2] >> 19) & 7, w[4])):
+                    self.params[k] = (self.params[k] + stride) & _M32
+                if rem > 1:
+                    loops[-1][1] = rem - 1
+                    nxt = rel(w[1])
+                else:
+                    loops.pop()
+            elif op == DESC_LDPARAM:
+                a = (w[1] + (self.bases[((hdr >> 13) & 3) << 2 | (hdr >> 9) & 3] if hdr & (1 << 8) else 0)) & _M32
+                if a & 3:
+                    fail("LDPARAM address not 4-byte aligned")
+                try:
+                    v = int(self.ddr_read(a, 4).view("<u4")[0])
+                except SaError:
+                    fail(f"LDPARAM read {a:#x}", XERR_RRESP)
+                self.params[w[2] & 7] = (v * (w[3] & 0xFFFF) + w[4]) & _M32
+            if limit:
+                return n
+            addr = nxt
         raise RuntimeError(f"list did not end within {max_desc} descriptors")
 
     def _command(self, op, hdr, w):
         f = lambda x, lo, n: (x >> lo) & ((1 << n) - 1)
-        ddr = (f(w[1], 0, 32) + (self.bases[f(hdr, 9, 2)] if hdr & (1 << 8) else 0)) & _M32
+        base = self.bases[f(hdr, 13, 2) << 2 | f(hdr, 9, 2)]
+        ddr = (f(w[1], 0, 32) + (base if hdr & (1 << 8) else 0)) & _M32
         if op == DESC_LD:
             self.ld(ddr, f(w[2], 0, 32), f(w[2], 32, 16), f(w[2], 48, 16), f(w[3], 0, 32), f(w[3], 32, 2))
         elif op == DESC_ST:

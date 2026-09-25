@@ -59,6 +59,23 @@
 #define MBOX_DL_BASE0      0x98  /* in:  relocation bases BASE0..BASE3 (0x98..0xA4)   */
 #define MBOX_DL_STATUS     0xA8  /* out: value of the last END descriptor            */
 #define MBOX_DL_EXEC       0xAC  /* out: descriptors decoded                         */
+/* L1 resident runtime firmware (firmware/rt, docs/llm_inference_plan.md §5.1) */
+#define MBOX_RING_BASE     0xB0  /* in:  submission ring (DDR, 64-B entries)             */
+#define MBOX_RING_SIZE     0xB4  /* in:  entries, a power of 2                           */
+#define MBOX_RING_TAIL     0xB8  /* in:  doorbell: entries submitted (free-running)      */
+#define MBOX_RING_HEAD     0xBC  /* out: entries completed (free-running)                */
+#define MBOX_CPL_BASE      0xC0  /* in:  completion ring (DDR, 32-B records, same index) */
+#define MBOX_FW_STATE      0xC4  /* out: RT_READY, or ERR_* when it cannot run            */
+#define MBOX_FW_VERSION    0xC8  /* out: RT_VERSION                                       */
+#define MBOX_HEARTBEAT     0xCC  /* out: idle-loop counter                                */
+#define RT_READY           0x52554E00u   /* "RUN\0"                                     */
+#define RT_VERSION         1u
+#define RT_RUN_LIST        0x01u /* ring entry types (w0[7:0])                           */
+#define RT_NOP             0x02u
+#define RT_RESET           0x03u /* mat_reset, then go on                                */
+#define RT_EXIT            0x04u /* complete it, then leave (the core halts)             */
+#define RT_F_IRQ           (1u << 8)     /* entry flags: mat_notify after completion      */
+#define RT_F_PERF          (1u << 9)     /*              counters into the perf area      */
 #define GEMM_NO_PREFETCH   (1u << 0)
 #define GEMM_NO_BSPLIT     (1u << 1)
 #define GEMM_FORCE_BSPLIT  (1u << 2)
@@ -77,6 +94,8 @@
 
 #define ERR_NO_UNIT        0xDEAD0001u   /* FIRST_ERR: ID register mismatch  */
 #define ERR_NO_DESC        0xDEAD0003u   /* FIRST_ERR: overlay without descriptor unit */
+#define ERR_NO_L1          0xDEAD0004u   /* FW_STATE: no mat_notify / command extensions */
+#define ERR_BAD_RING       0xDEAD0005u   /* FW_STATE: ring size not a power of 2         */
 #define ERR_TIMEOUT        0xDEAD0002u   /* FIRST_ERR: job never set done    */
 
 #endif

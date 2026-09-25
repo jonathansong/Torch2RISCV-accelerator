@@ -9,6 +9,9 @@
 //              mat_submit (6) -> descriptor fetch unit (list, count). While a
 //              list runs, queued PCPI commands wait (program order) and
 //              mat_fence also waits for the list to finish.
+//              mat_notify (7) -> sets NOTIFY_STATUS (host interrupt, L1).
+//              mat_cfg keys 11..34 write the fetch unit's BASE0..15 /
+//              PARAM0..7 (waiting while a list runs).
 //   funct7 = 2: vec_cfg (0), vec_run (1) -> command queue (M3 vector engine)
 // Load/store/exec capture the current configuration into the packet, so
 // software may reconfigure right after issuing. With a sticky error set,
@@ -61,12 +64,16 @@ module sa_pcpi #(
     input  wire [31:0]           perf_rdata,
     output wire [1:0]            perf_ev,         // {waiting in mat_fence, stalled on a full queue}
 
-    // descriptor fetch unit (sa_cmdfetch): mat_submit, relocation bases
+    // descriptor fetch unit (sa_cmdfetch): mat_submit, BASE / PARAM registers
     input  wire                  fetch_busy,
     output reg                   submit,          // one-cycle pulse
     output reg  [31:0]           submit_addr,
     output reg  [31:0]           submit_count,
-    output reg  [127:0]          bases            // BASE3 .. BASE0 (mat_cfg keys 11..14)
+    output reg                   reg_we,          // one-cycle pulse: mat_cfg keys 11..34
+    output reg  [4:0]            reg_idx,         // 0..15 BASE0..15, 16..23 PARAM0..7
+    output reg  [31:0]           reg_val,
+    // host notification (mat_notify)
+    output reg                   notify           // one-cycle pulse
 );
     `include "sa_defs.vh"
 
@@ -75,7 +82,7 @@ module sa_pcpi #(
     wire [6:0] funct7 = pcpi_insn[31:25];
     wire       ours   = opcode == 7'b0001011 &&
                         ((funct7 == 7'd0 && funct3 <= 3'd4) ||
-                         (funct7 == 7'd1 && funct3 <= 3'd6) ||
+                         funct7 == 7'd1 ||
                          (funct7 == 7'd2 && funct3 <= 3'd1));
 
     assign pcpi_wait = pcpi_valid && ours;
@@ -113,11 +120,12 @@ module sa_pcpi #(
         pcpi_wr     <= 0;
         perf_ctl_we <= 0;
         submit      <= 0;
+        reg_we      <= 0;
+        notify      <= 0;
         if (!resetn) begin
             state       <= S_IDLE;
             perf_ctl    <= 0;
             perf_rsel   <= 0;
-            bases       <= 0;
             q_valid     <= 0;
             leg_trigger <= 0;
             leg_reset   <= 0;
@@ -197,7 +205,15 @@ module sa_pcpi #(
                         endcase
                     end else begin
                         case (op)
-                            3'd0: begin
+                            3'd0:
+                                if (rs1[7:0] >= CFG_BASE0 && rs1[7:0] < CFG_PARAM0 + 8'd8) begin
+                                    if (!fetch_busy) begin  // fetch unit registers: not while a list runs
+                                        reg_we  <= 1;
+                                        reg_idx <= rs1[4:0] - CFG_BASE0[4:0];
+                                        reg_val <= rs2;
+                                        respond(0, 0);
+                                    end
+                                end else begin
                                 case (rs1[7:0])
                                     CFG_LD_ROWS:      ld_rows  <= rs2[15:0];
                                     CFG_LD_ROW_BYTES: ld_rb    <= rs2[15:0];
@@ -210,14 +226,10 @@ module sa_pcpi #(
                                     CFG_EX_B_STEP:    ex_bstep <= rs2[15:0];
                                     CFG_EX_C_STEP:    ex_cstep <= rs2[15:0];
                                     CFG_EX_C_ROW:     ex_crow  <= rs2[15:0];
-                                    CFG_BASE0:        bases[31:0]   <= rs2;
-                                    CFG_BASE0 + 1:    bases[63:32]  <= rs2;
-                                    CFG_BASE0 + 2:    bases[95:64]  <= rs2;
-                                    CFG_BASE0 + 3:    bases[127:96] <= rs2;
                                     default: ;
                                 endcase
                                 respond(0, 0);
-                            end
+                                end
                             3'd1, 3'd2, 3'd3:
                                 if (q_valid && q_ready) begin
                                     q_valid <= 0;
@@ -238,6 +250,10 @@ module sa_pcpi #(
                                     submit_count <= rs2;
                                     respond(0, 0);
                                 end
+                            3'd7: begin                     // mat_notify: raise the host interrupt
+                                notify <= 1;
+                                respond(0, 0);
+                            end
                             default:                        // mat_perf
                                 if (rs1[31]) begin           // control: rs2[0] clear, rs2[1] enable
                                     perf_ctl_we <= 1;

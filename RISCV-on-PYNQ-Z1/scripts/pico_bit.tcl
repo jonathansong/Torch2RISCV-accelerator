@@ -228,8 +228,9 @@ proc create_root_design { parentCell } {
 
   # Create instance: irqConcat, and set properties
   set irqConcat [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconcat:2.1 irqConcat ]
+  # In0: PicoRV32 trap; In1: matmul_0/notify_irq (L1: mat_notify, rising edge)
   set_property -dict [ list \
-   CONFIG.NUM_PORTS {1} \
+   CONFIG.NUM_PORTS {2} \
  ] $irqConcat
 
   # Create instance: pico_processor_0 (hierarchy, see pico_processor.tcl)
@@ -1197,6 +1198,7 @@ Flash#unassigned#unassigned#unassigned#unassigned#unassigned#UART 0#UART 0#Enet\
   connect_bd_net -net S00_ARESETN_1 [get_bd_pins pico_processor_0/s_axi_aresetn] [get_bd_pins porReset/peripheral_aresetn] [get_bd_pins psAxiInterconnect/M00_ARESETN] [get_bd_pins psAxiInterconnect/M01_ARESETN] [get_bd_pins psAxiInterconnect/M02_ARESETN] [get_bd_pins psAxiInterconnect/S00_ARESETN] [get_bd_pins psInterruptController/s_axi_aresetn] [get_bd_pins subprocessorClk/s_axi_aresetn]
   connect_bd_net -net irq [get_bd_pins irqConcat/In0] [get_bd_pins pico_processor_0/irq]
   connect_bd_net -net irqConcat_dout [get_bd_pins irqConcat/dout] [get_bd_pins psInterruptController/intr]
+  connect_bd_net -net notify_irq [get_bd_pins irqConcat/In1] [get_bd_pins matmul_0/notify_irq]
   connect_bd_net -net porReset_interconnect_aresetn [get_bd_pins porReset/interconnect_aresetn] [get_bd_pins psAxiInterconnect/ARESETN]
   connect_bd_net -net por_resetn [get_bd_pins pico_processor_0/por_resetn] [get_bd_pins porReset/ext_reset_in] [get_bd_pins processing_system7_0/FCLK_RESET0_N]
   connect_bd_net -net processing_system7_0_GPIO_O [get_bd_pins processing_system7_0/GPIO_O] [get_bd_pins resetSlice/Din]

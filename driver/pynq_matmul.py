@@ -19,6 +19,8 @@ releases it from reset. Two firmwares consume the same mailbox:
   desc_run_fw.bin     (firmware/desc_run)     runs a descriptor list the ARM built
                                               (DescList) with one mat_submit ->
                                               MatmulOverlay.run_list / gemm_list / vector_list
+  rt_fw.bin           (firmware/rt)           L1 resident runtime: command ring in DDR,
+                                              completion records, notify interrupt -> Device
 
     from pynq_matmul import MatmulOverlay
     mm = MatmulOverlay("picorv32.bit", "matmul_insn_fw.bin")
@@ -63,6 +65,12 @@ MBOX_PERF_COUNT = 0x8C                   # counters copied to the perf area (0 =
 MBOX_DL_ADDR, MBOX_DL_COUNT, MBOX_DL_BASE0 = 0x90, 0x94, 0x98   # desc_run_fw inputs
 MBOX_DL_STATUS, MBOX_DL_EXEC = 0xA8, 0xAC                       #             outputs
 ERR_NO_DESC = 0xDEAD0003
+# L1 resident runtime (firmware/rt, docs/llm_inference_plan.md §5.1)
+MBOX_RING_BASE, MBOX_RING_SIZE, MBOX_RING_TAIL, MBOX_RING_HEAD = 0xB0, 0xB4, 0xB8, 0xBC
+MBOX_CPL_BASE, MBOX_FW_STATE, MBOX_FW_VERSION, MBOX_HEARTBEAT = 0xC0, 0xC4, 0xC8, 0xCC
+RT_READY = 0x52554E00
+RT_RUN_LIST, RT_NOP, RT_RESET, RT_EXIT = 0x01, 0x02, 0x03, 0x04
+RT_F_IRQ, RT_F_PERF = 1 << 8, 1 << 9
 
 # Performance counters (rtl/sysarray/sa_perf.v, docs/perf_counters_and_desc_dma_plan.md):
 # the firmware copies them to the 256 bytes below the mailbox after its
@@ -126,51 +134,109 @@ class DescList:
     """A list of 64-byte descriptors (docs/double_buffer_design.md §8.6):
     8 little-endian 64-bit words each, w0 = {tag = index, flags, opcode}.
     Every command carries its whole configuration (no mat_cfg state).
-    DDR addresses are physical; base=n makes one relative to BASE n (0..3),
-    fence_before waits for all engines first (use it, or fence(), between a
-    store and a later load of the same DDR bytes: DDR is not tracked)."""
+    DDR addresses are physical; base=n makes one relative to BASE n (0..3;
+    0..15 with the L1 extensions), fence_before waits for all engines first
+    (use it, or fence(), between a store and a later load of the same DDR
+    bytes: DDR is not tracked).
+
+    L1 command extensions (CAPS bit 24, docs/llm_inference_plan.md §5.3):
+    dyn=[(field, param, add)] takes up to two fields from PARAM registers
+    (replace, or add when add=True; field names in DYN_FIELDS), and setreg /
+    loop_end / call / ret / ldparam / relative jump."""
     LD, ST, EX, VE, FENCE, JUMP, END = 0x01, 0x02, 0x03, 0x04, 0x10, 0x11, 0x12
+    LOOP_END, SETREG, CALL, RET, LDPARAM = 0x13, 0x14, 0x15, 0x16, 0x17
     RELOC, FENCE_BEFORE = 1 << 8, 1 << 11
+    _DMA = {"ddr": 1, "laddr": 2, "rows": 3, "row_bytes": 4, "pitch": 5}
+    DYN_FIELDS = {
+        LD: _DMA, ST: _DMA,
+        EX: {"a": 1, "b": 2, "c": 3, "kt": 4, "repeat": 5, "bstep": 6, "cstep": 7},
+        VE: {"src1": 1, "src2": 2, "dst": 3, "len": 4, "valid": 5, "rowlen": 6, "p1": 7, "period": 8,
+             "A": 9, "B": 10, "imm": 11},
+        JUMP: {"target": 1}, CALL: {"target": 1}, LOOP_END: {"count": 1},
+        SETREG: {"v0": 1, "v1": 2, "v2": 3}, LDPARAM: {"addr": 1},
+    }
+    REG_BASE, REG_PARAM = 0, 16            # SETREG / mat_cfg register numbers: BASE n = n, PARAM n = 16 + n
 
     def __init__(self):
         self.rows = []
 
-    def _put(self, op, flags, *words):
+    def _put(self, op, flags, *words, dyn=()):
+        if len(dyn) > 2:
+            raise ValueError("at most two dynamic fields per descriptor")
+        for i, d in enumerate(dyn):
+            name, param, add = (tuple(d) + (False,))[:3]
+            flags |= (self.DYN_FIELDS[op][name] | (param & 7) << 4 | (0x80 if add else 0)) << (16 + 8 * i)
         w = [(len(self.rows) << 32) | flags | op] + [x & _M64 for x in words]
         self.rows.append(w + [0] * (8 - len(w)))
         return self
 
     @classmethod
     def _flags(cls, base, fence_before):
-        return (cls.RELOC | (base << 9) if base is not None else 0) | (cls.FENCE_BEFORE if fence_before else 0)
+        f = cls.FENCE_BEFORE if fence_before else 0
+        if base is not None:
+            f |= cls.RELOC | (base & 3) << 9 | (base >> 2 & 3) << 13
+        return f
 
-    def ld(self, ddr, la, rows, row_bytes, pitch, mode=LD_LINEAR, base=None, fence_before=False):
+    def ld(self, ddr, la, rows, row_bytes, pitch, mode=LD_LINEAR, base=None, fence_before=False, dyn=()):
         return self._put(self.LD, self._flags(base, fence_before), ddr & _M32,
-                         la | rows << 32 | row_bytes << 48, pitch | mode << 32)
+                         la | rows << 32 | row_bytes << 48, pitch | mode << 32, dyn=dyn)
 
-    def st(self, ddr, la, rows, row_bytes, pitch, base=None, fence_before=False):
+    def st(self, ddr, la, rows, row_bytes, pitch, base=None, fence_before=False, dyn=()):
         return self._put(self.ST, self._flags(base, fence_before), ddr & _M32,
-                         la | rows << 32 | row_bytes << 48, pitch)
+                         la | rows << 32 | row_bytes << 48, pitch, dyn=dyn)
 
-    def ex(self, a, b, c, kt, acc=False, repeat=1, bstep=0, cstep=0, crow=1, fence_before=False):
+    def ex(self, a, b, c, kt, acc=False, repeat=1, bstep=0, cstep=0, crow=1, fence_before=False, dyn=()):
         return self._put(self.EX, self._flags(None, fence_before),
                          a | b << 16 | c << 32 | kt << 48 | int(acc) << 60,
-                         repeat | bstep << 16 | cstep << 32 | crow << 48)
+                         repeat | bstep << 16 | cstep << 32 | crow << 48, dyn=dyn)
 
     def ve(self, src1, src2, dst, length, op, types, period=0, scale=1, shift=0, zp=0,
-           lo=-2**31, hi=2**31 - 1, fence_before=False):
+           lo=-2**31, hi=2**31 - 1, fence_before=False, dyn=()):
         return self._put(self.VE, self._flags(None, fence_before), src1 | src2 << 32, dst | length << 32,
                          op | types << 8 | period << 16 | (scale & 0xFFFF) << 32 | shift << 48,
-                         (zp & _M32) | (lo & _M32) << 32, hi & _M32)
+                         (zp & _M32) | (lo & _M32) << 32, hi & _M32, dyn=dyn)
 
     def fence(self, mask=0):
         return self._put(self.FENCE, 0, mask)
 
-    def jump(self, addr):
-        return self._put(self.JUMP, 0, addr)
+    def jump(self, addr, rel=False, dyn=()):
+        """rel: addr is a signed offset in descriptors from this one."""
+        return self._put(self.JUMP, 0, addr & _M32, int(rel), dyn=dyn)
 
     def end(self, status=0):
         return self._put(self.END, 0, status & _M32)
+
+    # ---- L1 command extensions
+    def setreg(self, *regs, dyn=()):
+        """regs: up to three (register, value[, add]); register = n for BASE n,
+        REG_PARAM + n for PARAM n; add=True adds value to the register."""
+        if not 1 <= len(regs) <= 3:
+            raise ValueError("SETREG takes 1..3 registers")
+        w1, vals, addbits = 0, [0, 0, 0], 0
+        for i, r in enumerate(regs):
+            reg, val, add = (tuple(r) + (False,))[:3]
+            w1 |= (0x40 | reg) << (8 * i)
+            vals[i] = val & _M32
+            addbits |= int(add) << i
+        return self._put(self.SETREG, 0, w1, *vals, addbits, dyn=dyn)
+
+    def loop_end(self, offset, count, k1=0, s1=0, k2=0, s2=0, dyn=()):
+        """Close a loop: jump back `offset` descriptors (negative) while fewer
+        than `count` iterations ran; each iteration adds s1 to PARAM k1 and s2
+        to PARAM k2."""
+        return self._put(self.LOOP_END, 0, offset & _M32, count | (k1 & 7) << 16 | (k2 & 7) << 19,
+                         s1 & _M32, s2 & _M32, dyn=dyn)
+
+    def call(self, addr, rel=False, dyn=()):
+        return self._put(self.CALL, 0, addr & _M32, int(rel), dyn=dyn)
+
+    def ret(self):
+        return self._put(self.RET, 0)
+
+    def ldparam(self, addr, param, mul=1, add=0, base=None, fence_before=False, dyn=()):
+        """PARAM[param] = mem32[addr] * mul + add (addr 4-byte aligned)."""
+        return self._put(self.LDPARAM, self._flags(base, fence_before), addr & _M32, param & 7, mul & 0xFFFF,
+                         add & _M32, dyn=dyn)
 
     def __len__(self):
         return len(self.rows)
@@ -691,6 +757,150 @@ class MatmulOverlay:
             cyc = self._mbox(MBOX_BW_CYCLES + 4 * i)
             res.append((name, nbytes, cyc, nbytes / cyc if cyc else 0.0))
         return res, copies_ok
+
+
+class Device:
+    """L1 host interface (docs/llm_inference_plan.md §5): the resident runtime
+    firmware (firmware/rt, rt_fw.bin) serving a submission ring in DDR.
+
+        dev = Device("picorv32.bit")
+        seq = dev.submit(dl, bases=[...], params=[...])   # returns at once
+        rec = dev.wait(seq)                                # completion record
+        dev.close()
+
+    submit() copies a DescList into a DDR buffer (or takes a physical list
+    address), writes a 64-byte ring entry (+ an optional PARAM0..7 block),
+    flushes and rings the doorbell (mailbox RING_TAIL); up to ring_size
+    entries may be outstanding (not yet collected). The firmware completes entries in order and
+    writes {seq, status, cycles, descriptors decoded, END value}; wait()
+    polls RING_HEAD in the BRAM, or blocks on the notify interrupt
+    (matmul_0/notify_irq through the AXI interrupt controller) when
+    use_irq=True. Status 0 = success, otherwise the extended status of the
+    failed list (the unit has been reset; later entries run normally)."""
+
+    def __init__(self, bitfile=None, firmware=None, ring_size=64, download=True, use_irq=False,
+                 timeout=5.0):
+        if ring_size & (ring_size - 1):
+            raise ValueError("ring_size must be a power of 2")
+        self.mm = MatmulOverlay(bitfile, firmware or os.path.join(HERE, "rt_fw.bin"), download)
+        self.size, self.tail, self.head = ring_size, 0, 0
+        self.ring = allocate(shape=(ring_size, 8), dtype=np.uint64)
+        self.cpl = allocate(shape=(ring_size, 8), dtype=np.uint32)
+        self.params = allocate(shape=(ring_size, 8), dtype=np.uint32)
+        self.ring[:] = 0
+        self.cpl[:] = 0
+        self.ring.flush()
+        self.cpl.flush()
+        self.keep = {}                               # seq -> buffers alive until completion
+        self.done = {}                               # seq -> completion record
+        self.irq = None
+        if use_irq:
+            from pynq import Interrupt
+            self.irq = Interrupt("matmul_0/notify_irq")
+        bram = self.mm.bram
+        for w in range(MBOX_WORDS):
+            bram.write(MBOX + 4 * w, 0)
+        bram.write(MBOX + MBOX_RING_BASE, self.ring.physical_address)
+        bram.write(MBOX + MBOX_RING_SIZE, ring_size)
+        bram.write(MBOX + MBOX_CPL_BASE, self.cpl.physical_address)
+        self.mm.reset.write(0)
+        t0 = time.perf_counter()
+        while self.mm._mbox(MBOX_FW_STATE) != RT_READY:
+            if time.perf_counter() - t0 > timeout:
+                raise RuntimeError(f"rt_fw not ready (FW_STATE {self.mm._mbox(MBOX_FW_STATE):#x}); "
+                                   "the overlay needs CAPS bits 21, 22 and 24")
+        self.d = self.mm.d
+
+    def completed(self):
+        """Entries completed so far (RING_HEAD)."""
+        return self.mm._mbox(MBOX_RING_HEAD)
+
+    def submit(self, dl, bases=(0, 0, 0, 0), params=None, count=0, irq=None, perf=False, kind=RT_RUN_LIST,
+               timeout=5.0):
+        """Queue one entry; returns its sequence number. dl: DescList or a
+        physical list address (None for NOP / RESET / EXIT)."""
+        t0 = time.perf_counter()
+        # an entry's slot, and its completion record, may be reused only
+        # after the ARM has read that record: collect finished records while
+        # the ring is full (counting RING_HEAD alone would let the firmware
+        # overwrite records not yet read)
+        self._collect()
+        while self.tail - self.head >= self.size:
+            if time.perf_counter() - t0 > timeout:
+                raise TimeoutError("submission ring full")
+            self._collect()
+        seq, slot = self.tail, self.tail % self.size
+        keep = []
+        addr = 0
+        if isinstance(dl, DescList):
+            buf = allocate(shape=(len(dl), 8), dtype=np.uint64)
+            buf[:] = dl.array()
+            buf.flush()
+            keep.append(buf)
+            addr = buf.physical_address
+        elif dl is not None:
+            addr = int(dl)
+        pb = 0
+        if params is not None:
+            self.params[slot, :] = 0
+            self.params[slot, :len(params)] = [int(p) & _M32 for p in params]
+            self.params.flush()
+            pb = self.params.physical_address + 32 * slot
+        irq = self.irq is not None if irq is None else irq
+        flags = kind | (RT_F_IRQ if irq else 0) | (RT_F_PERF if perf else 0)
+        b = list(bases) + [0] * (4 - len(bases))
+        self.ring[slot, :] = [flags | seq << 32, addr, count, b[0] & _M32, b[1] & _M32, b[2] & _M32,
+                              b[3] & _M32, pb]
+        self.ring.flush()
+        self.keep[seq] = keep
+        self.tail += 1
+        self.mm.bram.write(MBOX + MBOX_RING_TAIL, self.tail)          # doorbell
+        return seq
+
+    def _collect(self):
+        head = self.completed()
+        if head != self.head:
+            self.cpl.invalidate()
+        while self.head < head:
+            c = self.cpl[self.head % self.size]
+            if int(c[0]) != self.head & _M32:
+                raise RuntimeError(f"completion record {self.head}: seq {int(c[0])}")
+            self.done[self.head] = {"seq": self.head, "status": int(c[1]), "cycles": int(c[2]),
+                                    "descriptors": int(c[3]), "end": int(c[4])}
+            for buf in self.keep.pop(self.head, []):
+                buf.freebuffer()
+            self.head += 1
+
+    def wait(self, seq, timeout=5.0):
+        """Completion record of `seq` (after all earlier entries)."""
+        t0 = time.perf_counter()
+        while True:
+            self._collect()
+            if seq in self.done:
+                return self.done.pop(seq)
+            if time.perf_counter() - t0 > timeout:
+                raise TimeoutError(f"entry {seq} not completed (head {self.completed()}, tail {self.tail})")
+            if self.irq is not None:
+                import asyncio
+                try:
+                    asyncio.get_event_loop().run_until_complete(asyncio.wait_for(self.irq.wait(), 0.2))
+                except asyncio.TimeoutError:
+                    pass
+
+    def run(self, dl, bases=(0, 0, 0, 0), params=None, count=0, timeout=5.0):
+        return self.wait(self.submit(dl, bases, params, count), timeout)
+
+    def close(self):
+        """EXIT entry (the firmware leaves its loop), then hold the core in reset."""
+        try:
+            self.wait(self.submit(None, kind=RT_EXIT), 2.0)
+        finally:
+            self.mm.reset.write(1)
+            for keep in self.keep.values():
+                for buf in keep:
+                    buf.freebuffer()
+            for buf in (self.ring, self.cpl, self.params):
+                buf.freebuffer()
 
 
 def perf_breakdown(perf, d):

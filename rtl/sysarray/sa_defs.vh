@@ -38,7 +38,8 @@ localparam [7:0] CFG_EX_REPEAT    = 8'd7;    // M2: output tiles per mat_exec (1
 localparam [7:0] CFG_EX_B_STEP    = 8'd8;    //     SPAD_B words between tiles' B strips
 localparam [7:0] CFG_EX_C_STEP    = 8'd9;    //     ACC words between tiles
 localparam [7:0] CFG_EX_C_ROW     = 8'd10;   //     ACC words between rows of a tile
-localparam [7:0] CFG_BASE0        = 8'd11;   // descriptor relocation bases BASE0..BASE3 (keys 11..14)
+localparam [7:0] CFG_BASE0        = 8'd11;   // descriptor relocation bases BASE0..BASE15 (keys 11..26; L1: 16)
+localparam [7:0] CFG_PARAM0       = 8'd27;   // L1: descriptor parameters PARAM0..PARAM7 (keys 27..34)
 
 // vec_cfg keys (funct7 = 2, funct3 = 0), M3
 localparam [7:0] VCFG_OP       = 8'd0;   // [2:0] op, [4] RELU, [5] REQUANT
@@ -120,8 +121,14 @@ endfunction
 // Descriptors (sa_cmdfetch.v; docs/double_buffer_design.md §8.6): 64 bytes =
 // 8 little-endian 64-bit words w0..w7, 64-byte aligned. w0 = header.
 localparam [7:0] DESC_LD = 8'h01, DESC_ST = 8'h02, DESC_EX = 8'h03, DESC_VE = 8'h04,
-                 DESC_FENCE = 8'h10, DESC_JUMP = 8'h11, DESC_END = 8'h12;   // 0x00 is invalid
+                 DESC_FENCE = 8'h10, DESC_JUMP = 8'h11, DESC_END = 8'h12,   // 0x00 is invalid
+                 // L1 command extensions (docs/llm_inference_plan.md §5.3)
+                 DESC_LOOP_END = 8'h13, DESC_SETREG = 8'h14, DESC_CALL = 8'h15, DESC_RET = 8'h16,
+                 DESC_LDPARAM = 8'h17;
 localparam integer DF_RELOC = 8;          // w0 flags: DDR address += BASE[BASESEL]
 localparam integer DF_BASESEL = 9;        //           [10:9]
 localparam integer DF_FENCE_BEFORE = 11;  //           wait for idle engines first
 localparam integer DF_IRQ = 12;           //           END: reserved (ignored)
+localparam integer DF_BASESEL_HI = 13;    //           [14:13] BASESEL bits 3:2 (L1: BASE0..15)
+localparam integer DF_DYN0 = 16;          //           [23:16] dynamic slot 0, [31:24] slot 1 (L1):
+                                          //           [3:0] field (0 = none) [6:4] PARAM [7] add

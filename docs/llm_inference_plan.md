@@ -1,6 +1,6 @@
 # LLM 推理：架构方案与实施步骤
 
-状态：**方案，尚未开始实施**。
+状态：**L0、L1 已完成并上板验证**。后续各级仍是方案。
 
 **目标**：在 PYNQ-Z1 上做一个**架构与工业界主流 LLM 推理加速器一致**的完整系统，
 端到端地在板上运行 llama2 结构的模型（TinyStories），生成文本。系统由四部分组成：
@@ -292,6 +292,20 @@ L1 的硬件改动分两部分，一次构建：
 - **命令环与完成中断**：面向 host 运行时；
 - **命令处理扩展**：面向编译器，包括 IREE 的 binding、push constant、命令缓冲和动态形状。
 
+> **L1 完成并上板验证**（`bitstreams/l1/`）。
+> - **仿真**：
+>   - 功能模拟器 272 项检查；
+>   - `tb_sa_unit` 新增 15 项 L1 检查，8 个故意引入的错误都被发现；
+>   - 两张 Python 生成的 L1 列表在 RTL 上联合仿真通过，D=8 和 16 都做了；
+>   - `RING_TEST`：9 个条目提交到大小为 4 的命令环，3 个故意引入的固件错误都被发现；
+>   - 所有旧测试不回归。
+> - **板上**：`l1_ring_demo.py` 的 6 项测试全部通过；`m4_demo`、`m4_perf`、`m5_desc_demo` 不回归。
+> - **与计划的差别**：
+>   1. 完成中断改为边沿中断 `notify_irq`，因为 ARM 访问不到加速器的 CSR；
+>   2. 驱动必须在读走完成记录之后才能复用命令环的槽。上板时发现，只按 `RING_HEAD` 判断环满，
+>      会让固件覆盖还没读取的完成记录；已修正。
+>   3. 取指单元实测 4.4k LUT，高于预估。
+
 ### 5.1 命令环
 
 **提交命令环**：由 ARM 在 DDR 里分配，不开 cache，或者每次写完都 flush。条目个数是 2 的幂，默认 64 个；
@@ -332,17 +346,20 @@ BASE4–15 由列表内部的 SETREG 设置（§5.3）。
 **门铃**：ARM 写 `RING_TAIL`，`rt_fw` 在空闲循环里轮询。这是一种简化：
 真实芯片一般是写一个 MMIO 门铃寄存器，产生设备端中断。改成中断方式放在 L6。
 
-**完成中断**：
-- 新指令 `mat_notify`（funct7=1，funct3=7），把 `IRQ_STATUS[0]` 置 1。这一位是粘滞的，ARM 写 1 清零（W1C）。
-- `sa_unit` 新增输出 `irq` = `IRQ_STATUS[0] & IRQ_ENABLE`。
-- BD：`irqConcat` 改为 `NUM_PORTS 2`，`In1` 接 `matmul_0/irq`，经已有的 `psInterruptController`（axi_intc）
-  送到 `IRQ_F2P`。
-- ARM 端：Python 用 `pynq.Interrupt`，C 运行时用 UIO；两者都保留轮询 `RING_HEAD` 的备用路径。
+**完成中断**（实现时修改为边沿中断，原因见下）：
+- 新指令 `mat_notify`（funct7=1，funct3=7）：`sa_unit` 的新输出 **`notify_irq`** 产生一个脉冲
+  （高 4 个周期，之后至少低 1 个周期；连续的 notify 会排队，保证每次都有独立的上升沿），`NOTIFY_COUNT` 加 1。
+- BD：`irqConcat` 改为 `NUM_PORTS 2`，`In1` 接 `matmul_0/notify_irq`（接口声明为 `EDGE_RISING`），
+  经已有的 `psInterruptController`（axi_intc）送到 `IRQ_F2P`。axi_intc 锁存边沿，ARM 在 intc 上应答。
+- **为什么不用原计划的电平中断加 W1C**：当前 BD 中 `matmul_0` 的 CSR 只映射在 PicoRV32 的地址空间（0x80000000），
+  ARM 访问不到，也就无法写 1 清除状态。边沿中断不需要清除加速器里的状态，性质上类似 PCIe 的 MSI 消息中断。
+- ARM 端：Python 用 `pynq.Interrupt("matmul_0/notify_irq")`，C 运行时用 UIO；两者都保留轮询 `RING_HEAD` 的备用路径。
+  多个边沿在 ARM 应答前可能合并成一次中断，所以 ARM 醒来后要按 `RING_HEAD` 处理所有已完成的条目。
 - 为什么由固件发中断：固件必须先写完完成记录，ARM 被唤醒时才能读到一致的状态。
   END 描述符的 IRQ 位留给 ARM 直接提交的场景（L6）。
 
-**新增 CSR**（AXI-Lite）：0xD4 `IRQ_STATUS`（W1C），0xD8 `IRQ_ENABLE`，0xDC `NOTIFY_COUNT`（只读）。
-**CAPS bit 22** 表示有 `mat_notify` 和中断。
+**新增 CSR**（AXI-Lite，只有 PicoRV32 可访问）：0xD4 `NOTIFY_COUNT`（只读）。
+**CAPS bit 22** 表示有 `mat_notify` 和 `notify_irq`。
 
 ### 5.2 固件 `firmware/rt/rt_fw.c`
 
@@ -374,9 +391,9 @@ loop:
 | 1 | **BASE0–15** | BASESEL 加宽到 4 位：`{w0[14:13], w0[10:9]}`。旧列表的 w0[14:13] 为 0，含义不变 | IREE 一个 dispatch 常有 5–8 个 binding |
 | 2 | **PARAM0–7**（32 位） | `mat_cfg` key 27–34；命令环参数块；SETREG；LDPARAM | 动态形状和位置，对应 IREE 的 push constant |
 | 3 | **动态字段** | w0[31:16] 是两个 8 位动态槽（原为保留位）：`[3:0]` 字段号（0 = 不用），`[6:4]` 选哪个 PARAM，`[7]` 0 = 替换、1 = 相加 | 长度、次数、地址偏移可以取自 PARAM，于是一个模型只需一张静态列表 |
-| 4 | **SETREG**（opcode 0x14） | w1：最多 3 个寄存器号，每个 6 位加 1 位有效位（0–15 = BASE，16–23 = PARAM）；w2–w4：对应的值；w5[2:0]：每个寄存器替换还是相加 | 在列表内部绑定参数，相当于 Vulkan 的 bind descriptor set 和 push constants |
+| 4 | **SETREG**（opcode 0x14） | w1：3 个 7 位项，位于 [6:0]、[14:8]、[22:16]，每项 {[6] 有效，[5:0] 寄存器号：0–15 = BASE，16–23 = PARAM}；w2–w4：对应的值；w5[2:0]：每项替换（0）还是相加（1）；按项的顺序依次写入 | 在列表内部绑定参数，相当于 Vulkan 的 bind descriptor set 和 push constants |
 | 5 | **LOOP_END**（opcode 0x13） | w1：跳回的目标（相对偏移，单位是描述符条数，有符号）；w2[15:0]：次数（≥ 1，也可以用动态槽取自 PARAM）；w2[18:16] / w2[21:19]：每轮递增的 PARAM k1 / k2；w3 / w4：各自的步长（有符号 32 位） | 分块循环、按头循环、按层循环；对应 IREE 的 workgroup 数量 |
-| 6 | **相对 JUMP、CALL、RET** | JUMP 的 w2[0] = REL；CALL（0x15）：w1 是目标（相对或绝对），把返回地址压入**深度 4** 的返回栈；RET（0x16）：弹出返回地址 | 位置无关的可执行体：命令缓冲 = SETREG … CALL 某个 kernel |
+| 6 | **相对 JUMP、CALL、RET** | JUMP / CALL（0x15）：w2[0] = REL 时 w1 是有符号偏移（单位是描述符条数），否则是 64 字节对齐的绝对地址；CALL 把下一条的地址压入**深度 4** 的返回栈；RET（0x16）：弹出并跳转 | 位置无关的可执行体：命令缓冲 = SETREG … CALL 某个 kernel |
 | 7 | **LDPARAM**（opcode 0x17） | w1：DDR 地址（可以重定位，4 字节对齐）；w2[2:0]：写入哪个 PARAM；w3[15:0]：乘数；w4：加数。结果 `PARAM = mem32 × mul + add` | 由数据决定的地址：嵌入表查找、按位置张量更新 KV、gather；如果数据刚由 ST 写入，前面必须有 FENCE |
 
 **LOOP 的语义**：
@@ -421,7 +438,7 @@ loop:
 ### 5.5 验证
 
 - **`tb_sa_unit`**：
-  - `mat_notify` 与 `IRQ_STATUS`：置位、W1C、使能、计数；
+  - `mat_notify`：每次一个 4 周期脉冲，连续两次产生两个独立的上升沿，`NOTIFY_COUNT` 计数，legacy `irq` 不受影响；
   - 负向测试原来用 funct3=7 作为非法编码，现在它已占用，改用 funct7=3；
   - **命令处理扩展的定向测试**：
     - 每个动态字段的替换和相加；
@@ -862,7 +879,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 |---|---|---|---|---|
 | D=8 基线（M3 实测 21.7k，加 PERF 和 DESC） | ~24k | 96 | 130 | M3 报告；D=16 时计数器与取指合计约 +1.8k |
 | L1 命令环、中断、`mat_notify` | < 0.3k | 0 | 0 | 几个寄存器 |
-| L1 命令处理扩展（16 个 BASE、PARAM、动态字段、SETREG、LOOP、CALL/RET、LDPARAM） | 1.5–2.5k | 1 | 0 | M5 取指单元 OOC 为 816 LUT；这里是它的 2–3 倍 |
+| L1 命令处理扩展（16 个 BASE、PARAM、动态字段、SETREG、LOOP、CALL/RET、LDPARAM） | 1.5–2.5k（**实测约 3.6k**） | 1（实测 2） | 0 | **OOC 实测**（D=8，50 MHz）：取指单元 4,408 LUT、2,106 FF、2 DSP，整个 `sa_unit` 21,787 LUT，WNS +2.37 ns。多出的主要是寄存器组的多个读写口和字段改写逻辑 |
 | L2 fp32 lane × 8（2 个乘法器、2 个加法器、转换、比较、表格） | 11–14k | 32 | 0 | 每个 lane 约 1.4–1.7k LUT、4 DSP；表格用 LUTRAM |
 | L2 微程序控制、转置缓冲、归约、下标生成、加宽的命令包、精确访问范围 | 2–3k | 0 | 0 | 8×8×32 的转置缓冲约 2k FF |
 | **合计** | **~39–44k（73–83%）** | **~129** | **130** | D=16 在 92% 时仍能满足 50 MHz |
@@ -921,8 +938,9 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 
 | 项 | 编码 | 级 |
 |---|---|---|
-| `mat_notify` | funct7=1，funct3=7：置 `IRQ_STATUS[0]`，`NOTIFY_COUNT` 加 1 | L1 |
-| CSR | 0xD4 `IRQ_STATUS`（W1C），0xD8 `IRQ_ENABLE`，0xDC `NOTIFY_COUNT` | L1 |
+| `mat_notify` | funct7=1，funct3=7：`notify_irq` 一个上升沿脉冲，`NOTIFY_COUNT` 加 1 | L1 |
+| CSR | 0xD4 `NOTIFY_COUNT`（只读） | L1 |
+| `sa_unit` 端口 | `notify_irq`（EDGE_RISING），BD 中接 `irqConcat/In1` | L1 |
 | CAPS | bit 22 NOTIFY/IRQ，bit 23 FP32 VE，bit 24 CMDX（命令处理扩展） | L1 / L2 |
 | mailbox | 0xB0–0xCC：命令环与固件状态（§5.1） | L1 |
 | 命令环条目 | w7 = 参数块地址 | L1 |

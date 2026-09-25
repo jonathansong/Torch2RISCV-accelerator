@@ -260,7 +260,10 @@ module sa_unit #(
     output wire         pcpi_ready,
 
     (* X_INTERFACE_INFO = "xilinx.com:signal:interrupt:1.0 irq INTERRUPT", X_INTERFACE_PARAMETER = "SENSITIVITY LEVEL_HIGH" *)
-    output wire         irq
+    output wire         irq,
+    // L1: mat_notify (edge; the ARM acknowledges at its interrupt controller)
+    (* X_INTERFACE_INFO = "xilinx.com:signal:interrupt:1.0 notify_irq INTERRUPT", X_INTERFACE_PARAMETER = "SENSITIVITY EDGE_RISING" *)
+    output wire         notify_irq
 );
     `include "sa_defs.vh"
     localparam integer SAW = $clog2(SPAD_WORDS);
@@ -283,7 +286,9 @@ module sa_unit #(
     wire         fetch_busy, fetch_submit, fetch_err;
     wire [3:0]   fetch_err_code;
     wire [31:0]  fetch_addr, fetch_count;
-    wire [127:0] fetch_bases;
+    wire         fetch_reg_we, notify;
+    wire [4:0]   fetch_reg_idx;
+    wire [31:0]  fetch_reg_val;
     wire [31:0]  desc_addr, desc_done, desc_status, desc_err_idx, desc_exec;
     wire [31:0]  f_araddr;
     wire         f_arvalid, f_arready, f_rvalid, f_rready;
@@ -337,13 +342,14 @@ module sa_unit #(
         .perf_ctl_we(perf_pctl_we), .perf_ctl(perf_pctl), .perf_rsel(perf_prsel),
         .perf_rdata(perf_prdata), .perf_ev(pcpi_ev),
         .fetch_busy(fetch_busy), .submit(fetch_submit), .submit_addr(fetch_addr),
-        .submit_count(fetch_count), .bases(fetch_bases));
+        .submit_count(fetch_count), .reg_we(fetch_reg_we), .reg_idx(fetch_reg_idx),
+        .reg_val(fetch_reg_val), .notify(notify));
 
     // ------------------------------------------------ descriptor fetch unit
     sa_cmdfetch #(.D(D)) fetch (
         .clk(aclk), .resetn(resetn),
         .submit(fetch_submit), .submit_addr(fetch_addr), .submit_count(fetch_count),
-        .busy(fetch_busy), .bases(fetch_bases),
+        .busy(fetch_busy), .reg_we(fetch_reg_we), .reg_idx(fetch_reg_idx), .reg_val(fetch_reg_val),
         .out_valid(f_valid), .out_ready(f_ready), .out_pkt(f_pkt),
         .sched_err(ext_status_s[1]), .clear_error(clear_error),
         .q_empty(ext_status_s[20:16] == 5'd0), .eng_busy(ext_status_s[7:4]),
@@ -380,7 +386,7 @@ module sa_unit #(
         .perf_ctl_we(perf_cctl_we), .perf_ctl(perf_cctl), .perf_en(perf_en),
         .perf_rsel(perf_crsel), .perf_rdata(perf_crdata),
         .fst_addr(desc_addr), .fst_done(desc_done), .fst_status(desc_status),
-        .fst_err_idx(desc_err_idx), .fst_exec(desc_exec));
+        .fst_err_idx(desc_err_idx), .fst_exec(desc_exec), .notify(notify), .notify_irq(notify_irq));
 
     // ------------------------------------------------ performance counters
     sa_perf #(.NCNT(PERF_NCNT), .PERF(PERF)) perf (

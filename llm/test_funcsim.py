@@ -8,6 +8,9 @@
    (build_gemm_list / build_vector_list) match the driver's NumPy goldens.
 3. Control flow: JUMP chains, count limits, BASE relocation, END status.
 4. Illegal descriptors / commands raise the RTL engine and error code.
+5. L1 command extensions (plan §5.3): BASE4-15, dynamic fields, SETREG,
+   LOOP_END (nested), relative JUMP, CALL / RET, LDPARAM, and their errors;
+   expected values are computed independently of the simulator.
 
     python3 llm/test_funcsim.py        (exit status 0 = all passed)
 """
@@ -42,14 +45,14 @@ def put_list(sim, dl, off):
 
 
 def cosim_cases(d):
-    for name, dl, chunks, out_off, exp in gdc.build_cases(d):
+    for name, dl, chunks, out_off, exp, n_exec in gdc.build_cases(d):
         sim = SaFuncSim(d, gdc.DDR_BASE, gdc.DDR_BYTES)
         for off, data in chunks:
             sim.ddr_write(gdc.DDR_BASE + off, data)
         sim.ddr_write(gdc.DDR_BASE + gdc.LIST_OFF, dl.array().tobytes())
         n = sim.run_list(gdc.DDR_BASE + gdc.LIST_OFF)
         got = sim.ddr_read(gdc.DDR_BASE + out_off, len(exp)).tobytes()
-        check(f"D={d} cosim case: {name}", got == exp and n == len(dl),
+        check(f"D={d} cosim case: {name}", got == exp and n == n_exec,
               f"{sum(a != b for a, b in zip(got, exp))} bytes differ")
 
 
@@ -161,13 +164,153 @@ def errors(d):
     expect("VE int8 in ACC", lambda: sim.ve(pm.laddr(pm.MEM_ACC, 0), 0, pm.laddr(pm.MEM_SPAD_A, 0), 1, 5, 0),
            ENG_VE, XERR_RANGE)
     bad = pm.DescList().end()
-    bad.rows[0][0] |= 1 << 20                     # reserved header bit
+    bad.rows[0][0] |= 1 << 15                     # reserved header bit
     sim.ddr_write(BASE + 0x1000, bad.array().tobytes())
     expect("reserved header bit", lambda: sim.run_list(BASE + 0x1000), ENG_FETCH, XERR_SHAPE)
     sim.ddr_write(BASE + 0x2000, bytes(64))
     expect("opcode 0 (zeroed memory)", lambda: sim.run_list(BASE + 0x2000), ENG_FETCH, XERR_SHAPE)
     sim.ddr_write(BASE + 0x3000, pm.DescList().jump(BASE + 0x3010).array().tobytes())
     expect("misaligned JUMP", lambda: sim.run_list(BASE + 0x3000), ENG_FETCH, XERR_SHAPE)
+
+
+def l1_extensions(d):
+    DL, P = pm.DescList, pm.DescList.REG_PARAM
+    SA = pm.laddr(pm.MEM_SPAD_A, 0)
+    rng = np.random.default_rng(d)
+
+    def fresh():
+        sim = SaFuncSim(d, BASE, 1 << 20)
+        src = rng.integers(0, 256, 1 << 14, dtype=np.uint8)
+        sim.ddr_write(BASE + 0x10000, src.tobytes())
+        return sim, src
+
+    def run(sim, dl, **kw):
+        return sim.run_list(put_list(sim, dl, 0x1000), **kw)
+
+    # BASE4..15 relocation
+    sim, src = fresh()
+    dl = DL()
+    for b in (4, 9, 15):
+        dl.ld(0, SA, 1, 64, 64, base=b).st(0, SA, 1, 64, 64, base=15 - b + 1 if b != 15 else 1)
+    dl.end()
+    bases = [0] * 16
+    for b in (4, 9, 15):
+        bases[b] = BASE + 0x10000 + 64 * b
+        bases[15 - b + 1 if b != 15 else 1] = BASE + 0x20000 + 64 * b
+    run(sim, dl, bases=bases)
+    check(f"D={d} L1 BASE4..15 relocation",
+          all(np.array_equal(sim.ddr_read(BASE + 0x20000 + 64 * b, 64), src[64 * b:64 * b + 64]) for b in (4, 9, 15)))
+
+    # dynamic fields: rows (replace) and DDR address (add)
+    sim, src = fresh()
+    dl = DL().ld(BASE + 0x10000, SA, 1, 64, 64, dyn=[("rows", 3), ("ddr", 1, True)]) \
+             .st(BASE + 0x20000, SA, 1, 64, 64, dyn=[("rows", 3)]).end()
+    run(sim, dl, params=[0, 128, 0, 5])
+    got = sim.ddr_read(BASE + 0x20000, 6 * 64)
+    check(f"D={d} L1 dynamic rows (replace) + DDR address (add)",
+          np.array_equal(got[:320], src[128:448]) and not got[320:].any())
+
+    # dynamic VE LEN and EX Kt against the static commands
+    sim, src = fresh()
+    x = rng.integers(-128, 128, 64 * d, dtype=np.int8)
+    sim.ddr_write(BASE + 0x30000, x.tobytes())
+    n = 5 * d
+    dl = DL().ld(BASE + 0x30000, SA, 1, 64 * d, 64 * d) \
+             .ve(SA, SA, pm.laddr(pm.MEM_SPAD_B, 0), 8 * d, pm.VOPS["add"], 0, dyn=[("len", 2)]) \
+             .st(BASE + 0x40000, pm.laddr(pm.MEM_SPAD_B, 0), 1, 8 * d, 8 * d).end()
+    run(sim, dl, params=[0, 0, n])
+    got = sim.ddr_read(BASE + 0x40000, 8 * d).view(np.int8)
+    exp = np.concatenate([np.clip(2 * x[:n].astype(int), -128, 127), np.zeros(3 * d, int)])
+    check(f"D={d} L1 dynamic VE LEN", np.array_equal(got, exp.astype(np.int8)))
+    a = rng.integers(-128, 128, (d, 4 * d), dtype=np.int8)
+    b = rng.integers(-128, 128, (4 * d, d), dtype=np.int8)
+    outs = []
+    for dyn in (False, True):
+        sim, _ = fresh()
+        sim.ddr_write(BASE + 0x30000, a.tobytes())
+        sim.ddr_write(BASE + 0x38000, b.tobytes())
+        dl = DL().ld(BASE + 0x30000, SA, d, 4 * d, 4 * d, pm.LD_INTERLEAVE) \
+                 .ld(BASE + 0x38000, pm.laddr(pm.MEM_SPAD_B, 0), 4 * d, d, d)
+        dl.ex(0, 0, 0, 1 if dyn else 3, dyn=[("kt", 0)] if dyn else ())
+        dl.st(BASE + 0x40000, pm.laddr(pm.MEM_ACC, 0), d, 4 * d, 4 * d).end()
+        run(sim, dl, params=[3])
+        outs.append(sim.ddr_read(BASE + 0x40000, 4 * d * d).view("<i4").reshape(d, d))
+    exp = a[:, :3 * d].astype(np.int32) @ b[:3 * d].astype(np.int32)
+    check(f"D={d} L1 dynamic EX Kt", np.array_equal(outs[0], exp) and np.array_equal(outs[1], exp))
+
+    # SETREG (replace, add, BASE and PARAM)
+    sim, src = fresh()
+    dl = DL().setreg((P + 0, 5), (P + 1, 7), (6, BASE + 0x10000 + 256)).setreg((P + 0, 3, True)) \
+             .ld(0, SA, 1, 64, 64, base=6).st(BASE + 0x20000, SA, 1, 64, 64).end()
+    run(sim, dl)
+    check(f"D={d} L1 SETREG replace / add, BASE via SETREG",
+          sim.params[:2] == [8, 7] and np.array_equal(sim.ddr_read(BASE + 0x20000, 64), src[256:320]))
+
+    # LOOP_END: 8 blocks copied by a 2-descriptor body with PARAM address strides
+    sim, src = fresh()
+    dl = DL().ld(BASE + 0x10000, SA, 1, 256, 256, dyn=[("ddr", 0, True)]) \
+             .st(BASE + 0x20000, SA, 1, 256, 256, dyn=[("ddr", 1, True)]) \
+             .loop_end(-2, 8, k1=0, s1=256, k2=1, s2=256).end(0x77)
+    n = run(sim, dl, params=[0, 0])
+    check(f"D={d} L1 LOOP_END x8 with PARAM strides",
+          np.array_equal(sim.ddr_read(BASE + 0x20000, 2048), src[:2048]) and sim.params[:2] == [2048, 2048]
+          and n == 8 * 3 + 1 and sim.dl_status == 0x77)
+
+    # nested loops (3 x 4), count 1, and relative JUMP skipping a descriptor
+    sim, _ = fresh()
+    dl = DL().setreg((P + 4, 1, True)).loop_end(-1, 4, k1=2, s1=1).loop_end(-2, 3, k1=3, s1=1) \
+             .loop_end(-1, 1, k1=5, s1=10).jump(2, rel=True).setreg((P + 6, 99)).end()
+    run(sim, dl, params=[0] * 8)
+    check(f"D={d} L1 nested loops 3x4, count 1, relative JUMP",
+          sim.params[4] == 12 and sim.params[2] == 12 and sim.params[3] == 3 and sim.params[5] == 10
+          and sim.params[6] == 0)
+
+    # CALL / RET: a subroutine called twice, and nesting to depth 4
+    sim, _ = fresh()
+    main_l = DL().call(BASE + 0x3000).call(BASE + 0x3000).call(BASE + 0x3100).end()
+    sub = DL().setreg((P + 0, 1, True)).ret()
+    chain = DL().call(2, rel=True).ret().call(2, rel=True).ret().call(2, rel=True).ret() \
+                .setreg((P + 1, 1, True)).ret()                    # 4 frames deep at the SETREG
+    sim.ddr_write(BASE + 0x3000, sub.array().tobytes())
+    sim.ddr_write(BASE + 0x3100, chain.array().tobytes())
+    run(sim, main_l, params=[0, 0])
+    check(f"D={d} L1 CALL / RET (twice, and depth 4)", sim.params[:2] == [2, 1])
+
+    # LDPARAM: gather a row whose index is in DDR
+    sim, src = fresh()
+    sim.ddr_write(BASE + 0x5004, np.array([37], "<u4").tobytes())
+    dl = DL().ldparam(4, 2, mul=64, add=0x10000, base=0) \
+             .ld(BASE, SA, 1, 64, 64, dyn=[("ddr", 2, True)]).st(BASE + 0x20000, SA, 1, 64, 64).end()
+    run(sim, dl, bases=[BASE + 0x5000])
+    check(f"D={d} L1 LDPARAM (x mul + add, relocated) as a gather index",
+          sim.params[2] == 37 * 64 + 0x10000 and np.array_equal(sim.ddr_read(BASE + 0x20000, 64), src[37 * 64:38 * 64]))
+
+    # count limit inside a loop
+    sim, _ = fresh()
+    dl = DL().setreg((P + 0, 1, True)).loop_end(-1, 10).end()
+    n = run(sim, dl, count=7, params=[0])
+    check(f"D={d} L1 count limit inside a loop", n == 7 and sim.params[0] == 4)
+
+    def expect(name, dl, **kw):
+        sim, _ = fresh()
+        try:
+            run(sim, dl, **kw)
+        except SaError as e:
+            check(f"D={d} L1 error: {name}", (e.engine, e.code) == (ENG_FETCH, XERR_SHAPE),
+                  f"got engine {e.engine} code {e.code}")
+            return
+        check(f"D={d} L1 error: {name}", False, "no error")
+
+    bad = DL().fence().end()
+    bad.rows[0][0] |= 1 << 16                                   # a dynamic field on FENCE
+    expect("dynamic field undefined for the opcode", bad)
+    expect("LOOP_END count 0", DL().loop_end(-1, 0).end())
+    expect("loop stack overflow (3 levels)",
+           DL().setreg((P, 1)).loop_end(-1, 2).loop_end(-2, 2).loop_end(-3, 2).end())
+    expect("call stack overflow (depth 5)", DL().call(0, rel=True).end())
+    expect("RET without CALL", DL().ret().end())
+    expect("SETREG register 24", DL().setreg((24, 1)).end())
+    expect("LDPARAM not 4-byte aligned", DL().ldparam(BASE + 0x5002, 0).end())
 
 
 def main():
@@ -179,6 +322,7 @@ def main():
         random_vectors(d, rng, 60)
         control_flow(d)
         errors(d)
+        l1_extensions(d)
     print("PASS" if not fails else f"FAIL: {len(fails)}")
     return 0 if not fails else 1
 

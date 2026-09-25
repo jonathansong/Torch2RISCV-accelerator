@@ -193,7 +193,7 @@ class DeviceModel:
         return ((v * c).astype(F) + (sw * s).astype(F)).astype(F)
 
     def forward(self, token, pos):
-        c, sfu, d = self.cfg, self.sfu, self.d
+        c, sfu = self.cfg, self.sfu
         hs, rep = c.head_size, c.heads // c.kv_heads
         x = (self.emb_q[token].astype(F) * self.emb_s[token]).astype(F)
         for l in range(c.layers):
