@@ -270,6 +270,20 @@ L0 不改 RTL。
 - **不通过时**：只用 IREE 编译器，运行时自己用 C 写一个小的执行器，读 IREE 输出的可执行体和调度信息。
   §10 的硬件接口不受影响。
 
+> **L0 实测：通过**（IREE 3.11.0，详见 [`iree-sa/l0/README.md`](../iree-sa/l0/README.md)）。
+> - **流程**：torch → iree-turbine → iree-compile（llvm-cpu，armv7）→ 板上的 IREE 运行时
+>   （clang-18 交叉编译，静态链接）。
+> - **结果**：测试模型用 local-sync 和 local-task 两种驱动都与 torch 一致，15 个单算子测试全部 PASS。
+>
+> 途中解决了 armv7 特有的两个问题，都通过链接器包装脚本加一个很小的 libm shim 解决：
+> 1. **缺少 `fmaxf`/`fminf`**：Cortex-A9 没有 IEEE 语义的 max/min 指令，LLVM 会调用这两个函数，
+>    而嵌入式 ELF 里没有 libm。
+> 2. **IREE 自带 musl 里的 `fmaf` 是空实现（`unreachable`）**：Cortex-A9 没有 FMA，`exp` 的多项式近似会调用它，
+>    结果 `exp` 总是返回常数 4。shim 提供了正确舍入的软件 `fmaf`，与 glibc 在 4000 万组输入上逐位一致。
+>    这可能是 IREE 的 bug，值得向上游报告。
+>
+> 编译脚本会在主机上检查每个 armv7 可执行体，不允许有外部导入，也不允许 libm 函数是空实现。
+
 ---
 
 ## 5. L1：host 接口与命令处理扩展
