@@ -1009,6 +1009,38 @@ IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 →
 
 验收：8 条序列同时生成，每条的文本与单独生成时一致；记录总 tok/s。
 
+**实现记录**（`llm/compile_batch.py` 的 `BatchCompiler`、`llm/runtime.py` 的 `BatchLlamaDevice`；只支持 D=8，D=16 的 ACC 放不下）
+- **激活**：D × n 行主序的 fp32 矩阵，行 b 是序列 b。
+  - 逐元素的 VE 直接跑 D 倍长；
+  - 按序列的归约用 REDUCE 的 ROWLEN = n/D，顺序与单序列相同，所以结果逐位一致；
+  - 每条序列的标量用 DIV 广播，每通道的向量用 MOD。
+- **A 条带**（字 kb·D + b = 序列 b 的第 kb 段）：VE 的下标模式表达不了这种映射，所以绕道 DDR：ST 量化后的矩阵 → FENCE → LD INTERLEAVE。
+- **GEMM**：EX 把 C 直接写进输出矩阵（C 的行步长 = 矩阵的一行），分块边界与 q/k/v、h1/h3 的分段对齐，
+  它们各成一个矩阵；反量化每个线性层只做一次。
+  分类层分块处理，用跨步 ST 写出 D × vocab 的 logits 矩阵。
+- **注意力**：按序列展开，每条序列内部是头循环；该序列的 PARAM 从 DDR 参数表的对应项用 LDPARAM 读入。
+- **每条序列独立**：各有一个 KV cache 和一个 pos，可以在不同的步开始（连续批处理的雏形）；
+  没有序列的槽位跑一个 pos 0 的哑 token。
+- ACC 中注意力阶段与 FFN 阶段的缓冲区复用同一片空间：stories15M 用 3,820 个字。
+- 列表 2,137 条描述符，每步执行 7,231 条。
+
+**验证**
+- 主机：tiny 模型 16 步、stories15M 12 步，8 条序列错开开始，各序列的 logits 和 KV cache 都与单序列 DeviceModel 逐位一致。
+- RTL 联合仿真：批处理的 tiny 解码器，第 0 步和第 8 步（位置 8..1）逐位一致。
+- 变异测试：RMSNorm 权重的 MOD 改成 DIV，被检出。
+
+**板上结果**（`notebooks/llm/l5b_batch_demo.py`，stories15M，`bitstreams/l2`）
+
+| 方式 | 墙钟 tok/s | 设备 |
+|---|---|---|
+| 单序列（L5 的 `LlamaDevice`） | 17.5 | 2.51M 周期/token，19.9 tok/s |
+| 8 条序列批处理 | **63.3（3.6×）** | 5.19M 周期/步，**77.0 tok/s（3.9×）** |
+
+- 8 条序列错开开始时，每条 64 个位置都与单独生成**逐位一致**，文本完全相同。
+- 没有达到 8×，因为每一步中与序列数成正比的工作增加了 8 倍：VE 的逐元素和归约、按序列的注意力、A 条带经 DDR 的往返（每次 FENCE）。
+  一步的计数器：EX useful 40.5%，LD 忙碌 42.6%，VE active 51.3%，队首阻塞 VE 28.8%、EX 24.1%、ST 12.3%；VE 命令 4,104 条。
+  所以权重带宽不再是瓶颈，VE 成了瓶颈。继续提速要让 VE 与 EX 重叠、加宽 VE（资源紧），或者减少 FENCE。
+
 ### 11.2 L5.5：75 MHz（附加目标）
 
 - `pico_bit.tcl` 中的 `subprocessorClk` 改为 75 MHz。PicoRV32、加速器和 HP 口都用这个时钟，HP 口本身支持到 150 MHz。
@@ -1129,6 +1161,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | `llm/compile_layer.py`、`llm/test_l3.py` | L3、L4 | 手写列表生成器（LOOP、PARAM）及其主机测试 |
 | `llm/compile_model.py`、`llm/test_l4.py` | L4 | 整个解码器的静态列表（每个 token 只改参数）及其主机测试 |
 | `llm/runtime.py`、`llm/prepare_l5.py` | L5 | ARM 运行时 `LlamaDevice`、采样器；验收用的参考数据 |
+| `llm/compile_batch.py`、`llm/test_l5b.py` | L5b | 多序列并发 decode 的静态列表（`BatchLlamaDevice`）及其主机测试 |
 | `llm/runtime.py`、`llm/tokenizer.py` | L5 | Python 运行时 |
 | `firmware/rt/` | L1 | 常驻固件 `rt_fw` |
 | `firmware/include/mailbox.h`、`sysarray_intrinsics.h` | L1、L2 | 命令环字段、`mat_notify`、新的 `mat_cfg` / `vec_cfg` key |

@@ -192,15 +192,21 @@ class ModelCompiler:
             dl.st(self.rkv(off), laddr(MEM_SPAD_A, st), 1, c.kv_dim, c.kv_dim, base=self.rkv.base,
                   dyn=[("ddr", P_SCR, True)])
 
-    def attention(self, dl, layer):
+    def attention(self, dl, layer, q=None, att=None, kv=None, fence=True):
+        """Multi-head attention of one sequence: q (ACC word of its q vector,
+        default QKV), att (output word, default ATT), kv ((K, V) offsets in the
+        KV region, default this layer's); the PARAMs P0..P5 of its position."""
         c, d = self.cfg, self.d
         hs = c.head_size
         hw = hs // d                                    # words per head row
         kvp = self.m.get("kvp", layer)
         a_k, a_v = float(kvp[4]), float(kvp[5])
-        koff, voff = self.kv_offsets(layer)
+        koff, voff = self.kv_offsets(layer) if kv is None else kv
+        q = self.QKV if q is None else q
+        att = self.ATT if att is None else att
         smax = c.seq_len
-        dl.fence()                                      # this token's K / V rows are in DDR
+        if fence:
+            dl.fence()                                  # this token's K / V rows are in DDR
         dl.setreg((DescList.REG_PARAM + P_L0, 0), (DescList.REG_PARAM + P_L1, 0))
         start = len(dl)
         # scores
@@ -208,7 +214,6 @@ class ModelCompiler:
               dyn=[("ddr", P_L0, True), ("rows", P_POSPAD)])
         dl.transpose(laddr(MEM_SPAD_A, self.KRAW), laddr(MEM_SPAD_B, self.KT), d * d, I8 | I8 << 2, hw,
                      dyn=[("len", P_KTLEN)])
-        q = self.QKV
         dl.ve(acc(q), 0, acc(self.TMP), hs, COPY, T_FF, fp=True, func="abs", reduce="max",
               dyn=[("src1", P_L1, True)])                                                        # amax
         dl.ve(acc(self.TMP), 0, acc(self.TMP + 1), d, COPY, T_FF, fp=True, A=CL.INV127)            # s_q
@@ -233,7 +238,7 @@ class ModelCompiler:
               dyn=[("ddr", P_L0, True), ("rows", P_POSPAD)])
         dl.ex(0, self.VB, self.OC, 1, repeat=hw, bstep=d, cstep=1, crow=hw,
               dyn=[("kt", P_TILES), ("bstep", P_POSPAD)])
-        dl.ve(acc(self.OC), 0, acc(self.ATT), hs, COPY, I32 | F32 << 2, fp=True, A=a_v, B=NEG0,
+        dl.ve(acc(self.OC), 0, acc(att), hs, COPY, I32 | F32 << 2, fp=True, A=a_v, B=NEG0,
               dyn=[("dst", P_L1, True)])
         dl.loop_end(start - len(dl), c.heads, k1=P_L0, s1=hs, k2=P_L1, s2=hw)
 

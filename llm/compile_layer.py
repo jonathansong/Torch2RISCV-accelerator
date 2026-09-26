@@ -49,10 +49,11 @@ class Layout:
         self.acc0 = self.scr                        # first activation word (bank 0)
         self.acc1 = self.cbank + self.scr           # bank 1
 
-    def chunk_tiles(self, k, nt):
+    def chunk_tiles(self, k, nt, rows=1):
         """Output tiles per chunk: the largest divisor of nt whose weights fit a
-        SPAD_B bank (k words per tile) and whose scratch (C rows, s_w, y) fits."""
-        cap = min(self.sbank // k, self.scr // (self.d + 2))
+        SPAD_B bank (k words per tile) and whose scratch (C rows, s_w, `rows`
+        y rows) fits."""
+        cap = min(self.sbank // k, self.scr // (self.d + 1 + rows))
         if cap < 1:
             raise ValueError(f"in = {k}: one weight tile does not fit a SPAD_B bank")
         return max(n for n in range(1, cap + 1) if nt % n == 0)
@@ -77,21 +78,26 @@ def quant_act(dl, lay, x, n, tmp, a_strip=0):
 
 
 def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=0, iobase=1, a_strip=0,
-           loop=None, params=(0, 1)):
+           loop=None, params=(0, 1), rows=1):
     """y = dequant(A strip x W^T): k inputs (the A strip at SPAD_A a_strip),
     n_out outputs; w_off / sw_off: offsets of the packed weights and of s_w
     (relocated by BASE wbase); s_x: ACC word of the activation scale.
     Output: ACC words from `out` (fp32, n_out / D words) or DDR offset
     out_ddr (relocated by BASE iobase). loop: use LOOP_END (default: when the
     output goes to DDR and there are more than 4 chunks); PARAM params[0] /
-    params[1] are overwritten then. Returns the chunk size in tiles."""
+    params[1] are overwritten then. rows > 1 (DDR output only): the A strip holds
+    `rows` different rows (L5b: sequences, s_x = `rows` consecutive words) and
+    the output is a rows x n_out fp32 matrix at out_ddr (row pitch 4 * n_out).
+    Returns the chunk size in tiles."""
     d, sb, cb = lay.d, lay.sbank, lay.cbank
     if k % d or n_out % d or (out is None) == (out_ddr is None):
         raise ValueError("linear: k, n_out multiples of D; exactly one of out / out_ddr")
     nt = n_out // d
-    nc = lay.chunk_tiles(k, nt)
+    if rows > 1 and out_ddr is None:
+        raise ValueError("linear: several rows need a DDR output")
+    nc = lay.chunk_tiles(k, nt, rows)
     nch = nt // nc
-    wbytes, fbytes = nc * k * d, 4 * nc * d                         # per chunk: weights, fp32 vector
+    wbytes, fbytes = nc * k * d, 4 * nc * d                         # per chunk: weights, fp32 vector (one row)
     o_sw, o_y = d * nc, d * nc + nc                                # scratch offsets in the ACC bank
     use_loop = (out_ddr is not None and nch > 4) if loop is None else loop
     if use_loop and out_ddr is None:
@@ -112,10 +118,14 @@ def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=
         if prefetch:
             load(j + 1, dyn)
         y = c + o_y if out is None else out + j * nc
-        dl.ve(acc(c), acc(c + o_sw), acc(y), nc * d, MUL, I32 | F32 << 2, fp=True, t2=F32)   # * s_w
-        dl.ve(acc(y), acc(s_x), acc(y), nc * d, MUL, T_FF, fp=True, m2="div", period=nc)     # * s_x
+        if rows == 1:
+            dl.ve(acc(c), acc(c + o_sw), acc(y), nc * d, MUL, I32 | F32 << 2, fp=True, t2=F32)   # * s_w
+        else:                                                                                  # C rows are contiguous
+            dl.ve(acc(c), acc(c + o_sw), acc(y), rows * nc * d, MUL, I32 | F32 << 2, fp=True, t2=F32,
+                  m2="mod", period=nc)
+        dl.ve(acc(y), acc(s_x), acc(y), rows * nc * d, MUL, T_FF, fp=True, m2="div", period=nc)  # * s_x (per row)
         if out_ddr is not None:
-            dl.st(out_ddr + j * fbytes, acc(y), 1, fbytes, fbytes, base=iobase,
+            dl.st(out_ddr + j * fbytes, acc(y), rows, fbytes, fbytes if rows == 1 else 4 * n_out, base=iobase,
                   dyn=[("ddr", p_f, True)] if dyn else ())
 
     load(0, False)

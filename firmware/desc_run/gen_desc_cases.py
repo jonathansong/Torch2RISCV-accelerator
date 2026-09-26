@@ -292,6 +292,43 @@ def build_cases(d, seed=11):
         sim.ddr_write(DDR_BASE + IO4, CM.arg_block(pos, toks[pos]))
         sim.run_list(DDR_BASE + LIST_OFF, params=CM.token_params(pos, d, tcfg.head_size))
 
+    # ---- L5b: D sequences per step (batched tiny decoder); step 0 and step D, where sequence b
+    # is at position D - b (staggered starts); earlier steps from the functional simulator
+    import compile_batch as CB
+    if d == 8:
+        M5, IO5, KV5 = 0x0, 0x10000, 0x10000 + CB.IO_LOGITS + 4 * d * tcfg.vocab
+        kvb5 = d * CM.kv_bytes(tcfg)
+        assert tm.raw.size <= IO5 and KV5 + kvb5 <= LIST_OFF
+        bc = CB.BatchCompiler(tm, model=CM.Region(0, DDR_BASE + M5), io=CM.Region(1, DDR_BASE + IO5),
+                              kv=CM.Region(2, DDR_BASE + KV5))
+        bl = bc.build()
+        dms = [DeviceModel(tcfg, tw, tkv, d=d, sfu=SfuExact) for _ in range(d)]
+        seqs = [[int(t) for t in trng.integers(0, tcfg.vocab, tcfg.seq_len)] for _ in range(d)]
+        sim = SaFuncSim(d, DDR_BASE, DDR_BYTES)
+        sim.ddr_write(DDR_BASE + M5, tm.raw.tobytes())
+        sim.ddr_write(DDR_BASE + LIST_OFF, bl.array().tobytes())
+        for step in range(d + 1):
+            poses = [max(step - b, 0) for b in range(d)]
+            toks5 = [seqs[b][poses[b]] if step >= b else 1 for b in range(d)]
+            wants = [dms[b].forward(toks5[b], poses[b]) if step >= b else None for b in range(d)]
+            args5 = CB.arg_table(poses, toks5, d, tcfg.head_size)
+            if step in (0, d):
+                kv_state = sim.ddr_read(DDR_BASE + KV5, kvb5).tobytes()
+
+                def l5_ok(out, wants=wants, poses=poses, step=step):
+                    lg = np.frombuffer(out[:4 * d * tcfg.vocab], f32).reshape(d, tcfg.vocab)
+                    kc = np.frombuffer(out[KV5 - IO5 - CB.IO_LOGITS:], np.int8)
+                    kc = kc.reshape(d, tcfg.layers, 2, tcfg.seq_len, tcfg.kv_dim)
+                    return all(lg[b].tobytes() == wants[b].astype(f32).tobytes() and
+                               all(np.array_equal(kc[b, l, 0, :poses[b] + 1], dms[b].kc[l, :poses[b] + 1]) and
+                                   np.array_equal(kc[b, l, 1, :poses[b] + 1], dms[b].vc[l, :poses[b] + 1])
+                                   for l in range(tcfg.layers)) for b in range(d) if step >= b)
+                l2_case(f"L5b batched tiny decoder, {d} sequences at positions {poses}: logits + KV caches", bl,
+                        [(M5, tm.raw.tobytes()), (KV5, kv_state), (IO5, args5)],
+                        IO5 + CB.IO_LOGITS, KV5 + kvb5 - IO5 - CB.IO_LOGITS, l5_ok)
+            sim.ddr_write(DDR_BASE + IO5, args5)
+            sim.run_list(DDR_BASE + LIST_OFF)
+
     return cases
 
 

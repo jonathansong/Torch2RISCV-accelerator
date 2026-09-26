@@ -18,6 +18,7 @@ This directory implements level L0 of
 | `test_l4.py` | L4: runs the list token after token in the functional simulator. Logits and KV cache must be bit-exact with `DeviceModel(sfu=SfuExact)`. Models: a random tiny model and stories15M. `--save` writes the golden run for the board. |
 | `runtime.py` | L5: `LlamaDevice` is the ARM runtime. It loads the model once into CMA, then per token submits the static list through the rt_fw ring, waits for the notify interrupt and samples on the ARM (run.c's `Sampler`). |
 | `prepare_l5.py` | L5: builds the reference data for the board acceptance: golden logits MD5s, and the fp32 sequences with their top-5 for the accuracy test. |
+| `compile_batch.py`, `test_l5b.py` | L5b: decodes D = 8 sequences per step with one static list. Activations are D × n matrices and the A strip goes through DDR. Each sequence has its own KV cache and position and stays bit-exact with its single-sequence run. `runtime.BatchLlamaDevice` drives it. |
 | `test_funcsim.py` | Checks the functional simulator against the RTL co-simulation cases, the driver's golden models, control flow and error codes. |
 
 All scripts run on the host and need only NumPy. The checkpoints and
@@ -101,3 +102,11 @@ On the board, `notebooks/llm/l5_generate.py` runs stories15M end to end on the d
 - **Speed**: sampled generation runs at 15.1 tok/s wall clock (18.9 tok/s on the device).
 - **Stability**: 10 × 256 tokens with 0 errors and 2,560 interrupts received.
 - See plan §9.3 for the details.
+
+## L5b results
+
+On the board, `notebooks/llm/l5b_batch_demo.py` decodes 8 stories15M sequences at once:
+
+- Every position of every sequence is bit-exact with its single-sequence run, and the texts are identical.
+- Throughput is 63.3 tok/s wall clock, 3.6× a single sequence. The device runs at 77.0 tok/s (3.9×).
+- The limit is now the vector engine rather than weight bandwidth. See plan §11.1 for the details.
