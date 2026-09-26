@@ -91,7 +91,8 @@ def prefetch(dl, lay, k, n_out, w_off, bank, wbase=0, rows=1):
 
 
 def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=0, iobase=1, a_strip=0,
-           loop=None, params=(0, 1), rows=1, bank0=0, preloaded=False, after_last_ex=None):
+           loop=None, params=(0, 1), rows=1, bank0=0, preloaded=False, after_last_ex=None, order=None,
+           after_chunk=None, nc=None):
     """y = dequant(A strip x W^T): k inputs (the A strip at SPAD_A a_strip),
     n_out outputs; w_off / sw_off: offsets of the packed weights and of s_w
     (relocated by BASE wbase); s_x: ACC word of the activation scale.
@@ -106,36 +107,50 @@ def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=
     after_last_ex(free_bank): called right after the last chunk's EX is
     emitted, with the SPAD_B bank that EX does not use (to prefetch the next
     layer's weights there while this layer's tail and the next layer's vector
-    steps run). Returns the chunk size in tiles."""
+    steps run). order: the chunks in the order to compute them (default
+    0, 1, ...; chunk 0 first when preloaded; the unrolled form only);
+    after_chunk(i, j): called after the i-th computed chunk (chunk j) is
+    dequantized, to append work that uses its outputs. nc: tiles per chunk
+    (default: the largest that fits, Layout.chunk_tiles). Returns the chunk
+    size in tiles."""
     d, sb, cb = lay.d, lay.sbank, lay.cbank
     if k % d or n_out % d or (out is None) == (out_ddr is None):
         raise ValueError("linear: k, n_out multiples of D; exactly one of out / out_ddr")
     nt = n_out // d
     if rows > 1 and out_ddr is None:
         raise ValueError("linear: several rows need a DDR output")
-    nc = lay.chunk_tiles(k, nt, rows)
+    cap = lay.chunk_tiles(k, nt, rows)
+    if nc is None:
+        nc = cap
+    elif nt % nc or nc > min(lay.sbank // k, lay.scr // (d + 1 + rows)):
+        raise ValueError(f"linear: {nc} tiles per chunk do not divide {nt} or do not fit")
     nch = nt // nc
     wbytes, fbytes = nc * k * d, 4 * nc * d                         # per chunk: weights, fp32 vector (one row)
     o_sw, o_y = d * nc, d * nc + nc                                # scratch offsets in the ACC bank
     use_loop = (out_ddr is not None and nch > 4) if loop is None else loop
     if use_loop and out_ddr is None:
         raise ValueError("linear: the looped form writes to DDR")
+    order = list(range(nch)) if order is None else list(order)
+    if sorted(order) != list(range(nch)) or (use_loop and order != list(range(nch))) or \
+            (preloaded and order[0] != 0):
+        raise ValueError("linear: order must be a permutation of the chunks (unrolled; chunk 0 first if preloaded)")
     p_w, p_f = params
 
-    def load(j, dyn, weights=True):
-        p = (j + bank0) & 1
+    # i: position in the computation order (bank parity), j = order[i]: the chunk (offsets)
+    def load(i, dyn, weights=True):
+        p, j = (i + bank0) & 1, order[i]
         if weights:
             dl.ld(w_off + j * wbytes, laddr(MEM_SPAD_B, p * sb), nc, k * d, k * d, base=wbase,
                   dyn=[("ddr", p_w, True)] if dyn else ())
         dl.ld(sw_off + j * fbytes, acc(p * cb + o_sw), 1, fbytes, fbytes, base=wbase,
               dyn=[("ddr", p_f, True)] if dyn else ())
 
-    def chunk(j, dyn, prefetch):
-        p = (j + bank0) & 1
+    def chunk(i, dyn, prefetch):
+        p, j = (i + bank0) & 1, order[i]
         c = p * cb
         dl.ex(a_strip, p * sb, c, k // d, repeat=nc, bstep=k, cstep=1, crow=nc)
         if prefetch:
-            load(j + 1, dyn)
+            load(i + 1, dyn)
         elif after_last_ex is not None:
             after_last_ex(1 - p)
         y = c + o_y if out is None else out + j * nc
@@ -148,6 +163,8 @@ def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=
         if out_ddr is not None:
             dl.st(out_ddr + j * fbytes, acc(y), rows, fbytes, fbytes if rows == 1 else 4 * n_out, base=iobase,
                   dyn=[("ddr", p_f, True)] if dyn else ())
+        if after_chunk is not None:
+            after_chunk(i, j)
 
     load(0, False, weights=not preloaded)
     j = 0

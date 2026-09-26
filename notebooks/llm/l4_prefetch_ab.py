@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""A/B on the board: the stories15M token list with and without weight prefetching.
+"""A/B on the board: the stories15M token list without and with the scheduling optimizations of plan §8.8.
 
-Prefetching (compile_model.ModelCompiler(prefetch=True)) loads the first
-weight chunk of every linear layer while the vector steps before it run
-(norms, quantization, RoPE, attention, SiLU, residuals), instead of after
-them. Same bitstream (L2), same tokens: both lists must give logits
-bit-exact with DeviceModel (l4_golden.npz); the script compares the device
-cycles per token and the counter breakdown of the last token.
+Variants (compile_model.ModelCompiler flags):
+- baseline: neither;
+- prefetch: the first weight chunk of every linear layer is loaded while the
+  vector steps before it run (norms, quantization, RoPE, attention, ...);
+- prefetch + fused SiLU: W13 in h1 / h3 chunk pairs, the SiLU of each pair
+  right after it, overlapping the next chunk's EX.
+Same bitstream (L2), same tokens: every list must give logits bit-exact
+with DeviceModel (l4_golden.npz); the script compares the device cycles per
+token and the counter breakdown of the last token.
 
 Files: as l4_decoder_demo.py (picorv32.bit / .hwh, rt_fw.bin, pynq_matmul.py,
 the llm/ modules, stories15M_d8.w8a8, l4_golden.npz).
@@ -71,23 +74,26 @@ def main():
     gold = np.load(args.golden)
     toks, want = [int(t) for t in gold["tokens"]], gold["logits"]
     res = {}
-    for name, pf in (("without prefetch", False), ("with prefetch", True)):
-        dl = CM.ModelCompiler(m, prefetch=pf).build()
+    variants = (("baseline", False, False), ("prefetch", True, False), ("prefetch + fused SiLU", True, True))
+    for name, pf, fs in variants:
+        dl = CM.ModelCompiler(m, prefetch=pf, fuse_silu=fs).build()
         ok, cyc, perf = run(dev, m, dl, toks, want)
         res[name] = cyc
         b = perf_breakdown(perf, dev.d) if perf else None
-        print(f"{name:>17}: {len(toks)} tokens {'all bit-exact' if ok else 'NOT bit-exact'}, "
+        print(f"{name:>22}: {len(dl)} descriptors, {len(toks)} tokens {'all bit-exact' if ok else 'NOT bit-exact'}, "
               f"{cyc.mean():.0f} cycles per token = {50e6 / cyc.mean():.2f} tok/s (device)")
         if b:
-            print(f"{'':>19}last token: EX useful {100 * b['ex_useful']:.1f}%, LD busy {100 * b['ld_busy']:.1f}%, "
+            print(f"{'':>24}last token: EX useful {100 * b['ex_useful']:.1f}%, LD busy {100 * b['ld_busy']:.1f}%, "
                   f"VE active {100 * b['ve_active']:.1f}%, head blocked "
                   + ", ".join(f"{e} {100 * v:.1f}%" for e, v in b["head_blocked"].items()))
         if not ok:
             print("FAIL")
             return 1
-    a, b = res["without prefetch"], res["with prefetch"]
-    print(f"prefetch saves {a.mean() - b.mean():.0f} cycles per token ({100 * (1 - b.mean() / a.mean()):.1f}%), "
-          f"{a.mean() / b.mean():.3f}x; per position: min {(a - b).min()}, max {(a - b).max()}")
+    a = res["baseline"]
+    for name, _, _ in variants[1:]:
+        b = res[name]
+        print(f"{name} vs baseline: {a.mean() - b.mean():.0f} cycles per token less "
+              f"({100 * (1 - b.mean() / a.mean()):.1f}%), {a.mean() / b.mean():.3f}x")
     dev.close()
     print("PASS")
     return 0

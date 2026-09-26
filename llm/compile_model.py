@@ -77,13 +77,16 @@ class Region:
 
 
 class ModelCompiler:
-    def __init__(self, m, d=None, model=Region(0), io=Region(1), kv=Region(2), prefetch=True):
+    def __init__(self, m, d=None, model=Region(0), io=Region(1), kv=Region(2), prefetch=True, fuse_silu=True):
         """m: export_w8a8.W8A8. Regions: where the model file, the io area and
         the KV cache are (BASE index + fixed add). prefetch: load the first
         weight chunk of every linear layer while the vector steps before it run
         (right after the previous layer's last EX, into the SPAD_B bank that EX
-        does not use; attention then keeps to the other bank)."""
-        self.prefetch = prefetch
+        does not use; attention then keeps to the other bank). fuse_silu: compute
+        W13 in h1 / h3 chunk pairs and the SiLU of each pair right after it, so it
+        overlaps the next chunk's EX (the FFN activations live in the ACC bank
+        the following chunks' scratch does not use)."""
+        self.prefetch, self.fuse_silu = prefetch, fuse_silu
         self._seq, self._li, self._pre_bank = [], 0, None
         self.m, self.cfg = m, m.cfg
         c = self.cfg
@@ -123,6 +126,10 @@ class ModelCompiler:
         if nxt[0] > lay.cbank:
             raise ValueError(f"ACC plan needs {nxt[0]} words, bank 0 has {lay.cbank}")
         self.acc_used = nxt[0]
+        # second copies of the FFN activations in ACC bank 1 (SiLU fused into W13)
+        self.H13b, self.Ub = lay.acc1, lay.acc1 + w(2 * c.hidden)
+        if self.Ub + w(c.hidden) > 2 * lay.cbank:
+            raise ValueError("ACC bank 1 plan does not fit")
         sb = lay.sbank
         # SPAD_A: A strips at 0 (bank 0); raw K_h, embedding row, KV staging in bank 1
         self.KRAW = sb
@@ -274,14 +281,40 @@ class ModelCompiler:
               dyn=[("dst", P_L1, True)])
         dl.loop_end(start - len(dl), c.heads, k1=P_L0, s1=hs, k2=P_L1, s2=hw)
 
-    def silu_mul(self, dl):
-        """U = (h1 * recip(1 + exp(-h1))) * h3."""
-        c = self.cfg
-        h1, h3 = self.H13, self.H13 + c.hidden // self.d
-        dl.ve(acc(h1), 0, acc(self.U), c.hidden, COPY, T_FF, fp=True, A=-1.0, func="exp", B=NEG0)
-        dl.ve(acc(self.U), 0, acc(self.U), c.hidden, COPY, T_FF, fp=True, B=1.0, func="recip")
-        dl.ve(acc(h1), acc(self.U), acc(self.U), c.hidden, MUL, T_FF, fp=True, B=NEG0)
-        dl.ve(acc(self.U), acc(h3), acc(self.U), c.hidden, MUL, T_FF, fp=True, B=NEG0)
+    def silu_mul(self, dl, h13=None, u=None, g0=0, groups=None):
+        """U = (h1 * recip(1 + exp(-h1))) * h3, for groups [g0, g0 + groups) (default all)."""
+        c, d = self.cfg, self.d
+        h13 = self.H13 if h13 is None else h13
+        u = (self.U if u is None else u) + g0
+        n = d * (c.hidden // d if groups is None else groups)
+        h1, h3 = h13 + g0, h13 + c.hidden // d + g0
+        dl.ve(acc(h1), 0, acc(u), n, COPY, T_FF, fp=True, A=-1.0, func="exp", B=NEG0)
+        dl.ve(acc(u), 0, acc(u), n, COPY, T_FF, fp=True, B=1.0, func="recip")
+        dl.ve(acc(h1), acc(u), acc(u), n, MUL, T_FF, fp=True, B=NEG0)
+        dl.ve(acc(u), acc(h3), acc(u), n, MUL, T_FF, fp=True, B=NEG0)
+
+    def ffn_up(self, dl, l):
+        """W13 and SiLU; returns the ACC word of U (the input of W2)."""
+        c, d, lay = self.cfg, self.d, self.lay
+        if not self.fuse_silu:
+            self.linear(dl, self.XN, c.dim, "w13", l, out=self.H13)
+            self.silu_mul(dl)
+            return self.U
+        half = c.hidden // d                                        # tiles of h1 (= of h3)
+        cap = min(lay.sbank // c.dim, lay.scr // (d + 2))
+        nc = max(x for x in range(1, min(cap, half) + 1) if half % x == 0)
+        nh = half // nc
+        bank0 = self._pre_bank if self._pre_bank is not None else 0  # chunk 0's SPAD_B / ACC scratch bank
+        # the SiLU after each pair overlaps the next (even-position) chunk, whose scratch is in ACC bank0:
+        # keep the FFN activations in the other bank
+        h13, u = (self.H13b, self.Ub) if bank0 == 0 else (self.H13, self.U)
+        order = [j for m in range(nh) for j in (m, nh + m)]
+
+        def after(i, j):
+            if j >= nh:                                             # h3 chunk m done (h1 chunk m before it)
+                self.silu_mul(dl, h13, u, (j - nh) * nc, nc)
+        self.linear(dl, self.XN, c.dim, "w13", l, out=h13, order=order, after_chunk=after, nc=nc)
+        return u
 
     def residual(self, dl):
         dl.ve(acc(self.X), acc(self.Y), acc(self.X), self.cfg.dim, ADD, T_FF, fp=True, B=NEG0)
@@ -296,9 +329,8 @@ class ModelCompiler:
         self.linear(dl, self.ATT, c.dim, "wo", l, out=self.Y)
         self.residual(dl)
         self.rmsnorm(dl, self.X, "rms_ffn", l, self.XN)
-        self.linear(dl, self.XN, c.dim, "w13", l, out=self.H13)
-        self.silu_mul(dl)
-        self.linear(dl, self.U, c.hidden, "w2", l, out=self.Y)
+        u = self.ffn_up(dl, l)
+        self.linear(dl, u, c.hidden, "w2", l, out=self.Y)
         self.residual(dl)
 
     def final(self, dl):
