@@ -175,6 +175,11 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
   completion IRQ, resident RISC-V firmware, compiler-facing command
   extensions for MLIR/IREE, fp32 vector/special-function unit, W8A8 + int8
   KV cache) built in levels L0-L6, 50 MHz with 75 MHz as a stretch goal
+- [LLM compiler plan (中文)](docs/iree_compiler_plan.md) - the design of the
+  end-to-end compiler (level L6-IREE): a quantized PyTorch llama exported with
+  iree-turbine, an IREE target-backend plugin that emits descriptor-list
+  templates, and a C HAL driver on the ARM that submits them through the
+  command ring, in stages C0-C5
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)
 - [Custom instruction encoding](docs/custom_isa_encoding.md) and

@@ -24,6 +24,7 @@
 
 - [`double_buffer_design.md`](double_buffer_design.md)：当前加速器，§3 数据布局、§6 VE、§7 记分板、§8 指令与描述符；
 - [`perf_counters_and_desc_dma_plan.md`](perf_counters_and_desc_dma_plan.md)：性能计数器与描述符 DMA（M5）；
+- [`iree_compiler_plan.md`](iree_compiler_plan.md)：L6-IREE 的详细设计（PyTorch → MLIR/IREE → 描述符列表）；
 - [`../notebooks/llm/README.md`](../notebooks/llm/README.md)：第一步测量。结论：单序列 decode 受带宽限制，D=16、50 MHz 下只计 GEMV 为 24.5 tok/s（stories15M），与 ARM 的 int8 版本 22.9 tok/s 基本持平。
 
 ---
@@ -1034,6 +1035,9 @@ IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 →
    转换算子有三种：TRANSPOSE、DIV-D 复制行、经 DDR 的 LD INTERLEAVE。
 5. **代价模型**：功能模拟器的周期估计（§4.3），用计数器校准。
 
+> **详细设计**：本节是概要。编译器与运行时的完整设计、分阶段计划（C0–C5）和验收见
+> [`iree_compiler_plan.md`](iree_compiler_plan.md)。
+
 ### 10.4 两种接入方式
 
 - **A. 模板库**（先做，L6-IREE）：把 linalg 的具名算子匹配到预先写好的可执行体模板，
@@ -1166,7 +1170,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | **L5** | Python 运行时；端到端生成文本 | Python | 否 | §9.2 的 4 项 | **完成**（89741a3；15.1 tok/s 墙钟，top-1 96.2%） |
 | L5b | 多序列并发 decode | Python | 否 | §11.1 | **完成**（faf7bc7；8 条序列 63.3 tok/s） |
 | L5.5 | 75 MHz | 时钟与少量时序修复 | 是 | §11.2 | 未做（LUT 已用 83%，时序更难收敛） |
-| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5 | 未做（IREE 的编译器和运行时已在 L0 于板上验证） |
+| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | 未做，方案已写（C0–C5）；IREE 的编译器和运行时已在 L0 于板上验证 |
 | L6 | 其他扩展 | — | 视情况 | 每项单独定 | 未做 |
 
 - **建议顺序**：L0 → L1 → L2 → L3 → L4 → L5 → L6-IREE，L5b 和 L5.5 可以穿插进行。
