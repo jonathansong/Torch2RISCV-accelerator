@@ -4,6 +4,8 @@
 (256×256×256，M4 板卡构建，D = 16) 为例，逐层跟踪一次运行：Python
 驱动 → PicoRV32 固件 → PCPI 自定义指令 → 调度器 → 各引擎 → BRAM / DDR，
 再返回 Python。int8 GEMM 和向量运算走的是同一条路，只是多了 VE 命令。
+第 10 节是 M5 的描述符列表路径。第 11 节是 LLM 推理中的一个 token（L4–L5，D = 8 的 `l2` 构建）：
+命令环、常驻固件、带 PARAM / LOOP 的静态列表，以及中断。
 
 配套阅读：[`double_buffer_design.md`](double_buffer_design.md)（设计，
 §4 EX、§5 DMA、§7 记分板、§8 指令）、[`memory_model.md`](memory_model.md)
@@ -25,6 +27,7 @@
 8. [按层调试清单](#8-按层调试清单)
 9. [亲眼看这个过程](#9-亲眼看这个过程)
 10. [另一条路径：描述符列表](#10-另一条路径描述符列表)
+11. [第三条路径：LLM 的一个 token](#11-第三条路径llm-的一个-tokenl4l5)
 
 ---
 
@@ -430,3 +433,73 @@ PicoRV32 只执行一条 `mat_submit`（M5，设计文档 §8.6）。从调度�
 实测（`notebooks/m5_desc_demo.py`，设计文档 §10.5）：本来受前端限制的小运算明显变快
 （16³ 4.19×、64³ 1.23×、int8 64³ 1.52×、广播向量运算 2.60×），256³ 这类大 GEMM 不变，
 因为它们的前端本来就跑在硬件前面。
+
+---
+
+## 11. 第三条路径：LLM 的一个 token（L4–L5）
+
+以 `llm/runtime.py` 的 `LlamaDevice.forward(token)` 为例：stories15M，`bitstreams/l2`（D = 8，带 fp32 VE），
+一个 token 约 2.48M 周期（49.6 ms）。完整方案见 [`llm_inference_plan.md`](llm_inference_plan.md) §5、§8、§9。
+和第 10 节相比，多了三样东西：
+- 命令环：固件常驻，ARM 随时提交；
+- 静态列表：整个模型一张，只靠参数变化；
+- 中断：完成时通知 ARM。
+
+```
+LlamaDevice.forward ──► 写参数块 (pos, token) + 环条目 (列表地址、BASE0–2、PARAM 块) ──► flush
+   ──► 写 mailbox RING_TAIL（门铃）
+rt_fw（PicoRV32 常驻循环）读到新条目 ──► mat_cfg 设 BASE0–3、PARAM0–7 ──► mat_submit ──► mat_fence
+   ──► sa_cmdfetch 取指 953 条（执行 2,477 条）：LDPARAM 算地址，动态槽替换字段，LOOP_END 循环
+   ──► 调度器 ──► LD / EX / ST / VE（整数）/ VE（fp32，sa_vefp）──► SPAD / ACC，DDR 经 HP2
+   ──► END ──► rt_fw 写完成记录 + RING_HEAD ──► mat_notify ──► notify_irq ──► AXI intc ──► ARM
+LlamaDevice.wait 被中断唤醒 ──► invalidate ──► 读 logits ──► NumPy 采样下一个 token
+```
+
+**1. Python（`llm/runtime.py`）**
+- 启动时只做一次：把模型文件 `.w8a8`、io 区、KV cache 和静态列表放进同一块 CMA 缓冲，
+  列表由 `llm/compile_model.py` 的 `ModelCompiler.build()` 生成。
+- 每个 token：
+  - 在 io 区写两个字 (pos, token)；
+  - 用 `Device.submit()` 写一个 64 字节的环条目：类型 RUN_LIST、IRQ 标志、seq、列表地址、
+    BASE0 = 模型、BASE1 = io、BASE2 = KV，以及 PARAM0–5 的参数块（pos+1、pos_pad 等，§8.5）；
+  - flush 以后写 mailbox 的 `RING_TAIL`，这就是门铃。
+
+**2. 固件（`firmware/rt/rt_fw.c`）**
+- 常驻循环轮询 `RING_TAIL`。读到新条目后：
+  - 用 `mat_cfg` 写 BASE 和 PARAM（key 11–34）；
+  - `mat_submit` 启动列表，`mat_fence` 等它结束；
+  - 在 DDR 写 32 字节的完成记录 (seq、状态、周期、执行条数、END 值)，更新 `RING_HEAD`；
+  - 如果条目带 IRQ 标志，执行 `mat_notify`。
+- 出错时先 `mat_reset` 再继续，后面的条目不受影响。
+
+**3. 取指单元（`sa_cmdfetch.v`）**：与第 10 节相同，另外有 L1 的扩展：
+- **动态槽**：描述符 w0[31:16] 的两个槽，在译码时用 PARAM 替换或加到字段上。
+  例如注意力的 LD K 以 `rows = P1`（pos_pad）、`ddr += P6`（头偏移）读入，
+  EX 的 `repeat = P2`，softmax 的 `VALID = P0`；
+- **LDPARAM**：取指时从 DDR 读一个字，乘以 mul 加上 add，写进 PARAM。
+  设备用它从参数块算出 KV 行偏移（pos × dim）、RoPE 行偏移、嵌入行偏移，并读出嵌入的 scale；
+- **LOOP_END**：注意力按头循环（P6、P7 每轮加一次步长）、分类层按块循环；
+- **FENCE**：本 token 的 K、V 行 ST 进 DDR 以后，注意力才能把它们 LD 回来。硬件不跟踪 DDR 依赖，
+  这个 FENCE 是必须的（`memory_model.md`）。
+
+**4. 引擎**：LD、EX、ST 和整数 VE 与第 5 节相同，另外：
+- **fp32 VE**（`sa_vefp.v`，命令的 FP 位或 op = 6 时由它执行）：
+  - RMSNorm：REDUCE SUM，然后 RSQRT；
+  - 激活量化：REDUCE MAX(ABS)，然后 RECIP，最后输出 int8 并用 DIV 复制成 A 条带；
+  - 反量化：I32 × s_w（MOD）× s_x（DIV）；
+  - RoPE（SWAPNEG）、softmax（VALID、EXP）、SiLU；
+  - TRANSPOSE 把 K 变成 B 条带。
+- **一个线性层**：权重按块用 LD 读进 SPAD_B，两个 bank 交替；EX 用复制行的 A 条带乘上权重；
+  下一块的 LD 与这一块的 EX 重叠（分类层 LD 忙碌 93.9%）。
+
+**5. 返回**：`Device.wait()` 在 `notify_irq` 上等（PYNQ `Interrupt`），醒来后读完成记录，
+invalidate 以后读 logits。完成记录必须先由 ARM 读过，对应的环位置才能复用（`memory_model.md` 的命令环一节）。
+
+**周期花在哪**（最后一个 token 的计数器，`l5_generate.py`）：
+- EX useful 约 77%，LD 忙碌约 80%，VE active 约 14%；
+- 队首阻塞中约 80% 是 VE：后处理和注意力的 VE 步骤在等前面的 EX 完成；
+- ARM 端每个 token 另有约 13 ms：采样、等中断、拷贝 logits。
+
+**批处理**（L5b，`llm/compile_batch.py`）：同样的路径，只是一步里 8 条序列共用一次权重流。
+每条序列的 PARAM 由 LDPARAM 从 DDR 参数表读入，A 条带经 DDR 往返（ST → FENCE → LD INTERLEAVE）。
+8 条序列合计 63.3 tok/s，瓶颈转到 VE。

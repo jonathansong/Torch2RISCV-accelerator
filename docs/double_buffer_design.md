@@ -24,6 +24,21 @@ Changes are marked *(M4)*. **Performance counters** (`sa_perf.v`, `mat_perf`;
 the board (`RISCV-on-PYNQ-Z1/bitstreams/m5/`): front-end-bound work runs 1.2–4.2×
 faster, large GEMMs unchanged (§10.5).
 
+**LLM inference levels L0–L5b** ([`llm_inference_plan.md`](llm_inference_plan.md))
+build on this unit. The LLM work uses a **D = 8** build (L0) to leave room for
+new logic. The unit was extended twice:
+- **L1**: compiler-facing command extensions in `sa_cmdfetch.v` (BASE0–15,
+  PARAM0–7, dynamic fields, SETREG, LOOP_END, CALL / RET, LDPARAM); a host
+  interrupt (`mat_notify`, `notify_irq`); a resident runtime firmware that
+  serves a command ring. Bitstream: `bitstreams/l1`.
+- **L2**: an fp32 vector engine (`sa_vefp.v`: fp32 ops, EXP / RECIP / RSQRT,
+  row reductions, index modes, TRANSPOSE), next to the integer VE of §6.
+  Bitstream: `bitstreams/l2`, 44.0k LUT, WNS +1.84 ns at 50 MHz.
+
+stories15M runs end to end on the `l2` build, bit-exact with the reference
+model. Changes are marked *(L1)* / *(L2)*; the full specifications are in the
+LLM plan §5 and §6.
+
 ## 1. Goals and decisions
 
 The Phase 3/4 unit processes one independent 8×8×8 job at a time, straight
@@ -321,6 +336,27 @@ For data from DDR the three HP ports limit elementwise ops to ≈ 3 int16
 elements/cycle, so VL matters most for fused ops and multi-pass work on data
 that is already on chip.
 
+### 6.5 fp32 vector engine *(L2)*
+
+`rtl/sysarray/sa_vefp.v` sits next to the integer engine. `sa_unit` routes a
+VE command to it when FLAGS bit 0 (FP) is set or when op = 6 (TRANSPOSE). The
+two engines share the memory ports (ORed; only one is busy at a time) and the
+VE performance events.
+- **Numerics**: IEEE fp32 with round to nearest even, flush to zero, and a
+  canonical NaN. Bit-exact with `llm/fp32.py` and `llm/sfu.py` through the
+  functional simulator `llm/sa_funcsim.py`.
+- **Per group**: `y = FUNC(OP(src1, src2) × A + B)`, then RELU and the VALID
+  mask, then an output conversion (F32 / I32 to ACC, I8 to SPAD) or a row
+  reduction (SUM / MAX, one broadcast word per row).
+- **Index modes**: LIN, MOD P, DIV P, and IMM for src2; SWAPNEG for RoPE.
+- **Lane folding**: FL = D / 2 physical fp lanes. A group passes through as two
+  halves. The full-width engine did not fit next to the rest of the unit.
+- **Two modes**: a stream mode for element-wise work, and a microsequencer
+  for the special functions and reductions.
+
+Encoding: descriptor w3[63:53], w5[63:32], w6, w7 and `vec_cfg` keys 10–15
+(LLM plan §6.6). Implementation record and measurements: LLM plan §6.9.
+
 ### 6.4 Implementation *(M3)*
 
 - **Types are tied to memories**: int32 lives only in ACC (one word per
@@ -398,6 +434,7 @@ dispatch queue (8 entries) is full.
 | 4 | `mat_fence` | engine mask (bit0 LD, 1 ST, 2 EX, 3 VE; 0 = all) | — | extended status |
 | 5 | `mat_perf` | read: counter index [4:0]; control: bit 31 = 1 | control: [0] clear, [1] enable | read: counter; control: number of counters |
 | 6 | `mat_submit` | descriptor list address (64-byte aligned) | count (0 = until END) | — (§8.6) |
+| 7 | `mat_notify` *(L1)* | — | — | — : one pulse on `notify_irq` (the host interrupt), `NOTIFY_COUNT` (CSR 0xD4) + 1; CAPS bit 22 |
 
 `mat_exec` flags: bit28 accumulate. Kt: 1 .. 4095 k-tiles.
 
@@ -421,6 +458,8 @@ mirror (0x40 + 4·i, `PERF_CTRL` at 0x3C). Counter list: §10.4.
 | 8 EX_B_STEP *(M2)* | SPAD_B words between the tiles' B strips |
 | 9 EX_C_STEP *(M2)* | ACC words between tiles |
 | 10 EX_C_ROW *(M2)* | ACC words between rows of a tile (default 1) |
+| 11–26 BASE0–15 *(descriptor DMA, L1)* | descriptor relocation bases (the fetch unit's registers; keys 11–14 = BASE0–3 since M5) |
+| 27–34 PARAM0–7 *(L1)* | descriptor parameters (dynamic fields, LOOP_END, LDPARAM) |
 
 Configuration is copied into each command when it is queued, so software
 may change it immediately after issuing.
@@ -463,6 +502,11 @@ Captured at queue time like `mat_cfg`.
 Validation at dispatch (sticky error, like §5.4): zero groups, a type > 2,
 op > COPY, MUL on int32, a type in the wrong memory, or a range past the end
 of its memory. The queue packet is 261 bits wide (`SA_PKT_W`).
+
+*(L2)* Keys 10–15 hold the fp32 engine's fields: FLAGS (FP, FUNC, M1, M2,
+REDUCE, SWAPNEG), IMM, A, B, ROWLEN / VALID, P1 / S. TYPES gains VT_F32 = 3
+(ACC only) and a src2 type in bits [5:4]. Op 6 is TRANSPOSE. The packet
+grows to 432 bits.
 
 ### 8.5 Compatibility
 
@@ -532,6 +576,18 @@ configuration, no `mat_cfg` state is used.
   index of a failing descriptor, 0xD0 descriptors decoded in the current
   list. CAPS bit 21 = present.
 
+*(L1)* Compiler-facing extensions (CAPS bit 24; LLM plan §5.3, appendix A):
+- BASESEL widens to `{w0[14:13], w0[10:9]}` (BASE0–15);
+- w0[31:16] holds two dynamic slots, each replacing or adding a PARAM into a
+  numbered field;
+- new opcodes: 0x13 LOOP_END (two nested levels, two PARAMs stepped per
+  iteration), 0x14 SETREG, 0x15 CALL / 0x16 RET (depth 4), 0x17 LDPARAM
+  (`PARAM = mem32 × mul + add`, read at fetch time);
+- JUMP w2[0] = relative.
+
+The END IRQ bit is still unused: the host is notified through `mat_notify`
+from the runtime firmware. *(L2)* VE descriptors use w3[63:53] and w5–w7.
+
 **Implementation**: descriptors are prefetched with one 8-beat burst each,
 up to four in flight, into a 32 × 64-bit LUTRAM FIFO (no BRAM), assembled
 and decoded one at a time. The fetch unit shares DMA port 0 with the LD
@@ -549,6 +605,11 @@ fetch AR stalled.
   HP1/HP2/HP3, each mapped 0x0000_0000–0x1FFF_FFFF.
 - PCPI and the CSR window at 0x8000_0000 unchanged; ACC/SPAD are not
   memory-mapped to the CPU (only reachable through the engines).
+- *(As built, M4)* One DMA port (HP2) only; the three-port option was
+  dropped (§10.3), so HP1 / HP3 stay off.
+- *(L1)* `irqConcat` gets a second input: `In1` = `matmul_0/notify_irq`
+  (rising edge) into the AXI interrupt controller, next to the PicoRV32
+  trap on `In0`.
 
 ## 10. Expected performance
 
@@ -771,6 +832,13 @@ With the performance counters (`bitstreams/m4p`): 48.3k LUT (90.7 %; +0.65k),
 well (`bitstreams/m5`): 48.9k LUT (92.0 %; +0.66k), 36.4k FF, same DSP / BRAM,
 WNS +2.5 ns.
 
+*(L0–L2, D = 8)* The LLM builds go back to D = 8 to make room:
+- `bitstreams/l0`: 23.5k LUT, WNS +1.56 ns.
+- `bitstreams/l1`: command extensions and notify, 27.1k LUT (51 %), WNS +2.35 ns.
+- `bitstreams/l2`: fp32 VE, 44.0k LUT (82.7 %), 33.6k FF, 116 DSP, 130 BRAM36,
+  WNS +1.84 ns. In OOC, `sa_vefp` is 17.2k LUT with FL = 4 lanes; with 8 lanes
+  it was 28.9k and the unit did not place.
+
 Everything runs at 50 MHz; the Phase 2 LUT-PE array alone reached ≈ 99 MHz,
 so timing margin is large. BRAM has no room for an ILA without shrinking
 the memory parameters.
@@ -789,6 +857,7 @@ regression, then the tested bitstream is committed under
 | **M4** | D = 16 build (8 DSP columns, VL = 16); three HP ports with striping if the D = 16 measurements need them (§10.1) | All of the above at D = 16; resource/timing report *(done, board-verified; three ports not needed, §10.3)* |
 | **M4 + perf** | Performance counters (`sa_perf.v`, `mat_perf`); firmware schedule tuning | Counters checked against exact invariants on the board; measured cycle breakdown (§10.4) *(done, `bitstreams/m4p`)* |
 | **M5** | Descriptor DMA (`sa_cmdfetch.v`, `mat_submit`, ARM-built lists) | Same results as the PCPI path; front-end-bound work faster, nothing slower (§10.5) *(done, `bitstreams/m5`)* |
+| **L0–L5b** | LLM inference on this unit (D = 8): command ring and extensions (L1), fp32 VE (L2), W8A8 linears (L3), the whole decoder as one list (L4), the ARM runtime (L5), batched decode (L5b) | [`llm_inference_plan.md`](llm_inference_plan.md) §13 *(done, `bitstreams/l1`, `l2`)* |
 
 ## 13. Verification
 
@@ -819,8 +888,9 @@ regression, then the tested bitstream is committed under
   the shared 16-bit DDR3 would lower it.
 - **BRAM at 93 %**: placement is fine at 50 MHz, but debugging with an ILA
   needs a reduced-memory build.
-- **LUT at 92 %** (M5 build): further logic needs `DSP_COLS = 10` (≈ 5k LUT
-  freed, 216 of 220 DSP) or a slimmer VE.
+- **LUT at 92 %** (M5 build, D = 16): further logic needs `DSP_COLS = 10`
+  (≈ 5k LUT freed, 216 of 220 DSP) or a slimmer VE. *(L2)* The LLM build is
+  D = 8 at 82.7 % with the fp32 VE. D = 16 with the fp32 VE would not fit.
 - **Complexity**: the scoreboard and multi-port DMA were the risky parts;
   both got randomized tests against reference models before integration
   (the multi-port DMA is tested at `NPORTS = 3` but not built).

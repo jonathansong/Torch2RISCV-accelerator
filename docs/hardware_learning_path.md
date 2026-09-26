@@ -11,6 +11,14 @@ The project history is itself a curriculum: Phase 2 → Phase 4 built a
 simple 8×8 unit, M1 → M4 rebuilt it as a double-buffered 16×16 accelerator
 with a vector engine, and M5 made it observable (performance counters) and
 added a descriptor DMA once the counters showed where time was lost.
+The LLM levels L0–L5b ([`llm_inference_plan.md`](llm_inference_plan.md))
+then turned it into an industry-style inference system on a D = 8 build:
+- a command ring served by resident firmware, with a host interrupt, and
+  compiler-facing descriptor extensions (L1);
+- an fp32 vector engine with special functions (L2);
+- W8A8 linears, and the whole llama2 decoder as one static list (L3–L4);
+- an ARM runtime that generates text (L5) and batches 8 sequences (L5b).
+
 Reading the commits in order (`git log --reverse`) shows each idea arriving
 on its own. To follow one operation through every layer first, read
 [`execution_walkthrough.md`](execution_walkthrough.md) (Chinese).
@@ -46,13 +54,16 @@ on its own. To follow one operation through every layer first, read
    │ GPIO EMIO[0] = RISC-V reset                        ▼ PCPI
    │ builds descriptor lists in DDR              sa_pcpi ─────┐
    │  (fetched after mat_submit)                 sa_cmdfetch ─┴► sa_sched (queue, decode, scoreboard)
+   │ L1: command ring in DDR, served by           (L1: BASE/PARAM, dynamic fields, LOOP, CALL, LDPARAM)
+   │  firmware/rt; waits on notify_irq ◄── AXI intc ◄── notify_irq ◄── mat_notify
    │                                                               │ in-order dispatch to 4 engines
    ▼                                                               │   (sa_perf counts events everywhere)
  DDR3 (512 MB) ◄── HP0 ── PicoRV32 data (DDR access)               ├─► LD  (DDR → SPAD/ACC)  ┐
       ▲                                                            ├─► ST  (SPAD/ACC → DDR)  ├─ AXI4 ─► HP2
       └────────── HP2 ◄── axi_protocol_converter ◄─────────────────┤                         ┘
                                                                    ├─► EX  (D×D systolic array, K-streaming)
-                                                                   └─► VE  (vector engine, VL = D)
+                                                                   └─► VE  (integer sa_ve, VL = D;
+                                                                            L2: fp32 sa_vefp + SFU + TRANSPOSE)
                                                      SPAD_A, SPAD_B (128 KB each), ACC (256 KB): 2 banks each
 ```
 
@@ -60,6 +71,12 @@ Numbers to keep in mind (M5 build, board-measured): D = 16, 256 MAC/cycle
 peak at 50 MHz, 202.6 MAC/cycle on a 256³ GEMM (the array does useful work
 79 % of the time), one HP port at 7.9 B/cycle (99 % of 8 B/cycle), 128 of
 140 BRAM36 in the accelerator, 92 % of LUTs.
+
+The LLM build (`bitstreams/l2`, D = 8) has these numbers:
+- 44.0k LUT (82.7 %), WNS +1.84 ns at 50 MHz;
+- stories15M decoded entirely on the device at 18.9 tok/s (15.1 tok/s wall
+  clock, including the ARM side), bit-exact with the reference model;
+- 8 sequences batched at 63.3 tok/s.
 
 ---
 
@@ -377,6 +394,35 @@ memory ids, keys, error codes) open next to it.
 - *Check:* why must JUMP drain the prefetched bursts instead of just
   changing the fetch address? Why is opcode 0x00 invalid on purpose?
 
+- *(L1)* The same unit decodes the compiler-facing extensions. Each
+  descriptor has two dynamic slots that replace or add a PARAM into a field.
+  SETREG, LOOP_END (two levels), CALL / RET and LDPARAM (a DDR word × mul +
+  add into a PARAM) are executed inside the fetch unit
+  (`llm_inference_plan.md` §5.3).
+- *Check:* why can a LOOP_END re-fetch its body from DDR every iteration
+  without a loop buffer, and what does that cost? Why must a LOOP body reset
+  its PARAMs with SETREG before it starts?
+
+### 5.11 fp32 vector engine - `sa_vefp.v`, `sa_fp32_*.v` *(L2)*
+- The arithmetic units: `sa_fp32_add.v` and `sa_fp32_mul.v` (4 stages each)
+  and `sa_fp32_cvt.v` (i2f / f2i). They use round to nearest even, flush to
+  zero and a canonical NaN, and are bit-exact with `llm/fp32.py`.
+- `sa_vefp.v` runs FL = D / 2 physical lanes (lane folding: a group passes as
+  two halves). A stream pipeline handles element-wise work. A
+  microsequencer reuses each lane's M2 / A2 / i2f / f2i for EXP / RECIP /
+  RSQRT (table lookup plus Newton steps, `llm/sfu.py`) and for row
+  reductions. A small state machine does TRANSPOSE.
+- *Check:* why does the reduction order (lane-sequential, then a pairwise
+  tree) have to be a specification rather than an implementation detail?
+  Why did folding to D / 2 lanes cost nothing for binary ops?
+
+### 5.12 Host notification - `mat_notify`, `notify_irq` *(L1)*
+- `sa_pcpi` funct3 = 7 pulses `notify_irq`: 4 cycles high, then at least 1
+  low. A pending counter keeps back-to-back notifies as separate edges.
+  `NOTIFY_COUNT` (0xD4) counts them.
+- *Check:* why is this an edge interrupt and not a level with a W1C status
+  bit? (Hint: which master can reach the CSRs?)
+
 **Lab (Stage 5).** Pick one change and carry it through simulation:
 - make `sa_ld` issue at most 4 outstanding bursts (`QD`) and measure
   `tb_sa_dma` burst counts / cycles;
@@ -559,10 +605,16 @@ from the counters), §10.5 (descriptor lists vs PCPI).
 ## Stage 10 - Where to go next (capstone ideas)
 
 Each is a self-contained project on top of M5; they are listed roughly by
-difficulty. (Already done in this repository, as worked examples: the
-performance counters and the descriptor DMA - see
-[`perf_counters_and_desc_dma_plan.md`](perf_counters_and_desc_dma_plan.md)
-for how such a project is planned, verified and measured.)
+difficulty. Several are already done in this repository and serve as worked
+examples:
+- the performance counters and the descriptor DMA
+  ([`perf_counters_and_desc_dma_plan.md`](perf_counters_and_desc_dma_plan.md));
+- the whole LLM path, L0–L5b ([`llm_inference_plan.md`](llm_inference_plan.md)).
+  It covers the command ring and firmware, the fp32 VE, and the compiler-facing
+  descriptor extensions (which answer item 10's question in practice).
+
+Both documents show how such a project is planned, verified (functional
+simulator, then RTL co-simulation, then the board) and measured.
 
 1. **Board stress test**: run the random command stream as descriptor lists
    (`DescList`) with a Python reference model - millions of commands on the
@@ -609,6 +661,14 @@ for how such a project is planned, verified and measured.)
 | Counter check passed in simulation, failed on the board | the counting window includes a few instructions, fetched much slower on the board | check a constant offset range, not a simulated tolerance (`m4_perf.py`) |
 | Read error of a descriptor fetch lost (found in review) | a non-blocking assignment before a `case` was overwritten by one inside it | apply the error after the `case` (`sa_cmdfetch.v`) |
 | `xvlog`: redeclaration of ANSI port | a new port had the name of an existing internal register | rename the port (`sa_legacy.v`) |
+| *(L1)* Board: "completion record 0: seq 192" after a long async batch | the driver counted RING_HEAD alone and let the firmware overwrite records the ARM had not read yet | reuse a ring slot only after its record was read (`Device.submit`) |
+| *(L1)* Back-to-back `mat_notify` merged into one interrupt | two pulses closer than the edge detector could see | a pending counter; ≥ 4 cycles high, ≥ 1 low (`sa_legacy.v`) |
+| *(L2)* One micro-program ran past its end | the END micro-op literal was truncated to 16 bits | `{4'd9, 11'd0}` (`sa_vefp.v`) |
+| *(L2)* RSQRT wrong for odd exponents | a signed / unsigned mix in the exponent arithmetic | `$signed({11'd0, odd})` (`sa_vefp.v`) |
+| *(L2)* Round-half-up mutation caught by one vector only | random fp32 inputs almost never hit an exact tie | directed tie vectors (`gen_fp32_vectors.py`) |
+| *(L2)* Integer VE commands issued through PCPI were rejected | the A register resets to 1.0 (the fp32 default) and was sent in every packet, but integer commands must carry zero L2 fields | L2 fields go into the packet only for fp commands (`sa_pcpi.v`) |
+| *(L2)* The unit did not place (60.7k LUT needed) | 8 full fp32 lanes | lane folding FL = D / 2 (`sa_vefp.v`), 17.2k LUT |
+| *(L2)* Random cosim "errors" after reductions | the test compared ACC words the command never writes (stale data) | store only the reduction outputs (test fix, `gen_desc_cases.py`) |
 
 ## Appendix B - Glossary
 
@@ -636,6 +696,17 @@ for how such a project is planned, verified and measured.)
   engine is busy: the hardware waits for the next command.
 - **Descriptor list** - 64-byte commands in DDR built by the ARM and run by
   the fetch unit after one `mat_submit`; FENCE / JUMP / END control it.
+- **BASE / PARAM** *(L1)* - the fetch unit's relocation bases (16) and
+  32-bit parameters (8). Dynamic fields, LOOP_END and LDPARAM use them; one
+  static list serves every token.
+- **Command ring** *(L1)* - 64-byte entries in DDR that the ARM submits
+  (doorbell = mailbox `RING_TAIL`). The resident firmware `firmware/rt` runs
+  them and writes a completion record for each.
+- **Lane folding** *(L2)* - the fp32 VE has D / 2 physical lanes; a group of
+  D elements passes through them as two halves.
+- **Bit-exact** - the device, the functional simulator
+  (`llm/sa_funcsim.py`) and `DeviceModel(sfu=SfuExact)` produce the same bits
+  for every step, including the order of reductions.
 
 ## Appendix C - References
 

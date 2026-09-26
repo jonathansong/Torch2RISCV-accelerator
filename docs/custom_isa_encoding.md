@@ -6,18 +6,44 @@ R-type instructions in the RISC-V **custom-0** opcode space and drives the
 matmul unit directly, bypassing its AXI4-Lite CSRs.
 
 > **Status.** This page specifies the Phase 4 group (funct7 = 0). Since M1 the
-> overlay runs the double-buffered accelerator `rtl/sysarray`, which keeps
-> these five instructions with the same behavior (`sa_pcpi.v` + the legacy
-> sequencer `sa_legacy.v`; at D = 16 a job is zero-padded to 16×16) and adds
-> two more groups in the same opcode space:
+> overlay runs the double-buffered accelerator `rtl/sysarray`. It keeps these
+> five instructions with the same behavior (`sa_pcpi.v` plus the legacy
+> sequencer `sa_legacy.v`; at D = 16 a job is zero-padded to 16×16). It adds
+> two more groups in the same opcode space, which grew with milestones M2–M5
+> and with levels L1–L2 of the LLM plan (`llm_inference_plan.md`):
 >
 > | funct7 | Group | Instructions (funct3) | Specification |
 > |---|---|---|---|
 > | 0 | legacy 8×8×8 jobs | `mat_trigger` 0, `mat_status` 1, `mat_reset` 2, `mat_wait` 3, `mat_cycles` 4 | this page |
-> | 1 | matrix / DMA | `mat_cfg` 0, `mat_load` 1, `mat_store` 2, `mat_exec` 3, `mat_fence` 4, `mat_perf` 5, `mat_submit` 6 | `double_buffer_design.md` §8.1–8.3, §8.6 |
-> | 2 | vector | `vec_cfg` 0, `vec_run` 1 | `double_buffer_design.md` §8.4 |
+> | 1 | matrix / DMA / host | `mat_cfg` 0, `mat_load` 1, `mat_store` 2, `mat_exec` 3, `mat_fence` 4, `mat_perf` 5, `mat_submit` 6, **`mat_notify` 7** (L1) | `double_buffer_design.md` §8.1–8.3, §8.6; `llm_inference_plan.md` §5 |
+> | 2 | vector | `vec_cfg` 0, `vec_run` 1 | `double_buffer_design.md` §8.4; `llm_inference_plan.md` §6.6 |
 >
-> C wrappers for all of them: `firmware/include/sysarray_intrinsics.h`.
+> These are the extensions since M5:
+>
+> - **`mat_notify`** (funct7 = 1, funct3 = 7, L1) raises the host interrupt:
+>   `notify_irq` pulses (4 cycles high, queued so back-to-back notifies stay
+>   separate edges) and `NOTIFY_COUNT` (CSR 0xD4) increments. The resident
+>   runtime firmware (`firmware/rt`) issues it after each completed ring
+>   entry whose IRQ flag is set.
+> - **`mat_cfg` keys 11–34** (L1) write the descriptor fetch unit's registers
+>   BASE0–15 (keys 11–26) and PARAM0–7 (keys 27–34). The write waits while a
+>   list is running.
+> - **`vec_cfg` keys 10–15** (L2) hold the fp32 vector engine fields:
+>   10 FLAGS (FP, FUNC, M1, M2, REDUCE, SWAPNEG), 11 IMM, 12 A, 13 B,
+>   14 ROWLEN / VALID, 15 P1 / S. `vec_run` passes them only for fp commands
+>   (FLAGS bit 0), and S only for TRANSPOSE (op 6). Integer VE commands are
+>   unaffected by earlier `vec_cfg` settings.
+> - **CAPS** (CSR 0x24) bits:
+>   - 20 performance counters;
+>   - 21 descriptor fetch;
+>   - 22 `mat_notify` + `notify_irq`;
+>   - 23 fp32 vector engine;
+>   - 24 command extensions.
+>
+>   The current overlay (`bitstreams/l2`, D = 8) sets all of them.
+>
+> C wrappers for all of them: `firmware/include/sysarray_intrinsics.h`
+> (`SA_CAPS_*`, `SA_CFG_BASE(n)` / `SA_CFG_PARAM(n)`, `SA_VCFG_*`).
 
 ## Encoding
 
@@ -37,10 +63,11 @@ matmul unit directly, bypassing its AXI4-Lite CSRs.
 | 4 | `mat_cycles` | rd | Accelerator cycles of the last job (CYCLES) | no |
 
 - `funct7` must be 0 and `funct3` ≤ 4 for this group. Encodings no group
-  claims (today: funct7 = 1 with funct3 = 7, funct7 = 2 with funct3 ≥ 2,
-  funct7 ≥ 3) are not answered, so the core's PCPI timeout turns them into
-  an illegal-instruction trap. `mat_perf` and `mat_submit` exist only on
-  overlays that set CAPS bits 20 / 21; firmware checks CAPS before using them.
+  claims (today: funct7 = 2 with funct3 ≥ 2, and funct7 ≥ 3) are not
+  answered, so the core's PCPI timeout turns them into an illegal-instruction
+  trap.
+- `mat_perf`, `mat_submit` and `mat_notify` exist only on overlays that set
+  CAPS bits 20 / 21 / 22. Firmware checks CAPS before using them.
 - STATUS is the same word as the STATUS CSR: bit0 done, bit1 busy, bit2
   error, bits[11:8] error code (1 DIM, 2 address, 3 read response,
   4 write response).

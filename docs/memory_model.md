@@ -1,9 +1,11 @@
 # Memory model (overlay)
 
 Three bus masters share the PS DDR; only the ARM goes through the CPU caches.
-Written for Phase 3 (`matmul_unit`), extended for the double-buffered
-accelerator `sa_unit` (M1–M5: `rtl/sysarray`, `docs/double_buffer_design.md`),
-which keeps the same address map.
+This page was written for Phase 3 (`matmul_unit`). It was then extended for
+the double-buffered accelerator `sa_unit` (M1–M5: `rtl/sysarray`,
+`docs/double_buffer_design.md`), which keeps the same address map, and for
+the LLM levels L1–L5b (`docs/llm_inference_plan.md`): the command ring, the
+notify interrupt, and the runtime's buffers.
 
 ## Address maps
 
@@ -13,7 +15,8 @@ which keeps the same address map.
 | Program BRAM, 8 KB used | `0x4001_0000` (64 KB window) | `0xC000_0000` (reset vector) | — |
 | Performance counter area (256 B below the mailbox) | `0x4001_1E00` | `0xC000_1E00` | — |
 | Mailbox (last 256 B of BRAM) | `0x4001_1F00` | `0xC000_1F00` | — |
-| accelerator CSRs | — | `0x8000_0000` (4 KB): Phase 2 CSR map, CAPS 0x24, EXT_STATUS 0x28, PERF_CTRL 0x3C, counters 0x40–0xBC, descriptor status 0xC0–0xD0 | — |
+| accelerator CSRs | — | `0x8000_0000` (4 KB): Phase 2 CSR map, CAPS 0x24, EXT_STATUS 0x28, PERF_CTRL 0x3C, counters 0x40–0xBC, descriptor status 0xC0–0xD0, NOTIFY_COUNT 0xD4 (L1) | — |
+| notify interrupt (L1) | `matmul_0/notify_irq` → `irqConcat/In1` → AXI interrupt controller → IRQ_F2P (PYNQ `Interrupt("matmul_0/notify_irq")`) | raised by `mat_notify` | — |
 | RISC-V clock (clk_wiz DRP) | `0x4000_1000` | — | — |
 | AXI interrupt controller | `0x4002_0000` | — | — |
 | RISC-V reset | PS GPIO EMIO[0], 1 = hold | — | — |
@@ -31,6 +34,9 @@ which keeps the same address map.
   area: < 0x1E00 bytes (`firmware/common/link.ld`, checked by
   `load_firmware()`). After its measurement window the firmware copies the
   counters to 0x1E00-0x1EFF and their number to `MBOX_PERF_COUNT`.
+- The ARM cannot reach the accelerator CSRs; only PicoRV32 maps them. That
+  is why the host notification is an edge interrupt (`mat_notify`) and not a
+  status bit the ARM clears.
 
 ## Coherency
 
@@ -50,14 +56,61 @@ Descriptor lists (M5) are data the PL reads: the driver writes them into a
 `pynq.allocate` buffer and `flush()`es it before the firmware submits the
 list, like A and B.
 
+### Command ring (L1)
+
+The resident runtime firmware `firmware/rt` serves a submission ring in DDR.
+The mailbox holds its fields: `RING_BASE` / `RING_SIZE` / `RING_TAIL` /
+`RING_HEAD` at 0xB0–0xBC, `CPL_BASE` 0xC0, and `FW_STATE` / `FW_VERSION` /
+`HEARTBEAT` at 0xC4–0xCC. The driver's `Device` holds three `pynq.allocate`
+buffers:
+
+| Buffer | Content | Cache maintenance |
+|---|---|---|
+| ring | 64-byte entries: {type, flags, seq}, list address, count, BASE0–3, parameter block address | `flush()` after writing an entry, then the doorbell (`RING_TAIL`, mailbox MMIO) |
+| parameter blocks | PARAM0–7 of an entry, 32 bytes per slot | `flush()` with the entry |
+| completion records | 32 bytes per entry: seq, status, cycles, descriptors decoded, END value | `invalidate()` before reading, once `RING_HEAD` has passed the entry |
+
+A slot (entry plus completion record) is reused only after the ARM has read
+that slot's record. `submit()` collects finished records while the ring is
+full. Counting `RING_HEAD` alone would let the firmware overwrite records
+the ARM has not read yet; a board test found exactly this bug.
+
+### Relocation and the LLM runtime's buffers (L3–L5b)
+
+The DDR fields of LD / ST / LDPARAM descriptors can be relocated by a BASE
+register: address = field + BASE[n]. The ring entry sets BASE0–3, so a list
+built once is position-independent. `llm/runtime.py` (`LlamaDevice`,
+`BatchLlamaDevice`) uses one CMA buffer per model:
+
+| Region (BASE) | Content | Written by |
+|---|---|---|
+| model (BASE0) | the `.w8a8` file (`llm/export_w8a8.py`) | ARM once, then read-only |
+| io (BASE1) | argument block (pos, token), or the per-sequence argument table (L5b); logits; the L5b xq staging area | ARM (arguments), device (the rest) |
+| kv (BASE2) | int8 KV cache: layer l at l · 2 · seq_len · kv_dim, K then V; L5b: one cache per sequence | device; the ARM clears it when a sequence starts |
+| list | the static token list (`llm/compile_model.py` / `compile_batch.py`) | ARM once |
+
+Per token the ARM writes the argument block and `flush()`es it, submits the
+list, waits for the interrupt, then `invalidate()`s and reads the logits.
+Rows of the KV cache beyond the current position must be zero, which is why
+the cache is cleared at the start of a sequence.
+
 ## Ordering inside the accelerator
 
 The accelerator's scoreboard orders commands only through the on-chip
 memories (SPAD / ACC banks). **DDR is not tracked**: a store and a later load
 of the same DDR bytes can overlap. Software separates them with `mat_fence`
 (PCPI path) or a FENCE descriptor / the FENCE_BEFORE flag (descriptor
-lists); the GEMM and vector schedules never reload what they stored, so
-they need none.
+lists). The GEMM and vector schedules never reload what they stored, so
+they need none. The LLM lists do reload, and they fence in two places:
+
+- after appending this token's K / V rows (ST) and before attention reads
+  the cache back (LD);
+- in L5b, between storing the quantized activation matrix and reloading it
+  with LD INTERLEAVE as the A strip.
+
+LDPARAM also reads DDR, from the fetch unit and at fetch time. It only reads
+data the ARM wrote before submitting (argument blocks, model constants), so
+it needs no fence.
 
 ## Alignment rules
 
