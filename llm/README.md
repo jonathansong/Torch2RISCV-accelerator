@@ -16,6 +16,8 @@ This directory implements level L0 of
 | `test_l3.py` | L3: runs real stories15M layer inputs through the lists in the functional simulator. The results must be bit-exact with `DeviceModel(sfu=SfuExact)` and close to fp32. `--save` writes the cases for the board test. |
 | `compile_model.py` | L4: emits the whole decoder as one static list. Per token only the PARAM block and a (pos, token) argument block change; the device derives its own addresses with LDPARAM. Attention runs as a head loop. |
 | `test_l4.py` | L4: runs the list token after token in the functional simulator. Logits and KV cache must be bit-exact with `DeviceModel(sfu=SfuExact)`. Models: a random tiny model and stories15M. `--save` writes the golden run for the board. |
+| `runtime.py` | L5: `LlamaDevice` is the ARM runtime. It loads the model once into CMA, then per token submits the static list through the rt_fw ring, waits for the notify interrupt and samples on the ARM (run.c's `Sampler`). |
+| `prepare_l5.py` | L5: builds the reference data for the board acceptance: golden logits MD5s, and the fp32 sequences with their top-5 for the accuracy test. |
 | `test_funcsim.py` | Checks the functional simulator against the RTL co-simulation cases, the driver's golden models, control flow and error codes. |
 
 All scripts run on the host and need only NumPy. The checkpoints and
@@ -89,3 +91,13 @@ On the board (`notebooks/llm/l4_decoder_demo.py`, L2 bitstream), stories15M runs
 - All 36 tokens (16 prompt + 20 greedy) are bit-exact with `DeviceModel`, and the text matches.
 - Each token takes 2.48 M cycles: 49.6 ms, or 20.2 tok/s. For comparison, the ARM llama2.c int8 build runs at 22.9 tok/s with 2 threads.
 - See plan §8.7 for the details.
+
+## L5 results
+
+On the board, `notebooks/llm/l5_generate.py` runs stories15M end to end on the device, with every token waited for by the notify interrupt:
+
+- **Correctness**: 128 greedy tokens after the prompt are bit-exact with `DeviceModel`, and the text is identical.
+- **Accuracy**: teacher-forced top-1 against fp32 is 96.2% over 1,554 positions, above the 95% gate.
+- **Speed**: sampled generation runs at 15.1 tok/s wall clock (18.9 tok/s on the device).
+- **Stability**: 10 × 256 tokens with 0 errors and 2,560 interrupts received.
+- See plan §9.3 for the details.

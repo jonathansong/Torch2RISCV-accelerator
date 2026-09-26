@@ -826,6 +826,7 @@ class Device:
         self.keep = {}                               # seq -> buffers alive until completion
         self.done = {}                               # seq -> completion record
         self.irq = None
+        self.irq_events = 0                          # notify interrupts received by wait()
         if use_irq:
             from pynq import Interrupt
             self.irq = Interrupt("matmul_0/notify_irq")
@@ -916,6 +917,7 @@ class Device:
                 import asyncio
                 try:
                     asyncio.get_event_loop().run_until_complete(asyncio.wait_for(self.irq.wait(), 0.2))
+                    self.irq_events += 1
                 except asyncio.TimeoutError:
                     pass
 

@@ -893,6 +893,33 @@ KV cache 每层两块，都是行主序：位置 t 对应 `Smax × dim` 中的�
    估计 50 MHz 下约 25 tok/s（stories15M）。
 4. **稳定性**：连续生成 10 段，每段 256 个 token，没有错误和超时，中断次数等于 token 数。
 
+### 9.3 实现记录与结果
+
+**文件**
+- `llm/runtime.py`：`LlamaDevice` 与 `Sampler`。
+  - 模型、io 区、KV cache 和静态列表放在同一块 CMA 缓冲里，列表只生成、写入一次；
+  - 每个 token：写参数块 (pos, token) → 带 PARAM 块通过 rt_fw 命令环提交 → 等 notify 中断 → 读 logits → 在 ARM 上采样；
+  - `Sampler` 移植自 run.c：temperature、top-p 和 xorshift 随机数；
+  - 提示词走同一条 decode 路径，`generate()` 也支持 teacher forcing。
+- `driver/pynq_matmul.py`：`Device.irq_events` 统计收到的中断次数。
+- `llm/prepare_l5.py`：主机端参考数据。
+  - 贪心：DeviceModel 金标准每个位置 logits 的 MD5；
+  - 精度：L0 的 8 个评测提示词，fp32 的贪心序列及其每个位置的 top-5，以及 DeviceModel 的 argmax。
+- `notebooks/llm/l5_generate.py`：板上验收，对应 §9.2 的 4 项。
+
+**板上结果**（stories15M，D=8，50 MHz，`bitstreams/l2`，每个 token 都等中断）
+
+| 项 | 结果 |
+|---|---|
+| 1 正确性 | 提示词加 128 个贪心 token，共 132 个位置，logits 全部与 DeviceModel 逐位一致，文本完全相同：**通过** |
+| 2 精度 | 在 1,554 个位置上 teacher-forced top-1 与 fp32 一致率 **96.2%**（门槛 95%）；每个位置的 argmax 与 DeviceModel 相同：**通过** |
+| 3 演示 | temperature 0.8、top-p 0.9 生成的故事通顺。墙钟 **15.1 tok/s**，其中设备 18.9 tok/s（每个 token 2.44–2.85M 周期，随 pos 增长）。一个 token 的计数器：EX useful 77%，LD 忙碌 80%（每个忙碌周期 7.90 B），队首阻塞中 VE 占 81% |
+| 4 稳定性 | 10 段 × 256 个 token，共 2,560 个 token，0 个错误，收到 2,560 次中断：**通过**（14.7 tok/s） |
+
+- 墙钟与设备速度的差距约 13 ms/token，花在 ARM 端：NumPy 对 32000 维 logits 做 softmax 和采样、中断等待、logits 拷贝。
+- 对比 ARM 上 llama2.c 的 int8 版本（2 线程）是 22.9 tok/s。本方案的目标是工业界式的架构，而不是速度。
+  主要的提速方向留到 L6：VE 与 EX 重叠、L5.5 的 75 MHz、prefill。
+
 ---
 
 ## 10. 编译器接口：MLIR / IREE
@@ -1101,6 +1128,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | `llm/export_w8a8.py` | L3 | 模型导出 |
 | `llm/compile_layer.py`、`llm/test_l3.py` | L3、L4 | 手写列表生成器（LOOP、PARAM）及其主机测试 |
 | `llm/compile_model.py`、`llm/test_l4.py` | L4 | 整个解码器的静态列表（每个 token 只改参数）及其主机测试 |
+| `llm/runtime.py`、`llm/prepare_l5.py` | L5 | ARM 运行时 `LlamaDevice`、采样器；验收用的参考数据 |
 | `llm/runtime.py`、`llm/tokenizer.py` | L5 | Python 运行时 |
 | `firmware/rt/` | L1 | 常驻固件 `rt_fw` |
 | `firmware/include/mailbox.h`、`sysarray_intrinsics.h` | L1、L2 | 命令环字段、`mat_notify`、新的 `mat_cfg` / `vec_cfg` key |
