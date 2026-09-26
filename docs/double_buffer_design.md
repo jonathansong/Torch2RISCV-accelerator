@@ -400,9 +400,27 @@ the same DDR bytes (and before the ARM reads results).
 Commands on the same engine execute in order, so they are not checked
 against each other (back-to-back `mat_exec` overlap the drain of one tile
 with the compute of the next).
-Implementation: per bank one reader count and one writer count, each tagged
-with the engine; updated at dispatch and completion. In-order dispatch makes
-it deadlock-free. Software double-buffers by alternating banks:
+Implementation (`sa_sched.v`, as built):
+- Stage d2 computes each command's read and write bank masks (6 bits each)
+  from its address ranges.
+- Each engine keeps a mask FIFO of its in-flight commands: dispatched and
+  not yet done, up to 8 entries (the 4-entry engine queue plus the running
+  command). The entries are pushed at dispatch and popped when the engine
+  reports done. Engines complete in order, so FIFO order is completion order.
+- The OR of an engine's live entries is its current read set and write set.
+- The head command dispatches only if its masks do not conflict with the
+  sets of the *other* engines (RAW, WAR, WAW), and its engine queue has room.
+- *(M3)* EX and VE share the memory ports of SPAD side B and ACC side A, so
+  between these two any common bank conflicts, even two readers.
+
+In-order dispatch makes it deadlock-free. Its cost is head-of-line blocking:
+a blocked head also holds back later commands that could run. The
+`HAZ_*` counters measure this (§10.4). In the LLM lists (L4 / L5), a VE
+command waiting for its EX is the main cause.
+
+Tracking is per bank, so two commands on disjoint addresses of the same
+bank still wait for each other (a false dependency; see LLM plan §11.3 for
+a finer-grained option). Software double-buffers by alternating banks:
 
 ```c
 // C = A · B, M×K times K×N, D×D output tiles, one A strip resident per bank
