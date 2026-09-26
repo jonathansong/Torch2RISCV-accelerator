@@ -77,9 +77,14 @@ class Region:
 
 
 class ModelCompiler:
-    def __init__(self, m, d=None, model=Region(0), io=Region(1), kv=Region(2)):
+    def __init__(self, m, d=None, model=Region(0), io=Region(1), kv=Region(2), prefetch=True):
         """m: export_w8a8.W8A8. Regions: where the model file, the io area and
-        the KV cache are (BASE index + fixed add)."""
+        the KV cache are (BASE index + fixed add). prefetch: load the first
+        weight chunk of every linear layer while the vector steps before it run
+        (right after the previous layer's last EX, into the SPAD_B bank that EX
+        does not use; attention then keeps to the other bank)."""
+        self.prefetch = prefetch
+        self._seq, self._li, self._pre_bank = [], 0, None
         self.m, self.cfg = m, m.cfg
         c = self.cfg
         self.d = d or m.d
@@ -125,8 +130,11 @@ class ModelCompiler:
         self.KST, self.VST = self.EMB + w(c.dim), self.EMB + 2 * w(c.dim)
         if self.VST + w(c.dim) > 2 * sb or c.hidden > sb:
             raise ValueError("SPAD_A plan does not fit")
-        # SPAD_B: K^T strips (bank 0), V strips (bank 1)
+        # SPAD_B: K^T strips (bank 0), V strips (bank 1); with prefetching both in the
+        # bank the prefetched weights do not use (attention_banks())
         self.KT, self.VB = 0, sb
+        if 2 * c.seq_len * (c.head_size // d) > sb:
+            raise ValueError("K^T and V strips do not fit one SPAD_B bank")
 
     # ------------------------------------------------------------ pieces
     def rmsnorm(self, dl, x, g_name, layer, dst):
@@ -142,9 +150,32 @@ class ModelCompiler:
 
     def linear(self, dl, x, k, name, layer, **kw):
         s_x = CL.quant_act(dl, self.lay, x, k, self.TMP)
+        bank0, pre = (self._pre_bank, True) if self._pre_bank is not None else (0, False)
+        self._li += 1
+        nxt = self._seq[self._li] if self._li < len(self._seq) else None
+        self._pre_bank = None
+
+        def after(free):                                # the next layer's chunk 0 -> the free bank
+            if nxt is not None:
+                self._prefetch(dl, nxt, free)
         return CL.linear(dl, self.lay, k, self._nout(name), self.rm(self.m.offset(name, layer)),
                          self.rm(self.m.offset("s_" + name, layer)), s_x, wbase=self.rm.base,
-                         iobase=self.rio.base, params=(P_L0, P_L1), **kw)
+                         iobase=self.rio.base, params=(P_L0, P_L1), bank0=bank0, preloaded=pre,
+                         after_last_ex=after if self.prefetch else None, **kw)
+
+    def _prefetch(self, dl, lin, bank):
+        name, layer, k = lin
+        CL.prefetch(dl, self.lay, k, self._nout(name), self.rm(self.m.offset(name, layer)), bank,
+                    wbase=self.rm.base)
+        self._pre_bank = bank
+
+    def attention_banks(self):
+        """(K^T word, V word) in SPAD_B: both in the bank the prefetched weights
+        of the next linear layer do not use."""
+        if self._pre_bank is None:
+            return self.KT, self.VB
+        b = (1 - self._pre_bank) * self.lay.sbank
+        return b, b + self.cfg.seq_len * (self.cfg.head_size // self.d)
 
     def _nout(self, name):
         c = self.cfg
@@ -205,6 +236,7 @@ class ModelCompiler:
         q = self.QKV if q is None else q
         att = self.ATT if att is None else att
         smax = c.seq_len
+        kt, vb = self.attention_banks()
         if fence:
             dl.fence()                                  # this token's K / V rows are in DDR
         dl.setreg((DescList.REG_PARAM + P_L0, 0), (DescList.REG_PARAM + P_L1, 0))
@@ -212,7 +244,7 @@ class ModelCompiler:
         # scores
         dl.ld(self.rkv(koff), laddr(MEM_SPAD_A, self.KRAW), 1, hs, c.kv_dim, base=self.rkv.base,
               dyn=[("ddr", P_L0, True), ("rows", P_POSPAD)])
-        dl.transpose(laddr(MEM_SPAD_A, self.KRAW), laddr(MEM_SPAD_B, self.KT), d * d, I8 | I8 << 2, hw,
+        dl.transpose(laddr(MEM_SPAD_A, self.KRAW), laddr(MEM_SPAD_B, kt), d * d, I8 | I8 << 2, hw,
                      dyn=[("len", P_KTLEN)])
         dl.ve(acc(q), 0, acc(self.TMP), hs, COPY, T_FF, fp=True, func="abs", reduce="max",
               dyn=[("src1", P_L1, True)])                                                        # amax
@@ -220,7 +252,7 @@ class ModelCompiler:
         dl.ve(acc(self.TMP), 0, acc(self.TMP + 2), d, COPY, T_FF, fp=True, A=CL.INV127, func="recip")
         dl.ve(acc(q), acc(self.TMP + 2), laddr(MEM_SPAD_A, 0), hs * d, MUL, F32 | I8 << 2, fp=True,
               m1="div", p1=d, m2="div", period=hs, dyn=[("src1", P_L1, True)])                  # q_h strip
-        dl.ex(0, self.KT, self.SC, hw, repeat=1, bstep=hs, cstep=1, crow=self.rmax, dyn=[("repeat", P_TILES)])
+        dl.ex(0, kt, self.SC, hw, repeat=1, bstep=hs, cstep=1, crow=self.rmax, dyn=[("repeat", P_TILES)])
         dl.ve(acc(self.SC), acc(self.TMP + 1), acc(self.SCF), d, MUL, I32 | F32 << 2, fp=True, t2=F32,
               m2="div", period=self.rmax, A=a_k, B=NEG0, dyn=[("len", P_POSPAD)])                 # * s_q * a_k
         # softmax over pos + 1 valid scores
@@ -234,9 +266,9 @@ class ModelCompiler:
         dl.ve(acc(self.E), acc(self.S + 2), laddr(MEM_SPAD_A, 0), d * d, MUL, F32 | I8 << 2, fp=True,
               m1="div", p1=d, m2="div", period=smax, A=127.0, B=NEG0, dyn=[("len", P_PLEN)])     # p strip
         # att_h = P V
-        dl.ld(self.rkv(voff), laddr(MEM_SPAD_B, self.VB), 1, hs, c.kv_dim, LD_INTERLEAVE, base=self.rkv.base,
+        dl.ld(self.rkv(voff), laddr(MEM_SPAD_B, vb), 1, hs, c.kv_dim, LD_INTERLEAVE, base=self.rkv.base,
               dyn=[("ddr", P_L0, True), ("rows", P_POSPAD)])
-        dl.ex(0, self.VB, self.OC, 1, repeat=hw, bstep=d, cstep=1, crow=hw,
+        dl.ex(0, vb, self.OC, 1, repeat=hw, bstep=d, cstep=1, crow=hw,
               dyn=[("kt", P_TILES), ("bstep", P_POSPAD)])
         dl.ve(acc(self.OC), 0, acc(att), hs, COPY, I32 | F32 << 2, fp=True, A=a_v, B=NEG0,
               dyn=[("dst", P_L1, True)])
@@ -282,8 +314,15 @@ class ModelCompiler:
             p = prologue
             dl.setreg(*[(DescList.REG_PARAM + i, p[i]) for i in range(3)])
             dl.setreg(*[(DescList.REG_PARAM + i, p[i]) for i in range(3, 6)])
+        lays = list(range(c.layers) if layers is None else layers)
+        self._seq = [(n, l, c.hidden if n == "w2" else c.dim) for l in lays for n in ("wqkv", "wo", "w13", "w2")]
+        if logits:
+            self._seq.append(("wcls", None, c.dim))
+        self._li, self._pre_bank = 0, None
+        if self.prefetch and self._seq:
+            self._prefetch(dl, self._seq[0], 0)             # hidden behind the embedding and the first norm
         self.embed(dl)
-        for l in (range(c.layers) if layers is None else layers):
+        for l in lays:
             self.layer(dl, l)
         if dump_x:
             dl.st(self.rio(IO_X), acc(self.X), 1, 4 * c.dim, 4 * c.dim, base=self.rio.base)

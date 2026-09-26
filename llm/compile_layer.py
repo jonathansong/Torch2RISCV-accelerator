@@ -77,8 +77,21 @@ def quant_act(dl, lay, x, n, tmp, a_strip=0):
     return tmp + 1
 
 
+def chunk_bytes(lay, k, n_out, rows=1):
+    """(tiles per chunk, weight bytes per chunk, chunks) of a linear layer."""
+    nc = lay.chunk_tiles(k, n_out // lay.d, rows)
+    return nc, nc * k * lay.d, n_out // lay.d // nc
+
+
+def prefetch(dl, lay, k, n_out, w_off, bank, wbase=0, rows=1):
+    """LD chunk 0 of a linear layer's weights into SPAD_B `bank` ahead of time
+    (the layer is then built with preloaded=True, bank0=bank)."""
+    nc, wbytes, _ = chunk_bytes(lay, k, n_out, rows)
+    dl.ld(w_off, laddr(MEM_SPAD_B, bank * lay.sbank), nc, k * lay.d, k * lay.d, base=wbase)
+
+
 def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=0, iobase=1, a_strip=0,
-           loop=None, params=(0, 1), rows=1):
+           loop=None, params=(0, 1), rows=1, bank0=0, preloaded=False, after_last_ex=None):
     """y = dequant(A strip x W^T): k inputs (the A strip at SPAD_A a_strip),
     n_out outputs; w_off / sw_off: offsets of the packed weights and of s_w
     (relocated by BASE wbase); s_x: ACC word of the activation scale.
@@ -88,7 +101,12 @@ def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=
     params[1] are overwritten then. rows > 1 (DDR output only): the A strip holds
     `rows` different rows (L5b: sequences, s_x = `rows` consecutive words) and
     the output is a rows x n_out fp32 matrix at out_ddr (row pitch 4 * n_out).
-    Returns the chunk size in tiles."""
+    bank0: SPAD_B bank (and ACC scratch bank) of chunk 0, chunks alternate from
+    it; preloaded: chunk 0's weights are already there (prefetch()).
+    after_last_ex(free_bank): called right after the last chunk's EX is
+    emitted, with the SPAD_B bank that EX does not use (to prefetch the next
+    layer's weights there while this layer's tail and the next layer's vector
+    steps run). Returns the chunk size in tiles."""
     d, sb, cb = lay.d, lay.sbank, lay.cbank
     if k % d or n_out % d or (out is None) == (out_ddr is None):
         raise ValueError("linear: k, n_out multiples of D; exactly one of out / out_ddr")
@@ -104,19 +122,22 @@ def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=
         raise ValueError("linear: the looped form writes to DDR")
     p_w, p_f = params
 
-    def load(j, dyn):
-        p = j & 1
-        dl.ld(w_off + j * wbytes, laddr(MEM_SPAD_B, p * sb), nc, k * d, k * d, base=wbase,
-              dyn=[("ddr", p_w, True)] if dyn else ())
+    def load(j, dyn, weights=True):
+        p = (j + bank0) & 1
+        if weights:
+            dl.ld(w_off + j * wbytes, laddr(MEM_SPAD_B, p * sb), nc, k * d, k * d, base=wbase,
+                  dyn=[("ddr", p_w, True)] if dyn else ())
         dl.ld(sw_off + j * fbytes, acc(p * cb + o_sw), 1, fbytes, fbytes, base=wbase,
               dyn=[("ddr", p_f, True)] if dyn else ())
 
     def chunk(j, dyn, prefetch):
-        p = j & 1
+        p = (j + bank0) & 1
         c = p * cb
         dl.ex(a_strip, p * sb, c, k // d, repeat=nc, bstep=k, cstep=1, crow=nc)
         if prefetch:
             load(j + 1, dyn)
+        elif after_last_ex is not None:
+            after_last_ex(1 - p)
         y = c + o_y if out is None else out + j * nc
         if rows == 1:
             dl.ve(acc(c), acc(c + o_sw), acc(y), nc * d, MUL, I32 | F32 << 2, fp=True, t2=F32)   # * s_w
@@ -128,7 +149,7 @@ def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=
             dl.st(out_ddr + j * fbytes, acc(y), rows, fbytes, fbytes if rows == 1 else 4 * n_out, base=iobase,
                   dyn=[("ddr", p_f, True)] if dyn else ())
 
-    load(0, False)
+    load(0, False, weights=not preloaded)
     j = 0
     if use_loop:
         pairs = (nch - 1) // 2                                     # the prefetch of the last pair stays in range
