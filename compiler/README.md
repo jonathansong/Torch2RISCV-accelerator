@@ -67,6 +67,15 @@ directory about 10–15 GB. ccache is capped at 8 GB.
 - Setup: the frontend Python environment is checked. A turbine export of a
   small torch model (matmul + softmax), compiled with the pip `iree-compile`,
   matches torch.
+- **iree-compile built from source** (2026-09-27): 5,261 build steps, 2 h
+  20 min at 4 jobs (533 CPU-min). The build directory is 1.8 GB; the
+  object files mostly live in ccache. `--iree-hal-list-target-backends`
+  shows `sa`, `vmvx`, `vmvx-inline`.
+  - With `--iree-hal-target-device=sa`, the C0 module runs the whole
+    pipeline and every dispatch stops in the sa backend's
+    `serializeExecutable` with the intended "not implemented yet (stage C2)"
+    error. So registration, the device-to-backend wiring and serialization
+    all work.
 - The `sa` plugin is a skeleton. It registers `#hal.device.target<"sa">` and
   `#hal.executable.target<"sa", "sa-desc-v1", {d = 8}>` (option
   `--iree-sa-d`). Compiling a dispatch for `sa` stops with "descriptor
