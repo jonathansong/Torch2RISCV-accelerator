@@ -13,7 +13,7 @@ an `sa` HAL driver through the command ring.
 | `scripts/fetch_iree_sources.sh` | Adds the compiler's submodules (llvm-project, torch-mlir) to the IREE source tree | setup |
 | `scripts/build_iree_compiler.sh` | Builds iree-compile from source with our plugins | setup |
 | `plugins/sa/` | The `sa` HAL target plugin (C++): the `sa` device and backend, executable format `sa-desc-v1`. Today a skeleton that only registers them | C2–C5 |
-| `frontend/` | The quantized torch llama and its export (planned) | C0 |
+| `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories) | C0 |
 | `runtime/` | The `sa` HAL driver (C), with `board` and `sim` transports (planned) | C1 |
 | `sim/` | The simulator service on top of `llm/sa_funcsim.py` (planned) | C1 |
 | `tests/` | End-to-end tests (planned) | all |
@@ -71,3 +71,15 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   `#hal.executable.target<"sa", "sa-desc-v1", {d = 8}>` (option
   `--iree-sa-d`). Compiling a dispatch for `sa` stops with "descriptor
   generation is not implemented yet"; stage C2 fills this in.
+- **C0 done** (docs/iree_compiler_plan.md §3.5):
+  - stories15M exports with a dynamic attention length and the KV cache as
+    mutable globals;
+  - compiled with llvm-cpu, 12 steps match eager to 4e-7 and `DeviceModel`
+    argmax 12/12;
+  - the armv7 build passes on the board (two single-step cases);
+  - the dispatch inventory is in `frontend/inventory/`: 241 calls and 65
+    executables per token.
+
+  ```sh
+  python3 compiler/frontend/export.py --out build/c0/stories15M --armv7   # then on the board: bash run_c0.sh
+  ```

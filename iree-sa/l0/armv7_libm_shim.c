@@ -42,3 +42,54 @@ HIDDEN float fmaf(float x, float y, float z)
 HIDDEN void __aeabi_unwind_cpp_pr0(void) { __builtin_trap(); }
 HIDDEN void __aeabi_unwind_cpp_pr1(void) { __builtin_trap(); }
 HIDDEN void __aeabi_unwind_cpp_pr2(void) { __builtin_trap(); }
+
+/* ARM EABI integer division helpers. The Cortex-A9 (ARMv7-A without the
+ * integer divide extension) has no SDIV / UDIV, so LLVM calls these for every
+ * integer division, e.g. index arithmetic on dynamic shapes (found in stage
+ * C0: the llama's attention length T is dynamic). Binary long division; a
+ * division by zero returns 0 (the dispatches never divide by zero).
+ * *divmod return {quotient, remainder} in r0:r1, i.e. as the low / high
+ * halves of a 64-bit value. */
+static unsigned udiv32(unsigned n, unsigned d, unsigned *rem)
+{
+    unsigned q = 0, r = 0;
+    if (d == 0) {
+        *rem = 0;
+        return 0;
+    }
+    for (int i = 31; i >= 0; i--) {
+        r = (r << 1) | ((n >> i) & 1u);
+        if (r >= d) {
+            r -= d;
+            q |= 1u << i;
+        }
+    }
+    *rem = r;
+    return q;
+}
+
+HIDDEN unsigned __aeabi_uidiv(unsigned n, unsigned d)
+{
+    unsigned r;
+    return udiv32(n, d, &r);
+}
+
+HIDDEN unsigned long long __aeabi_uidivmod(unsigned n, unsigned d)
+{
+    unsigned r, q = udiv32(n, d, &r);
+    return (unsigned long long)r << 32 | q;
+}
+
+HIDDEN int __aeabi_idiv(int n, int d)
+{
+    unsigned r, q = udiv32(n < 0 ? 0u - (unsigned)n : (unsigned)n, d < 0 ? 0u - (unsigned)d : (unsigned)d, &r);
+    return (n < 0) != (d < 0) ? (int)(0u - q) : (int)q;          /* truncation toward zero */
+}
+
+HIDDEN unsigned long long __aeabi_idivmod(int n, int d)
+{
+    unsigned r, q = udiv32(n < 0 ? 0u - (unsigned)n : (unsigned)n, d < 0 ? 0u - (unsigned)d : (unsigned)d, &r);
+    int qs = (n < 0) != (d < 0) ? (int)(0u - q) : (int)q;
+    int rs = n < 0 ? (int)(0u - r) : (int)r;                        /* the remainder has the dividend's sign */
+    return (unsigned long long)(unsigned)rs << 32 | (unsigned)qs;
+}

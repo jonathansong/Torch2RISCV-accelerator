@@ -1,6 +1,6 @@
 # LLM 编译器：基于 MLIR / IREE 的端到端方案（PyTorch → 描述符列表）
 
-状态：**方案**，还没有开始实现。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
+状态：**C0 完成**（主机和板上验证，§3.5）；环境已就绪（`compiler/`）。C1–C5 还是方案。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
 取代那里 §10.4、§10.5 的概要。
 
 **目标**：从一个 PyTorch 写的 llama 类模型出发，用 MLIR / IREE 自动编译，得到在 PYNQ-Z1 上运行的完整程序：
@@ -169,6 +169,58 @@ PicoRV32 rt_fw、sa_cmdfetch、sa_sched、各引擎：不变
   - 它们对应哪个手写片段（`compile_layer` / `compile_model` 的哪一段）。
 
   这份清单决定 C3 要写哪些模板，是整个计划的**第一个决策点**（§13）。
+
+### 3.5 C0 结果（2026-09-27）
+
+**实现**：`compiler/frontend/qllama.py`（量化模型）、`compiler/frontend/export.py`（导出、编译、对比、清单、板上包）。
+
+**数值**
+- **eager QLlama**：
+  - 与 `DeviceModel(sfu=Sfu64)` 比，每个 token 的 logits 相对差约 1e-7，KV cache 完全一致，说明运算步骤一一对应；
+  - 与 `SfuExact` 版比，EXP 的近似（误差约 1e-5）让 int8 量化偶尔翻转 ±1，差异约 2%，argmax 仍然一致。
+    设备最终要逐位对上的是 `SfuExact` 版。
+- **IREE 编译（llvm-cpu，主机）**：stories15M 连续 12 步，与 eager 版相差 ≤ 4e-7，argmax 12/12 与 `DeviceModel` 一致。
+  KV cache 作为可变全局变量，在调用之间保留。
+- **板上（armv7 Cortex-A9，L0 的 `iree-run-module`）**：pos 0、pos 5（T = 8）两个单步用例，与主机输出一致（阈值 1e-3），**C0 board PASS**。
+  多步 decode 需要在一个进程里连续调用，等 C1 的运行时再测。
+
+**导出与编译中确定的做法**（C2、C3 沿用）
+
+| 问题 | 做法 |
+|---|---|
+| `emb_q[tok]` 这种用 0 维张量做下标的写法，被当成数据相关的标量，导出失败 | gather 一律写成 `index_select` |
+| 按层写 KV cache（`kc[l].index_copy_`）导出成 index_put 加切片写回，IREE 的 CPU 后端拒绝（“write affecting operations on global resources are restricted to workgroup distributed contexts”） | KV cache 摊平成 (layers·seq_len, kv_dim)，每层一次 `index_copy_` 写第 l·S + pos 行 |
+| 注意力的动态长度 | T 由输入 `valid[T]` 的维度带出，是有输入支撑的动态形状，导出稳定；编译后成为 push constant |
+| 常量表达式提升把 int8 权重提前转置并扩展成 int32（占 4 倍内存，matmul 看到的是 i32×i32） | 编译加 `--iree-opt-const-expr-hoisting=false`，线性层 dispatch 直接读 int8 权重 |
+| armv7 链接失败：`__aeabi_idiv` 未定义（Cortex-A9 没有硬件整数除法，动态形状的下标计算要用） | 在 `iree-sa/l0/armv7_libm_shim.c` 中补 `__aeabi_{u,}idiv{,mod}`，与 C 的 `/`、`%` 在 400 万组输入上一致 |
+| 权重 | 外置到参数文件（.irpa，16.9 MB，嵌入表与分类层共用一份） |
+
+**dispatch 清单**（`compiler/frontend/inventory/stories15M_dispatches.md`）：每个 token 调用 **241 次** dispatch，去重后 65 个可执行体。
+
+| 类别 | 每个 token 的调用 | 对应的手写片段 | 模板 |
+|---|---|---|---|
+| 逐元素运算链 | 122 | RoPE、SiLU、残差、量化的缩放与取整、softmax 的 exp 等 | VE 表达式编译器 |
+| 归约 | 56 | RMSNorm 的平方和、量化的 amax、softmax 的 max 与 sum | `reduce` |
+| int8 线性层（GEMV + 反量化） | 24 + 分类层 1 | `compile_layer.linear` | `qlinear` |
+| gather | 14 | 嵌入行、RoPE 行 | `gather` |
+| KV cache 行写入（scatter） | 12 | `compile_model.kv_append` | `kv_write` |
+| 注意力 Q·Kᵀ、P·V（按头的 batch_matmul，长度 T 动态） | 6 + 6 | `compile_model.attention` | `attn_scores`、`attn_pv` |
+
+**对 C2、C3 的影响**
+1. **线性层的形式正是模板要的**：dispatch 读取行主序的 int8 W (out × in)，在内部做符号扩展和转置，
+   vecmat 用 i64 累加再截断成 i32（int8 × int8 在 k ≤ 768 时不会溢出，可以当 int32 累加处理），
+   反量化尾部（`sitofp`、× s_w、× s_x）已经融在同一个 dispatch 里。
+2. **权重布局**：参数文件里是行主序的 W，而设备要 B 条带的打包布局。两种办法：
+   - 编译器端：数据分块，在编译期打包；
+   - 驱动端：加载参数文件时重排一次。
+
+   C2 先用驱动端的办法（简单，且与 `export_w8a8.pack_b` 相同），数据分块留到 C4。
+3. **逐元素和归约占 178/241**，而且被切得很细（一次量化 = 一个归约 dispatch 加一个逐元素 dispatch）。
+   VE 表达式编译器是 C3 的重点；C4 的融合与跨 dispatch 调度对速度影响最大。
+4. **每层的常量**（a_k、a_v、1/s_k……）被写进了 dispatch 体，形状相同的层也不能共用可执行体（注意力每层一个）。
+   改进办法：前端把它们作为参数张量传入，让各层的 dispatch 去重。
+5. **dispatch 之间的数据经过 DDR**：241 次 dispatch，每次之间可能有 FENCE。
+   C3 完成后，先用分段计时量化这部分开销，再决定 C4 的优先级。
 
 ---
 
@@ -390,7 +442,7 @@ C4 的做法，按收益排序：
 
 | 阶段 | 内容 | 验收 | 工作量（相对 L1–L5） |
 |---|---|---|---|
-| **C0 前端** | 量化 torch 模型；iree-turbine 导出；`llvm-cpu` 在主机和板上运行；dispatch 清单（环境已就绪，见 `compiler/README.md`） | §3.4；清单与手写片段的对照表 | 小 |
+| **C0 前端** | 量化 torch 模型；iree-turbine 导出；`llvm-cpu` 在主机和板上运行；dispatch 清单 | §3.4；清单与手写片段的对照表。**已完成**（§3.5） | 小 |
 | **C1 驱动** | sa HAL 驱动（board、sim 两种传输层）；模拟器服务；sa-desc-v1 读写 | §5.6：手工封装的模板在 sim 与板上与 `DeviceModel` 逐位一致 | 中 |
 | **C2 第一条纵向切片** | 从源码构建带插件的 iree-compile；插件只支持量化线性层一种 dispatch，其余报错；用一个“单线性层”的 torch 模型测试 | torch → iree-compile → .vmfb → sim 与板上，结果与 `DeviceModel.linear` 逐位一致 | 中（构建环境是主要难点） |
 | **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致 | 大 |
