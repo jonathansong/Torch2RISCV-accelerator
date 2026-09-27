@@ -1,0 +1,187 @@
+// sa HAL driver: the `board` transport (docs/iree_compiler_plan.md §5.1, §5.4).
+//
+// rt_fw (firmware/rt) serves a submission ring in DDR (llm_inference_plan.md
+// §5.1): 64-byte entries {type | flags | seq << 32, list address, count,
+// BASE0..3, parameter block}, 32-byte completion records {seq, status,
+// cycles, descriptors, END value}, doorbell = mailbox RING_TAIL, progress =
+// mailbox RING_HEAD. This transport owns the ring; the memory window, the
+// mailbox and a running rt_fw come from the caller:
+//
+//   sa_board_attach(mem, mem_phys, mem_size, mailbox, ring_entries, d)
+//     mem / mailbox: pointers already mapped in this process (a PYNQ launcher
+//     loads this library with ctypes and passes its buffers' addresses; the
+//     memory window must be non-cacheable, since this code does no cache
+//     maintenance). Layout of the window: ring at 0 (ring_entries * 64 bytes),
+//     completion records at 0x2000 (ring_entries * 32 bytes), the arena from
+//     64 KB on. The launcher points rt_fw's mailbox RING_BASE / RING_SIZE /
+//     CPL_BASE there and starts it before the first dispatch.
+//
+// Without sa_board_attach, the transport maps both itself through /dev/mem
+// (a static test program started by a PYNQ launcher, compiler/runtime/test/
+// board_launcher.py, which allocated the window, set up the ring and started
+// rt_fw):
+//   SA_BOARD_MEM=<physical address>:<bytes>   the window (page aligned)
+//   SA_BOARD_MBOX=<physical address>          the mailbox (BRAM + 0x1F00)
+//   SA_BOARD_RING=<entries>  SA_BOARD_D=<array size>
+// O_SYNC makes the DDR mapping non-cacheable (ARM: write-combining normal
+// memory for RAM, strongly ordered for the BRAM), so no cache maintenance.
+// SA_BOARD_DEVMEM=<file> replaces /dev/mem (the ring emulator on the host).
+//
+// Completion is polled (RING_HEAD); the notify interrupt is not used here.
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "sa_context.h"
+
+enum {
+  MBOX_RING_BASE = 0xB0, MBOX_RING_SIZE = 0xB4, MBOX_RING_TAIL = 0xB8, MBOX_RING_HEAD = 0xBC,
+  MBOX_CPL_BASE = 0xC0, MBOX_FW_STATE = 0xC4,
+};
+#define RT_READY 0x52554E00u
+#define RT_RUN_LIST 0x01u
+#define SA_BOARD_CPL_OFFSET 0x2000u
+#define SA_BOARD_HEAP_OFFSET 0x10000u
+
+typedef struct sa_board_t {
+  volatile uint32_t* mbox;
+  uint32_t ring_entries;
+  uint32_t tail;           // entries submitted
+} sa_board_t;
+
+static struct {
+  void* mem;
+  uint32_t mem_phys, mem_size, ring_entries, d;
+  void* mailbox;
+} sa_board_attached;
+
+void sa_board_attach(void* mem, uint32_t mem_phys, uint32_t mem_size, void* mailbox, uint32_t ring_entries,
+                     uint32_t d) {
+  sa_board_attached.mem = mem;
+  sa_board_attached.mem_phys = mem_phys;
+  sa_board_attached.mem_size = mem_size;
+  sa_board_attached.mailbox = mailbox;
+  sa_board_attached.ring_entries = ring_entries;
+  sa_board_attached.d = d;
+}
+
+static uint32_t mbox_rd(sa_board_t* b, uint32_t off) { return b->mbox[off / 4]; }
+static void mbox_wr(sa_board_t* b, uint32_t off, uint32_t v) { b->mbox[off / 4] = v; }
+
+static double sa_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+static iree_status_t sa_board_run(sa_transport_t* t, uint32_t list_phys, sa_completion_t* out) {
+  sa_board_t* b = (sa_board_t*)t->impl;
+  uint32_t seq = b->tail, slot = seq % b->ring_entries;
+  volatile uint64_t* e = (volatile uint64_t*)(t->mem + 64u * slot);
+  volatile uint32_t* c = (volatile uint32_t*)(t->mem + SA_BOARD_CPL_OFFSET + 32u * slot);
+  e[0] = (uint64_t)RT_RUN_LIST | (uint64_t)seq << 32;
+  e[1] = list_phys;
+  for (int i = 2; i < 8; ++i) e[i] = 0;          // count 0 (to END), BASE0..3 0, no parameter block
+  __sync_synchronize();
+  b->tail = seq + 1;
+  mbox_wr(b, MBOX_RING_TAIL, b->tail);           // doorbell
+  double t0 = sa_now();
+  while ((int32_t)(mbox_rd(b, MBOX_RING_HEAD) - b->tail) < 0) {
+    if (sa_now() - t0 > 10.0) {
+      return iree_make_status(IREE_STATUS_DEADLINE_EXCEEDED,
+                              "sa board: entry %u not completed (RING_HEAD %u, FW_STATE %#x)", seq,
+                              mbox_rd(b, MBOX_RING_HEAD), mbox_rd(b, MBOX_FW_STATE));
+    }
+  }
+  __sync_synchronize();
+  if (c[0] != seq) {
+    return iree_make_status(IREE_STATUS_DATA_LOSS, "sa board: completion record %u has seq %u", seq, c[0]);
+  }
+  out->status = c[1];
+  out->cycles = c[2];
+  out->descriptors = c[3];
+  out->end = c[4];
+  return iree_ok_status();
+}
+
+static void sa_board_close(sa_transport_t* t) { (void)t; }
+
+// Maps [phys, phys + size) through /dev/mem (O_SYNC); returns NULL on failure.
+static void* sa_devmem_map(uint32_t phys, uint32_t size) {
+  const char* devmem = getenv("SA_BOARD_DEVMEM");  // compiler/sim/sa_board_emu.py
+  int fd = open(devmem ? devmem : "/dev/mem", O_RDWR | O_SYNC);
+  if (fd < 0) return NULL;
+  long page = sysconf(_SC_PAGESIZE);
+  uint32_t base = phys & ~(uint32_t)(page - 1);
+  void* p = mmap(NULL, size + (phys - base), PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)base);
+  close(fd);
+  return p == MAP_FAILED ? NULL : (uint8_t*)p + (phys - base);
+}
+
+// SA_BOARD_* (see the top of this file) -> sa_board_attach.
+static iree_status_t sa_board_attach_from_env(void) {
+  const char* mem = getenv("SA_BOARD_MEM");
+  const char* mbox = getenv("SA_BOARD_MBOX");
+  if (!mem || !mbox) return iree_ok_status();
+  unsigned long phys = 0, size = 0, mbox_phys = strtoul(mbox, NULL, 0);
+  char* end = NULL;
+  phys = strtoul(mem, &end, 0);
+  if (end && *end == ':') size = strtoul(end + 1, NULL, 0);
+  const char* ring = getenv("SA_BOARD_RING");
+  const char* d = getenv("SA_BOARD_D");
+  if (!size || !mbox_phys || !ring || !d) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "SA_BOARD_MEM=<phys>:<bytes>, SA_BOARD_MBOX, SA_BOARD_RING and SA_BOARD_D are needed");
+  }
+  void* m = sa_devmem_map((uint32_t)phys, (uint32_t)size);
+  void* b = sa_devmem_map((uint32_t)mbox_phys, 0x100);
+  if (!m || !b) {
+    return iree_make_status(IREE_STATUS_PERMISSION_DENIED, "sa board: cannot map /dev/mem (%#lx, %#lx); run as root",
+                            phys, mbox_phys);
+  }
+  sa_board_attach(m, (uint32_t)phys, (uint32_t)size, b, (uint32_t)strtoul(ring, NULL, 0),
+                  (uint32_t)strtoul(d, NULL, 0));
+  return iree_ok_status();
+}
+
+iree_status_t sa_transport_board_open(iree_allocator_t host_allocator, sa_transport_t** out) {
+  if (!sa_board_attached.mem) {
+    IREE_RETURN_IF_ERROR(sa_board_attach_from_env());
+  }
+  if (!sa_board_attached.mem || !sa_board_attached.mailbox) {
+    return iree_make_status(IREE_STATUS_UNAVAILABLE,
+                            "sa board: no board attached (SA_BOARD_* or sa_board_attach)");
+  }
+  sa_transport_t* t = NULL;
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(host_allocator, sizeof(*t) + sizeof(sa_board_t), (void**)&t));
+  memset(t, 0, sizeof(*t) + sizeof(sa_board_t));
+  sa_board_t* b = (sa_board_t*)(t + 1);
+  b->mbox = (volatile uint32_t*)sa_board_attached.mailbox;
+  b->ring_entries = sa_board_attached.ring_entries;
+  if (mbox_rd(b, MBOX_FW_STATE) != RT_READY) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "sa board: rt_fw not ready (FW_STATE %#x)",
+                            mbox_rd(b, MBOX_FW_STATE));
+  }
+  if (mbox_rd(b, MBOX_RING_BASE) != sa_board_attached.mem_phys ||
+      mbox_rd(b, MBOX_CPL_BASE) != sa_board_attached.mem_phys + SA_BOARD_CPL_OFFSET ||
+      mbox_rd(b, MBOX_RING_SIZE) != b->ring_entries) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "sa board: the ring is not at the start of the memory window");
+  }
+  b->tail = mbox_rd(b, MBOX_RING_HEAD);          // continue after whatever ran before
+  t->name = "board";
+  t->mem = (uint8_t*)sa_board_attached.mem;
+  t->mem_phys = sa_board_attached.mem_phys;
+  t->mem_size = sa_board_attached.mem_size;
+  t->heap_offset = SA_BOARD_HEAP_OFFSET;
+  t->d = sa_board_attached.d;
+  t->run = sa_board_run;
+  t->close = sa_board_close;
+  t->impl = b;
+  *out = t;
+  return iree_ok_status();
+}

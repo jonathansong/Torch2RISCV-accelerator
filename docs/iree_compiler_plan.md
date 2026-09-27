@@ -322,6 +322,40 @@ PicoRV32 rt_fw、sa_cmdfetch、sa_sched、各引擎：不变
   - 一个量化线性层在 `sim` 和板上都与 `DeviceModel.linear` 逐位一致；
   - 连续提交 1000 次，没有错误和超时，信号量与中断次数一致。
 
+### 5.7 C1 实现与结果（2026-09-27）
+
+代码在 `compiler/runtime/`（驱动、测试）、`compiler/sim/`（模拟器服务、命令环模拟）、`compiler/runtime/tools/`（sa-desc-v1 读写、测试可执行体）。
+
+**结构**：sa 设备 = IREE 的 local-sync 设备 + 三个自己的部件，不重写 HAL 对象：
+
+| 部件 | 文件 | 作用 |
+|---|---|---|
+| context 与 arena | `sa/sa_context.c` | 设备可见窗口（板上 CMA / sim 的共享内存 DDR）上的首次适配分配器，作为 heap allocator 的 `data_allocator`，所以每个 buffer 都有物理地址；拼装并提交 dispatch 列表 |
+| loader | `sa/sa_loader.c` | 解析 sa-desc-v1，模板拷进 arena；`issue_call` 只在 workgroup (0,0,0) 提交：`SETREG`（BASE i = binding i 的物理地址，PARAM j = push constant j）+ `CALL` 模板 + `END 0x5A` |
+| 传输层 | `sa/sa_transport_sim.c`、`sa/sa_transport_board.c` | `sim`：Unix socket + 共享内存文件，服务端是 `compiler/sim/sa_sim_server.py`（`SaFuncSim`）。`board`：rt_fw 的命令环（环在窗口开头，完成记录在 +0x2000），轮询 `RING_HEAD` |
+| 注册 | `sa/sa_driver_module.c`、`iree_runtime_plugin.cmake` | IREE 外部 HAL 驱动 `sa`（`-DIREE_EXTERNAL_HAL_DRIVERS=sa`），`iree-run-module --list_drivers` 可见 |
+
+**与 §5.1–5.4 的差别**（C1 的简化，功能相同）：
+- **一个 dispatch 一张列表、一个命令环条目**，不是一个命令缓冲一张列表（§5.2）。barrier 自然满足（逐个同步执行）。合并成一张列表留到 C4。
+- **轮询 `RING_HEAD`**，没有用 `notify_irq`（§5.4）。
+- **板上内存**：静态 armv7 程序不能用 PYNQ 的 CMA 接口，所以由 PYNQ launcher（`runtime/test/board_launcher.py`）分配窗口、设置命令环、启动 rt_fw；程序通过 `/dev/mem`（`O_SYNC`，ARM 上对 RAM 是不经缓存的 write-combine 映射）映射窗口和 mailbox，**不需要缓存维护**。之后可以换成 `sa_board_attach()`（由调用者传入已映射的内存）。
+- **错误**：完成记录的扩展状态解码成 “引擎 + 错误类型”（`sa_sched.v`：[11:8] code，[15:12] engine，[24] fetch busy），附带已解码的描述符数；sim 与 emu 按同样的格式报告。
+- 遇到一个 IREE 的问题：heap buffer 在 data/host 分配器不同（split 模式）时用 `malloc_aligned` 分配，却用 `free` 释放对齐后的指针（`hal/buffer_heap.c`）。arena 按地址查找所在的块，所以任何块内指针都能释放。
+
+**测试**（`runtime/test/sa_hal_test.c`，只用 IREE HAL API：registry → device → executable cache → allocator → 命令缓冲 → queue_execute → 信号量）：
+
+| 项目 | sim（主机） | board 模拟（主机，`sim/sa_board_emu.py`） | 板上（L2 bitstream、rt_fw） |
+|---|---|---|---|
+| qlinear（`compile_layer` 的量化线性层，K=64、N=160）vs `DeviceModel.linear` | 逐位一致 | 逐位一致 | 逐位一致 |
+| axpb（push constant → PARAM → 动态字段） | 逐位一致 | 逐位一致 | 逐位一致 |
+| binding 带偏移（同一 buffer 的子区间） | 逐位一致 | 逐位一致 | 逐位一致 |
+| fault（LD 越界）：提交失败并报告设备状态 | LD range error，0x1000203，3 个描述符 | 同左 | 同左 |
+| 出错后再运行 qlinear | 逐位一致 | 逐位一致 | 逐位一致 |
+| 压力：qlinear + barrier + axpb 连续提交，每次检查结果与信号量 | — | 200 次，0 错（环回绕 25 圈） | **1000 次，0 错**，信号量 1003 = 期望；每次提交 152 µs（2 个 dispatch） |
+| D 不匹配的可执行体 | 加载时报 INCOMPATIBLE | — | — |
+
+构建：`compiler/scripts/build_sa_runtime.sh host|armv7`（只构建运行时，约 1 分钟）；板上部署 `compiler/scripts/deploy_c1.sh` → `build/deploy_c1`。
+
 ---
 
 ## 6. 编译器：sa 目标后端插件（C2、C3）
@@ -443,7 +477,7 @@ C4 的做法，按收益排序：
 | 阶段 | 内容 | 验收 | 工作量（相对 L1–L5） |
 |---|---|---|---|
 | **C0 前端** | 量化 torch 模型；iree-turbine 导出；`llvm-cpu` 在主机和板上运行；dispatch 清单 | §3.4；清单与手写片段的对照表。**已完成**（§3.5） | 小 |
-| **C1 驱动** | sa HAL 驱动（board、sim 两种传输层）；模拟器服务；sa-desc-v1 读写 | §5.6：手工封装的模板在 sim 与板上与 `DeviceModel` 逐位一致 | 中 |
+| **C1 驱动** | sa HAL 驱动（board、sim 两种传输层）；模拟器服务；sa-desc-v1 读写 | §5.6：手工封装的模板在 sim 与板上与 `DeviceModel` 逐位一致。**已完成**（§5.7） | 中 |
 | **C2 第一条纵向切片** | 从源码构建带插件的 iree-compile；插件只支持量化线性层一种 dispatch，其余报错；用一个“单线性层”的 torch 模型测试 | torch → iree-compile → .vmfb → sim 与板上，结果与 `DeviceModel.linear` 逐位一致 | 中（构建环境是主要难点） |
 | **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致 | 大 |
 | **C4 性能** | 精简 FENCE、跨 dispatch 预取、更大的 dispatch、代价模型 | 每 token 周期与手写路径相差 ≤ 10% | 中 |
@@ -470,8 +504,8 @@ compiler/
     dialect/              sa 方言与流水线（C5）
     test/                 lit 测试
   frontend/               C0：qllama.py（量化模型）、export.py（iree-turbine 导出）、对比脚本
-  runtime/                C1：sa HAL 驱动（C），传输层 board / sim
-  sim/                    模拟器服务（Python，基于 llm/sa_funcsim.py）
+  runtime/                C1：sa HAL 驱动（C，sa/），传输层 board / sim；tools/（sa-desc-v1）；test/
+  sim/                    模拟器服务 sa_sim_server.py、命令环模拟 sa_board_emu.py（基于 llm/sa_funcsim.py）
   tests/                  端到端测试（主机 sim、板上脚本）
 iree-sa/l0/               已有：armv7 工具链验证（L0）
 build/iree/               不入库：IREE 源码、Python 环境、编译器构建目录

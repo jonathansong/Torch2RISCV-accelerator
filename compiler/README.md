@@ -12,10 +12,12 @@ an `sa` HAL driver through the command ring.
 | `env.sh` | Paths and settings; `source compiler/env.sh` | setup |
 | `scripts/fetch_iree_sources.sh` | Adds the compiler's submodules (llvm-project, torch-mlir) to the IREE source tree | setup |
 | `scripts/build_iree_compiler.sh` | Builds iree-compile from source with our plugins | setup |
+| `scripts/build_sa_runtime.sh` | Builds the IREE runtime with the `sa` HAL driver, `host` or `armv7` (about a minute) | C1 |
+| `scripts/deploy_c1.sh` | Stages the C1 board test in `build/deploy_c1` | C1 |
 | `plugins/sa/` | The `sa` HAL target plugin (C++): the `sa` device and backend, executable format `sa-desc-v1`. Today a skeleton that only registers them | C2–C5 |
 | `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories) | C0 |
-| `runtime/` | The `sa` HAL driver (C), with `board` and `sim` transports (planned) | C1 |
-| `sim/` | The simulator service on top of `llm/sa_funcsim.py` (planned) | C1 |
+| `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports. `tools/`: sa-desc-v1 writer / reader (`sadesc.py`), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
+| `sim/` | `sa_sim_server.py` (the `sim` transport's device: `llm/sa_funcsim.py` on a shared-memory DDR), `sa_board_emu.py` (rt_fw's ring emulated on the host, for the `board` transport) | C1 |
 | `tests/` | End-to-end tests (planned) | all |
 
 ## Environment
@@ -91,4 +93,17 @@ directory about 10–15 GB. ccache is capped at 8 GB.
 
   ```sh
   python3 compiler/frontend/export.py --out build/c0/stories15M --armv7   # then on the board: bash run_c0.sh
+  ```
+- **C1 done** (docs/iree_compiler_plan.md §5.7): the `sa` HAL driver runs
+  hand-built sa-desc-v1 executables through the plain IREE HAL API,
+  bit-exact on sim, on the host ring emulation and on the board; device errors
+  come back as failed submissions with the decoded status.
+
+  ```sh
+  compiler/scripts/build_sa_runtime.sh host
+  python3 compiler/runtime/tools/make_test_exec.py --d 8 --out build/c1/d8
+  python3 compiler/sim/sa_sim_server.py --d 8 --once &            # sim transport
+  build/iree/build-sa-host/runtime/plugins/hal/drivers/sa/sa_hal_test build/c1/d8
+  python3 compiler/sim/sa_board_emu.py --d 8 -- build/iree/build-sa-host/runtime/plugins/hal/drivers/sa/sa_hal_test build/c1/d8
+  compiler/scripts/deploy_c1.sh     # board: python3 board_launcher.py -- ./sa_hal_test test_d8 1000
   ```
