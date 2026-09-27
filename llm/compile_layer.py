@@ -92,7 +92,7 @@ def prefetch(dl, lay, k, n_out, w_off, bank, wbase=0, rows=1):
 
 def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=0, iobase=1, a_strip=0,
            loop=None, params=(0, 1), rows=1, bank0=0, preloaded=False, after_last_ex=None, order=None,
-           after_chunk=None, nc=None):
+           after_chunk=None, nc=None, sbase=None):
     """y = dequant(A strip x W^T): k inputs (the A strip at SPAD_A a_strip),
     n_out outputs; w_off / sw_off: offsets of the packed weights and of s_w
     (relocated by BASE wbase); s_x: ACC word of the activation scale.
@@ -111,8 +111,8 @@ def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=
     0, 1, ...; chunk 0 first when preloaded; the unrolled form only);
     after_chunk(i, j): called after the i-th computed chunk (chunk j) is
     dequantized, to append work that uses its outputs. nc: tiles per chunk
-    (default: the largest that fits, Layout.chunk_tiles). Returns the chunk
-    size in tiles."""
+    (default: the largest that fits, Layout.chunk_tiles). sbase: BASE of s_w
+    (default wbase). Returns the chunk size in tiles."""
     d, sb, cb = lay.d, lay.sbank, lay.cbank
     if k % d or n_out % d or (out is None) == (out_ddr is None):
         raise ValueError("linear: k, n_out multiples of D; exactly one of out / out_ddr")
@@ -142,7 +142,7 @@ def linear(dl, lay, k, n_out, w_off, sw_off, s_x, out=None, out_ddr=None, wbase=
         if weights:
             dl.ld(w_off + j * wbytes, laddr(MEM_SPAD_B, p * sb), nc, k * d, k * d, base=wbase,
                   dyn=[("ddr", p_w, True)] if dyn else ())
-        dl.ld(sw_off + j * fbytes, acc(p * cb + o_sw), 1, fbytes, fbytes, base=wbase,
+        dl.ld(sw_off + j * fbytes, acc(p * cb + o_sw), 1, fbytes, fbytes, base=wbase if sbase is None else sbase,
               dyn=[("ddr", p_f, True)] if dyn else ())
 
     def chunk(i, dyn, prefetch):

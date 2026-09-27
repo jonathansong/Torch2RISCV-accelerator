@@ -385,8 +385,11 @@ IREE 怎样切 dispatch，决定了模板要处理什么形状。插件在 IREE 
 
 ### 6.3 数据分块与权重打包
 
-- matmul 的操作数带 encoding，由插件为 sa 设备解析成 pack：内块 [D, D]，布局与 B 条带一致（`export_w8a8.pack_b`）。
-- 常量权重在编译期求值（const-eval），pack 在编译时完成，运行时不做重排。结果必须与 `export_w8a8` 逐字节相同（有测试）。
+- ~~matmul 的操作数带 encoding，由插件为 sa 设备解析成 pack~~。C2 的实验表明这条路现在走不通：IREE 的 data tiling 需要 i8 × i8 → i32 的 matmul 形式（前端写的是扩展成 i32 后的 matmul）和插件自定义的 encoding resolver；在 torch 图里手写打包又会被 IREE 的布局规范化撤销（变回运行时转置）。
+  **实际做法（C2）**：插件的预处理 pass `iree-sa-pack-linear-weights`（`plugins/sa/target/PackLinearWeights.cpp`），只在目标是 sa 设备时运行：
+  `vecmat(x, transpose(extsi(W)))`（W 是常量或不可变 global 的 i8 权重）→ `Wp = linalg.pack W inner_tiles=[D]`（i8 [N/D, K, D]，即 `pack_b`）+ 直接读 Wp 的 contraction + `collapse_shape`，算术与原 vecmat 相同。
+- 常量权重在编译期求值（const-eval），pack 在编译时完成，运行时不做重排：编译时导入参数（`--iree-parameter-import=model=<irpa> --iree-parameter-import-maximum-size=...`），打包后的权重导出到新的归档（`--iree-parameter-export=model=<packed.irpa>`）。结果与 `export_w8a8.pack_b` 逐字节相同（`compiler/tests/test_c2.py` 检查）。
+  权重先被打包成 i8，所以常量提升可以重新打开（阈值 `--iree-opt-const-expr-max-size-increase-threshold=0`，不再出现 C0 那样把权重提升成 i32 的情况）：stories15M 整个模型 4.5 秒编完，5 种线性层全部变成 pack 布局，打包后的参数 16.1 MB。
 - 激活侧：复制行的 A 条带由模板内部生成（VE 的 DIV-D 复制，或 L5b 的经 DDR + LD INTERLEAVE），不经过 IREE 的 pack。
 
 ### 6.4 模板库与匹配（C3，方式 A）
@@ -420,6 +423,34 @@ IREE 怎样切 dispatch，决定了模板要处理什么形状。插件在 IREE 
 - **可选**：CPU 与加速器混合执行，不支持的 dispatch 放在 `llvm-cpu` 上，用 IREE 的多设备与亲和性（affinity）。
   IREE 这部分还在演进，作为后备方案，不作为主路径（§12）。
 - llama decode 用到的 dispatch 种类有限（手写路径已经全部覆盖），所以目标是**全部在加速器上**。
+
+### 6.7 C2 结果（2026-09-27）
+
+第一条纵向切片：一个 torch int8 线性层 → iree-turbine → 带 sa 插件的 iree-compile → .vmfb + 打包后的 .irpa → `iree-run-module --device=sa`（C1 驱动）。
+
+| 部件 | 文件（`compiler/plugins/sa/`） | 作用 |
+|---|---|---|
+| 预处理 | `target/PackLinearWeights.cpp` | 线性层权重 → B 条带布局（§6.3） |
+| 翻译 | `target/LowerWorkgroupCount.cpp` | 每个 export 的 workgroup 数为 (1, 1, 1)：一个 dispatch = 一个模板，只执行一次 |
+| 匹配 | `target/Match.cpp` | 严格匹配 dispatch 的结构：x（i8 或 i32）的 load、`acc[t, j] += ext(x[k]) * ext(Wp[t, k, j])`（fill 0）、尾部 `(f32(i32(acc)) * s_w) * s_x`（运算顺序、无 fast-math）、整块的 binding；得到 k、n 和每个操作数的 binding |
+| 模板 | `target/Templates.cpp`、`target/DescList.cpp` | `compile_layer.linear` 与 `DescList` 的 C++ 移植；Python 参考 `templates/reference.py` |
+| 序列化 | `target/SATarget.cpp` | sa-desc-v1（与 `runtime/tools/sadesc.py` 相同的布局）；没有模板的 dispatch 报错并打印整个 dispatch |
+
+qlinear 模板（参考 `templates/reference.py`）：
+- A 条带：x 为 i8 时 LD 进 SPAD_A，再用 DIV-D 的 VE COPY 复制成 D 行；x 为 i32 时 LD 进 ACC，再做 I32 → I8 的 COPY。
+- s_x：LD 一个 fp32（DMA 以 8 字节为单位），用只对第一个元素的 max 归约（`valid = 1`）把它广播到整个字。VE 的下标模式以字为单位，不能在字内广播。
+- 之后与 `compile_layer.linear` 相同（分块、双缓冲、反量化；超过 4 块时用 LOOP_END，偏移放在模板私有的 PARAM6/7）。
+
+测试（`compiler/tests/test_c2.py`，板上 `compiler/tests/board_c2.py`）：
+
+| 用例 | 形状 | 模板 vs Python 参考 | 打包权重 vs `pack_b` | sim（D=8、16） | 板上（D=8） |
+|---|---|---|---|---|---|
+| qkv_i8 | k=288，n=864，x i8 | 逐字节相同 | 相同 | 逐位一致 | 逐位一致 |
+| qkv_i32 | k=288，n=864，x i32 | 逐字节相同 | 相同 | 逐位一致 | 逐位一致 |
+| w2_i32 | k=768，n=288 | 逐字节相同 | 相同 | 逐位一致 | 逐位一致 |
+| long_i8 | k=288，n=2048（LOOP_END 形式） | 逐字节相同 | 相同 | 逐位一致 | 逐位一致 |
+
+另外：C++ 模板生成器单独编译后，与 Python 参考逐字节比较了 56 个配置（D=8/16，含 n=32000 的分类器形状、binding 顺序打乱）；非 sa 目标（vmvx）不受预处理 pass 影响。
 
 ---
 
@@ -478,7 +509,7 @@ C4 的做法，按收益排序：
 |---|---|---|---|
 | **C0 前端** | 量化 torch 模型；iree-turbine 导出；`llvm-cpu` 在主机和板上运行；dispatch 清单 | §3.4；清单与手写片段的对照表。**已完成**（§3.5） | 小 |
 | **C1 驱动** | sa HAL 驱动（board、sim 两种传输层）；模拟器服务；sa-desc-v1 读写 | §5.6：手工封装的模板在 sim 与板上与 `DeviceModel` 逐位一致。**已完成**（§5.7） | 中 |
-| **C2 第一条纵向切片** | 从源码构建带插件的 iree-compile；插件只支持量化线性层一种 dispatch，其余报错；用一个“单线性层”的 torch 模型测试 | torch → iree-compile → .vmfb → sim 与板上，结果与 `DeviceModel.linear` 逐位一致 | 中（构建环境是主要难点） |
+| **C2 第一条纵向切片** | 从源码构建带插件的 iree-compile；插件只支持量化线性层一种 dispatch，其余报错；用一个“单线性层”的 torch 模型测试 | torch → iree-compile → .vmfb → sim 与板上，结果与 `DeviceModel.linear` 逐位一致。**已完成**（§6.7） | 中（构建环境是主要难点） |
 | **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致 | 大 |
 | **C4 性能** | 精简 FENCE、跨 dispatch 预取、更大的 dispatch、代价模型 | 每 token 周期与手写路径相差 ≤ 10% | 中 |
 | **C5 代码生成** | sa 方言与完整流水线（§8） | 不用模板库编译 stories15M，结果与 C3 一致 | 大 |
@@ -498,15 +529,15 @@ compiler/
   env.sh                  路径与设置（IREE 版本、源码、构建目录、Python 环境）
   scripts/                拉取 IREE 编译器的子模块；从源码构建带插件的 iree-compile
   plugins/sa/             sa 目标后端插件（C++，经 IREE_CMAKE_PLUGIN_PATHS 编进 iree-compile）
-    target/               TargetDevice / TargetBackend、sa-desc-v1 序列化（C2）
-    templates/            模板生成器（移植自 compile_layer / compile_model，C3）
+    target/               TargetDevice / TargetBackend、预处理（权重打包）、匹配、C++ 模板与 DescList、sa-desc-v1 序列化（C2）
+    templates/            模板的 Python 参考（reference.py，C++ 输出须与之逐字节相同）
     ve_expr/              VE 表达式编译器（C3）
     dialect/              sa 方言与流水线（C5）
     test/                 lit 测试
   frontend/               C0：qllama.py（量化模型）、export.py（iree-turbine 导出）、对比脚本
   runtime/                C1：sa HAL 驱动（C，sa/），传输层 board / sim；tools/（sa-desc-v1）；test/
   sim/                    模拟器服务 sa_sim_server.py、命令环模拟 sa_board_emu.py（基于 llm/sa_funcsim.py）
-  tests/                  端到端测试（主机 sim、板上脚本）
+  tests/                  端到端测试：test_c2.py（主机 sim）、board_c2.py（板上）
 iree-sa/l0/               已有：armv7 工具链验证（L0）
 build/iree/               不入库：IREE 源码、Python 环境、编译器构建目录
 ```

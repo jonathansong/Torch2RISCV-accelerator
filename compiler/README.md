@@ -14,11 +14,12 @@ an `sa` HAL driver through the command ring.
 | `scripts/build_iree_compiler.sh` | Builds iree-compile from source with our plugins | setup |
 | `scripts/build_sa_runtime.sh` | Builds the IREE runtime with the `sa` HAL driver, `host` or `armv7` (about a minute) | C1 |
 | `scripts/deploy_c1.sh` | Stages the C1 board test in `build/deploy_c1` | C1 |
-| `plugins/sa/` | The `sa` HAL target plugin (C++): the `sa` device and backend, executable format `sa-desc-v1`. Today a skeleton that only registers them | C2–C5 |
+| `scripts/deploy_c2.sh` | Runs the C2 host test and stages the board test in `build/deploy_c2` | C2 |
+| `plugins/sa/` | The `sa` HAL target plugin (C++). `target/`: the `sa` device and backend, the preprocessing pass that packs linear weights, dispatch matching, the C++ templates and `DescList`, sa-desc-v1 serialization. `templates/reference.py`: the Python reference of the templates | C2–C5 |
 | `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories) | C0 |
 | `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports. `tools/`: sa-desc-v1 writer / reader (`sadesc.py`), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
 | `sim/` | `sa_sim_server.py` (the `sim` transport's device: `llm/sa_funcsim.py` on a shared-memory DDR), `sa_board_emu.py` (rt_fw's ring emulated on the host, for the `board` transport) | C1 |
-| `tests/` | End-to-end tests (planned) | all |
+| `tests/` | End-to-end tests: `test_c2.py` (host), `board_c2.py` (board) | C2– |
 
 ## Environment
 
@@ -78,10 +79,12 @@ directory about 10–15 GB. ccache is capped at 8 GB.
     `serializeExecutable` with the intended "not implemented yet (stage C2)"
     error. So registration, the device-to-backend wiring and serialization
     all work.
-- The `sa` plugin is a skeleton. It registers `#hal.device.target<"sa">` and
+- The `sa` plugin registers `#hal.device.target<"sa">` and
   `#hal.executable.target<"sa", "sa-desc-v1", {d = 8}>` (option
-  `--iree-sa-d`). Compiling a dispatch for `sa` stops with "descriptor
-  generation is not implemented yet"; stage C2 fills this in.
+  `--iree-sa-d`). Since C2 it compiles the int8 linear dispatch; other
+  dispatches stop with "no template for dispatch" and the dispatch's IR.
+  Rebuilding iree-compile after plugin changes: `cmake --build
+  $IREE_BUILD -j 4 --target iree-compile` (a few minutes with ccache).
 - **C0 done** (docs/iree_compiler_plan.md §3.5):
   - stories15M exports with a dynamic attention length and the KV cache as
     mutable globals;
@@ -106,4 +109,15 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   build/iree/build-sa-host/runtime/plugins/hal/drivers/sa/sa_hal_test build/c1/d8
   python3 compiler/sim/sa_board_emu.py --d 8 -- build/iree/build-sa-host/runtime/plugins/hal/drivers/sa/sa_hal_test build/c1/d8
   compiler/scripts/deploy_c1.sh     # board: python3 board_launcher.py -- ./sa_hal_test test_d8 1000
+  ```
+- **C2 done** (docs/iree_compiler_plan.md §6.7): torch int8 linear layers
+  compile with the sa plugin (weights packed at compile time by
+  `iree-sa-pack-linear-weights` + const-eval, exported to a new parameter
+  archive; templates byte-identical to the Python reference) and run with
+  `iree-run-module --device=sa`, bit-exact with `DeviceModel.linear` on sim
+  (D = 8, 16) and on the board.
+
+  ```sh
+  python3 compiler/tests/test_c2.py [--d 16]       # host: export, compile, check, run on sim
+  compiler/scripts/deploy_c2.sh                     # board: python3 board_c2.py
   ```

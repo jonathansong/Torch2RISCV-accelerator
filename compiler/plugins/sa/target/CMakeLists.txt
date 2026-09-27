@@ -7,15 +7,31 @@ iree_setup_c_src_root(PACKAGE_ROOT_PREFIX sa)
 iree_cc_library(
   NAME
     SATarget
+  HDRS
+    "DescList.h"
+    "Match.h"
+    "SAPasses.h"
+    "Templates.h"
   SRCS
+    "DescList.cpp"
+    "LowerWorkgroupCount.cpp"
+    "Match.cpp"
+    "PackLinearWeights.cpp"
     "SATarget.cpp"
+    "Templates.cpp"
   DEPS
     LLVMSupport
+    MLIRArithDialect
+    MLIRDialectUtils
     MLIRIR
+    MLIRLinalgDialect
     MLIRPass
     MLIRSupport
+    MLIRTensorDialect
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::Target
+    iree::compiler::Dialect::TensorExt::IR
+    iree::compiler::Dialect::Util::IR
     iree::compiler::PluginAPI
   PUBLIC
 )

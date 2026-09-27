@@ -34,6 +34,38 @@ from pynq_matmul import (BRAM_ARM_BASE, MBOX, MBOX_CPL_BASE, MBOX_FW_STATE, MBOX
 CPL_OFFSET = 0x2000                      # sa_transport_board.c
 
 
+def start(bit, fw, mb=16, ring=16):
+    """Overlay + window + ring + rt_fw; returns (mm, buf, env for the program)."""
+    mm = MatmulOverlay(bit, fw)
+    buf = allocate(shape=(mb << 20,), dtype=np.uint8)
+    buf[:] = 0
+    buf.flush()                          # no dirty lines left: the program maps the window non-cacheable
+    phys = buf.physical_address
+    bram = mm.bram
+    for w in range(MBOX_WORDS):
+        bram.write(MBOX + 4 * w, 0)
+    bram.write(MBOX + MBOX_RING_BASE, phys)
+    bram.write(MBOX + MBOX_RING_SIZE, ring)
+    bram.write(MBOX + MBOX_CPL_BASE, phys + CPL_OFFSET)
+    mm.reset.write(0)
+    t0 = time.perf_counter()
+    while mm._mbox(MBOX_FW_STATE) != RT_READY:
+        if time.perf_counter() - t0 > 5:
+            raise RuntimeError(f"rt_fw not ready (FW_STATE {mm._mbox(MBOX_FW_STATE):#x})")
+    print(f"launcher: overlay D = {mm.d}, rt_fw ready, window {mb} MB at {phys:#x}, ring {ring}", flush=True)
+    env = dict(os.environ, SA_TRANSPORT="board", SA_BOARD_MEM=f"{phys:#x}:{mb << 20:#x}",
+               SA_BOARD_MBOX=f"{BRAM_ARM_BASE + MBOX:#x}", SA_BOARD_RING=str(ring), SA_BOARD_D=str(mm.d))
+    return mm, buf, env
+
+
+def stop(mm, buf):
+    """Holds the RISC-V in reset and frees the window; returns (RING_HEAD, heartbeat)."""
+    head, beat = mm._mbox(MBOX_RING_HEAD), mm._mbox(MBOX_HEARTBEAT)
+    mm.reset.write(1)
+    buf.freebuffer()
+    return head, beat
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bit", default=os.path.join(HERE, "picorv32.bit"))
@@ -45,33 +77,12 @@ def main():
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
     if not cmd:
         ap.error("no program given")
-
-    mm = MatmulOverlay(args.bit, args.fw)
-    buf = allocate(shape=(args.mb << 20,), dtype=np.uint8)
-    buf[:] = 0
-    buf.flush()                          # no dirty lines left: the program maps the window non-cacheable
-    phys = buf.physical_address
-    bram = mm.bram
-    for w in range(MBOX_WORDS):
-        bram.write(MBOX + 4 * w, 0)
-    bram.write(MBOX + MBOX_RING_BASE, phys)
-    bram.write(MBOX + MBOX_RING_SIZE, args.ring)
-    bram.write(MBOX + MBOX_CPL_BASE, phys + CPL_OFFSET)
-    mm.reset.write(0)
-    t0 = time.perf_counter()
-    while mm._mbox(MBOX_FW_STATE) != RT_READY:
-        if time.perf_counter() - t0 > 5:
-            raise RuntimeError(f"rt_fw not ready (FW_STATE {mm._mbox(MBOX_FW_STATE):#x})")
-    print(f"launcher: overlay D = {mm.d}, rt_fw ready, window {args.mb} MB at {phys:#x}, ring {args.ring}",
-          flush=True)
-    env = dict(os.environ, SA_TRANSPORT="board", SA_BOARD_MEM=f"{phys:#x}:{args.mb << 20:#x}",
-               SA_BOARD_MBOX=f"{BRAM_ARM_BASE + MBOX:#x}", SA_BOARD_RING=str(args.ring), SA_BOARD_D=str(mm.d))
+    mm, buf, env = start(args.bit, args.fw, args.mb, args.ring)
+    rc = 1
     try:
         rc = subprocess.call(cmd, env=env)
     finally:
-        head, beat = mm._mbox(MBOX_RING_HEAD), mm._mbox(MBOX_HEARTBEAT)
-        mm.reset.write(1)
-        buf.freebuffer()
+        head, beat = stop(mm, buf)
     print(f"launcher: program exit {rc}; rt_fw completed {head} entries (heartbeat {beat})")
     return rc
 
