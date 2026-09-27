@@ -82,6 +82,17 @@ iree_status_t sa_context_phys(sa_context_t* context, const void* ptr, uint32_t* 
 iree_status_t sa_context_dispatch(sa_context_t* context, uint32_t entry_phys, uint32_t count,
                                   const uint32_t* regs, const uint32_t* values, sa_completion_t* out);
 
+// Profiling (SA_PROFILE=1): per export, the dispatch count, the device cycles
+// (rt_fw's completion records) and the host time of the submission (list
+// build, ring, wait).
+void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, uint32_t cycles, uint64_t host_ns);
+// Prints the profile (sorted by device cycles) to |f| (a FILE*); per_step
+// divides the totals (e.g. by the number of tokens). No-op without SA_PROFILE.
+void sa_context_profile_report(void* f, double per_step);
+// Totals since the last reset: dispatches, device cycles, host ns.
+void sa_context_profile_totals(uint64_t* dispatches, uint64_t* cycles, uint64_t* host_ns);
+void sa_context_profile_reset(void);
+
 // Registers the "sa" HAL driver (sa_driver_module.c).
 iree_status_t iree_hal_sa_driver_module_register(iree_hal_driver_registry_t* registry);
 

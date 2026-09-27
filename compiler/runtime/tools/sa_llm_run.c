@@ -24,10 +24,13 @@
 #include "iree/modules/hal/types.h"
 #include "iree/tooling/context_util.h"
 #include "iree/vm/api.h"
+#include "sa_context.h"
 
 IREE_FLAG(string, tokens, "1", "Comma-separated token ids fed in order.");
 IREE_FLAG(int32_t, generate, 0, "Then generate this many tokens greedily.");
 IREE_FLAG(int32_t, valid_len, 256, "Length of the valid input (the static attention length).");
+IREE_FLAG(int32_t, pad, 0,
+          "Dynamic attention length: valid has length pos + 1 rounded up to a multiple of this (0: valid_len).");
 IREE_FLAG(string, logits_out, "", "File the float32 logits of every step are appended to.");
 
 static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* allocator, const void* data,
@@ -101,8 +104,9 @@ static iree_status_t run(iree_allocator_t host) {
     iree_hal_buffer_view_t *bt = NULL, *bp = NULL, *bv = NULL;
     if (iree_status_is_ok(status)) status = make_view(device, allocator, &token, 1, IREE_HAL_ELEMENT_TYPE_INT_64, &bt);
     if (iree_status_is_ok(status)) status = make_view(device, allocator, &pos64, 1, IREE_HAL_ELEMENT_TYPE_INT_64, &bp);
+    iree_host_size_t vlen = FLAG_pad > 0 ? (iree_host_size_t)((pos / FLAG_pad + 1) * FLAG_pad) : (iree_host_size_t)FLAG_valid_len;
     if (iree_status_is_ok(status))
-      status = make_view(device, allocator, valid, (iree_host_size_t)FLAG_valid_len, IREE_HAL_ELEMENT_TYPE_FLOAT_32, &bv);
+      status = make_view(device, allocator, valid, vlen, IREE_HAL_ELEMENT_TYPE_FLOAT_32, &bv);
     if (iree_status_is_ok(status)) {
       iree_vm_ref_t r = iree_hal_buffer_view_move_ref(bt);
       status = iree_vm_list_push_ref_move(inputs, &r);
@@ -120,6 +124,7 @@ static iree_status_t run(iree_allocator_t host) {
     if (iree_status_is_ok(status))
       status = iree_vm_invoke(context, function, IREE_VM_INVOCATION_FLAG_NONE, NULL, inputs, outputs, host);
     double dt = now() - t0;
+    if (pos == 0) sa_context_profile_reset();      // the first step includes loading
     iree_hal_buffer_view_t* out = NULL;
     if (iree_status_is_ok(status)) {
       out = iree_vm_list_get_buffer_view_assign(outputs, 0);
@@ -150,6 +155,15 @@ static iree_status_t run(iree_allocator_t host) {
   if (iree_status_is_ok(status) && steps > 1)
     printf("%d steps, %.1f ms per step after the first (%.2f tokens/s)\n", steps, 1e3 * total / (steps - 1),
            (steps - 1) / total);
+  if (iree_status_is_ok(status) && steps > 1 && getenv("SA_PROFILE")) {
+    uint64_t nd, cyc, ns;
+    sa_context_profile_totals(&nd, &cyc, &ns);
+    printf("per step (after the first): %.1f dispatches, device %.2f ms (%.0f cycles at 50 MHz), "
+           "submissions %.2f ms, rest of the runtime %.2f ms\n",
+           nd / (double)(steps - 1), cyc / (steps - 1) / 50e3, cyc / (double)(steps - 1),
+           ns / 1e6 / (steps - 1), 1e3 * total / (steps - 1) - ns / 1e6 / (steps - 1));
+    sa_context_profile_report(stdout, steps - 1);
+  }
   if (lf) fclose(lf);
   free(valid);
   free(logits);

@@ -34,6 +34,7 @@ enum DynField : uint32_t {
   DYN_VE_SRC1 = 1, DYN_VE_SRC2 = 2, DYN_VE_DST = 3, DYN_VE_LEN = 4, DYN_VE_VALID = 5, DYN_VE_ROWLEN = 6,
   DYN_VE_P1 = 7, DYN_VE_PERIOD = 8, DYN_VE_A = 9, DYN_VE_B = 10, DYN_VE_IMM = 11,
   DYN_LDPARAM_ADDR = 1,
+  DYN_SETREG_V0 = 1, DYN_SETREG_V1 = 2, DYN_SETREG_V2 = 3,
 };
 struct Dyn {
   uint32_t field;
@@ -80,8 +81,10 @@ public:
   DescList &ldparam(uint32_t addr, uint32_t param, uint32_t mul = 1, uint32_t add = 0, int base = -1,
                     bool fenceBefore = false, const std::vector<Dyn> &dyn = {});
   DescList &fence(uint32_t mask = 0);
-  // regs: up to three (register, value)
-  DescList &setreg(const std::vector<std::pair<uint32_t, uint32_t>> &regs, const std::vector<Dyn> &dyn = {});
+  // regs: up to three (register, value); addMask bit i: register i += value
+  // (instead of =). A dynamic field v0..v2 (DYN_SETREG_V0 + i) takes the value from a PARAM.
+  DescList &setreg(const std::vector<std::pair<uint32_t, uint32_t>> &regs, const std::vector<Dyn> &dyn = {},
+                   uint32_t addMask = 0);
   DescList &loopEnd(int32_t offset, uint32_t count, uint32_t k1, uint32_t s1, uint32_t k2, uint32_t s2);
   DescList &ret();
 

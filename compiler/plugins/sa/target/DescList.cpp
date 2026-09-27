@@ -100,14 +100,15 @@ DescList &DescList::veFp(uint32_t src1, uint32_t src2, uint32_t dst, uint32_t le
              dyn);
 }
 
-DescList &DescList::setreg(const std::vector<std::pair<uint32_t, uint32_t>> &regs, const std::vector<Dyn> &dyn) {
+DescList &DescList::setreg(const std::vector<std::pair<uint32_t, uint32_t>> &regs, const std::vector<Dyn> &dyn,
+                           uint32_t addMask) {
   if (regs.empty() || regs.size() > 3) fail("SETREG takes 1..3 registers");
   uint64_t w1 = 0, vals[3] = {0, 0, 0};
   for (size_t i = 0; i < regs.size(); ++i) {
     w1 |= uint64_t(0x40 | regs[i].first) << (8 * i);
     vals[i] = regs[i].second & M32;
   }
-  return put(SETREG, 0, {w1, vals[0], vals[1], vals[2], 0}, dyn);
+  return put(SETREG, 0, {w1, vals[0], vals[1], vals[2], uint64_t(addMask & 7)}, dyn);
 }
 
 DescList &DescList::loopEnd(int32_t offset, uint32_t count, uint32_t k1, uint32_t s1, uint32_t k2, uint32_t s2) {

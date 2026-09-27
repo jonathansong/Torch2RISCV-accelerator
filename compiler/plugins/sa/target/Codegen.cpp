@@ -117,6 +117,8 @@ struct Local {
   Layout layout = Layout::Packed;
   uint32_t words = 0;          // allocated words
   int64_t n = 0;               // elements (upper bound if dynamic)
+  uint32_t rowStride = 0;      // > 0: rows of a dynamic length at this word stride
+  int64_t rows = 1;
 };
 
 // VE source operand
@@ -163,6 +165,12 @@ struct Geo {
   std::optional<Lin> dynInner;
   int64_t rows = 1;            // for reductions: output rows
   bool reduction = false;
+  bool singleRow = false;      // one row of a row-by-row generic: no ROWLEN
+};
+
+// A row of a [H, T] generic with a dynamic T, compiled one row at a time
+struct RowSel {
+  int64_t row = 0, H = 1;
 };
 
 class Gen {
@@ -324,6 +332,8 @@ private:
     std::optional<Lin> dynN;   // dynamic element count
     std::optional<Lin> dynInner;
     int64_t inner = 0;
+    std::optional<Lin> dynDim;   // the dynamic dimension itself
+    int64_t before = 1, after = 1; // static elements before / after it
   };
   std::map<void *, Source> sources;          // load result -> Source
   std::map<void *, Local> locals;            // tensor value -> local copy (packed)
@@ -384,6 +394,13 @@ private:
     if (dyn) {
       int64_t other = n / opt.maxDynamic;
       s.dynN = Lin{dyn->ord, dyn->mul * other, dyn->shift, dyn->add * other};
+      s.dynDim = dyn;
+      bool seen = false;
+      for (int64_t sz : sizes) {
+        if (ShapedType::isDynamic(sz)) seen = true;
+        else if (!seen) s.before *= sz;
+        else s.after *= sz;
+      }
     }
     int64_t last = rt.getRank() ? rt.getShape().back() : 1;
     s.inner = ShapedType::isDynamic(last) ? opt.maxDynamic : last;
@@ -391,6 +408,28 @@ private:
     sources[load.getResult().getAsOpaquePointer()] = s;
     return true;
   }
+
+  // Row loops: rows of a dynamic length T (bytes per row = f(T)), row r at
+  // DDR offset r * bytes: a PARAM accumulates the offset on the device (SETREG
+  // PARAM += PARAM), so each DMA has two dynamic fields (address, bytes).
+  int rowAcc = -1;
+  int rowAccParam() {
+    if (rowAcc < 0) rowAcc = privateParam();
+    return rowAcc;
+  }
+  template <typename F>
+  void rowLoop(int64_t H, int bytesParam, F dma) {
+    int acc = rowAccParam();
+    dl.setreg({{::sa::DescList::REG_PARAM + uint32_t(acc), 0}});
+    for (int64_t r = 0; r < H; ++r) {
+      dma(r, std::vector<::sa::Dyn>{{::sa::DYN_DMA_DDR, uint32_t(acc), true},
+                                    {::sa::DYN_DMA_ROW_BYTES, uint32_t(bytesParam), false}});
+      if (r + 1 < H)
+        dl.setreg({{::sa::DescList::REG_PARAM + uint32_t(acc), 0}}, {{::sa::DYN_SETREG_V0, uint32_t(bytesParam), false}},
+                  1);
+    }
+  }
+  bool stridedSource(const Source &s) const { return s.dynDim && s.after == 1 && s.before > 1 && s.before <= 16; }
 
   // LD of a source into a packed local
   std::optional<Local> materialize(Value v) {
@@ -408,6 +447,25 @@ private:
     }
     if (!vt) return fail("element type of a loaded tensor"), std::nullopt;
     uint32_t es = esize(et);
+    if (stridedSource(s)) {
+      // H rows of T: row r at word r * stride (the largest T)
+      uint32_t stride = uint32_t((opt.maxDynamic * es + 4 * d - 1) / (4 * d));
+      if (*vt == ::sa::VT_I8) stride = uint32_t((opt.maxDynamic + d - 1) / d);
+      Local l = newLocal(*vt, int64_t(stride) * s.before * (*vt == ::sa::VT_I8 ? d : d));
+      l.rowStride = stride;
+      l.rows = s.before;
+      Lin b = *s.dynDim;
+      b.mul *= es;
+      b.add *= es;
+      int bp = paramFor(b);
+      uint32_t maxBytes = uint32_t(opt.maxDynamic * es);
+      if (s.r.off % 8) return fail("load not 8-byte aligned"), std::nullopt;
+      rowLoop(s.before, bp, [&](int64_t r, std::vector<::sa::Dyn> dy) {
+        dl.ld(s.r.off, la(l) + uint32_t(r) * stride, 1, maxBytes, maxBytes, s.r.base, 0, false, dy);
+      });
+      locals[key] = l;
+      return l;
+    }
     Local l = newLocal(*vt, n);
     uint32_t bytes = uint32_t((s.n * es + 7) / 8 * 8);
     if (s.r.off % 8) return fail("load not 8-byte aligned"), std::nullopt;
@@ -497,6 +555,19 @@ private:
       }
       n *= sz;
     }
+    if (l.rowStride) {
+      if (!dyn) return fail("row-strided value stored with a static size");
+      Lin b = *dyn;
+      b.mul *= es;
+      b.add *= es;
+      int bp = paramFor(b);
+      uint32_t maxBytes = uint32_t(opt.maxDynamic * es);
+      if (span->r.off % 8) return fail("store not 8-byte aligned");
+      rowLoop(l.rows, bp, [&](int64_t r, std::vector<::sa::Dyn> dy) {
+        dl.st(span->r.off, la(l) + uint32_t(r) * l.rowStride, 1, maxBytes, maxBytes, span->r.base, false, dy);
+      });
+      return true;
+    }
     if (l.layout == Layout::Bcast && n > 1) l = packBcast(l, n);
     uint32_t bytes = uint32_t((n * es + 7) / 8 * 8);
     std::vector<::sa::Dyn> dy;
@@ -542,7 +613,7 @@ private:
         if (p.s2->vt != p.s1.vt) fp.t2 = int(p.s2->vt);
       }
     }
-    if (red != ::sa::RED_NONE || p.validParam >= 0) {
+    if (!g.singleRow && (red != ::sa::RED_NONE || p.validParam >= 0)) {
       // rows of `inner` elements: ROWLEN words per row
       if (g.dynInner) {
         Lin rl = *g.dynInner;
@@ -560,7 +631,9 @@ private:
   }
 
   // ------------------------------------------------------------ linalg.generic
-  bool genericOp(linalg::GenericOp g);
+  bool genericOp(linalg::GenericOp g, const RowSel *sel = nullptr);
+  std::map<void *, Local> rowOutputs;         // results of row-by-row generics (shared by the rows)
+  std::map<std::pair<void *, int>, int> validParams;   // prefix-mask VALID counts already in a PARAM
   bool qlinear(linalg::GenericOp con, linalg::GenericOp epi);
   bool attention(linalg::BatchMatmulOp bmm);
   bool scatter(IREE::LinalgExt::ScatterOp sc);
@@ -664,7 +737,7 @@ SmallVector<SmallVector<int64_t>> points(ArrayRef<int64_t> ranges) {
 }
 
 // =============================================================== the generic compiler
-bool Gen::genericOp(linalg::GenericOp g) {
+bool Gen::genericOp(linalg::GenericOp g, const RowSel *sel) {
   // iteration space
   auto iters = g.getIteratorTypesArray();
   int nloops = int(iters.size());
@@ -725,9 +798,30 @@ bool Gen::genericOp(linalg::GenericOp g) {
   if (nloops > 1 && geo.inner % d) return fail("innermost size not a multiple of D");
   if (nloops > 0 && geo.n > 1 && nloops == 1 && geo.n % d && !geo.reduction && geo.n > d)
     return fail("1-D size not a multiple of D");
+  // [H, T] with a dynamic T: one row at a time (each VE then needs only a
+  // dynamic LEN, and VALID for a mask)
+  if (!sel && nloops == 2 && geo.dynInner) {
+    if (ranges[0] > 16) return fail("more than 16 rows of a dynamic length");
+    for (int64_t r = 0; r < ranges[0]; ++r) {
+      RowSel rs{r, ranges[0]};
+      if (!genericOp(g, &rs)) return false;
+    }
+    for (unsigned i = 0; i < g.getNumResults(); ++i) {
+      auto it = rowOutputs.find(g.getResult(i).getAsOpaquePointer());
+      if (it == rowOutputs.end()) return fail("row-by-row generic without its result");
+      locals[g.getResult(i).getAsOpaquePointer()] = it->second;
+    }
+    return err.empty();
+  }
+  if (sel) {
+    geo.n = geo.inner;
+    geo.dynN = geo.dynInner;
+    geo.rows = 1;
+    geo.singleRow = true;
+  }
   uint32_t wordsPerRow = uint32_t(geo.inner / d);
   int rowParam = -1;
-  if (geo.dynInner) {
+  if (geo.dynInner && !sel) {
     Lin rl = *geo.dynInner;
     rl.shift += int(std::log2(double(d)));
     rowParam = paramFor(rl);
@@ -775,6 +869,10 @@ bool Gen::genericOp(linalg::GenericOp g) {
       if (l->layout != Layout::Packed) return fail("identity operand in broadcast layout");
       e.kind = EV::Mem;
       e.opd = {la(*l), l->vt, ::sa::IDX_LIN, 0};
+      if (sel) {
+        if (!l->rowStride) return fail("row-by-row operand not in the row layout");
+        e.opd.la += uint32_t(sel->row) * l->rowStride;
+      }
     } else if (nloops == 2 && m.getNumResults() == 1 && isa<AffineDimExpr>(m.getResult(0)) &&
                cast<AffineDimExpr>(m.getResult(0)).getPosition() == 0) {
       // one value per row
@@ -782,6 +880,7 @@ bool Gen::genericOp(linalg::GenericOp g) {
       if (!b) return false;
       e.kind = EV::Mem;
       e.opd = {la(*b), ::sa::VT_F32, ::sa::IDX_DIV, wordsPerRow, rowParam};
+      if (sel) e.opd = {la(*b) + uint32_t(sel->row), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
     } else if (nloops == 2 && m.getNumResults() == 1 && isa<AffineDimExpr>(m.getResult(0)) &&
                cast<AffineDimExpr>(m.getResult(0)).getPosition() == 1) {
       // the same vector for every row
@@ -789,6 +888,7 @@ bool Gen::genericOp(linalg::GenericOp g) {
       if (!l) return false;
       e.kind = EV::Mem;
       e.opd = {la(*l), l->vt, ::sa::IDX_MOD, wordsPerRow, rowParam};
+      if (sel) e.opd = {la(*l), l->vt, ::sa::IDX_LIN, 0};
     } else {
       return fail("unsupported indexing map of a generic input");
     }
@@ -1026,9 +1126,17 @@ bool Gen::genericOp(linalg::GenericOp g) {
       // VALID = pos + 1 (sle) or pos (slt), pos = the scalar input (i64, low word)
       auto span = sources.find(g.getDpsInputs()[c.arg].getAsOpaquePointer());
       if (span == sources.end()) return fail("mask scalar not loaded from a binding");
-      int p = privateParam();
-      dl.ldparam(span->second.r.off, uint32_t(p), 1, c.pred == arith::CmpIPredicate::sle ? 1 : 0,
-                 span->second.r.base);
+      // one PARAM per (scalar, predicate), loaded once (also for the rows of a row-by-row generic)
+      auto vkey = std::make_pair(span->first, int(c.pred));
+      int p;
+      if (auto vi = validParams.find(vkey); vi != validParams.end()) {
+        p = vi->second;
+      } else {
+        p = privateParam();
+        validParams[vkey] = p;
+        dl.ldparam(span->second.r.off, uint32_t(p), 1, c.pred == arith::CmpIPredicate::sle ? 1 : 0,
+                   span->second.r.base);
+      }
       EV x = evOf(s.getTrueValue());
       std::optional<EV> pe;
       if (x.kind == EV::Pending && pends[x.pend].validParam < 0) pe = x;
@@ -1227,6 +1335,12 @@ bool Gen::genericOp(linalg::GenericOp g) {
     else pe = copyPend(e);
     if (!pe) return false;
     if (pends[pe->pend].validNegInf && rk != ::sa::RED_MAX) return fail("-inf mask in a sum");
+    if (sel) {
+      void *key = g.getResult(0).getAsOpaquePointer();
+      if (!rowOutputs.count(key)) rowOutputs[key] = newLocal(::sa::VT_F32, sel->H, Layout::Bcast);
+      emitPend(pends[pe->pend], la(rowOutputs[key]) + uint32_t(sel->row), ::sa::VT_F32, geo, rk);
+      return err.empty();
+    }
     Local out = newLocal(::sa::VT_F32, geo.rows, Layout::Bcast);
     emitPend(pends[pe->pend], la(out), ::sa::VT_F32, geo, rk);
     locals[g.getResult(0).getAsOpaquePointer()] = out;
@@ -1240,34 +1354,58 @@ bool Gen::genericOp(linalg::GenericOp g) {
       continue;
     }
     EV e = evOf(y);
-    auto emitTo = [&](EV x, VType vt) -> std::optional<Local> {
+    // the output: in row mode one row of a shared row-strided local
+    auto outLocal = [&](VType vt) -> std::pair<Local, uint32_t> {
+      if (!sel) {
+        Local out = newLocal(vt, geo.n);
+        return {out, la(out)};
+      }
+      void *key = g.getResult(r).getAsOpaquePointer();
+      if (!rowOutputs.count(key)) {
+        uint32_t stride = uint32_t((geo.inner + d - 1) / d);
+        Local out = newLocal(vt, int64_t(stride) * sel->H * d);
+        out.rowStride = stride;
+        out.rows = sel->H;
+        rowOutputs[key] = out;
+      }
+      Local out = rowOutputs[key];
+      return {out, la(out) + uint32_t(sel->row) * out.rowStride};
+    };
+    auto emitTo = [&](EV x, VType vt, bool final) -> std::optional<Local> {
       std::optional<EV> pe;
       if (x.kind == EV::Pending) pe = x;
       else pe = copyPend(x);
       if (!pe) return std::nullopt;
       if (pends[pe->pend].validNegInf) return fail("-inf mask outside a max reduction"), std::nullopt;
+      if (final) {
+        auto [out, dst] = outLocal(vt);
+        emitPend(pends[pe->pend], dst, vt, geo);
+        Local row = out;
+        row.word = dst & 0xFFFF;
+        return row;
+      }
       Local out = newLocal(vt, geo.n);
       emitPend(pends[pe->pend], la(out), vt, geo);
       return out;
     };
     std::optional<Local> out;
     if (ot.isF32()) {
-      out = emitTo(e, ::sa::VT_F32);
+      out = emitTo(e, ::sa::VT_F32, true);
     } else if (ot.isInteger(8) && e.kind == EV::ToI8) {
-      out = emitTo(*e.inner, ::sa::VT_I8);
+      out = emitTo(*e.inner, ::sa::VT_I8, true);
     } else if (ot.isInteger(32) && e.kind == EV::I32OfI8) {
-      auto i8 = emitTo(*e.inner->inner, ::sa::VT_I8);
+      auto i8 = emitTo(*e.inner->inner, ::sa::VT_I8, false);
       if (!i8) return false;
-      Local o32 = newLocal(::sa::VT_I32, geo.n);
+      auto [o32, dst] = outLocal(::sa::VT_I32);
       Pend p;
       p.s1 = {la(*i8), ::sa::VT_I8, ::sa::IDX_LIN, 0};
-      emitPend(p, la(o32), ::sa::VT_I32, geo);
+      emitPend(p, dst, ::sa::VT_I32, geo);
       out = o32;
     } else {
       return fail("unsupported result type of a generic");
     }
     if (!out) return false;
-    locals[g.getResult(r).getAsOpaquePointer()] = *out;
+    if (!sel) locals[g.getResult(r).getAsOpaquePointer()] = *out;
   }
   return err.empty();
 }
@@ -1435,8 +1573,6 @@ bool Gen::qlinear(linalg::GenericOp con, linalg::GenericOp epi) {
 // -> TRANSPOSE -> K^T tiles; q_h or p_h as a replicated int8 A strip; EX; VE.
 bool Gen::attention(linalg::BatchMatmulOp bmm) {
   Value a = bmm.getDpsInputs()[0], b = bmm.getDpsInputs()[1];
-  auto aT = cast<RankedTensorType>(a.getType()), bT = cast<RankedTensorType>(b.getType());
-  if (!aT.hasStaticShape() || !bT.hasStaticShape()) return fail("dynamic attention shapes");
   // which operand is the extended cache slice
   bool scores = a.getDefiningOp<linalg::GenericOp>() != nullptr;
   Value cacheExt = scores ? a : b, small = scores ? b : a;
@@ -1455,9 +1591,23 @@ bool Gen::attention(linalg::BatchMatmulOp bmm) {
   if (cache == sources.end() || sm == sources.end()) return fail("attention operands are not loads");
   auto cT = cache->second.type;   // [T, H, hs] i8
   if (cT.getRank() != 3 || !cT.getElementType().isInteger(8)) return fail("attention cache type");
-  int64_t T = cT.getDimSize(0), H = cT.getDimSize(1), hs = cT.getDimSize(2);
+  int64_t H = cT.getDimSize(1), hs = cT.getDimSize(2);
+  bool dynT = ShapedType::isDynamic(cT.getDimSize(0));
+  int64_t T = dynT ? opt.maxDynamic : cT.getDimSize(0);
+  if (ShapedType::isDynamic(H) || ShapedType::isDynamic(hs)) return fail("attention: dynamic heads");
   if (T % d || hs % d) return fail("attention: T and head size must be multiples of D");
   if (!cast<RankedTensorType>(small.getType()).getElementType().isInteger(32)) return fail("attention q / p type");
+  // dynamic T: its PARAMs
+  std::optional<Lin> tl = dynT ? cache->second.dynDim : std::nullopt;
+  if (dynT && !tl) return fail("attention: dynamic length not from a push constant");
+  auto par = [&](int64_t mul, int shift) {
+    Lin l = *tl;
+    l.mul *= mul;
+    l.add *= mul;
+    l.shift += shift;
+    return uint32_t(paramFor(l));
+  };
+  int logd = int(std::log2(double(d)));
   // the epilogue
   linalg::GenericOp epi;
   for (Operation *u : bmm->getResult(0).getUsers()) epi = dyn_cast<linalg::GenericOp>(u);
@@ -1495,6 +1645,7 @@ bool Gen::attention(linalg::BatchMatmulOp bmm) {
   if (!store) return fail("attention result is not stored");
   auto out = spanOf(store.getTarget());
   if (!out) return false;
+  if (out->r.off % 8 || cache->second.r.off % 8 || sm->second.r.off % 8) return fail("unaligned attention operand");
   std::optional<Local> sq;
   if (scores) {
     sq = perElementBcast(epi.getDpsInputs()[sqArg], H);
@@ -1503,15 +1654,21 @@ bool Gen::attention(linalg::BatchMatmulOp bmm) {
   const uint32_t hw = uint32_t(hs / d), tiles = uint32_t(T / d), sb = lay.sbank;
   const uint32_t kraw = sb, kt = 0, vb = sb;
   if (uint32_t(T) * hw > sb) return fail("attention: K rows do not fit a SPAD bank");
-  Local srcw = newLocal(::sa::VT_I32, scores ? hs : T);
-  Local c = newLocal(::sa::VT_I32, int64_t(d) * (scores ? tiles : hw) * d);
-  Local res = newLocal(::sa::VT_F32, scores ? T : hs);
-  for (int64_t h = 0; h < H; ++h) {
-    if (scores) {
+  using DV = std::vector<::sa::Dyn>;
+  auto dyn1 = [&](uint32_t field, uint32_t p) { return dynT ? DV{{field, p, false}} : DV{}; };
+  if (scores) {
+    uint32_t pT = dynT ? par(1, 0) : 0, pThs = dynT ? par(hs, 0) : 0, pTiles = dynT ? par(1, logd) : 0;
+    Local srcw = newLocal(::sa::VT_I32, hs);
+    Local c = newLocal(::sa::VT_I32, int64_t(d) * tiles * d);
+    // the scores of all heads, one row (up to T) per head
+    Local res = newLocal(::sa::VT_F32, int64_t(tiles) * H * d);
+    res.rowStride = tiles;
+    res.rows = H;
+    for (int64_t h = 0; h < H; ++h) {
       dl.ld(cache->second.r.off + uint32_t(h * hs), laddr(::sa::MEM_SPAD_A, kraw), uint32_t(T), uint32_t(hs),
-            uint32_t(H * hs), cache->second.r.base);
+            uint32_t(H * hs), cache->second.r.base, 0, false, dyn1(::sa::DYN_DMA_ROWS, pT));
       dl.transpose(laddr(::sa::MEM_SPAD_A, kraw), laddr(::sa::MEM_SPAD_B, kt), uint32_t(T * hs),
-                   ::sa::vtypes(::sa::VT_I8, ::sa::VT_I8), hw);
+                   ::sa::vtypes(::sa::VT_I8, ::sa::VT_I8), hw, false, dyn1(::sa::DYN_VE_LEN, pThs));
       dl.ld(sm->second.r.off + uint32_t(h * hs * 4), la(srcw), 1, uint32_t(hs * 4), uint32_t(hs * 4),
             sm->second.r.base);
       ::sa::VeFp rep;
@@ -1519,26 +1676,51 @@ bool Gen::attention(linalg::BatchMatmulOp bmm) {
       rep.p1 = uint32_t(d);
       dl.veFp(la(srcw), 0, laddr(::sa::MEM_SPAD_A, 0), uint32_t(hs * d), ::sa::VOP_COPY,
               ::sa::vtypes(::sa::VT_I32, ::sa::VT_I8), 0, rep);
-      dl.ex(0, kt, c.word, hw, false, tiles, uint32_t(hs), 1, tiles);
+      dl.ex(0, kt, c.word, hw, false, tiles, uint32_t(hs), 1, tiles, false, dyn1(::sa::DYN_EX_REPEAT, pTiles));
       ::sa::VeFp fp;
       fp.m2 = ::sa::IDX_DIV;
       fp.t2 = int(::sa::VT_F32);
       fp.A = scale;
       fp.B = NEG0;
-      dl.veFp(acc(c.word), la(*sq) + uint32_t(h), la(res), uint32_t(T), ::sa::VOP_MUL,
-              ::sa::vtypes(::sa::VT_I32, ::sa::VT_F32), 0xFFFF, fp);
-      dl.st(out->r.off + uint32_t(h * T * 4), la(res), 1, uint32_t(T * 4), uint32_t(T * 4), out->r.base);
+      dl.veFp(acc(c.word), la(*sq) + uint32_t(h), la(res) + uint32_t(h) * tiles, uint32_t(T), ::sa::VOP_MUL,
+              ::sa::vtypes(::sa::VT_I32, ::sa::VT_F32), 0xFFFF, fp, false, dyn1(::sa::DYN_VE_LEN, pT));
+    }
+    if (dynT) {
+      int bp = int(par(4, 0));
+      rowLoop(H, bp, [&](int64_t h, std::vector<::sa::Dyn> dy) {
+        dl.st(out->r.off, la(res) + uint32_t(h) * tiles, 1, uint32_t(T * 4), uint32_t(T * 4), out->r.base, false, dy);
+      });
     } else {
-      dl.ld(sm->second.r.off + uint32_t(h * T * 4), la(srcw), 1, uint32_t(T * 4), uint32_t(T * 4),
-            sm->second.r.base);
+      for (int64_t h = 0; h < H; ++h)
+        dl.st(out->r.off + uint32_t(h * T * 4), la(res) + uint32_t(h) * tiles, 1, uint32_t(T * 4), uint32_t(T * 4),
+              out->r.base);
+    }
+  } else {
+    // p: [H, 1, T] i32, one row per head
+    std::optional<Local> p;
+    if (dynT) {
+      p = materialize(small);
+      if (!p) return false;
+      if (!p->rowStride) return fail("attention p not in the row layout");
+    } else {
+      p = newLocal(::sa::VT_I32, T * H);
+      p->rowStride = uint32_t(T / d);
+      dl.ld(sm->second.r.off, la(*p), 1, uint32_t(T * H * 4), uint32_t(T * H * 4), sm->second.r.base);
+    }
+    uint32_t pT = dynT ? par(1, 0) : 0, pTd = dynT ? par(d, 0) : 0, pTiles = dynT ? par(1, logd) : 0;
+    Local c = newLocal(::sa::VT_I32, int64_t(d) * hw * d);
+    Local res = newLocal(::sa::VT_F32, hs);
+    for (int64_t h = 0; h < H; ++h) {
       ::sa::VeFp rep;
       rep.m1 = ::sa::IDX_DIV;
       rep.p1 = uint32_t(d);
-      dl.veFp(la(srcw), 0, laddr(::sa::MEM_SPAD_A, 0), uint32_t(T * d), ::sa::VOP_COPY,
-              ::sa::vtypes(::sa::VT_I32, ::sa::VT_I8), 0, rep);
+      dl.veFp(la(*p) + uint32_t(h) * p->rowStride, 0, laddr(::sa::MEM_SPAD_A, 0), uint32_t(T * d), ::sa::VOP_COPY,
+              ::sa::vtypes(::sa::VT_I32, ::sa::VT_I8), 0, rep, false, dyn1(::sa::DYN_VE_LEN, pTd));
       dl.ld(cache->second.r.off + uint32_t(h * hs), laddr(::sa::MEM_SPAD_B, vb), uint32_t(T), uint32_t(hs),
-            uint32_t(H * hs), cache->second.r.base, /*LD_INTERLEAVE=*/1);
-      dl.ex(0, vb, c.word, tiles, false, hw, uint32_t(T), 1, hw);
+            uint32_t(H * hs), cache->second.r.base, /*LD_INTERLEAVE=*/1, false, dyn1(::sa::DYN_DMA_ROWS, pT));
+      DV exd;
+      if (dynT) exd = {{::sa::DYN_EX_KT, pTiles, false}, {::sa::DYN_EX_BSTEP, pT, false}};
+      dl.ex(0, vb, c.word, tiles, false, hw, uint32_t(T), 1, hw, false, exd);
       ::sa::VeFp fp;
       fp.A = scale;
       fp.B = NEG0;
@@ -1547,7 +1729,6 @@ bool Gen::attention(linalg::BatchMatmulOp bmm) {
       dl.st(out->r.off + uint32_t(h * hs * 4), la(res), 1, uint32_t(hs * 4), uint32_t(hs * 4), out->r.base);
     }
   }
-  if (out->r.off % 8 || cache->second.r.off % 8 || sm->second.r.off % 8) return fail("unaligned attention operand");
   skipOps.push_back(epi.getOperation());
   handledStores.push_back(store.getOperation());
   return err.empty();

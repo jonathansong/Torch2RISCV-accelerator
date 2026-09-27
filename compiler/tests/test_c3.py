@@ -46,13 +46,17 @@ def main():
     ap.add_argument("--steps", type=int, default=12, help="prompt tokens fed on the sim")
     ap.add_argument("--generate", type=int, default=0, help="then greedy tokens on the sim")
     ap.add_argument("--skip-export", action="store_true")
+    ap.add_argument("--static-len", action="store_true",
+                    help="attention over seq_len positions (the C3 form) instead of a dynamic length")
     ap.add_argument("--board-bundle", help="stage the board test here")
     ap.add_argument("--board-generate", type=int, default=60, help="greedy tokens in the board test")
     args = ap.parse_args()
     out = args.out
     ok = True
     if not args.skip_export:
-        print(sh([PY, os.path.join(COMPILER, "frontend", "export.py"), "--static-len", "--out", out]).strip().splitlines()[-2])
+        print(sh([PY, os.path.join(COMPILER, "frontend", "export.py"), "--out", out]
+                 + (["--static-len"] if args.static_len else [])).strip().splitlines()[-2])
+    run_args = [] if args.static_len else ["--pad=8"]
     t0 = time.time()
     shutil.rmtree(os.path.join(out, "sa_bin"), ignore_errors=True)
     shutil.rmtree(os.path.join(out, "sa_sources"), ignore_errors=True)
@@ -85,7 +89,8 @@ def main():
     logits_path = os.path.join(out, "logits_sim.f32")
     res = sh([RUN, "--device=sa", f"--module={os.path.join(out, 'sa.vmfb')}",
               f"--parameters=model={os.path.join(out, 'sa_packed.irpa')}", "--tokens=" + ",".join(map(str, toks)),
-              f"--generate={args.generate}", f"--logits_out={logits_path}"], env=dict(os.environ, SA_SIM_SOCKET=sock))
+              f"--generate={args.generate}", f"--logits_out={logits_path}"] + run_args,
+             env=dict(os.environ, SA_SIM_SOCKET=sock))
     srv.wait()
     sim_tokens = [int(t) for t in res.splitlines()[0].split(":")[1].split()]
     got = np.fromfile(logits_path, np.float32).reshape(-1, cfg.vocab)
@@ -101,6 +106,8 @@ def main():
     ok &= exact == len(got)
     if args.board_bundle:
         stage(args.board_bundle, out, prompt, dm, cfg, w, kv, tok, args.board_generate)
+        with open(os.path.join(args.board_bundle, "sa_args.txt"), "w") as f:
+            f.write(" ".join(run_args))
     print("C3 PASS" if ok else "C3 FAILED")
     return 0 if ok else 1
 

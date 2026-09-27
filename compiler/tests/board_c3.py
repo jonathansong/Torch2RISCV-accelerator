@@ -30,11 +30,13 @@ def main():
     want_logits = np.load(os.path.join(HERE, "expected_logits.npy"))
     n_gen = len(want_tokens) - len(prompt)
     logits_path = os.path.join(HERE, "logits_board.f32")
+    args_file = os.path.join(HERE, "sa_args.txt")
+    extra = open(args_file).read().split() if os.path.exists(args_file) else []
     mm, buf, env = BL.start(os.path.join(HERE, "picorv32.bit"), os.path.join(HERE, "rt_fw.bin"), mb=64, ring=16)
     try:
         cmd = [os.path.join(HERE, "sa-llm-run"), "--device=sa", f"--module={HERE}/sa.vmfb",
                f"--parameters=model={HERE}/sa_packed.irpa", "--tokens=" + ",".join(str(int(t)) for t in prompt),
-               f"--generate={n_gen}", f"--logits_out={logits_path}"]
+               f"--generate={n_gen}", f"--logits_out={logits_path}"] + extra
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     finally:
         head, beat = BL.stop(mm, buf)

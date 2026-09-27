@@ -1,6 +1,7 @@
 // sa HAL driver: the context, its arena allocator and the dispatch list (sa_context.h).
 #include "sa_context.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -218,4 +219,72 @@ iree_status_t sa_context_dispatch(sa_context_t* c, uint32_t entry_phys, uint32_t
   c->dispatches++;
   iree_slim_mutex_unlock(&c->mutex);
   return status;
+}
+
+// ---------------------------------------------------------------- profiling
+typedef struct sa_profile_entry_t {
+  char name[96];
+  uint64_t count, cycles, host_ns;
+} sa_profile_entry_t;
+static sa_profile_entry_t sa_profile[512];
+static int sa_profile_n = -1;              // -1: not initialized, -2: disabled
+
+static int sa_profile_enabled(void) {
+  if (sa_profile_n == -1) sa_profile_n = getenv("SA_PROFILE") ? 0 : -2;
+  return sa_profile_n >= 0;
+}
+
+void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, uint32_t cycles, uint64_t host_ns) {
+  (void)context;
+  if (!sa_profile_enabled()) return;
+  int i = 0;
+  for (; i < sa_profile_n; ++i)
+    if (strlen(sa_profile[i].name) == name.size && !memcmp(sa_profile[i].name, name.data, name.size)) break;
+  if (i == sa_profile_n) {
+    if (sa_profile_n == 512) return;
+    size_t n = name.size < 95 ? name.size : 95;
+    memcpy(sa_profile[i].name, name.data, n);
+    sa_profile[i].name[n] = 0;
+    ++sa_profile_n;
+  }
+  sa_profile[i].count++;
+  sa_profile[i].cycles += cycles;
+  sa_profile[i].host_ns += host_ns;
+}
+
+void sa_context_profile_totals(uint64_t* dispatches, uint64_t* cycles, uint64_t* host_ns) {
+  *dispatches = *cycles = *host_ns = 0;
+  for (int i = 0; i < sa_profile_n; ++i) {
+    *dispatches += sa_profile[i].count;
+    *cycles += sa_profile[i].cycles;
+    *host_ns += sa_profile[i].host_ns;
+  }
+}
+
+void sa_context_profile_reset(void) {
+  if (sa_profile_n > 0) {
+    memset(sa_profile, 0, sizeof(sa_profile));
+    sa_profile_n = 0;
+  }
+}
+
+static int sa_profile_cmp(const void* a, const void* b) {
+  const sa_profile_entry_t *x = a, *y = b;
+  return x->cycles < y->cycles ? 1 : x->cycles > y->cycles ? -1 : 0;
+}
+
+void sa_context_profile_report(void* fp, double per_step) {
+  if (!sa_profile_enabled() || sa_profile_n <= 0) return;
+  FILE* f = (FILE*)fp;
+  qsort(sa_profile, (size_t)sa_profile_n, sizeof(sa_profile[0]), sa_profile_cmp);
+  uint64_t n, cyc, ns;
+  sa_context_profile_totals(&n, &cyc, &ns);
+  fprintf(f, "%-58s %8s %12s %8s %10s\n", "export", "calls", "cycles", "cyc %", "host us");
+  for (int i = 0; i < sa_profile_n; ++i) {
+    const sa_profile_entry_t* e = &sa_profile[i];
+    fprintf(f, "%-58.58s %8.1f %12.0f %7.1f%% %10.1f\n", e->name, e->count / per_step, e->cycles / per_step,
+            100.0 * (double)e->cycles / (double)(cyc ? cyc : 1), e->host_ns / per_step / 1e3);
+  }
+  fprintf(f, "%-58s %8.1f %12.0f %8s %10.1f   (per step)\n", "total", n / per_step, cyc / per_step, "",
+          ns / per_step / 1e3);
 }

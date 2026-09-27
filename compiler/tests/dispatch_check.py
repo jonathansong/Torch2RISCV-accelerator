@@ -13,7 +13,7 @@ both on the same binding contents, and every byte the dispatch may write
 Inputs: push constants that are binding offsets take the first call site's
 values (util.assume.int); dynamic lengths (workload ordinals) take --t;
 fp32 data is normal(0, 1), int8 / int32 data int8-valued, i64 scalars
-(token, position, row) --t - 1.
+(token, position, row) --t - 3 (rows partly masked).
 
     python3 compiler/tests/dispatch_check.py <sources dir> <binaries dir> [--d 8] [--t 16] [numbers...]
 """
@@ -110,7 +110,7 @@ def fill(rng, et, n, t):
     if et in ("i8", "i32", "i16"):
         return rng.integers(-127, 128, n).astype(O.NP[et]).tobytes()
     if et == "i64":
-        return np.full(n, t - 1, np.int64).tobytes()
+        return np.full(n, max(0, t - 3), np.int64).tobytes()     # pos + 1 < T: partly masked rows
     return bytes(n)
 
 
