@@ -11,6 +11,7 @@
 // (0, 0, 0) issues it; the other workgroups of the grid are no-ops.
 //
 // File layout: compiler/runtime/tools/sadesc.py.
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -83,35 +84,25 @@ static void sa_executable_destroy(iree_hal_executable_t* base) {
   iree_allocator_free(host, e);
 }
 
-static iree_status_t sa_executable_issue_call(iree_hal_local_executable_t* base, iree_host_size_t ordinal,
-                                              const iree_hal_executable_dispatch_state_v0_t* dispatch_state,
-                                              const iree_hal_executable_workgroup_state_v0_t* workgroup_state,
-                                              uint32_t worker_id) {
-  sa_executable_t* e = (sa_executable_t*)base;
-  if (IREE_UNLIKELY(ordinal >= e->export_count)) {
-    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa: export ordinal %u out of range",
-                            (unsigned)ordinal);
+// The register values of one dispatch (the setup table or the default).
+static iree_status_t sa_export_regs(sa_executable_t* e, const sa_export_t* x, uint32_t binding_count,
+                                    void* const* binding_ptrs, uint32_t constant_count, const uint32_t* constants,
+                                    uint32_t* regs, uint32_t* vals, uint32_t* out_n) {
+  uint32_t phys[16], n = 0;
+  if (binding_count > 16) return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa: more than 16 bindings");
+  for (uint32_t i = 0; i < binding_count; ++i) {
+    IREE_RETURN_IF_ERROR(sa_context_phys(e->context, binding_ptrs[i], &phys[i]), "binding %u of '%.*s'", i,
+                         (int)x->name.size, x->name.data);
   }
-  // one descriptor list per dispatch
-  if (workgroup_state->workgroup_id_x | workgroup_state->workgroup_id_y | workgroup_state->workgroup_id_z) {
-    return iree_ok_status();
-  }
-  const sa_export_t* x = &e->exports[ordinal];
-  uint32_t phys[16];
-  for (uint32_t i = 0; i < dispatch_state->binding_count; ++i) {
-    IREE_RETURN_IF_ERROR(sa_context_phys(e->context, dispatch_state->binding_ptrs[i], &phys[i]),
-                         "binding %u of '%.*s'", i, (int)x->name.size, x->name.data);
-  }
-  uint32_t regs[24], vals[24], n = 0;
   if (x->setup_count == 0) {
-    for (uint32_t i = 0; i < dispatch_state->binding_count; ++i) regs[n] = i, vals[n++] = phys[i];
-    for (uint32_t i = 0; i < dispatch_state->constant_count; ++i)
-      regs[n] = SA_REG_PARAM + i, vals[n++] = dispatch_state->constants[i];
+    if (constant_count > 6) return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa: more than 6 constants");
+    for (uint32_t i = 0; i < binding_count; ++i) regs[n] = i, vals[n++] = phys[i];
+    for (uint32_t i = 0; i < constant_count; ++i) regs[n] = SA_REG_PARAM + i, vals[n++] = constants[i];
   } else {
     for (uint32_t i = 0; i < x->setup_count; ++i) {
       const sa_setup_t* s = &x->setup[i];
       int64_t v = s->add;
-      if (s->constant >= 0) v += ((int64_t)dispatch_state->constants[s->constant] * s->mul) >> (s->kind >> 4);
+      if (s->constant >= 0) v += ((int64_t)constants[s->constant] * s->mul) >> (s->kind >> 4);
       if ((s->kind & 15) == SA_SETUP_BASE) {
         regs[n] = s->reg;
         vals[n++] = phys[s->binding] + (uint32_t)v;
@@ -121,6 +112,13 @@ static iree_status_t sa_executable_issue_call(iree_hal_local_executable_t* base,
       }
     }
   }
+  *out_n = n;
+  return iree_ok_status();
+}
+
+// One dispatch submitted and waited for (inline execution; profiling).
+static iree_status_t sa_export_run_now(sa_executable_t* e, const sa_export_t* x, uint32_t n, const uint32_t* regs,
+                                       const uint32_t* vals) {
   sa_completion_t done = {0};
   struct timespec t0, t1;
   clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -145,6 +143,52 @@ static iree_status_t sa_executable_issue_call(iree_hal_local_executable_t* base,
                             (int)x->name.size, x->name.data, done.end);
   }
   return iree_ok_status();
+}
+
+static iree_status_t sa_executable_issue_call(iree_hal_local_executable_t* base, iree_host_size_t ordinal,
+                                              const iree_hal_executable_dispatch_state_v0_t* dispatch_state,
+                                              const iree_hal_executable_workgroup_state_v0_t* workgroup_state,
+                                              uint32_t worker_id) {
+  sa_executable_t* e = (sa_executable_t*)base;
+  if (IREE_UNLIKELY(ordinal >= e->export_count)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa: export ordinal %u out of range",
+                            (unsigned)ordinal);
+  }
+  // one descriptor list per dispatch
+  if (workgroup_state->workgroup_id_x | workgroup_state->workgroup_id_y | workgroup_state->workgroup_id_z) {
+    return iree_ok_status();
+  }
+  const sa_export_t* x = &e->exports[ordinal];
+  uint32_t regs[24], vals[24], n = 0;
+  IREE_RETURN_IF_ERROR(sa_export_regs(e, x, dispatch_state->binding_count, dispatch_state->binding_ptrs,
+                                      dispatch_state->constant_count, dispatch_state->constants, regs, vals, &n));
+  return sa_export_run_now(e, x, n, regs, vals);
+}
+
+bool sa_executable_isa(iree_hal_executable_t* executable);
+
+iree_status_t sa_executable_append(iree_hal_executable_t* executable, uint32_t ordinal, uint32_t binding_count,
+                                   void* const* binding_ptrs, uint32_t constant_count, const uint32_t* constants) {
+  if (!sa_executable_isa(executable)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa: the executable is not an sa-desc executable");
+  }
+  sa_executable_t* e = (sa_executable_t*)executable;
+  if (ordinal >= e->export_count) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa: export ordinal %u out of range", ordinal);
+  }
+  const sa_export_t* x = &e->exports[ordinal];
+  if (binding_count != e->attrs[ordinal].binding_count || constant_count != e->attrs[ordinal].constant_count) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa: '%.*s' takes %u bindings / %u constants",
+                            (int)x->name.size, x->name.data, e->attrs[ordinal].binding_count,
+                            e->attrs[ordinal].constant_count);
+  }
+  uint32_t regs[24], vals[24], n = 0;
+  IREE_RETURN_IF_ERROR(
+      sa_export_regs(e, x, binding_count, binding_ptrs, constant_count, constants, regs, vals, &n));
+  static int immediate = -1;                     // SA_PROFILE / SA_NO_BATCH: one list per dispatch
+  if (immediate < 0) immediate = getenv("SA_PROFILE") || getenv("SA_NO_BATCH");
+  if (immediate) return sa_export_run_now(e, x, n, regs, vals);
+  return sa_context_batch_add(e->context, x->entry_phys, n, regs, vals, x->name);
 }
 
 static iree_host_size_t sa_executable_export_count(iree_hal_executable_t* base) {
@@ -378,3 +422,7 @@ static const iree_hal_executable_loader_vtable_t sa_loader_vtable = {
     .query_support = sa_loader_query_support,
     .try_load = sa_loader_try_load,
 };
+
+bool sa_executable_isa(iree_hal_executable_t* executable) {
+  return iree_hal_resource_is(executable, &sa_executable_vtable);
+}

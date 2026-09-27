@@ -10,6 +10,7 @@
 #ifndef SA_CONTEXT_H_
 #define SA_CONTEXT_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "iree/base/api.h"
@@ -61,6 +62,16 @@ typedef struct sa_context_t {
   uint32_t list_phys;
   uint32_t list_capacity;          // descriptors
   uint64_t dispatches;             // statistics
+  // the batch list (sa_context_batch_*)
+  uint64_t* batch;
+  uint32_t batch_phys, batch_capacity, batch_count, batch_dispatches;
+  bool batch_fence;                // a FENCE before the next dispatch
+  struct {
+    uint32_t first;                // index of its first descriptor
+    const char* name;
+    uint32_t name_len;
+  } batch_names[1024];
+  uint64_t lists;                  // lists submitted (batches or single dispatches)
 } sa_context_t;
 
 // The process-wide context: the transport comes from SA_TRANSPORT (sim /
@@ -81,6 +92,17 @@ iree_status_t sa_context_phys(sa_context_t* context, const void* ptr, uint32_t* 
 // entry_phys + END in the scratch list and runs it.
 iree_status_t sa_context_dispatch(sa_context_t* context, uint32_t entry_phys, uint32_t count,
                                   const uint32_t* regs, const uint32_t* values, sa_completion_t* out);
+
+// Batches (docs/iree_compiler_plan.md §5.2, C4): the dispatches of one
+// command buffer go into one descriptor list, submitted once:
+//   add (SETREG + CALL of one dispatch; `name` for error messages),
+//   barrier (a FENCE before the next dispatch: its inputs are in DDR),
+//   flush (END, run the list, wait; on a device error the failing dispatch
+//   is named). A full list is flushed by add.
+iree_status_t sa_context_batch_add(sa_context_t* context, uint32_t entry_phys, uint32_t count, const uint32_t* regs,
+                                   const uint32_t* values, iree_string_view_t name);
+void sa_context_batch_barrier(sa_context_t* context);
+iree_status_t sa_context_batch_flush(sa_context_t* context);
 
 // Profiling (SA_PROFILE=1): per export, the dispatch count, the device cycles
 // (rt_fw's completion records) and the host time of the submission (list

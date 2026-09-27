@@ -14,10 +14,16 @@ iree_cc_library(
   NAME
     hal_driver
   HDRS
+    "sa_command_buffer.h"
     "sa_context.h"
+    "sa_device.h"
+    "sa_driver.h"
     "sa_loader.h"
   SRCS
+    "sa_command_buffer.c"
     "sa_context.c"
+    "sa_device.c"
+    "sa_driver.c"
     "sa_driver_module.c"
     "sa_loader.c"
     "sa_transport_board.c"
@@ -28,6 +34,10 @@ iree_cc_library(
     iree::hal::local
     iree::hal::local::executable_loader
     iree::hal::drivers::local_sync::sync_driver
+    iree::hal::utils::deferred_command_buffer
+    iree::hal::utils::file_transfer
+    iree::hal::utils::queue_emulation
+    iree::base::internal::arena
   PUBLIC
 )
 

@@ -1,10 +1,10 @@
 // sa HAL driver: registration of the "sa" driver (docs/iree_compiler_plan.md §5).
 //
-// The device is IREE's synchronous local device (inline execution on the
-// calling thread) with the sa pieces plugged in: a heap allocator whose buffer
+// The device (sa_device.c, from IREE's synchronous local device) runs the
+// dispatches of a command buffer as one descriptor list, with the sa pieces: a heap allocator whose buffer
 // memory comes from the device-visible arena, and the sa-desc-v1 loader.
 // Transport selection: SA_TRANSPORT=sim|board (sa_context.c).
-#include "iree/hal/drivers/local_sync/sync_driver.h"
+#include "sa_driver.h"
 #include "sa_context.h"
 #include "sa_loader.h"
 
@@ -28,8 +28,8 @@ static iree_status_t sa_driver_factory_try_create(void* self, iree_string_view_t
   sa_context_t* context = NULL;
   IREE_RETURN_IF_ERROR(sa_context_get(&context));
 
-  iree_hal_sync_device_params_t params;
-  iree_hal_sync_device_params_initialize(&params);
+  sa_device_params_t params;
+  sa_device_params_initialize(&params);
 
   iree_hal_executable_loader_t* loader = NULL;
   iree_status_t status = sa_loader_create(context, host_allocator, &loader);
@@ -40,7 +40,7 @@ static iree_status_t sa_driver_factory_try_create(void* self, iree_string_view_t
                                             &device_allocator);
   }
   if (iree_status_is_ok(status)) {
-    status = iree_hal_sync_driver_create(driver_name, &params, 1, &loader, device_allocator, host_allocator,
+    status = sa_driver_create(driver_name, &params, 1, &loader, device_allocator, host_allocator,
                                          out_driver);
   }
   iree_hal_allocator_release(device_allocator);

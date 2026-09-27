@@ -7,7 +7,7 @@
 
 // ---------------------------------------------------------------- descriptors
 // Opcodes and encodings of docs/llm_inference_plan.md §5.3 (driver/pynq_matmul.py DescList).
-enum { SA_OP_END = 0x12, SA_OP_SETREG = 0x14, SA_OP_CALL = 0x15 };
+enum { SA_OP_FENCE = 0x10, SA_OP_END = 0x12, SA_OP_SETREG = 0x14, SA_OP_CALL = 0x15 };
 
 static void sa_desc_clear(uint64_t* w) { memset(w, 0, 64); }
 
@@ -191,6 +191,12 @@ iree_status_t sa_context_get(sa_context_t** out_context) {
   if (!raw) return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "sa: no room for the list scratch");
   c->list = (uint64_t*)(((uintptr_t)raw + 63) & ~(uintptr_t)63);
   IREE_RETURN_IF_ERROR(sa_context_phys(c, c->list, &c->list_phys));
+  // the batch list: 8192 descriptors (512 KB)
+  c->batch_capacity = 8192;
+  void* braw = sa_arena_alloc(c, 64ull * c->batch_capacity + 64);
+  if (!braw) return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "sa: no room for the batch list");
+  c->batch = (uint64_t*)(((uintptr_t)braw + 63) & ~(uintptr_t)63);
+  IREE_RETURN_IF_ERROR(sa_context_phys(c, c->batch, &c->batch_phys));
   sa_global_context = c;
   *out_context = c;
   return iree_ok_status();
@@ -217,7 +223,91 @@ iree_status_t sa_context_dispatch(sa_context_t* c, uint32_t entry_phys, uint32_t
   __sync_synchronize();
   iree_status_t status = c->transport->run(c->transport, c->list_phys, out);
   c->dispatches++;
+  c->lists++;
   iree_slim_mutex_unlock(&c->mutex);
+  return status;
+}
+
+// ---------------------------------------------------------------- batches
+static const char* sa_engine_names[] = {"LD", "ST", "EX", "VE", "FETCH"};
+static const char* sa_error_names[] = {"none", "shape", "range", "read response", "write response"};
+
+iree_status_t sa_context_batch_add(sa_context_t* c, uint32_t entry_phys, uint32_t n, const uint32_t* regs,
+                                   const uint32_t* vals, iree_string_view_t name) {
+  uint32_t need = (n + 2) / 3 + 3;              // SETREGs, FENCE, CALL, END
+  if (c->batch_count + need > c->batch_capacity || c->batch_dispatches == 1024) {
+    IREE_RETURN_IF_ERROR(sa_context_batch_flush(c));
+  }
+  iree_slim_mutex_lock(&c->mutex);
+  uint64_t* w = c->batch;
+  uint32_t k = c->batch_count;
+  if (c->batch_fence && k > 0) {
+    sa_desc_clear(w + 8 * k);
+    w[8 * k] = SA_OP_FENCE;
+    ++k;
+  }
+  c->batch_fence = false;
+  c->batch_names[c->batch_dispatches].first = k;
+  c->batch_names[c->batch_dispatches].name = name.data;
+  c->batch_names[c->batch_dispatches].name_len = (uint32_t)name.size;
+  c->batch_dispatches++;
+  for (uint32_t i = 0; i < n; i += 3, ++k) sa_desc_setreg(w + 8 * k, n - i < 3 ? n - i : 3, regs + i, vals + i);
+  sa_desc_clear(w + 8 * k);
+  w[8 * k] = SA_OP_CALL;
+  w[8 * k + 1] = entry_phys;
+  c->batch_count = k + 1;
+  c->dispatches++;
+  iree_slim_mutex_unlock(&c->mutex);
+  return iree_ok_status();
+}
+
+void sa_context_batch_barrier(sa_context_t* c) { c->batch_fence = true; }
+
+iree_status_t sa_context_batch_flush(sa_context_t* c) {
+  iree_slim_mutex_lock(&c->mutex);
+  if (c->batch_dispatches == 0) {
+    c->batch_fence = false;
+    iree_slim_mutex_unlock(&c->mutex);
+    return iree_ok_status();
+  }
+  uint64_t* w = c->batch + 8 * c->batch_count;
+  sa_desc_clear(w);
+  w[0] = SA_OP_END;
+  w[1] = 0x5A;
+  __sync_synchronize();
+  sa_completion_t done = {0};
+  iree_status_t status = c->transport->run(c->transport, c->batch_phys, &done);
+  c->lists++;
+  uint32_t ndisp = c->batch_dispatches;
+  c->batch_count = 0;
+  c->batch_dispatches = 0;
+  c->batch_fence = false;
+  if (iree_status_is_ok(status) && done.status != 0) {
+    // the dispatch holding the failing descriptor (descriptors decoded count
+    // the top-level list and the CALLed templates; report the last dispatch
+    // whose CALL was reached)
+    uint32_t eng = (done.status >> 12) & 0xF, code = (done.status >> 8) & 0xF;
+    const char* en = eng < 5 ? sa_engine_names[eng] : "?";
+    const char* cn = code < 5 ? sa_error_names[code] : "?";
+    if (ndisp == 1) {
+      status = iree_make_status(IREE_STATUS_INTERNAL,
+                                "sa: dispatch '%.*s' failed on the %s device: %s %s error (status %#x, %u "
+                                "descriptors decoded)",
+                                (int)c->batch_names[0].name_len, c->batch_names[0].name, c->transport->name, en, cn,
+                                done.status, done.descriptors);
+    } else {
+      status = iree_make_status(
+          IREE_STATUS_INTERNAL,
+          "sa: one of %u dispatches ('%.*s' .. '%.*s') failed on the %s device: %s %s error (status %#x, %u "
+          "descriptors decoded; SA_NO_BATCH=1 runs them one by one to find it)",
+          ndisp, (int)c->batch_names[0].name_len, c->batch_names[0].name, (int)c->batch_names[ndisp - 1].name_len,
+          c->batch_names[ndisp - 1].name, c->transport->name, en, cn, done.status, done.descriptors);
+    }
+  } else if (iree_status_is_ok(status) && done.end != 0x5A) {
+    status = iree_make_status(IREE_STATUS_INTERNAL, "sa: batch ended with %#x (expected 0x5a)", done.end);
+  }
+  iree_slim_mutex_unlock(&c->mutex);
+  if (iree_status_is_ok(status) && done.cycles) sa_context_profile_record(c, IREE_SV("(batch)"), done.cycles, 0);
   return status;
 }
 
