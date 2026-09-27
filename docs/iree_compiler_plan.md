@@ -152,6 +152,7 @@ PicoRV32 rt_fw、sa_cmdfetch、sa_sched、各引擎：不变
 
 - torch 本身不是逐位参考（它的 exp、归约顺序不同），torch 的结果只用来检查精度（误差范围与 L0 的 top-1 门槛）。
 - 这些约定在编译器里以 fast-math 属性声明，插件在匹配时检查。不满足的 dispatch 报错，不做静默近似。
+- **分块归约**（大模型需要，§8.9）：整数累加（EX 跨 K 块累加 int32）结果与顺序无关，可以随意分块。fp32 归约（softmax 的 max / sum、长向量的求和）如果要分块，必须由预处理在 IR 里**显式**改写成分块形式（例如在线 softmax：块内按上面的硬件顺序，块间按块号依次合并，缩放方式固定），oracle 按 IR 执行，所以仍然逐位一致。代码生成不得私自改变 fp32 归约的顺序；max / min 除外（与顺序无关，如 abs-max 折半树）。
 
 ### 3.3 导出
 
@@ -585,7 +586,7 @@ C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层�
 **验收**：
 1. **正确**：旧的直接生成描述符的代码生成器（`Codegen.cpp` 的模板路径与 `Templates.cpp` 的 DescList 版本）退役，只用新流水线编译 stories15M：58 个 dispatch 全部通过 `dispatch_check.py`；sim 与板上 76/76 步逐位一致，文本与 L5 相同。默认配置（启用微内核）和 `--iree-sa-ukernels=none`（只用通用代码生成）**两种都要满足**。
 2. **不慢**：默认配置下，板上每个 token ≤ 2,591,234 周期（C4 的结果，`board_profile.py --batch`）；逐 dispatch 的周期（`SA_PROFILE=1`）与 C4 相比不超过 +2%。`--iree-sa-ukernels=none` 的周期也要记录，作为通用路径的质量指标。
-3. **通用**：一个 stories15M 之外、没有为它写过任何专用代码的模型变体（§8.7 C5.5），用 `--iree-sa-ukernels=none` 编译通过，sim 上逐 dispatch 与端到端逐位一致。
+3. **通用**：stories15M 之外、没有为它写过任何专用代码的模型（§8.7 C5.5：SmolLM2-135M 与 Qwen3 结构的小配置），用 `--iree-sa-ukernels=none` 编译通过；逐 dispatch 与 oracle 逐位一致，端到端与 torch fp32 的误差在范围内（这些模型没有手写的 DeviceModel）。编译器不写死任何板子或模型的数字（§8.9）。
 
 ### 8.2 现有代码生成器的各部分在 C5 中的去向
 
@@ -631,9 +632,9 @@ C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层�
 | # | pass | 输入 → 输出 | 要点 |
 |---|---|---|---|
 | 1 | `sa-normalize` | dispatch 的 linalg | 具名算子泛化（batch_matmul、fill）；extsi / trunci 折进 contraction；识别 i8 × i8 → i32 的 contraction |
-| 2 | `sa-tile` | linalg → scf.for + 切片 | TilingInterface（`scf::tileConsumerAndFuseProducersUsingSCF`）：contraction 按 N 分块，块大小由 SPAD_B bank 与 ACC 暂存区决定（同 `Layout.chunk_tiles`），尾部融进每块；过长的向量切段；块大小可由代价模型选 |
+| 2 | `sa-tile` | linalg → scf.for + 切片 | TilingInterface（`scf::tileConsumerAndFuseProducersUsingSCF`）：contraction 按 N 分块，块大小由 SPAD_B bank 与 ACC 暂存区决定（同 `Layout.chunk_tiles`），尾部融进每块；K 放不进一个 B 条带时按 K 分块，EX 用累加标志跨块累加（int32，结果与顺序无关）；过长的向量切段；所有容量来自目标配置（§8.9），块大小可由代价模型选 |
 | 3 | `sa-layout` | 张量加布局 | contraction 的 A → A 条带（由 packed x 做 DIV-D 复制），B → B 条带（打包后的权重直接 LD），Kᵀ → TRANSPOSE，标量 → 广播字，其余 packed；在布局不一致处插入转换 |
-| 4 | 缓冲化 | tensor → memref | 先试 IREE 的 one-shot bufferize（片上缓冲 = 带 `#sa.mem` 的 alloc）；不顺利就用自己的缓冲化（C3 已有同样的分析），见 §8.9 |
+| 4 | 缓冲化 | tensor → memref | 先试 IREE 的 one-shot bufferize（片上缓冲 = 带 `#sa.mem` 的 alloc）；不顺利就用自己的缓冲化（C3 已有同样的分析），见 §8.11 |
 | 5 | `sa-lower` | memref 上的 linalg / copy → `sa` | copy → `sa.ld / sa.st`；contraction → `sa.ex`；逐元素和归约的每个 arith / math → 单级 `sa.ve`（indexing map → LIN / MOD / DIV / IMM）；scatter / gather → LDPARAM + 动态地址；i64 标量运算 |
 | 6 | `sa-fuse-ve` | 单级 → 多级 `sa.ve` | C3 的折叠规则：常数乘 → A，常数加 → B，SFU 函数 → FUNC，取负 → A = −1，恒等的 B 用 −0；to_i8 链 → I8 输出；前缀掩码 → VALID。只做不改变舍入的合并 |
 | 7 | `sa-uniform` | `sa` | 标量 / 按行的值只算一次，相同的 LD 共用 |
@@ -679,11 +680,10 @@ C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层�
 | **C5.4 模板改成微内核** | 线性层、注意力的模板改写成输出 `sa` 操作的微内核（§8.8），加 `--iree-sa-ukernels`；旧的直接生成描述符的路径与 `--iree-sa-codegen` 开关退役；板上验收 | §8.1 的 1、2（两种配置） | 中 |
 | **C5.5 通用性** | 一个没有为它写过代码的模型变体，见下 | §8.1 的 3 | 中 |
 
-C5.5 的候选（待定，§13）：
-- (a) **结构变体**：在 `qllama` 里加开关，例如 LayerNorm 代替 RMSNorm、GELU 代替 SiLU、GQA（KV 头少于 Q 头）。维度仍用 stories15M，所以 DeviceModel 需要相应的对照实现。
-- (b) **更大的模型**：stories42M（dim 512、hidden 1376、8 层、8 个头、seq 1024；权重约 42M 个 int8）。矩阵形状都不同，seq 1024 超过现在 `--iree-sa-max-dynamic` 的 256，考验分块和片上内存规划，但没有新算子。
-
-建议 (a) 和 (b) 各选一种，先在 sim 上验收；(b) 能否放进板上的 CMA 窗口，另外确认。
+C5.5 的模型（§8.9 的第一步）：
+- **SmolLM2-135M**：Llama 结构，GQA（9 个 Q 头、3 个 KV 头）、dim 576、hidden 1536、30 层、词表 49152、嵌入与输出层共享。int8 约 135 MB，放得进 PYNQ-Z1。检验 HuggingFace 导入、通用量化、GQA，以及不同的形状；目标是板上运行。
+- **Qwen3 结构的小配置**：QK-norm、GQA、head_dim 128，维度取小（随机或截断的权重）。只在 sim 上验收，检验 Qwen3 特有的算子。
+- 验收（§8.1 第 3 条）：`--iree-sa-ukernels=none` 编译通过；逐 dispatch 与 oracle 逐位一致；端到端与 torch fp32 在误差范围内，生成质量正常（这些模型没有手写的 DeviceModel）。
 
 ### 8.8 扩展点与微内核
 
@@ -705,12 +705,58 @@ C5.5 的候选（待定，§13）：
 - 实验时不必改流水线：`iree-opt --pass-pipeline=...` 可以在任一阶段导出的 IR 上直接试。
 - 可选：接入 IREE 的 transform dialect 脚本，按算子指定分块、融合策略，不必重新编译编译器。
 
-### 8.9 C5 之后
+### 8.9 扩展性：更大的模型与开发板
+
+**目标**：不要求在 PYNQ-Z1 上运行 Qwen3、Llama3，但以后换了资源更多的开发板，编译器应当不改结构就能编译这些模型。所以编译器不能把 PYNQ-Z1 或 stories15M 的任何数字写死。
+
+**PYNQ-Z1 的限制**（硬件，不是编译器的问题）：DDR 512 MB，与 Linux 共用；权重带宽约 390 MB/s。
+
+| 模型 | 参数 | int8 权重 | PYNQ-Z1 |
+|---|---|---|---|
+| stories15M / 110M | 15M / 110M | 16 / 115 MB | 能（110M 需要扩大 CMA 窗口，约 3 tok/s） |
+| SmolLM2-135M（Llama 结构） | 135M | 约 135 MB | 能（约 2.5 tok/s） |
+| Qwen3-0.6B | 约 0.6B | 约 600 MB | 不能：超过整块 DDR |
+| Llama-3.2-1B | 1.24B | 约 1.2 GB | 不能 |
+
+描述符的 DDR 地址与 BASE 寄存器是 32 位，所以即使换板子，一个模型的全部数据也要在 4 GB 物理地址之内；更大需要改硬件。
+
+**1. 目标配置参数化**：硬件参数全部来自 `#hal.executable.target<"sa", …, {config}>`（已有 `d`），编译器里没有常数：
+- D、SPAD / ACC 大小与 bank 数、每条描述符的动态字段数、BASE / PARAM 个数、CAPS（FPVE、以后的 int4 解包等）；
+- 代价模型的参数（带宽、各引擎的延迟、多拍模式的代价）；
+- 驱动从设备读 D 与 CAPS，与可执行体比对（已有 D 的检查）。
+验证：同一个模型用不同的配置（D = 8 / 16、更大的 SPAD）编译，在按同样参数配置的 funcsim 上逐 dispatch 验证（funcsim 需要支持这些参数）。
+
+**2. 前端**：
+- 从 HuggingFace 模型导入（transformers → torch → iree-turbine），不再依赖手写的 `qllama.py`；`qllama.py` 保留为 stories 系列的参考。
+- 通用的量化改写：把 `nn.Linear` 换成量化线性层（W8A8，按输出通道的权重 scale）；可选 SmoothQuant 一类的离群值处理（只是把 scale 折进前后的算子，不改硬件）。硬件的 EX 只有 int8 × int8，更低位的权重（int4）需要硬件支持。
+- 结构特性：GQA、QK-norm（Qwen3）、RoPE 的变体（theta、Llama3 的频率缩放：预先算成表）、嵌入与输出层共享、SwiGLU / GELU、LayerNorm。
+- 长上下文：`max-dynamic` 与 KV cache 大小由模型配置决定，不是固定的 256。
+
+**3. 代码生成**（C5 的通用部分覆盖）：
+- K 维分块并跨块累加（Llama3-1B 的 W2：K = 8192 正好是一个 SPAD_B bank）；
+- 注意力按 T 分块（长序列的 K / V 放不进片上）：在线 softmax 由预处理显式写进 IR（§3.2），代码生成只按块执行；
+- GQA：KV 头的下标 = Q 头 / 组大小，用 DIV 下标模式或循环表示；
+- 大词表的分类层（128K–152K 行）：只是更多的块；
+- 一个命令缓冲的 dispatch 很多时（28 层约 900 个），驱动已会拆成多张列表。
+
+**4. 运行时**：设备窗口大小由启动配置决定（现在固定 64 MB）；arena 分配器支持几百 MB 到几 GB；参数文件按需加载进窗口。
+
+**5. 验证方法随规模调整**：
+- 大模型没有手写的 DeviceModel：逐 dispatch 仍与 oracle 逐位一致（oracle 按 IR 执行，与模型无关）；端到端与 torch fp32 比较误差，再看生成质量（top-1 一致率、困惑度）。
+- Python funcsim 跑 stories15M 约 1.4 s / token，整个 0.6B 模型在 sim 上不现实：用截断的层数（像 `QLlama(n_layers)`）做端到端检查，逐 dispatch 检查照常覆盖全部 dispatch；需要时把 funcsim 移植到 C（§13 第 2 条）。
+
+**6. prefill 与批处理**（可选）：批量 prefill 是 M > 1 的矩阵乘，能用满阵列；权重打包 pass 现在只认 vecmat，要推广到 matmul。
+
+**阶段**：
+- **C5.5**（§8.7）：SmolLM2-135M（板上）与 Qwen3 结构的小配置（sim）。
+- **C6 更大的模型**：Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译并逐 dispatch 验证（截断层数做端到端），编译器侧的上述各项补全；换开发板后在板上运行。
+
+### 8.10 C5 之后
 
 - **C4 续**：在 C5 的调度器和代价模型上做暂缓的融合。W13 + SiLU 由预处理组成一个 dispatch region，模板内交错；量化链合并成一个 dispatch；`enable-aggressive-reshape-movement`。目标仍是与手写路径相差 ≤ 10%。
 - 可选扩展（§10）：批处理 decode、prefill、更大的模型。
 
-### 8.10 风险与对策
+### 8.11 风险与对策
 
 | 风险 | 对策 |
 |---|---|
@@ -748,6 +794,8 @@ C5.5 的候选（待定，§13）：
 | **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致。**已完成**（§6.9，板上 12.6 tok/s） | 大 |
 | **C4 性能** | 精简 FENCE、跨 dispatch 预取、更大的 dispatch、代价模型 | 每 token 周期与手写路径相差 ≤ 10%。**部分完成，暂缓**（§7.1：差 13%，板上 17.7 tok/s） | 中 |
 | **C5 代码生成** | sa 方言与完整流水线（§8），模板改成 `sa` 层微内核，分步 C5.0–C5.5（§8.7） | 只用通用代码生成（`--iree-sa-ukernels=none`）也能编译 stories15M，结果与 C3 一致；默认配置每 token 周期不高于 C4；一个模型变体编译通过（§8.1） | 大 |
+
+| **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板 | 大 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。
 - **每一步都在主机上先过**（sim 传输层），再上板；上板通过后提交，与现有约定一致。
@@ -802,5 +850,5 @@ build/iree/               不入库：IREE 源码、Python 环境、编译器构
 3. **可执行体的编码**：自定义二进制还是 flatbuffer。倾向 flatbuffer（IREE 惯例），内容按 §4.2。实际用的是自定义二进制（§4.4）。
 4. **常量的存放**：参数文件（.irpa，推荐）还是嵌在 .vmfb 中。
 5. **C4 的跨 dispatch 调度放在哪里**：驱动（录制命令缓冲时看到相邻的 dispatch）还是编译器（链接阶段）。原本倾向编译器；**已定为驱动**（§7.1），编译器经 sa-desc v3 提供信息。
-6. **C5 的缓冲化**：IREE 的 one-shot bufferize（带 `#sa.mem` 内存空间），还是自己的缓冲化。先试前者（§8.4 第 4 步、§8.9）。
-7. **C5.5 的模型变体**：结构变体（LayerNorm / GELU / GQA）和 / 或更大的模型（stories42M）（§8.7）。
+6. **C5 的缓冲化**：IREE 的 one-shot bufferize（带 `#sa.mem` 内存空间），还是自己的缓冲化。先试前者（§8.4 第 4 步、§8.11）。
+7. **C5.5 的模型变体**：**已定**：SmolLM2-135M（板上）与 Qwen3 结构的小配置（sim）（§8.7、§8.9）。
