@@ -3,6 +3,7 @@
 #ifndef SA_TARGET_CODEGEN_H_
 #define SA_TARGET_CODEGEN_H_
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -40,11 +41,16 @@ struct Generated {
   uint32_t reads = 0, head = 0;
   bool usesSpadB = false;
   int prefixReg = -1;
+  // the descriptors as generated (C5.0: raised into sahw, SahwRaise.cpp):
+  // the body (ending with RET) and the prefix loads (their own BASE, no RET)
+  std::vector<std::array<uint64_t, 8>> bodyRows, prefixRows;
 };
 
 struct CodegenOptions {
   int64_t d = 8;
   int64_t maxDynamic = 256;          // upper bound of a dynamic dimension (local memory planning)
+  int64_t spadBytes = 128 * 1024;    // per SPAD (the target configuration, §8.9)
+  int64_t accBytes = 256 * 1024;
 };
 
 // Generates the template of |func| (a dispatch function). On failure returns

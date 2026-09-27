@@ -15,7 +15,7 @@ namespace sa {
 
 // Local memory plan for array size d (compile_layer.Layout).
 struct Layout {
-  explicit Layout(uint32_t d);
+  explicit Layout(uint32_t d, uint32_t spadBytes = 128 * 1024, uint32_t accBytes = 256 * 1024);
   // Output tiles per chunk (Layout.chunk_tiles); 0 if one tile does not fit.
   uint32_t chunkTiles(uint32_t k, uint32_t nt, uint32_t rows = 1) const;
 

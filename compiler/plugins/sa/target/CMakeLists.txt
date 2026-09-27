@@ -12,6 +12,7 @@ iree_cc_library(
     "Codegen.h"
     "SAPasses.h"
     "Templates.h"
+    "../transforms/SahwPasses.h"
   SRCS
     "CloneCheapProducers.cpp"
     "DescList.cpp"
@@ -20,7 +21,11 @@ iree_cc_library(
     "PackLinearWeights.cpp"
     "SATarget.cpp"
     "Templates.cpp"
+    "../transforms/SahwPasses.cpp"
+    "../transforms/SahwRaise.cpp"
+    "../transforms/SahwSerialize.cpp"
   DEPS
+    sa::SahwDialect
     LLVMSupport
     MLIRArithDialect
     MLIRDialectUtils

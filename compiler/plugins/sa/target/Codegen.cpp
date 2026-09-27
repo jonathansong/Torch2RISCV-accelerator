@@ -178,7 +178,8 @@ struct RowSel {
 
 class Gen {
 public:
-  Gen(FunctionOpInterface func, const CodegenOptions &o) : func(func), opt(o), d(o.d), lay(uint32_t(o.d)) {
+  Gen(FunctionOpInterface func, const CodegenOptions &o)
+      : func(func), opt(o), d(o.d), lay(uint32_t(o.d), uint32_t(o.spadBytes), uint32_t(o.accBytes)) {
     accTop[0] = lay.acc0;
     accTop[1] = lay.acc1;
   }
@@ -1962,6 +1963,8 @@ bool Gen::run(Generated &out, std::string &why) {
   }
   if (!err.empty()) return why = err, false;
   dl.ret();
+  for (const auto &w : dl.array()) out.bodyRows.push_back(w);
+  for (const auto &w : pre.array()) out.prefixRows.push_back(w);
   // the bindings behind the BASE registers (the setup table; default BASE i = binding i)
   using Row = ::sa::DescList::Row;
   auto baseOf = [](const Row &w) { return int((w[0] >> 9 & 3) | (w[0] >> 13 & 3) << 2); };

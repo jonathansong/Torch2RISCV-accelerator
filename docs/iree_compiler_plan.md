@@ -1,6 +1,6 @@
 # LLM 编译器：基于 MLIR / IREE 的端到端方案（PyTorch → 描述符列表）
 
-状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 进行中**（§8）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
+状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 进行中**（§8；C5.0 完成）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
 取代那里 §10.4、§10.5 的概要。
 
 **目标**：从一个 PyTorch 写的 llama 类模型出发，用 MLIR / IREE 自动编译，得到在 PYNQ-Z1 上运行的完整程序：
@@ -706,6 +706,14 @@ C5.5 的模型（§8.9 的第一步）：
 - **SmolLM2-135M**：Llama 结构，GQA（9 个 Q 头、3 个 KV 头）、dim 576、hidden 1536、30 层、词表 49152、嵌入与输出层共享。int8 约 135 MB，放得进 PYNQ-Z1。检验 HuggingFace 导入、通用量化、GQA，以及不同的形状；目标是板上运行。
 - **Qwen3 结构的小配置**：QK-norm、GQA、head_dim 128，维度取小（随机或截断的权重）。只在 sim 上验收，检验 Qwen3 特有的算子。
 - 验收（§8.1 第 3 条）：`--iree-sa-ukernels=none` 编译通过；逐 dispatch 与 oracle 逐位一致；端到端与 torch fp32 在误差范围内，生成质量正常（这些模型没有手写的 DeviceModel）。
+
+**C5.0 结果（2026-09-27）**：完成。
+- `sahw` 方言（`plugins/sa/dialect/SahwOps.td`）：`sahw.template` 与 prefix / head / body 三段、寄存器（`sahw.base`、`sahw.param`、`sahw.private`，`!sahw.base` / `!sahw.param` 类型）、全部命令（ld、st、ex、ve、transpose、ldparam、fence、setreg、loop）。
+- 做法与方案的差别：没有改写现有代码生成器，而是把它的输出（描述符行 + 装载表）逐字段**提升**成 `sahw`（`transforms/SahwRaise.cpp`，pass `iree-sahw-legacy-codegen`；LOOP_END → `sahw.loop` 区域，寄存器号 → 值）。旧生成器在 C5.1–C5.3 中被逐步替换，提升只是过渡。
+- 新的 pass：`iree-sahw-split-head`、`iree-sahw-assign-registers`；序列化器 `transforms/SahwSerialize.cpp`（sahw → sa-desc v3，含读写掩码、SPAD_B、前缀寄存器）。代码生成移到翻译流水线里，`serializeExecutable` 只序列化。
+- 目标配置：`#hal.executable.target` 的 config 带 `d`、`spad_bytes`、`acc_bytes`、`max_dynamic`、`dyn_fields`、`bases`、`params`（`transforms/SahwPasses.h` 的 `TargetConfig`）；`Layout` 的容量改为从配置读取。
+- 开关 `--iree-sa-codegen=dialect|templates`（默认 dialect）。
+- 验收（`tests/test_c50.py`）：lit 测试（`plugins/sa/test/`：方言往返、两个 pass）通过；stories15M 的 58 个可执行体两条路径**逐字节相同**；C2（D = 8、16）、C3（58 个 dispatch、12/12 步逐位一致）在新路径上通过。可执行体与板上验证过的 C4 相同，不需要重新上板。
 
 ### 8.8 扩展点与微内核
 

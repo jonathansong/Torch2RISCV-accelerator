@@ -17,7 +17,7 @@ an `sa` HAL driver through the command ring.
 | `scripts/deploy_c2.sh` | Runs the C2 host test and stages the board test in `build/deploy_c2` | C2 |
 | `scripts/compile_sa.sh` | Compiles an exported model for the sa device (parameters imported, weights packed, packed parameters exported, dispatch sources dumped) | C3 |
 | `scripts/deploy_c3.sh` | Runs the C3 host test and stages the board test in `build/deploy_c3` | C3 |
-| `plugins/sa/` | The `sa` HAL target plugin (C++). `target/`: the `sa` device and backend, the preprocessing pass that packs linear weights, dispatch matching, the C++ templates and `DescList`, sa-desc-v1 serialization. `templates/reference.py`: the Python reference of the templates | C2–C5 |
+| `plugins/sa/` | The `sa` HAL target plugin (C++). `dialect/`: the `sahw` dialect (C5). `transforms/`: sahw passes, serialization, target configuration. `test/`: lit tests (iree-opt + FileCheck). `target/`: the `sa` device and backend, the preprocessing pass that packs linear weights, dispatch matching, the C++ templates and `DescList`, sa-desc-v1 serialization. `templates/reference.py`: the Python reference of the templates | C2–C5 |
 | `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories) | C0 |
 | `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports; its own device and command buffer (C4) record a command buffer's dispatches and build one descriptor list per command buffer. `tools/`: sa-desc writer / reader (`sadesc.py`, format versions 1–3), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
 | `sim/` | `sa_sim_server.py` (the `sim` transport's device: `llm/sa_funcsim.py` on a shared-memory DDR), `sa_board_emu.py` (rt_fw's ring emulated on the host, for the `board` transport) | C1 |
@@ -151,4 +151,14 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   `SA_PROFILE=batch` (per list), `SA_NO_BATCH=1` (one list per dispatch, to
   find a failing dispatch).
 - **C5 in progress** (docs/iree_compiler_plan.md §8): full code generation
-  through an `sa` dialect, replacing the template library.
+  through two dialects, `sahl` (tile level) and `sahw` (command level).
+  **C5.0 done**: the `sahw` dialect (`plugins/sa/dialect/`), the output of the
+  C3/C4 generator raised into it, `sahw-split-head`, `sahw-assign-registers`
+  and the sahw serializer (`plugins/sa/transforms/`); the hardware parameters
+  come from the executable target configuration. `--iree-sa-codegen=dialect`
+  (default) and `=templates` give byte-identical executables.
+
+  ```sh
+  python3 compiler/tests/test_c50.py                       # lit tests + byte comparison of the two paths
+  $IREE_BUILD/llvm-project/bin/llvm-lit -v compiler/plugins/sa/test
+  ```

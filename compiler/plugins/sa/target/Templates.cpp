@@ -7,13 +7,11 @@
 
 namespace sa {
 
-static constexpr uint32_t SPAD_BYTES = 128 * 1024;  // per SPAD (pynq_matmul.SPAD_BYTES)
-static constexpr uint32_t ACC_BYTES = 262144;
 static constexpr uint32_t PRIVATE_PARAM_W = 6, PRIVATE_PARAM_F = 7;  // PARAM6 / 7: the template's own
 
-Layout::Layout(uint32_t d) : d(d) {
-  sbank = SPAD_BYTES / d / 2;            // words per SPAD bank (pynq_matmul._banks)
-  cbank = ACC_BYTES / (4 * d) / 2;       // words per ACC bank
+Layout::Layout(uint32_t d, uint32_t spadBytes, uint32_t accBytes) : d(d) {
+  sbank = spadBytes / d / 2;             // words per SPAD bank (pynq_matmul._banks)
+  cbank = accBytes / (4 * d) / 2;        // words per ACC bank
   scr = cbank / 4;                       // chunk scratch at the start of each ACC bank
   acc0 = scr;
   acc1 = cbank + scr;

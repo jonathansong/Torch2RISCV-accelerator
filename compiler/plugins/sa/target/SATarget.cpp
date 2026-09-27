@@ -11,12 +11,16 @@
 //     template is generated (Templates.cpp) and the executable written as
 //     sa-desc-v1 (compiler/runtime/tools/sadesc.py has the layout). A dispatch
 //     without a template is an error that shows the dispatch.
-// Stage C2 supports the int8 linear dispatch (qlinear).
+// Code generation (--iree-sa-codegen): `dialect` (default, C5) runs the code
+// generator in the translation pipeline and raises it into sahw.template
+// ops (transforms/), which serialization turns into bytes; `templates` is the
+// C3/C4 path (generated at serialization). Both give the same bytes (C5.0).
 
 #include "DescList.h"
 #include "Codegen.h"
 #include "SAPasses.h"
 #include "Templates.h"
+#include "../transforms/SahwPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetDevice.h"
@@ -41,6 +45,8 @@ struct SAOptions {
   // Development: a dispatch without a template becomes a warning and an export
   // that faults when run (so a partial module compiles for per-dispatch tests).
   bool allowUnsupported = false;
+  // Code generation path: "dialect" (sahw) or "templates" (C3/C4, direct).
+  std::string codegen = "dialect";
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -50,6 +56,8 @@ struct SAOptions {
                     llvm::cl::desc("Upper bound of dynamic dimensions (the sequence length)."));
     binder.opt<bool>("iree-sa-allow-unsupported", allowUnsupported, llvm::cl::cat(category),
                      llvm::cl::desc("Warn instead of failing on dispatches without a template (development)."));
+    binder.opt<std::string>("iree-sa-codegen", codegen, llvm::cl::cat(category),
+                            llvm::cl::desc("Code generation path: dialect (sahw, default) or templates (C3/C4)."));
   }
 };
 
@@ -57,7 +65,10 @@ static IREE::HAL::ExecutableTargetAttr
 getSAExecutableTarget(MLIRContext *context, const SAOptions &options) {
   Builder b(context);
   SmallVector<NamedAttribute> config;
-  config.emplace_back(b.getStringAttr("d"), b.getI64IntegerAttr(options.d));
+  sa::TargetConfig tc;
+  tc.d = options.d;
+  tc.maxDynamic = options.maxDynamic;
+  tc.addTo(b, config);
   return b.getAttr<IREE::HAL::ExecutableTargetAttr>(
       b.getStringAttr("sa"), b.getStringAttr("sa-desc-v1"),
       b.getDictionaryAttr(config));
@@ -101,17 +112,21 @@ public:
 
   void buildTranslationPassPipeline(IREE::HAL::ExecutableTargetAttr targetAttr,
                                     OpPassManager &passManager) override {
-    // Templates are matched and generated at serialization; here every
-    // export becomes a single workgroup.
+    // Every export becomes a single workgroup. The dialect path generates the
+    // templates here (sahw); the templates path at serialization.
     passManager.addPass(sa::createLowerWorkgroupCountPass());
+    if (options.codegen == "dialect") {
+      passManager.addPass(sa::createSahwLegacyCodegenPass(options.allowUnsupported));
+      passManager.addPass(sa::createSahwSplitHeadPass());
+      passManager.addPass(sa::createSahwAssignRegistersPass());
+    }
   }
 
   LogicalResult serializeExecutable(const SerializationOptions &serOptions,
                                     IREE::HAL::ExecutableVariantOp variantOp,
                                     OpBuilder &executableBuilder) override {
-    int64_t d = options.d;
-    if (auto config = variantOp.getTarget().getConfiguration())
-      if (auto dAttr = config.getAs<IntegerAttr>("d")) d = dAttr.getInt();
+    sa::TargetConfig tc = sa::TargetConfig::fromAttr(variantOp.getTarget().getConfiguration());
+    int64_t d = tc.d;
 
     struct Export {
       std::string name;
@@ -122,16 +137,30 @@ public:
     };
     SmallVector<std::pair<uint64_t, Export>> exports;
     auto innerModule = variantOp.getInnerModule();
+    // the dialect path: sahw.template ops from the translation pipeline
+    llvm::StringMap<sa::sahw::TemplateOp> templates;
+    if (innerModule)
+      for (auto t : innerModule.getOps<sa::sahw::TemplateOp>()) templates[t.getExportName()] = t;
     for (auto exportOp : variantOp.getBlock().getOps<IREE::HAL::ExecutableExportOp>()) {
+      uint64_t ordinal = exportOp.getOrdinal() ? exportOp.getOrdinal()->getZExtValue() : exports.size();
+      auto layout0 = exportOp.getLayout();
+      if (!templates.empty()) {
+        auto it = templates.find(exportOp.getSymName());
+        if (it == templates.end()) return exportOp.emitError() << "sa target: no sahw.template for this export";
+        sa::SerializedExport se;
+        if (failed(sa::serializeTemplate(it->second, se))) return failure();
+        exports.push_back({ordinal, {exportOp.getSymName().str(), se.templ, uint32_t(layout0.getBindings().size()),
+                                     uint32_t(layout0.getConstants()), se.cycles, se.setup, se.prefix,
+                                     se.prefixReads, se.writes, se.reads, se.head, se.flags, se.prefixReg}});
+        continue;
+      }
       auto func = innerModule ? innerModule.lookupSymbol<FunctionOpInterface>(exportOp.getSymName())
                               : FunctionOpInterface();
       if (!func) return exportOp.emitError() << "sa target: no function for this export";
       auto layout = exportOp.getLayout();
       uint32_t bindings = layout.getBindings().size(), constants = layout.getConstants();
       if (bindings > 16) return exportOp.emitError() << "sa target: " << bindings << " bindings (at most 16)";
-      sa::CodegenOptions copt;
-      copt.d = d;
-      copt.maxDynamic = options.maxDynamic;
+      sa::CodegenOptions copt = tc.codegenOptions();
       sa::Generated gen;
       std::string why;
       uint32_t cycles = 0;
@@ -153,7 +182,6 @@ public:
         gen.usesSpadB = true;
         cycles = 0xFFFFFFFFu;                    // marks the export as unsupported
       }
-      uint64_t ordinal = exportOp.getOrdinal() ? exportOp.getOrdinal()->getZExtValue() : exports.size();
       exports.push_back({ordinal, {exportOp.getSymName().str(), gen.templ, bindings, constants, cycles, gen.setup,
                                    gen.prefix, gen.prefixReads, gen.writes, gen.reads, gen.head,
                                    gen.usesSpadB ? 1u : 0u, uint32_t(gen.prefixReg < 0 ? 0 : gen.prefixReg)}});
@@ -241,7 +269,9 @@ struct SASession final
     sa::registerPackLinearWeightsPass();
     sa::registerCloneCheapProducersPass();
     sa::registerLowerWorkgroupCountPass();
+    sa::registerSahwPasses();
   }
+  void onRegisterDialects(DialectRegistry &registry) override { registry.insert<sa::sahw::SahwDialect>(); }
   // Only acts on modules that target the sa device (the pass checks), so the
   // default behavior of the compiler is unchanged.
   void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
