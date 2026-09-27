@@ -673,12 +673,14 @@ C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层�
 
 | 步骤 | 内容 | 验收 | 工作量 |
 |---|---|---|---|
-| **C5.0 基础设施** | 方言（ODS / TableGen）、verifier、序列化器、`--iree-sa-codegen` 开关、流水线骨架、FileCheck；现有代码生成器改为输出 `sa` 操作，然后由新的 `sa-schedule`（prefix / head）、`sa-assign-registers` 和序列化器完成 | 58 个 dispatch 的 sa-desc 与 C4 **逐字节相同**（先验证后半条流水线） | 中 |
-| **C5.1 逐元素与归约** | 流水线前半：normalize、layout（packed / 广播字）、缓冲化、lower、fuse-ve、uniform、legalize-dynamic、allocate | 约 40 个非 contraction 的 dispatch 用新路径全部通过 `dispatch_check`；混合路径端到端 sim 逐位一致；逐 dispatch 周期不高于 C4 | 大 |
-| **C5.2 线性层** | contraction 分块、A / B 条带、尾部按块融合、软件流水、`sa.loop`、prefix | 5 种线性层通过；板上逐 dispatch 周期与 C4 相差 ≤ 1%（模板的调度就是参照） | 大 |
-| **C5.3 注意力、scatter、gather、i64 标量** | batch_matmul（Kᵀ 条带、TRANSPOSE）、动态 T 的行循环、带掩码的 softmax、KV 写入（LDPARAM）、嵌入 gather | 58 个 dispatch 全部走新路径 | 大 |
+| **C5.0 基础设施** | 方言（ODS / TableGen）、verifier、序列化器、`--iree-sa-codegen` 开关、流水线骨架、FileCheck；现有代码生成器改为输出 `sa` 操作，然后由新的 `sa-schedule`（prefix / head）、`sa-assign-registers` 和序列化器完成；**目标配置**（§8.9 第 1 项）：`#hal.executable.target` 的 config 带全部硬件参数，新代码只从这里读 | 58 个 dispatch 的 sa-desc 与 C4 **逐字节相同**（先验证后半条流水线） | 中 |
+| **C5.1 逐元素与归约** | 流水线前半：normalize、layout（packed / 广播字）、缓冲化、lower、fuse-ve、uniform、legalize-dynamic、allocate；funcsim 与 `dispatch_check` 支持目标配置的参数（D、SPAD / ACC 大小） | 约 40 个非 contraction 的 dispatch 用新路径全部通过 `dispatch_check`（D = 8，并用 D = 16 等配置交叉验证）；混合路径端到端 sim 逐位一致；逐 dispatch 周期不高于 C4 | 大 |
+| **C5.2 线性层** | contraction 分块（N，以及 K 放不下时按 K 分块、跨块累加）、A / B 条带、尾部按块融合、软件流水、`sa.loop`、prefix | 5 种线性层通过；另加 K = 8192 等单独的线性层测试（覆盖 K 分块）；板上逐 dispatch 周期与 C4 相差 ≤ 1%（模板的调度就是参照） | 大 |
+| **C5.3 注意力、scatter、gather、i64 标量** | batch_matmul（Kᵀ 条带、TRANSPOSE）、动态 T 的行循环、带掩码的 softmax、KV 写入（LDPARAM）、嵌入 gather；GQA 的下标映射（KV 头 = Q 头 / 组大小）按设计实现 | 58 个 dispatch 全部走新路径；GQA 用单独的注意力测试覆盖 | 大 |
 | **C5.4 模板改成微内核** | 线性层、注意力的模板改写成输出 `sa` 操作的微内核（§8.8），加 `--iree-sa-ukernels`；旧的直接生成描述符的路径与 `--iree-sa-codegen` 开关退役；板上验收 | §8.1 的 1、2（两种配置） | 中 |
-| **C5.5 通用性** | 一个没有为它写过代码的模型变体，见下 | §8.1 的 3 | 中 |
+| **C5.5 通用性** | 下面两个模型；前端（HuggingFace 导入、通用量化、QK-norm 等结构）、运行时（设备窗口可配置、分配器到 GB 级）、按 torch 误差验收的端到端测试 | §8.1 的 3；SmolLM2-135M 上板 | 中 |
+
+前端（§8.9 第 2 项）是独立的 Python 工作，与代码生成无关，可以在 C5.1–C5.3 期间穿插先做：先用现有的模板路径试编 SmolLM2 / Qwen3，看会暴露哪些不支持的 dispatch，反过来检查 C5 的覆盖面。
 
 C5.5 的模型（§8.9 的第一步）：
 - **SmolLM2-135M**：Llama 结构，GQA（9 个 Q 头、3 个 KV 头）、dim 576、hidden 1536、30 层、词表 49152、嵌入与输出层共享。int8 约 135 MB，放得进 PYNQ-Z1。检验 HuggingFace 导入、通用量化、GQA，以及不同的形状；目标是板上运行。
@@ -747,9 +749,24 @@ C5.5 的模型（§8.9 的第一步）：
 
 **6. prefill 与批处理**（可选）：批量 prefill 是 M > 1 的矩阵乘，能用满阵列；权重打包 pass 现在只认 vecmat，要推广到 matmul。
 
+**各项的时间表**（原则：越晚改代价越大的，写 C5 的 pass 时就做进去）：
+
+| # | 项目 | 何时做 | 理由 |
+|---|---|---|---|
+| 1 | 目标配置参数化 | C5.0 起贯穿 C5；funcsim 的参数化与交叉验证在 C5.1 | 新 pass 从第一行起不写常数，几乎没有额外成本；事后再改要翻遍所有 pass |
+| 3a | K 维分块、跨块累加 | C5.2 | 通用 contraction 分块的一部分；stories15M 用不到，用单独的线性层测试覆盖 |
+| 3b | GQA 下标映射 | C5.3 实现，C5.5 首次用上 | 注意力降级时按组映射设计，SmolLM2 需要 |
+| 2 | 前端：HuggingFace 导入、通用量化、QK-norm 等结构 | C5.5（可在 C5.1–C5.3 期间穿插先做） | 与代码生成无关；SmolLM2 与 Qwen3 小配置需要 |
+| 4 | 运行时：设备窗口可配置、分配器到 GB 级 | C5.5 | SmolLM2-135M 的权重约 135 MB，现在的 64 MB 窗口放不下；改动小 |
+| 5 | 验证：与 torch 比误差、截断层数 | C5.5 起；C funcsim 在 C6 视需要 | 新模型没有手写的 DeviceModel；Python sim 只在大模型上才太慢 |
+| 3c | 注意力按 T 分块（在线 softmax） | C6 | 涉及数值约定（预处理显式改写 IR、oracle 相应支持）；seq ≤ 2048 时是否需要，C5.5 前核实片上容量 |
+| 3d | 大词表、多张列表 | 已具备，C6 验证 | 不需要新代码 |
+| 6 | 批量 prefill | C6 之后（可选） | 只影响速度，不影响能否编译 |
+
 **阶段**：
-- **C5.5**（§8.7）：SmolLM2-135M（板上）与 Qwen3 结构的小配置（sim）。
-- **C6 更大的模型**：Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译并逐 dispatch 验证（截断层数做端到端），编译器侧的上述各项补全；换开发板后在板上运行。
+- **C5**：第 1、3a、3b 项（§8.7 的 C5.0–C5.3）。
+- **C5.5**（§8.7）：第 2、4、5 项；SmolLM2-135M（板上）与 Qwen3 结构的小配置（sim）。
+- **C6 更大的模型**：第 3c 项，第 5 项的 C funcsim（视需要）；Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译并逐 dispatch 验证（截断层数做端到端）；换开发板后在板上运行。之后可选第 6 项。
 
 ### 8.10 C5 之后
 
