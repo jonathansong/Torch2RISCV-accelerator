@@ -866,7 +866,15 @@ bool Gen::genericOp(linalg::GenericOp g, const RowSel *sel) {
     } else if (m.isIdentity() || (m.getNumResults() == unsigned(nloops) && m.isMinorIdentity())) {
       auto l = materialize(in);
       if (!l) return false;
-      if (l->layout != Layout::Packed) return fail("identity operand in broadcast layout");
+      if (l->layout != Layout::Packed) {
+        // a per-row result (one word per element) used element-wise: pack it
+        if (sel) return fail("broadcast-layout operand in a row-by-row generic");
+        void *key = in.getAsOpaquePointer();
+        Local p = packBcast(*l, rt.getNumElements());
+        locals[key] = p;
+        bcastLocals[key] = *l;
+        l = p;
+      }
       e.kind = EV::Mem;
       e.opd = {la(*l), l->vt, ::sa::IDX_LIN, 0};
       if (sel) {
@@ -1737,9 +1745,10 @@ bool Gen::attention(linalg::BatchMatmulOp bmm) {
 // =============================================================== scatter: one row into a cache
 bool Gen::scatter(IREE::LinalgExt::ScatterOp sc) {
   Value upd = sc.getUpdates(), idx = sc.getIndices(), orig = sc.getOriginal();
-  auto us = sources.find(upd.getAsOpaquePointer()), is = sources.find(idx.getAsOpaquePointer()),
-       os = sources.find(orig.getAsOpaquePointer());
-  if (us == sources.end() || is == sources.end() || os == sources.end()) return fail("scatter operands are not loads");
+  auto is = sources.find(idx.getAsOpaquePointer()), os = sources.find(orig.getAsOpaquePointer());
+  if (is == sources.end() || os == sources.end()) return fail("scatter index / target are not loads");
+  if (!sources.count(upd.getAsOpaquePointer()) && !locals.count(upd.getAsOpaquePointer()))
+    return fail("scatter update neither loaded nor computed");
   auto uT = cast<RankedTensorType>(upd.getType()), oT = cast<RankedTensorType>(orig.getType());
   if (sc.getDimensionMap() != ArrayRef<int64_t>{0} || uT.getDimSize(0) != 1 || !uT.hasStaticShape() ||
       !oT.hasStaticShape() || uT.getElementType() != oT.getElementType())

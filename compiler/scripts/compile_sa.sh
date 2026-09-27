@@ -4,6 +4,8 @@
 # the packed parameters exported (docs/iree_compiler_plan.md §6.3).
 #   compiler/scripts/compile_sa.sh <dir with qllama.mlir / .irpa> [extra iree-compile flags]
 # -> <dir>/sa.vmfb, <dir>/sa_packed.irpa, <dir>/sa_sources/ (dispatch sources)
+# Aggressive dispatch fusion is on (C4: 242 -> 200 dispatches per token).
+# SA_COMPILE_FLAGS: extra iree-compile flags.
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 dir=$1; shift
@@ -12,4 +14,5 @@ mkdir -p "$dir/sa_sources"
   --iree-opt-const-expr-max-size-increase-threshold=0 \
   --iree-parameter-import=model="$dir/qllama.irpa" --iree-parameter-import-maximum-size=4294967295 \
   --iree-parameter-export=model="$dir/sa_packed.irpa" --iree-parameter-export-minimum-size=256 \
-  --iree-hal-dump-executable-sources-to="$dir/sa_sources" "$@" -o "$dir/sa.vmfb"
+  --iree-dispatch-creation-enable-aggressive-fusion \
+  --iree-hal-dump-executable-sources-to="$dir/sa_sources" ${SA_COMPILE_FLAGS:-} "$@" -o "$dir/sa.vmfb"
