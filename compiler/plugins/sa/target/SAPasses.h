@@ -14,6 +14,11 @@ namespace mlir::iree_compiler::sa {
 std::unique_ptr<Pass> createPackLinearWeightsPass(int64_t d);
 void registerPackLinearWeightsPass();
 
+// Preprocessing: index / scalar-only element-wise values are recomputed in
+// each consumer (CloneCheapProducers.cpp).
+std::unique_ptr<Pass> createCloneCheapProducersPass();
+void registerCloneCheapProducersPass();
+
 // Translation: every export runs as one workgroup (a dispatch is one
 // descriptor template), so the workgroup count regions become (1, 1, 1)
 // (LowerWorkgroupCount.cpp).

@@ -74,11 +74,13 @@ iree_allocator_t sa_context_data_allocator(sa_context_t* context);
 // Physical address of |ptr| inside the device-visible window.
 iree_status_t sa_context_phys(sa_context_t* context, const void* ptr, uint32_t* out_phys);
 
-// Runs one dispatch: builds SETREG (BASE i = binding_phys[i], PARAM j =
-// constants[j]) + CALL entry_phys + END in the scratch list and runs it.
-iree_status_t sa_context_dispatch(sa_context_t* context, uint32_t entry_phys, uint32_t binding_count,
-                                  const uint32_t* binding_phys, uint32_t constant_count,
-                                  const uint32_t* constants, sa_completion_t* out);
+// SETREG register numbers: BASE n = n, PARAM n = SA_REG_PARAM + n.
+#define SA_REG_PARAM 16
+
+// Runs one dispatch: builds SETREG (regs[i] = values[i], at most 24) + CALL
+// entry_phys + END in the scratch list and runs it.
+iree_status_t sa_context_dispatch(sa_context_t* context, uint32_t entry_phys, uint32_t count,
+                                  const uint32_t* regs, const uint32_t* values, sa_completion_t* out);
 
 // Registers the "sa" HAL driver (sa_driver_module.c).
 iree_status_t iree_hal_sa_driver_module_register(iree_hal_driver_registry_t* registry);

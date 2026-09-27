@@ -35,3 +35,8 @@ iree_cc_library(
 add_executable(sa_hal_test ${CMAKE_CURRENT_SOURCE_DIR}/../test/sa_hal_test.c)
 target_include_directories(sa_hal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sa_hal_test PRIVATE sa_runtime::hal_driver iree::hal)
+
+# The decode loop of an IREE-compiled llama (compiler/runtime/tools/sa_llm_run.c)
+add_executable(sa-llm-run ${CMAKE_CURRENT_SOURCE_DIR}/../tools/sa_llm_run.c)
+target_link_libraries(sa-llm-run PRIVATE iree::base iree::base::tooling::flags iree::hal iree::tooling::context_util iree::modules::hal::types
+                      iree::vm)

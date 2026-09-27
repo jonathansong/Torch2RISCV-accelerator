@@ -210,6 +210,29 @@ int main(int argc, char** argv) {
   iree_hal_command_buffer_release(cb);
   fails += compare("axpb (binding offsets)", big, 2 * pad + x1s, y1, y1s);
 
+  // axpb_off (sa-desc version 2): x and y in one buffer at byte offsets given
+  // as push constants, A / B through the register setup table
+  {
+    iree_hal_executable_export_ordinal_t off_ord = 0;
+    CHECK(iree_hal_executable_lookup_export_by_name(exe, IREE_SV("axpb_off"), &off_ord));
+    uint32_t offx = read_param(dir, "offx"), offy = read_param(dir, "offy");
+    iree_hal_buffer_t* one = make_buffer(device, offy + y1s, NULL);
+    CHECK(iree_hal_buffer_map_write(one, offx, x1, x1s));
+    uint32_t c4[4] = {offx, offy, consts[0], consts[1]};
+    iree_hal_buffer_ref_t r1[1] = {iree_hal_make_buffer_ref(one, 0, offy + y1s)};
+    CHECK(iree_hal_command_buffer_create(device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+                                         IREE_HAL_COMMAND_CATEGORY_DISPATCH, IREE_HAL_QUEUE_AFFINITY_ANY, 0, &cb));
+    CHECK(iree_hal_command_buffer_begin(cb));
+    CHECK(iree_hal_command_buffer_dispatch(cb, exe, off_ord, iree_hal_make_static_dispatch_config(1, 1, 1),
+                                           iree_make_const_byte_span(c4, sizeof(c4)),
+                                           (iree_hal_buffer_ref_list_t){1, r1}, IREE_HAL_DISPATCH_FLAG_NONE));
+    CHECK(iree_hal_command_buffer_end(cb));
+    submit_and_wait(device, cb, &timeline, sem);
+    iree_hal_command_buffer_release(cb);
+    fails += compare("axpb_off (setup table)", one, offy, y1, y1s);
+    iree_hal_buffer_release(one);
+  }
+
   // submission 3: the device reports an error -> the submission fails
   iree_hal_executable_export_ordinal_t fault = 0;
   CHECK(iree_hal_executable_lookup_export_by_name(exe, IREE_SV("fault"), &fault));

@@ -57,14 +57,33 @@ DescList &DescList::st(uint32_t ddr, uint32_t la, uint32_t nrows, uint32_t rowBy
 }
 
 DescList &DescList::ex(uint32_t a, uint32_t b, uint32_t c, uint32_t kt, bool accumulate, uint32_t repeat,
-                       uint32_t bstep, uint32_t cstep, uint32_t crow, bool fenceBefore) {
+                       uint32_t bstep, uint32_t cstep, uint32_t crow, bool fenceBefore, const std::vector<Dyn> &dyn) {
   return put(EX, dmaFlags(-1, fenceBefore),
              {a | uint64_t(b) << 16 | uint64_t(c) << 32 | uint64_t(kt) << 48 | uint64_t(accumulate) << 60,
-              repeat | uint64_t(bstep) << 16 | uint64_t(cstep) << 32 | uint64_t(crow) << 48});
+              repeat | uint64_t(bstep) << 16 | uint64_t(cstep) << 32 | uint64_t(crow) << 48},
+             dyn);
 }
 
+DescList &DescList::transpose(uint32_t src, uint32_t dst, uint32_t length, uint32_t types, uint32_t stride,
+                              bool fenceBefore, const std::vector<Dyn> &dyn) {
+  constexpr uint64_t VOP_TRANSPOSE = 6;
+  return put(VE, dmaFlags(-1, fenceBefore),
+             {uint64_t(src), dst | uint64_t(length) << 32, VOP_TRANSPOSE | uint64_t(types) << 8, 0, 0, 0,
+              uint64_t(stride) << 48},
+             dyn);
+}
+
+DescList &DescList::ldparam(uint32_t addr, uint32_t param, uint32_t mul, uint32_t add, int base, bool fenceBefore,
+                            const std::vector<Dyn> &dyn) {
+  return put(LDPARAM, dmaFlags(base, fenceBefore), {addr & M32, uint64_t(param & 7), uint64_t(mul & 0xFFFF),
+                                                   add & M32},
+             dyn);
+}
+
+DescList &DescList::fence(uint32_t mask) { return put(FENCE, 0, {uint64_t(mask)}); }
+
 DescList &DescList::veFp(uint32_t src1, uint32_t src2, uint32_t dst, uint32_t length, VOp op, uint32_t types,
-                         uint32_t period, const VeFp &fp, bool fenceBefore) {
+                         uint32_t period, const VeFp &fp, bool fenceBefore, const std::vector<Dyn> &dyn) {
   if (fp.t2 >= 0) types |= uint32_t(fp.t2 == 0 ? 1 : fp.t2) << 4;
   const int64_t scale = 1, shift = 0, zp = 0, lo = INT32_MIN, hi = INT32_MAX;
   uint64_t w3 = op | uint64_t(types) << 8 | uint64_t(period) << 16 | uint64_t(scale & 0xFFFF) << 32 |
@@ -77,17 +96,18 @@ DescList &DescList::veFp(uint32_t src1, uint32_t src2, uint32_t dst, uint32_t le
   uint64_t w6 = f32bits(fp.A) | f32bits(fp.B) << 32;
   uint64_t w7 = fp.rowlen | uint64_t(fp.valid) << 16 | uint64_t(fp.p1) << 32;
   return put(VE, dmaFlags(-1, fenceBefore), {src1 | uint64_t(src2) << 32, dst | uint64_t(length) << 32, w3, w4,
-                                             w5, w6, w7});
+                                             w5, w6, w7},
+             dyn);
 }
 
-DescList &DescList::setreg(const std::vector<std::pair<uint32_t, uint32_t>> &regs) {
+DescList &DescList::setreg(const std::vector<std::pair<uint32_t, uint32_t>> &regs, const std::vector<Dyn> &dyn) {
   if (regs.empty() || regs.size() > 3) fail("SETREG takes 1..3 registers");
   uint64_t w1 = 0, vals[3] = {0, 0, 0};
   for (size_t i = 0; i < regs.size(); ++i) {
     w1 |= uint64_t(0x40 | regs[i].first) << (8 * i);
     vals[i] = regs[i].second & M32;
   }
-  return put(SETREG, 0, {w1, vals[0], vals[1], vals[2], 0});
+  return put(SETREG, 0, {w1, vals[0], vals[1], vals[2], 0}, dyn);
 }
 
 DescList &DescList::loopEnd(int32_t offset, uint32_t count, uint32_t k1, uint32_t s1, uint32_t k2, uint32_t s2) {

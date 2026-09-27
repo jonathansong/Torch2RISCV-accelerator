@@ -18,10 +18,22 @@ File layout (little-endian):
     0  u32 name offset (in strings)   4  u32 name length
     8  u32 template offset (bytes, from the templates start, 64-aligned)
     12 u32 descriptor count
-    16 u16 binding count  18 u16 constant count  20 u32 flags (0)
-    24 u32 estimated cycles (0 = unknown)        28 u32 reserved
+    16 u16 binding count  18 u16 constant count
+    20 u32 register setup entry count (version 2; 0 = the default setup)
+    24 u32 estimated cycles (0 = unknown)
+    28 u32 register setup table offset (version 2, bytes from the file start)
   templates: 64-byte descriptors, the exports back to back
   strings: export names (not NUL-terminated)
+  register setup tables (version 2), 16 bytes per entry:
+    0 u8 kind (0 BASE, 1 PARAM)  1 u8 register  2 u8 binding  3 u8 0
+    4 i16 push constant ordinal (-1: none)  6 u16 0
+    8 i32 mul  12 i32 add   (the divisor is a power of two: kind | log2(div) << 4)
+  value = ((constant * mul) >> log2(div)) + add, and for BASE + the binding's
+  physical address. The default setup (no table) is BASE i = binding i,
+  PARAM j = push constant j. With a table, dynamic binding offsets (IREE
+  passes them as push constants), lengths derived from push constants and
+  constants beyond six are handled by the driver; the template only has
+  static offsets.
 
 The C loader (compiler/runtime/sa/sa_loader.c) reads the same layout.
 """
@@ -37,7 +49,9 @@ sys.path.insert(0, os.path.join(REPO, "driver"))
 from pynq_matmul import DescList  # noqa: E402
 
 MAGIC = b"SADESC1\0"
-VERSION = 1
+VERSION = 2
+SETUP = struct.Struct("<4BhH2i")
+SETUP_BASE, SETUP_PARAM = 0, 1
 HDR = struct.Struct("<8s9I20x")         # 64 bytes
 EXP = struct.Struct("<4I2H3I")
 MAX_CONSTANTS = 6                    # PARAM0..5; PARAM6 / 7 belong to the template
@@ -46,7 +60,7 @@ CAPS_DESC, CAPS_NOTIFY, CAPS_FPVE, CAPS_CMDX = 1 << 21, 1 << 22, 1 << 23, 1 << 2
 OP_JUMP, OP_CALL, OP_RET = DescList.JUMP, DescList.CALL, DescList.RET
 
 
-def check_template(rows, bindings, constants):
+def check_template(rows, bindings, constants):  # bindings: BASE registers the template may use
     """Position independence and the calling convention; raises ValueError."""
     if rows.shape[0] == 0 or (int(rows[-1, 0]) & 0xFF) != OP_RET:
         raise ValueError("a template must end with RET")
@@ -71,33 +85,46 @@ class Executable:
         self.d, self.caps = d, caps
         self.exports = []
 
-    def add(self, name, dl, bindings, constants=0, est_cycles=0):
-        """dl: a DescList ending with RET (or not: RET is appended)."""
+    def add(self, name, dl, bindings, constants=0, est_cycles=0, setup=None):
+        """dl: a DescList ending with RET (or not: RET is appended). setup:
+        register setup entries (kind, reg, binding, const, mul, div, add), or
+        None for the default (BASE i = binding i, PARAM j = constant j)."""
         rows = dl.array()
         if rows.shape[0] == 0 or (int(rows[-1, 0]) & 0xFF) != OP_RET:
             dl.ret()
             rows = dl.array()
-        check_template(rows, bindings, constants)
-        self.exports.append((name, rows, bindings, constants, est_cycles))
+        nbase = bindings
+        if setup:
+            nbase = 1 + max([e[1] for e in setup if e[0] == SETUP_BASE], default=-1)
+        check_template(rows, nbase, constants if not setup else 0)
+        self.exports.append((name, rows, bindings, constants, est_cycles, list(setup or [])))
         return len(self.exports) - 1
 
     def to_bytes(self):
         n = len(self.exports)
         exp_off = HDR.size
         tmpl_off = -(-(exp_off + EXP.size * n) // 64) * 64
-        tmpl = b"".join(rows.tobytes() for _, rows, _, _, _ in self.exports)
+        tmpl = b"".join(e[1].tobytes() for e in self.exports)
         str_off = tmpl_off + len(tmpl)
-        strings, table, t, s = b"", b"", 0, 0
-        for name, rows, b, c, cyc in self.exports:
+        strings = b"".join(e[0].encode() for e in self.exports)
+        setup_off = -(-(str_off + len(strings)) // 16) * 16
+        table, setups, t, s = b"", b"", 0, 0
+        for name, rows, b, c, cyc, setup in self.exports:
             nb = name.encode()
-            table += EXP.pack(s, len(nb), t, rows.shape[0], b, c, 0, cyc, 0)
-            strings += nb
+            table += EXP.pack(s, len(nb), t, rows.shape[0], b, c, len(setup), cyc,
+                              setup_off + len(setups) if setup else 0)
+            for kind, reg, binding, const, mul, div, add in setup:
+                if div & (div - 1):
+                    raise ValueError("setup divisor must be a power of two")
+                setups += SETUP.pack(kind | (div.bit_length() - 1) << 4, reg, binding, 0, const, 0, mul, add)
             t += rows.nbytes
             s += len(nb)
         hdr = HDR.pack(MAGIC, VERSION, self.d, self.caps, n, exp_off, tmpl_off, len(tmpl), str_off, len(strings))
         blob = hdr + table
         blob += b"\0" * (tmpl_off - len(blob))
-        return blob + tmpl + strings
+        blob += tmpl + strings
+        blob += b"\0" * (setup_off - len(blob)) if setups else b""
+        return blob + setups
 
     def save(self, path):
         with open(path, "wb") as f:
@@ -105,26 +132,45 @@ class Executable:
 
 
 def read(data):
-    """bytes -> (D, caps, [(name, rows uint64 (n, 8), bindings, constants, est_cycles)])."""
+    """bytes -> (D, caps, [(name, rows uint64 (n, 8), bindings, constants, est_cycles, setup)]);
+    setup: [(kind, reg, binding, const, mul, div, add)] (empty: the default)."""
     f = HDR.unpack_from(data, 0)
-    if f[0] != MAGIC or f[1] != VERSION:
-        raise ValueError("not an sa-desc-v1 executable")
+    if f[0] != MAGIC or f[1] not in (1, 2):
+        raise ValueError("not an sa-desc executable (version 1 or 2)")
     d, caps, n, exp_off, tmpl_off, tmpl_bytes, str_off, str_bytes = f[2:10]
     out = []
     for i in range(n):
-        so, sl, to, cnt, b, c, _, cyc, _ = EXP.unpack_from(data, exp_off + EXP.size * i)
+        so, sl, to, cnt, b, c, nsetup, cyc, setup_off = EXP.unpack_from(data, exp_off + EXP.size * i)
         name = data[str_off + so:str_off + so + sl].decode()
         rows = np.frombuffer(data, "<u8", cnt * 8, tmpl_off + to).reshape(cnt, 8)
-        out.append((name, rows, b, c, cyc))
+        setup = []
+        for j in range(nsetup if f[1] >= 2 else 0):
+            kd, reg, binding, _, const, _, mul, add = SETUP.unpack_from(data, setup_off + SETUP.size * j)
+            setup.append((kd & 15, reg, binding, const, mul, 1 << (kd >> 4), add))
+        out.append((name, rows, b, c, cyc, setup))
     return d, caps, out
 
 
-def dispatch_list(entry_phys, binding_phys, constants):
-    """The list the sa HAL driver submits for one dispatch (sa_loader.c builds the
-    same): SETREG BASE0.. = the bindings' physical addresses, SETREG PARAM0.. =
-    the push constants, CALL the export's template, END."""
-    regs = [(i, int(a)) for i, a in enumerate(binding_phys)]
-    regs += [(DescList.REG_PARAM + i, int(v)) for i, v in enumerate(constants)]
+def setup_values(setup, binding_phys, constants):
+    """The register values of one dispatch: [(register number for SETREG, value)]."""
+    if not setup:
+        regs = [(i, int(a)) for i, a in enumerate(binding_phys)]
+        return regs + [(DescList.REG_PARAM + i, int(v)) for i, v in enumerate(constants)]
+    regs = []
+    for kind, reg, binding, const, mul, div, add in setup:
+        v = ((int(constants[const]) * mul) >> (div.bit_length() - 1) if const >= 0 else 0) + add
+        if kind == SETUP_BASE:
+            regs.append((reg, (int(binding_phys[binding]) + v) & 0xFFFFFFFF))
+        else:
+            regs.append((DescList.REG_PARAM + reg, v & 0xFFFFFFFF))
+    return regs
+
+
+def dispatch_list(entry_phys, binding_phys, constants, setup=None):
+    """The list the sa HAL driver submits for one dispatch (sa_context.c builds the
+    same): SETREG of the register values (setup_values), CALL the export's
+    template, END."""
+    regs = setup_values(setup, binding_phys, constants)
     dl = DescList()
     for i in range(0, len(regs), 3):
         dl.setreg(*regs[i:i + 3])

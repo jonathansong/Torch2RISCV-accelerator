@@ -31,5 +31,5 @@ case "$which" in
     ;;
   *) echo "usage: $0 host|armv7" >&2; exit 2 ;;
 esac
-cmake --build "$B" -j "$SA_JOBS" --target sa_hal_test iree-run-module 2>&1 | grep -v dlopen | tail -n 30 || true
+cmake --build "$B" -j "$SA_JOBS" --target sa_hal_test sa-llm-run iree-run-module 2>&1 | grep -v dlopen | tail -n 30 || true
 echo "built: $(find "$B" -name sa_hal_test -type f) $B/tools/iree-run-module"

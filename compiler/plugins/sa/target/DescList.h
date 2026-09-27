@@ -30,6 +30,10 @@ inline uint32_t vtypes(VType in, VType out) { return uint32_t(in) | uint32_t(out
 // Fields a descriptor may take from a PARAM register (DescList.DYN_FIELDS).
 enum DynField : uint32_t {
   DYN_DMA_DDR = 1, DYN_DMA_LADDR = 2, DYN_DMA_ROWS = 3, DYN_DMA_ROW_BYTES = 4, DYN_DMA_PITCH = 5,
+  DYN_EX_A = 1, DYN_EX_B = 2, DYN_EX_C = 3, DYN_EX_KT = 4, DYN_EX_REPEAT = 5, DYN_EX_BSTEP = 6, DYN_EX_CSTEP = 7,
+  DYN_VE_SRC1 = 1, DYN_VE_SRC2 = 2, DYN_VE_DST = 3, DYN_VE_LEN = 4, DYN_VE_VALID = 5, DYN_VE_ROWLEN = 6,
+  DYN_VE_P1 = 7, DYN_VE_PERIOD = 8, DYN_VE_A = 9, DYN_VE_B = 10, DYN_VE_IMM = 11,
+  DYN_LDPARAM_ADDR = 1,
 };
 struct Dyn {
   uint32_t field;
@@ -63,13 +67,21 @@ public:
   DescList &st(uint32_t ddr, uint32_t la, uint32_t rows, uint32_t rowBytes, uint32_t pitch, int base = -1,
                bool fenceBefore = false, const std::vector<Dyn> &dyn = {});
   DescList &ex(uint32_t a, uint32_t b, uint32_t c, uint32_t kt, bool accumulate = false, uint32_t repeat = 1,
-               uint32_t bstep = 0, uint32_t cstep = 0, uint32_t crow = 1, bool fenceBefore = false);
+               uint32_t bstep = 0, uint32_t cstep = 0, uint32_t crow = 1, bool fenceBefore = false,
+               const std::vector<Dyn> &dyn = {});
   // The fp32 VE pipeline (DescList.ve with fp=True; scale / shift / zp / lo /
   // hi at their defaults).
   DescList &veFp(uint32_t src1, uint32_t src2, uint32_t dst, uint32_t length, VOp op, uint32_t types,
-                 uint32_t period, const VeFp &fp, bool fenceBefore = false);
+                 uint32_t period, const VeFp &fp, bool fenceBefore = false, const std::vector<Dyn> &dyn = {});
+  // D x D block transpose (DescList.transpose): length elements, stride words.
+  DescList &transpose(uint32_t src, uint32_t dst, uint32_t length, uint32_t types, uint32_t stride,
+                      bool fenceBefore = false, const std::vector<Dyn> &dyn = {});
+  // PARAM[param] = mem32[addr] * mul + add (DescList.ldparam).
+  DescList &ldparam(uint32_t addr, uint32_t param, uint32_t mul = 1, uint32_t add = 0, int base = -1,
+                    bool fenceBefore = false, const std::vector<Dyn> &dyn = {});
+  DescList &fence(uint32_t mask = 0);
   // regs: up to three (register, value)
-  DescList &setreg(const std::vector<std::pair<uint32_t, uint32_t>> &regs);
+  DescList &setreg(const std::vector<std::pair<uint32_t, uint32_t>> &regs, const std::vector<Dyn> &dyn = {});
   DescList &loopEnd(int32_t offset, uint32_t count, uint32_t k1, uint32_t s1, uint32_t k2, uint32_t s2);
   DescList &ret();
 

@@ -7,7 +7,6 @@
 // ---------------------------------------------------------------- descriptors
 // Opcodes and encodings of docs/llm_inference_plan.md §5.3 (driver/pynq_matmul.py DescList).
 enum { SA_OP_END = 0x12, SA_OP_SETREG = 0x14, SA_OP_CALL = 0x15 };
-enum { SA_REG_PARAM = 16 };
 
 static void sa_desc_clear(uint64_t* w) { memset(w, 0, 64); }
 
@@ -196,21 +195,10 @@ iree_status_t sa_context_get(sa_context_t** out_context) {
   return iree_ok_status();
 }
 
-iree_status_t sa_context_dispatch(sa_context_t* c, uint32_t entry_phys, uint32_t binding_count,
-                                  const uint32_t* binding_phys, uint32_t constant_count,
-                                  const uint32_t* constants, sa_completion_t* out) {
-  if (binding_count > 16 || constant_count > 6) {
-    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
-                            "sa: %u bindings / %u constants (at most 16 / 6)", binding_count, constant_count);
-  }
-  uint32_t regs[22], vals[22], n = 0;
-  for (uint32_t i = 0; i < binding_count; ++i) {
-    regs[n] = i;
-    vals[n++] = binding_phys[i];
-  }
-  for (uint32_t i = 0; i < constant_count; ++i) {
-    regs[n] = SA_REG_PARAM + i;
-    vals[n++] = constants[i];
+iree_status_t sa_context_dispatch(sa_context_t* c, uint32_t entry_phys, uint32_t n, const uint32_t* regs,
+                                  const uint32_t* vals, sa_completion_t* out) {
+  if (n > 24 || (n + 2) / 3 + 2 > c->list_capacity) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa: %u register values (at most 24)", n);
   }
   iree_slim_mutex_lock(&c->mutex);
   uint64_t* w = c->list;

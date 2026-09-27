@@ -35,6 +35,26 @@ struct QLinear {
 // success, else why the shape is not supported.
 std::string buildQLinear(uint32_t d, const QLinear &q, DescList &dl);
 
+// compile_layer.linear for one row with its operands anywhere: the weights at
+// BASE wBase + wOff, s_w at sBase + sOff, the output at yBase + yOff; s_x in
+// the ACC word sX (broadcast). epilogue(yWord, freeWord, ddrOff, dyn, pf) is
+// called for every chunk after y = (acc * s_w) * s_x is in ACC words yWord..
+// (nc words), before it is stored: it may append VE work on the chunk; freeWord
+// has nc more words of scratch; ddrOff is the chunk's byte offset in the
+// output (and in any operand with the output's layout), dyn / pf: in the
+// LOOP_END form, DDR addresses must also add PARAM pf. scratchRows: scratch
+// words per output word reserved per chunk beyond C and s_w (1 without an
+// epilogue, 2 with one). Returns the chunk size in tiles (0: does not fit).
+struct LinearPlace {
+  int wBase, sBase, yBase;
+  uint32_t wOff = 0, sOff = 0, yOff = 0;
+};
+using LinearEpilogue = void (*)(void *ctx, DescList &dl, uint32_t yWord, uint32_t freeWord, uint32_t ddrOff,
+                                bool dyn, uint32_t pf, uint32_t words);
+uint32_t emitLinear(DescList &dl, const Layout &lay, uint32_t k, uint32_t nOut, uint32_t sX,
+                    const LinearPlace &place, uint32_t pw, uint32_t pf, uint32_t scratchRows = 1,
+                    LinearEpilogue epilogue = nullptr, void *epilogueCtx = nullptr);
+
 }  // namespace sa
 
 #endif  // SA_TARGET_TEMPLATES_H_

@@ -9,13 +9,14 @@ iree_cc_library(
     SATarget
   HDRS
     "DescList.h"
-    "Match.h"
+    "Codegen.h"
     "SAPasses.h"
     "Templates.h"
   SRCS
+    "CloneCheapProducers.cpp"
     "DescList.cpp"
     "LowerWorkgroupCount.cpp"
-    "Match.cpp"
+    "Codegen.cpp"
     "PackLinearWeights.cpp"
     "SATarget.cpp"
     "Templates.cpp"
@@ -23,13 +24,17 @@ iree_cc_library(
     LLVMSupport
     MLIRArithDialect
     MLIRDialectUtils
+    MLIRFuncDialect
+    MLIRMathDialect
     MLIRIR
     MLIRLinalgDialect
+    MLIRLinalgTransforms
     MLIRPass
     MLIRSupport
     MLIRTensorDialect
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::Target
+    iree::compiler::Dialect::LinalgExt::IR
     iree::compiler::Dialect::TensorExt::IR
     iree::compiler::Dialect::Util::IR
     iree::compiler::PluginAPI

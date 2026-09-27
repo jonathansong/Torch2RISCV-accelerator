@@ -26,7 +26,9 @@ decode(token, pos, valid) -> logits
   valid: float32[T], T = pos_pad = ceil((pos + 1) / D) * D, 1.0 for positions
   0..pos and 0.0 after them. Attention reads the first T cache rows; T is a
   dynamic dimension carried by `valid` (an input-backed shape, which exports
-  cleanly; the device gets it as a push constant).
+  cleanly; the device gets it as a push constant). Only its length is used:
+  the attention mask is the prefix arange(T) <= pos (a length, as attention
+  kernels take; the sa backend maps it to the VE's VALID count).
 
 Reductions use torch's order here; the device (and DeviceModel) use the
 lane order of LLM plan §6.4, so eager results differ from DeviceModel by
@@ -57,18 +59,30 @@ def qlinear(xq, s_x, wq, s_w):
     return (acc.to(F32) * s_w) * s_x
 
 
+def f32c(v):
+    """A constant as the fp32 value DeviceModel uses (F(v), round to nearest),
+    written as a Python float that fp32 represents exactly: the export and
+    torch-mlir then cannot round it differently (1 / 288 came out one ulp low)."""
+    return float(np.float32(v))
+
+
 def quant_act(x):
     """Per-row (last dim) dynamic int8 quantization: (x_q, s_x)."""
     amax = torch.amax(torch.abs(x), dim=-1, keepdim=True)
-    s_x = amax * (1.0 / 127.0)
+    s_x = amax * f32c(1.0 / 127.0)
     inv = torch.reciprocal(s_x)
     return to_i8(x * inv), s_x
 
 
 class QLlama(torch.nn.Module):
-    def __init__(self, cfg, w, kv_scales, d=8):
+    def __init__(self, cfg, w, kv_scales, d=8, n_layers=None, tap=None):
+        """n_layers: return the residual stream x after that many layers instead of
+        the logits (DeviceModel.forward(..., n_layers); for localizing differences).
+        tap (with n_layers): return this intermediate of the last layer instead
+        ("q", "k", "att", "x_att": x after the attention block)."""
         super().__init__()
         self.cfg, self.d = cfg, d
+        self.n_layers, self.tap = n_layers, tap
         c = cfg
         if c.kv_heads != c.heads:
             raise ValueError("QLlama: multi-head attention only (kv_heads == heads)")
@@ -123,7 +137,7 @@ class QLlama(torch.nn.Module):
     # ------------------------------------------------------------ pieces
     def rmsnorm(self, x, g):
         ss = torch.sum(x * x, dim=-1, keepdim=True)
-        r = torch.rsqrt(ss * (1.0 / self.cfg.dim) + 1e-5)
+        r = torch.rsqrt(ss * f32c(1.0 / self.cfg.dim) + f32c(1e-5))
         return (x * r) * g
 
     @staticmethod
@@ -135,7 +149,7 @@ class QLlama(torch.nn.Module):
     def rope(self, v, cos, sin):
         return v * cos + self.swapneg(v) * sin
 
-    def attention(self, l, q, T, valid):
+    def attention(self, l, q, T, pos):
         c = self.cfg
         H, hs = c.heads, c.head_size
         r0 = l * c.seq_len
@@ -144,7 +158,9 @@ class QLlama(torch.nn.Module):
         qq, s_q = quant_act(q.reshape(H, hs))                                    # (H, hs), (H, 1)
         sc = torch.matmul(kh, qq.to(torch.int32).unsqueeze(-1)).squeeze(-1)     # (H, T) int32
         sc = (sc.to(F32) * s_q) * self.a_k[l]
-        mask = valid > 0.5                                                       # (T,)
+        # a prefix mask given by the length pos + 1 (as attention kernels take
+        # sequence lengths); `valid` only carries the padded length T
+        mask = torch.arange(T) <= pos                                            # (T,)
         m = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
         e = torch.where(mask, torch.exp(sc - m), torch.tensor(0.0))
         r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
@@ -159,7 +175,7 @@ class QLlama(torch.nn.Module):
         x = (self.emb_q.index_select(0, token).to(F32) * self.emb_s.index_select(0, token).unsqueeze(-1))[0]
         cos = self.rope_cos.index_select(0, pos)[0]
         sin = self.rope_sin.index_select(0, pos)[0]
-        for l in range(c.layers):
+        for l in range(c.layers if self.n_layers is None else self.n_layers):
             xq, s_x = quant_act(self.rmsnorm(x, self.rms_att[l]))
             qkv = qlinear(xq, s_x, self.wqkv[l], self.s_wqkv[l])
             q = self.rope(qkv[:c.dim], cos, sin)
@@ -168,22 +184,39 @@ class QLlama(torch.nn.Module):
             row = pos + l * c.seq_len
             self.kc.index_copy_(0, row, to_i8(k * self.inv_sk[l]).unsqueeze(0))
             self.vc.index_copy_(0, row, to_i8(v * self.inv_sv[l]).unsqueeze(0))
-            att = self.attention(l, q, T, valid)
+            att = self.attention(l, q, T, pos)
+            last = self.n_layers is not None and l == self.n_layers - 1
+            if last and self.tap in ("q", "k", "att"):
+                return {"q": q, "k": k, "att": att}[self.tap]
             aq, s_a = quant_act(att)
             x = x + qlinear(aq, s_a, self.wo[l], self.s_wo[l])
-            xq, s_x = quant_act(self.rmsnorm(x, self.rms_ffn[l]))
+            if last and self.tap == "x_att":
+                return x
+            xn = self.rmsnorm(x, self.rms_ffn[l])
+            if last and self.tap == "xn_ffn":
+                return xn
+            xq, s_x = quant_act(xn)
+            if last and self.tap == "sx_ffn":
+                return s_x.reshape(1) * 1.0
             h13 = qlinear(xq, s_x, self.w13[l], self.s_w13[l])
             h1, h3 = h13[:c.hidden], h13[c.hidden:]
             sig = torch.reciprocal(1.0 + torch.exp(h1 * -1.0))
-            hq, s_h = quant_act((h1 * sig) * h3)
+            u = (h1 * sig) * h3
+            if last and self.tap in ("h13", "u"):
+                return {"h13": h13, "u": u}[self.tap]
+            hq, s_h = quant_act(u)
             x = x + qlinear(hq, s_h, self.w2[l], self.s_w2[l])
+        if self.n_layers is not None:
+            return x
         xq, s_x = quant_act(self.rmsnorm(x, self.rms_final))
         return qlinear(xq, s_x, self.cls_q, self.cls_s)
 
 
-def step_inputs(token, pos, d):
-    """(token, pos, valid) tensors of one decode step."""
-    pp = (pos // d + 1) * d
+def step_inputs(token, pos, d, static_len=None):
+    """(token, pos, valid) tensors of one decode step. static_len: valid has this
+    fixed length (attention over a static number of positions, masked by pos;
+    the sa backend's form) instead of pos_pad."""
+    pp = static_len or (pos // d + 1) * d
     valid = torch.zeros(pp, dtype=F32)
     valid[:pos + 1] = 1.0
     return torch.tensor([token]), torch.tensor([pos]), valid

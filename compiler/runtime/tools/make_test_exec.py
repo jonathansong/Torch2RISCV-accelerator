@@ -10,6 +10,10 @@ templates built by the hand-written generator (llm/compile_layer.py):
                       y = x * A + B (push constants -> PARAM0 / PARAM1 -> dynamic fields)
   export 2 "fault":   binding x; an LD past the end of the accumulator memory: the
                       device reports a range error (the driver's error path)
+  export 3 "axpb_off": axpb with a register setup table (sa-desc version 2): one
+                      binding holding x at byte offset C0 and y at C1 (push
+                      constants, as IREE passes packed resources), BASE0 / BASE1 =
+                      binding + C0 / C1; A = C2, B = C3 into PARAM0 / 1
 
 The expected outputs come from the functional simulator running each export
 the way the sa HAL driver does (sadesc.dispatch_list: SETREG bases and
@@ -39,6 +43,7 @@ from ref_model import DeviceModel, SfuExact, quantize_rows  # noqa: E402
 from sa_funcsim import SaError, SaFuncSim  # noqa: E402
 
 K, N, M = 64, 160, 96
+OFF_X, OFF_Y = 448, 1280           # axpb_off: byte offsets in the one binding (8-aligned, as the DMA needs)
 
 
 def qlinear_template(d):
@@ -77,17 +82,17 @@ def run_in_sim(d, blob, export, buffers, constants):
     sim = SaFuncSim(d, base, size)
     _, _, exports = sadesc.read(blob)
     tmpl = base
-    sim.ddr_write(tmpl, b"".join(r.tobytes() for _, r, _, _, _ in exports))
+    sim.ddr_write(tmpl, b"".join(e[1].tobytes() for e in exports))
     offs, o = [], 0
-    for _, r, _, _, _ in exports:
+    for e in exports:
         offs.append(o)
-        o += r.nbytes
+        o += e[1].nbytes
     phys, a = [], base + 0x10000
     for b in buffers:
         phys.append(a)
         sim.ddr_write(a, b)
         a += -(-len(b) // 4096) * 4096
-    dl = sadesc.dispatch_list(tmpl + offs[export], phys, constants)
+    dl = sadesc.dispatch_list(tmpl + offs[export], phys, constants, exports[export][5])
     sim.ddr_write(base + 0x100000, dl.array().tobytes())
     n = sim.run_list(base + 0x100000)
     return [sim.ddr_read(p, len(b)).tobytes() for p, b in zip(phys, buffers)], n
@@ -104,6 +109,9 @@ def main():
     ex.add("qlinear", qlinear_template(d), bindings=3)
     ex.add("axpb", axpb_template(d), bindings=2, constants=2)
     ex.add("fault", fault_template(d), bindings=1)
+    ex.add("axpb_off", axpb_template(d), bindings=1, constants=4,
+           setup=[(sadesc.SETUP_BASE, 0, 0, 0, 1, 1, 0), (sadesc.SETUP_BASE, 1, 0, 1, 1, 1, 0),
+                  (sadesc.SETUP_PARAM, 0, 0, 2, 1, 1, 0), (sadesc.SETUP_PARAM, 1, 0, 3, 1, 1, 0)])
     blob = ex.to_bytes()
     with open(os.path.join(args.out, "test.sadesc"), "wb") as f:
         f.write(blob)
@@ -132,16 +140,23 @@ def main():
         ok2 = True
         print(f"fault in the simulator: {e}")
 
+    # axpb_off: x at OFF_X and y at OFF_Y of one buffer
+    buf = bytearray(OFF_Y + 4 * M)
+    buf[OFF_X:OFF_X + 4 * M] = x1.tobytes()
+    (b3,), n3 = run_in_sim(d, blob, 3, [bytes(buf)], [OFF_X, OFF_Y, f32bits(A), f32bits(B)])
+    ok3 = b3[OFF_Y:OFF_Y + 4 * M] == want1.tobytes() and b3[OFF_X:OFF_X + 4 * M] == x1.tobytes()
+    print(f"axpb_off in the simulator ({n3} descriptors, setup table): {'bit-exact' if ok3 else 'DIFFERENT'}")
+
     for name, data in (("x0", x0.tobytes()), ("w0", wblob), ("y0", y0), ("x1", x1.tobytes()), ("y1", y1)):
         with open(os.path.join(args.out, name + ".bin"), "wb") as f:
             f.write(data)
     with open(os.path.join(args.out, "test.txt"), "w") as f:
-        f.write(f"d {d}\nk {K}\nn {N}\nm {M}\nA {f32bits(A)}\nB {f32bits(B)}\n")
+        f.write(f"d {d}\nk {K}\nn {N}\nm {M}\nA {f32bits(A)}\nB {f32bits(B)}\noffx {OFF_X}\noffy {OFF_Y}\n")
     print(f"{os.path.join(args.out, 'test.sadesc')}: {len(blob)} bytes, D = {d}, exports "
           + ", ".join(f"{e[0]} ({e[1].shape[0]} descriptors)" for e in sadesc.read(blob)[2]))
     print(f"qlinear in the simulator ({n0} descriptors): {'bit-exact with DeviceModel' if ok0 else 'DIFFERENT'}")
     print(f"axpb in the simulator ({n1} descriptors): {'bit-exact with NumPy' if ok1 else 'DIFFERENT'}")
-    return 0 if ok0 and ok1 and ok2 else 1
+    return 0 if ok0 and ok1 and ok2 and ok3 else 1
 
 
 if __name__ == "__main__":

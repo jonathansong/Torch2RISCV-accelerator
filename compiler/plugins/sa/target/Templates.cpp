@@ -26,24 +26,22 @@ uint32_t Layout::chunkTiles(uint32_t k, uint32_t nt, uint32_t rows) const {
   return 0;
 }
 
-// compile_layer.linear for one row, output to DDR (out_ddr = 0 relative to
-// BASE iobase), weights at offset 0 of BASE wbase, s_w at offset 0 of BASE
-// sbase, chunk 0 in bank 0, default order, LOOP_END when there are more than
-// 4 chunks (PARAM pw / pf advance the DDR offsets).
-static void linear(DescList &dl, const Layout &lay, uint32_t k, uint32_t nOut, uint32_t sX, int wbase,
-                   int sbase, int iobase, uint32_t pw, uint32_t pf) {
+uint32_t emitLinear(DescList &dl, const Layout &lay, uint32_t k, uint32_t nOut, uint32_t sX,
+                    const LinearPlace &place, uint32_t pw, uint32_t pf, uint32_t scratchRows,
+                    LinearEpilogue epilogue, void *epilogueCtx) {
   const uint32_t d = lay.d, sb = lay.sbank, cb = lay.cbank;
-  const uint32_t nt = nOut / d, nc = lay.chunkTiles(k, nt), nch = nt / nc;
+  const uint32_t nt = nOut / d, nc = lay.chunkTiles(k, nt, scratchRows);
+  if (nc == 0) return 0;
+  const uint32_t nch = nt / nc;
   const uint32_t wbytes = nc * k * d, fbytes = 4 * nc * d;
   const uint32_t oSw = d * nc, oY = d * nc + nc;
   const bool useLoop = nch > 4;
 
+  auto dynOf = [](bool dyn, uint32_t p) { return dyn ? std::vector<Dyn>{{DYN_DMA_DDR, p, true}} : std::vector<Dyn>{}; };
   auto load = [&](uint32_t i, bool dyn) {
     uint32_t p = i & 1, j = i;
-    dl.ld(j * wbytes, laddr(MEM_SPAD_B, p * sb), nc, k * d, k * d, wbase, 0, false,
-          dyn ? std::vector<Dyn>{{DYN_DMA_DDR, pw, true}} : std::vector<Dyn>{});
-    dl.ld(j * fbytes, acc(p * cb + oSw), 1, fbytes, fbytes, sbase, 0, false,
-          dyn ? std::vector<Dyn>{{DYN_DMA_DDR, pf, true}} : std::vector<Dyn>{});
+    dl.ld(place.wOff + j * wbytes, laddr(MEM_SPAD_B, p * sb), nc, k * d, k * d, place.wBase, 0, false, dynOf(dyn, pw));
+    dl.ld(place.sOff + j * fbytes, acc(p * cb + oSw), 1, fbytes, fbytes, place.sBase, 0, false, dynOf(dyn, pf));
   };
   auto chunk = [&](uint32_t i, bool dyn, bool prefetch) {
     uint32_t p = i & 1, j = i, c = p * cb;
@@ -56,8 +54,8 @@ static void linear(DescList &dl, const Layout &lay, uint32_t k, uint32_t nOut, u
     VeFp sx;                                   // * s_x (broadcast word, DIV)
     sx.m2 = IDX_DIV;
     dl.veFp(acc(y), acc(sX), acc(y), nc * d, VOP_MUL, vtypes(VT_F32, VT_F32), nc, sx);
-    dl.st(j * fbytes, acc(y), 1, fbytes, fbytes, iobase, false,
-          dyn ? std::vector<Dyn>{{DYN_DMA_DDR, pf, true}} : std::vector<Dyn>{});
+    if (epilogue) epilogue(epilogueCtx, dl, y, y + nc, j * fbytes, dyn, pf, nc);
+    dl.st(place.yOff + j * fbytes, acc(y), 1, fbytes, fbytes, place.yBase, false, dynOf(dyn, pf));
   };
 
   load(0, false);
@@ -74,6 +72,7 @@ static void linear(DescList &dl, const Layout &lay, uint32_t k, uint32_t nOut, u
     }
   }
   for (uint32_t jj = j; jj < nch; ++jj) chunk(jj, false, jj + 1 < nch);
+  return nc;
 }
 
 std::string buildQLinear(uint32_t d, const QLinear &q, DescList &dl) {
@@ -109,7 +108,8 @@ std::string buildQLinear(uint32_t d, const QLinear &q, DescList &dl) {
   bc.reduce = RED_MAX;
   bc.valid = 1;
   dl.veFp(acc(sx), 0, acc(sx + 1), d, VOP_COPY, vtypes(VT_F32, VT_F32), 0, bc);
-  linear(dl, lay, k, n, sx + 1, q.bW, q.bSw, q.bY, PRIVATE_PARAM_W, PRIVATE_PARAM_F);
+  LinearPlace place{q.bW, q.bSw, q.bY};
+  emitLinear(dl, lay, k, n, sx + 1, place, PRIVATE_PARAM_W, PRIVATE_PARAM_F);
   dl.ret();
   return "";
 }

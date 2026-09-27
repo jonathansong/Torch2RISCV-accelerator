@@ -452,6 +452,68 @@ qlinear 模板（参考 `templates/reference.py`）：
 
 另外：C++ 模板生成器单独编译后，与 Python 参考逐字节比较了 56 个配置（D=8/16，含 n=32000 的分类器形状、binding 顺序打乱）；非 sa 目标（vmvx）不受预处理 pass 影响。
 
+### 6.8 C3 实施方案（2026-09-27，基于 C2 流程下 stories15M 的实际 dispatch）
+
+用 C2 的编译流程（权重打包 + 常量提升 + 导入参数）编译 stories15M，得到 64 个 dispatch（`build/c3/sources`）。与 C0 的清单相比，有几点决定了 C3 的做法：
+
+| 现象 | 例子 | 对策 |
+|---|---|---|
+| 同一个 dispatch 被多层复用，binding 的偏移来自 push constant（多个常量打包在一个资源里），同一 binding 上有多个偏移不同的张量 | 线性层（6 层共用）、量化 | **sa-desc 的寄存器装载表**（下面 A） |
+| push constant 超过 6 个；64 位的值由两个常量拼成（`extui`/`shli`/`ori`）；动态长度 T 以 workload ordinal 出现 | 注意力的 7 个常量 | 装载表只把设备需要的常量放进 PARAM |
+| 按数据的掩码 `select(valid[t] > 0.5, x, -inf)` | softmax 的 max / exp | 前端改成**按长度的掩码** `arange(T) <= pos`（主流做法：注意力内核接收序列长度），编译器识别“下标 ≤ 标量”的前缀掩码 → VE 的 VALID 字段（LDPARAM 读 pos） |
+| torch 的 exp、1/x、rsqrt | SiLU、softmax、RMSNorm、量化 | 映射到硬件 SFU（exp、recip、rsqrt）：结果按 DeviceModel(SfuExact) 的定义，与 L5 逐位一致 |
+| `to_i8` 展开成 NaN→0、±inf 截断、roundeven、±127 截断、fptosi | 量化、KV 写入 | 识别整个模式 → VE 的 I8 输出转换（本来就是这个语义） |
+| gather：`tensor.extract` 的行号来自设备上的 i64 标量 | 嵌入、RoPE 表 | LDPARAM 读行号算地址 → 动态地址的 LD |
+| scatter：KV 行写入缓存 | 每层 K、V | LDPARAM → 动态地址的 ST |
+| 设备上的 i64 标量运算 | `pos + l·S` | VE 上的 I32 运算（值 < 2^24，fp32 精确）；高位字清零 |
+| 注意力的两个小 int8 matmul（动态 T） | Q·Kᵀ、P·V | 移植 `compile_model.attention` 的模板 |
+
+实现分成几部分（C++，`plugins/sa/target/`；每一部分都有 Python 参考或 funcsim 测试）：
+
+- **A. sa-desc 寄存器装载表**：每个 export 带一张表，`BASE r = binding b 的物理地址 + push constant j`（或 + 0），`PARAM i = push constant j`。驱动在 SETREG 时计算。模板里只有静态偏移。这相当于 Vulkan 的 dynamic offset，设备端没有额外开销。格式版本升到 2（`sadesc.py`、驱动的 loader 同步）。
+- **B. dispatch 分析**：把 dispatch 函数解析成“张量 + 运算”的程序：每个 load / store 的（binding、偏移表达式、静态切片、形状、类型），push constant 的用途（偏移、长度、其他）。
+- **C. 片上存储模型**：张量按行主序展平，元素 e 在字 e/D 的第 e%D 个 lane；fp32 / i32 放 ACC，i8 放 SPAD；标量和“每行一个”的值存成广播字（所有 lane 相同）。动态维度按上界分配（插件选项，默认 seq_len）。
+- **D. VE 表达式编译器**（C3 的核心）：`linalg.generic` 的运算体（逐元素或按行归约）→ VE 指令序列。
+  - 操作数的访问方式：原样、标量广播、按行广播、成对交换取负（SWAPNEG）、gather 的行；
+  - 常量折进 A / B / imm；exp / recip / rsqrt / abs 用 SFU；
+  - 归约用 REDUCE（sum / max，ROWLEN、VALID）；to_i8 用 I8 输出转换；前缀掩码用 VALID。
+- **E. contraction 模板**：qlinear 推广到带偏移的 binding 和融合的尾部（例如残差加法，尾部其余的运算交给 D）；注意力的 Q·Kᵀ、P·V。
+- **F. gather / scatter / 整数标量**：见上表。
+- **G. 运行器**：一个 C 程序（IREE runtime API）逐 token 调用模型，写出 logits，相当于 L5 的 `LlamaDevice`（KV cache 是模块里的全局变量，要在同一进程里跨 token 保持）。
+- **H. 验证**：
+  - 每个模板有 Python 参考或 funcsim 测试；
+  - 端到端：IREE 编译的 stories15M 在 sim 上逐 token 的 logits 与 DeviceModel(SfuExact) 逐位一致；
+  - 板上生成的文本与 L5 完全相同。
+
+顺序：H 的框架 + 前端改动 → A → B/C/D（逐元素、归约）→ E（qlinear 推广）→ F → E（注意力）→ G → 端到端 → 板上。
+
+### 6.9 C3 结果（2026-09-27）
+
+**IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，每一步的 logits 与 DeviceModel(SfuExact) 逐位一致。**
+
+| 项目 | 结果 |
+|---|---|
+| 编译 | `compile_sa.sh`：4.4 s；64 个 dispatch 全部由 sa 后端生成模板（没有 CPU 回退）；sa.vmfb 10.3 MB + sa_packed.irpa 16.1 MB |
+| 逐 dispatch 差分测试（`tests/dispatch_check.py`：oracle 执行 IR 语义 vs 模板在 funcsim 中运行，每个调用点） | 64/64 逐位一致 |
+| 端到端，sim（`tests/test_c3.py`，`sa-llm-run` + `sa_sim_server.py`） | 20 步（12 个提示 + 8 个贪心）逐位一致；约 1.4 s / token（Python funcsim） |
+| 端到端，板上（`tests/board_c3.py`，L2 bitstream、rt_fw） | 76/76 步逐位一致，生成的 token 与主机参考相同；**12.6 tok/s**（L5 手写：15.1 tok/s）；每 token 242 次 dispatch |
+
+实现（`plugins/sa/target/`）：
+
+| 文件 | 内容 |
+|---|---|
+| `Codegen.cpp` | dispatch 程序分析：push constant → `Lin`（常数或 f(一个 push constant)，含 64 位拼接）、binding 区域与 BASE / PARAM 分配（装载表）、片上张量（packed / 广播两种布局，互转用复制 + TRANSPOSE）、VE 表达式编译器、qlinear（带融合尾部）、注意力、scatter、i64 标量 |
+| `CloneCheapProducers.cpp` | 预处理：只依赖下标和标量的逐元素值（掩码）复制进每个消费者，保留“下标 ≤ pos”的结构 |
+| `Templates.cpp` | `emitLinear`：带偏移和逐块尾部回调的 `compile_layer.linear`（C2 的字节比对不变） |
+| `DescList.cpp` | 增加动态字段、TRANSPOSE、LDPARAM、FENCE |
+
+表达式编译器的要点：每条 VE 是 `FUNC(OP(s1', s2)·A + B)`，IR 的运算按顺序折进这几个阶段（常数 → A / B / IMM，`1/x` / exp / rsqrt / abs → SFU，negf → A = −1）；恒等的 B 用 −0（`y + (−0) = y`，保持零的符号）；标量广播用“只对第一个元素的 max 归约”；前缀掩码 → VALID（LDPARAM 读 pos）；`to_i8` 整条链 → I8 输出转换；gather 的下标通过在迭代空间上逐点求值来判定（行 gather、成对交换）。
+
+与计划相比的决定：
+- **注意力长度静态**（`export.py --static-len`：valid 固定为 seq_len，按 pos 屏蔽）。动态 T 的带掩码 softmax 需要 LEN、ROWLEN、VALID、按行周期 4 个动态字段，而一条描述符最多 2 个。静态长度下结果仍逐位一致（被屏蔽的位置 exp = 0，求和多加的 +0 不改变部分和，P = 0 的行对 P·V 贡献 0），代价是注意力总按 256 个位置计算。按长度分桶编译几个版本是 C4 的选项。
+- **前端常数写成精确的 fp32 值**（`qllama.f32c`）：`1.0 / 288` 经导出后变成比 `F(1/288)` 小一个 ulp 的常数，是端到端唯一的差异来源（逐 dispatch 测试全过，用 `QLlama(n_layers, tap)` 逐层、逐步二分定位）。
+- 同一个可执行体被多层复用：偏移经装载表在驱动中计算，所以 64 个可执行体服务 242 次 dispatch。
+
 ---
 
 ## 7. 性能：跨 dispatch 的调度（C4）
@@ -510,7 +572,7 @@ C4 的做法，按收益排序：
 | **C0 前端** | 量化 torch 模型；iree-turbine 导出；`llvm-cpu` 在主机和板上运行；dispatch 清单 | §3.4；清单与手写片段的对照表。**已完成**（§3.5） | 小 |
 | **C1 驱动** | sa HAL 驱动（board、sim 两种传输层）；模拟器服务；sa-desc-v1 读写 | §5.6：手工封装的模板在 sim 与板上与 `DeviceModel` 逐位一致。**已完成**（§5.7） | 中 |
 | **C2 第一条纵向切片** | 从源码构建带插件的 iree-compile；插件只支持量化线性层一种 dispatch，其余报错；用一个“单线性层”的 torch 模型测试 | torch → iree-compile → .vmfb → sim 与板上，结果与 `DeviceModel.linear` 逐位一致。**已完成**（§6.7） | 中（构建环境是主要难点） |
-| **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致 | 大 |
+| **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致。**已完成**（§6.9，板上 12.6 tok/s） | 大 |
 | **C4 性能** | 精简 FENCE、跨 dispatch 预取、更大的 dispatch、代价模型 | 每 token 周期与手写路径相差 ≤ 10% | 中 |
 | **C5 代码生成** | sa 方言与完整流水线（§8） | 不用模板库编译 stories15M，结果与 C3 一致 | 大 |
 
@@ -537,7 +599,8 @@ compiler/
   frontend/               C0：qllama.py（量化模型）、export.py（iree-turbine 导出）、对比脚本
   runtime/                C1：sa HAL 驱动（C，sa/），传输层 board / sim；tools/（sa-desc-v1）；test/
   sim/                    模拟器服务 sa_sim_server.py、命令环模拟 sa_board_emu.py（基于 llm/sa_funcsim.py）
-  tests/                  端到端测试：test_c2.py（主机 sim）、board_c2.py（板上）
+  tests/                  test_c2 / test_c3（主机）、board_c2 / board_c3（板上）；oracle.py（dispatch 参考解释器）、
+                          dispatch_check.py（逐 dispatch 差分测试）、summarize.py
 iree-sa/l0/               已有：armv7 工具链验证（L0）
 build/iree/               不入库：IREE 源码、Python 环境、编译器构建目录
 ```

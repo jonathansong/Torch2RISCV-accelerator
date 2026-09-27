@@ -63,12 +63,17 @@ def load_model(args):
     return name, cfg, w, kv
 
 
-def export(m, cfg, d, out):
+def export(m, cfg, d, out, static_len=None):
+    """static_len: attention over a fixed number of positions (valid[static_len],
+    masked by pos) instead of a dynamic T; the sa backend's form."""
     import iree.turbine.aot as aot
     aot.externalize_module_parameters(m, external_scope="model")
-    T = torch.export.Dim("T", min=1, max=cfg.seq_len)
     t0 = time.time()
-    exp = aot.export(m, args=Q.step_inputs(1, 0, d), dynamic_shapes={"token": None, "pos": None, "valid": {0: T}})
+    if static_len:
+        exp = aot.export(m, args=Q.step_inputs(1, 0, d, static_len))
+    else:
+        T = torch.export.Dim("T", min=1, max=cfg.seq_len)
+        exp = aot.export(m, args=Q.step_inputs(1, 0, d), dynamic_shapes={"token": None, "pos": None, "valid": {0: T}})
     mlir_path, irpa_path = os.path.join(out, "qllama.mlir"), os.path.join(out, "qllama.irpa")
     with open(mlir_path, "w") as f:
         f.write(str(exp.mlir_module))
@@ -114,7 +119,7 @@ class IreeModel:
         return self.main.main(token.numpy(), pos.numpy(), valid.numpy()).to_host()
 
 
-def compare(name, cfg, w, kv, d, iree_model, tokens):
+def compare(name, cfg, w, kv, d, iree_model, tokens, static_len=None):
     m = Q.QLlama(cfg, w, kv, d).eval()
     dm = DeviceModel(cfg, w, kv, d=d, sfu=Sfu64)
     worst_e = worst_d = 0.0
@@ -122,7 +127,7 @@ def compare(name, cfg, w, kv, d, iree_model, tokens):
     t0 = time.time()
     with torch.no_grad():
         for pos, t in enumerate(tokens):
-            args = Q.step_inputs(t, pos, d)
+            args = Q.step_inputs(t, pos, d, static_len)
             got = iree_model(*args)
             e = m(*args).numpy()
             ref = dm.forward(t, pos)
@@ -241,12 +246,15 @@ def main():
     ap.add_argument("--d", type=int, default=8)
     ap.add_argument("--tokens", type=int, default=12)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--static-len", action="store_true",
+                    help="attention over seq_len positions masked by pos (static shapes; the sa backend's form)")
     ap.add_argument("--armv7", action="store_true", help="also compile for the board and stage build/deploy_c0")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     name, cfg, w, kv = load_model(args)
     m = Q.QLlama(cfg, w, kv, args.d).eval()
-    mlir_path, irpa_path = export(m, cfg, args.d, args.out)
+    static_len = cfg.seq_len if args.static_len else None
+    mlir_path, irpa_path = export(m, cfg, args.d, args.out, static_len)
     vmfb_path, disp = compile_host(mlir_path, args.out)
     rng = np.random.default_rng(5)
     if args.tiny:
@@ -255,7 +263,7 @@ def main():
         from tokenizer import Tokenizer
         tok = Tokenizer(os.path.join(os.path.dirname(args.checkpoint), "tokenizer.bin"), cfg.vocab)
         tokens = tok.encode("Once upon a time, there was a little girl named Lily. She")[:args.tokens]
-    ok = compare(name, cfg, w, kv, args.d, IreeModel(vmfb_path, irpa_path), tokens)
+    ok = compare(name, cfg, w, kv, args.d, IreeModel(vmfb_path, irpa_path), tokens, static_len)
     inventory(disp, args.out)
     if args.armv7:
         board_bundle(mlir_path, irpa_path, vmfb_path, cfg, args.d, args.out, os.path.join(REPO, "build", "deploy_c0"))
