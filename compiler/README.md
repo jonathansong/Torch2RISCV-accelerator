@@ -19,9 +19,9 @@ an `sa` HAL driver through the command ring.
 | `scripts/deploy_c3.sh` | Runs the C3 host test and stages the board test in `build/deploy_c3` | C3 |
 | `plugins/sa/` | The `sa` HAL target plugin (C++). `target/`: the `sa` device and backend, the preprocessing pass that packs linear weights, dispatch matching, the C++ templates and `DescList`, sa-desc-v1 serialization. `templates/reference.py`: the Python reference of the templates | C2–C5 |
 | `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories) | C0 |
-| `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports. `tools/`: sa-desc-v1 writer / reader (`sadesc.py`), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
+| `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports; its own device and command buffer (C4) record a command buffer's dispatches and build one descriptor list per command buffer. `tools/`: sa-desc writer / reader (`sadesc.py`, format versions 1–3), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
 | `sim/` | `sa_sim_server.py` (the `sim` transport's device: `llm/sa_funcsim.py` on a shared-memory DDR), `sa_board_emu.py` (rt_fw's ring emulated on the host, for the `board` transport) | C1 |
-| `tests/` | `test_c2.py` / `test_c3.py` (host), `board_c2.py` / `board_c3.py` (board); `oracle.py` (reference interpreter of dispatch IR with the device's numerics), `dispatch_check.py` (per-dispatch differential test), `summarize.py` | C2– |
+| `tests/` | `test_c2.py` / `test_c3.py` (host), `board_c2.py` / `board_c3.py` / `board_profile.py` (board); `oracle.py` (reference interpreter of dispatch IR with the device's numerics), `dispatch_check.py` (per-dispatch differential test), `summarize.py` | C2– |
 
 ## Environment
 
@@ -134,3 +134,21 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   python3 compiler/tests/test_c3.py [--generate 8]    # export, compile, per-dispatch check, sim run
   compiler/scripts/deploy_c3.sh                       # board: python3 board_c3.py
   ```
+- **C4 partly done, on hold** (docs/iree_compiler_plan.md §7.1): dynamic
+  attention length, aggressive fusion (200 dispatches per token), uniform
+  values computed once, one descriptor list per command buffer, and a list
+  scheduler in the driver (chunk-0 weight prefetch inside earlier dispatches,
+  FENCE masks from DDR read/write conflicts; sa-desc v3). Board: 2.591M
+  cycles per token, 17.7 tok/s, bit-exact; the hand path is 2.294M (target
+  within 10%: the SiLU / quantization fusion is deferred until after C5).
+
+  ```sh
+  python3 compiler/tests/test_c3.py --skip-export --out build/c4/fuse
+  compiler/scripts/deploy_c3.sh --skip-export --out build/c4/fuse
+  # board: python3 board_c3.py; python3 board_profile.py 40 [--batch] [NAME=VALUE...]
+  ```
+  Environment: `SA_PROFILE=1` (one list per dispatch, per-export cycles),
+  `SA_PROFILE=batch` (per list), `SA_NO_BATCH=1` (one list per dispatch, to
+  find a failing dispatch).
+- **C5 in progress** (docs/iree_compiler_plan.md §8): full code generation
+  through an `sa` dialect, replacing the template library.

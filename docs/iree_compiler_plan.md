@@ -1,6 +1,6 @@
 # LLM 编译器：基于 MLIR / IREE 的端到端方案（PyTorch → 描述符列表）
 
-状态：**C0 完成**（主机和板上验证，§3.5）；环境已就绪（`compiler/`）。C1–C5 还是方案。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
+状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 进行中**（§8）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
 取代那里 §10.4、§10.5 的概要。
 
 **目标**：从一个 PyTorch 写的 llama 类模型出发，用 MLIR / IREE 自动编译，得到在 PYNQ-Z1 上运行的完整程序：
@@ -256,6 +256,13 @@ PicoRV32 rt_fw、sa_cmdfetch、sa_sched、各引擎：不变
 | 片上存储器 | 模板独占 SPAD、ACC；dispatch 之间不保留任何片上数据（数据经过 DDR，LLM plan §10.3） |
 | 屏障 | 模板结束时不要求引擎空闲；dispatch 之间的依赖由命令缓冲的 FENCE 处理（§5.2） |
 
+### 4.4 实际格式（C1–C4）
+
+实现没有用 flatbuffer，而是自定义的小端二进制，定义与读写工具在 `compiler/runtime/tools/sadesc.py`（C 加载器 `runtime/sa/sa_loader.c` 读同样的布局）：
+- **v1**（C1）：头部、入口点表（名字、模板偏移与条数、binding / push constant 个数、估计周期）、模板区、名字区。
+- **v2**（C3）：每个入口点可带**装载表**（`BASE r = binding b + f(常量)`、`PARAM r = f(常量)`，`f(c) = ((c·mul) >> shift) + add`），由驱动求值。IREE 把 binding 偏移作为 push constant 传入，所以模板里只有静态偏移，同一个可执行体可服务多层。
+- **v3**（C4）：每个入口点 32 字节的扩展：**前缀**（可提前执行的权重 LD，经 BASE15，以 RET 结尾）、**head**（主体开头的 LD，以 RET 结尾，驱动可在其后插入别的 dispatch 的前缀）、读 / 写的 binding 掩码、是否使用 SPAD_B、前缀原来的 BASE 寄存器。模板不能使用 BASE15。
+
 ---
 
 ## 5. 运行时：sa HAL 驱动（C1）
@@ -289,6 +296,7 @@ PicoRV32 rt_fw、sa_cmdfetch、sa_sched、各引擎：不变
 - 一次 `queue_execute` 对应**一个**命令环条目，所以一个 token 的所有 dispatch 只经过 PicoRV32 一次（与 L4 的静态列表相同）。
 - 命令缓冲可以重用（IREE 的可重用命令缓冲）：动态值通过 push constant 传入，列表本身不变，就像手写路径“每个 token 只改参数块”。
   如果 IREE 每次都重新录制，也只是 ARM 端的开销，功能相同。
+- **实现（C4，§7.1）**：命令缓冲先记录 dispatch，flush 时由驱动统一排列表；屏障处的 FENCE 按 DDR 读写范围的冲突选择掩码，前缀放进更早的 dispatch 中。C1–C3 是一个 dispatch 一张列表。
 
 ### 5.3 内存与地址
 
@@ -531,6 +539,35 @@ C4 的做法，按收益排序：
 
 **验收**：IREE 版本每个 token 的周期与手写路径的差距 ≤ 10%，用 `l4_phase_cost.py` 式的分段计时说明剩下的差距在哪里。
 
+### 7.1 C4 结果（2026-09-27，暂缓）
+
+**板上：每个 token 2,591,234 周期（C3 起点 3.63M），墙钟 17.7 tok/s（C3：12.6；L5 手写路径：15.1），76/76 步逐位一致，文本与 L5 相同。** 手写路径（预取 + SiLU 融合）是 2,293,970 周期，差距 13%，没有达到 ≤ 10%。按用户的决定，剩下的优化暂缓，先做 C5：大的融合在通用代码生成里做更自然，C4 已有的运行时机制在 C5 中照样使用。
+
+| 步骤（提交） | 内容 | 周期 / token | tok/s（墙钟） |
+|---|---|---|---|
+| C3 起点（05d3c66） | 静态注意力长度，242 个 dispatch，一个 dispatch 一张列表 | 3.63M | 12.4 |
+| 1 动态注意力（a377e75） | 注意力按实际长度（`--pad=8`）；[H, T] 的值按行处理，使每条描述符不超过 2 个动态字段 | 2.93M | 14.4 |
+| 2 激进融合（173457e） | `--iree-dispatch-creation-enable-aggressive-fusion`：242 → 200 个 dispatch | 2.91M | 14.9 |
+| 3 只算一次（322c271） | 标量 / 按行的值只计算一次；区域内相同的 LD 共用 | 2.69M | 15.9 |
+| 4 批量提交（2a24101） | 一个命令缓冲一张列表（驱动自带的 sa device / command buffer，仿 IREE local-sync）；每 token 7 张列表；主机开销约 9 ms → 3.4 ms | 2.66M | 17.4 |
+| 5 列表调度（7b47707） | sa-desc v3；驱动在 flush 时排列表：线性层第 0 块权重的 LD 放进更早的、不用 SPAD_B 的 dispatch 的 head 之后，与其 VE 计算重叠；FENCE 按 DDR 冲突选掩码（写后读只等 ST，读后写只等 LD） | 2.610M | 17.9 |
+| 6 abs-max 折半树（e0f094e） | \|x\| 走流水模式，逐元素 MAX 折半，最后对少数几组 REDUCE（REDUCE 一次处理一组）；值 ≥ +0，顺序不影响结果 | 2.591M | 17.7 |
+
+测量工具：`SA_PROFILE=1`（一个 dispatch 一张列表，按入口点统计设备周期与主机时间）、`SA_PROFILE=batch`（按列表统计，外加屏障 / FENCE / 前缀的计数）、`board_profile.py [--batch] [NAME=VALUE]`。
+
+试过但放弃的：
+- **把前缀放在本 dispatch 的 FENCE 之前**：只省 6k 周期。调度器按顺序派发，前缀排在上一个 dispatch 的 ST 之后，而 ST 要等 VE 算完才能派发，所以没有真正提前。结论：预取必须在列表中排在要重叠的 VE 工作之前（于是有了步骤 5）。
+- **第 1 块权重也做成前缀**：变慢约 8 万周期。模板的双缓冲本来就让第 1 块的 LD 与第 0 块的 EX 并行；提前只会占用唯一的 LD 引擎，推迟宿主 dispatch 的加载。
+- IREE 的 `fuse-multi-use`、`element-wise-fuse-multi-reduction` 不改变 dispatch 数；`enable-aggressive-reshape-movement` 把 200 个降到 173 个（61 个可执行体），尚未验证。
+
+决定：**跨 dispatch 调度放在驱动里**（§13 第 5 条原本倾向编译器）。驱动在 flush 时能看到真实的 binding 地址，可以精确判断读写冲突；编译器通过 sa-desc v3 提供所需的信息（前缀、head、读写掩码、SPAD_B）。
+
+剩下的差距（逐 dispatch 计时，每个 token）与暂缓的条目：
+- **SiLU**：3 个 dispatch（exp；1 + 倒数、两次乘法、abs-max；量化），每层约 3 万周期，没有重叠。手写路径把 SiLU 融进 W13 的分块循环，与 EX 并行，省约 10.6 万周期。需要预处理自行组成 dispatch region（W13 与 SiLU 放在一起），模板内交错。
+- **量化链**：每个线性层前有 abs-max → 标量 → 量化 3 个 dispatch，每条边界一次 DDR 往返 + FENCE；168 个屏障全部是真实依赖。
+- **代价模型**（§7 第 4 条）：未做。第 1 块预取的教训说明，把哪些加载放进哪个宿主，需要周期估计才能判断。
+- 分类层（1.26M，与手写路径相同）和每层的权重流是下限：权重搬运约 1.92M 周期。
+
 ---
 
 ## 8. 完整代码生成：sa 方言（C5）
@@ -573,7 +610,7 @@ C4 的做法，按收益排序：
 | **C1 驱动** | sa HAL 驱动（board、sim 两种传输层）；模拟器服务；sa-desc-v1 读写 | §5.6：手工封装的模板在 sim 与板上与 `DeviceModel` 逐位一致。**已完成**（§5.7） | 中 |
 | **C2 第一条纵向切片** | 从源码构建带插件的 iree-compile；插件只支持量化线性层一种 dispatch，其余报错；用一个“单线性层”的 torch 模型测试 | torch → iree-compile → .vmfb → sim 与板上，结果与 `DeviceModel.linear` 逐位一致。**已完成**（§6.7） | 中（构建环境是主要难点） |
 | **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致。**已完成**（§6.9，板上 12.6 tok/s） | 大 |
-| **C4 性能** | 精简 FENCE、跨 dispatch 预取、更大的 dispatch、代价模型 | 每 token 周期与手写路径相差 ≤ 10% | 中 |
+| **C4 性能** | 精简 FENCE、跨 dispatch 预取、更大的 dispatch、代价模型 | 每 token 周期与手写路径相差 ≤ 10%。**部分完成，暂缓**（§7.1：差 13%，板上 17.7 tok/s） | 中 |
 | **C5 代码生成** | sa 方言与完整流水线（§8） | 不用模板库编译 stories15M，结果与 C3 一致 | 大 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。
@@ -625,6 +662,6 @@ build/iree/               不入库：IREE 源码、Python 环境、编译器构
 
 1. **C0 之后**：根据 dispatch 清单确定模板的清单与粒度（是否需要预处理来控制切分）。
 2. **模拟器传输层的实现**：Python 服务（快，复用现有代码）还是把 `sa_funcsim` 移植到 C（不依赖 Python，速度更快）。先用 Python。
-3. **可执行体的编码**：自定义二进制还是 flatbuffer。倾向 flatbuffer（IREE 惯例），内容按 §4.2。
+3. **可执行体的编码**：自定义二进制还是 flatbuffer。倾向 flatbuffer（IREE 惯例），内容按 §4.2。实际用的是自定义二进制（§4.4）。
 4. **常量的存放**：参数文件（.irpa，推荐）还是嵌在 .vmfb 中。
-5. **C4 的跨 dispatch 调度放在哪里**：驱动（录制命令缓冲时看到相邻的 dispatch）还是编译器（链接阶段）。倾向编译器，驱动保持简单。
+5. **C4 的跨 dispatch 调度放在哪里**：驱动（录制命令缓冲时看到相邻的 dispatch）还是编译器（链接阶段）。原本倾向编译器；**已定为驱动**（§7.1），编译器经 sa-desc v3 提供信息。
