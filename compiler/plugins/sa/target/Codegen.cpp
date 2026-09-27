@@ -1410,7 +1410,36 @@ bool Gen::genericOp(linalg::GenericOp g, const RowSel *sel) {
       return err.empty();
     }
     Local out = newLocal(::sa::VT_F32, geo.rows, Layout::Bcast);
-    emitPend(pends[pe->pend], la(out), ::sa::VT_F32, geo, rk);
+    const Pend &pp = pends[pe->pend];
+    int64_t groups = geo.n / d;
+    if (rk == ::sa::RED_MAX && pp.func == ::sa::FUNC_ABS && pp.validParam < 0 && !pp.validNegInf && geo.rows == 1 &&
+        geo.inner == geo.n && geo.n % d == 0 && !geo.dynN && !geo.dynInner && groups >= 8) {
+      // an abs-max (values >= +0, any order gives the same bits): |x| in the
+      // pipelined mode, halved by elementwise maxima, then a REDUCE over the
+      // few groups left (REDUCE runs one group at a time)
+      Local t = newLocal(::sa::VT_F32, geo.n);
+      Geo ge;
+      ge.n = ge.inner = geo.n;
+      emitPend(pp, la(t), ::sa::VT_F32, ge);
+      while (groups % 2 == 0 && groups > 4) {
+        int64_t h = groups / 2;
+        Pend m;
+        m.s1 = {la(t), ::sa::VT_F32, ::sa::IDX_LIN, 0};
+        m.s2 = Opd{la(t) + uint32_t(h), ::sa::VT_F32, ::sa::IDX_LIN, 0};
+        m.op = ::sa::VOP_MAX;
+        Geo gh;
+        gh.n = gh.inner = h * d;
+        emitPend(m, la(t), ::sa::VT_F32, gh);    // in place: dst = src1
+        groups = h;
+      }
+      Pend r;
+      r.s1 = {la(t), ::sa::VT_F32, ::sa::IDX_LIN, 0};
+      Geo gr = geo;
+      gr.n = gr.inner = groups * d;
+      emitPend(r, la(out), ::sa::VT_F32, gr, rk);
+    } else {
+      emitPend(pp, la(out), ::sa::VT_F32, geo, rk);
+    }
     locals[g.getResult(0).getAsOpaquePointer()] = out;
     return err.empty();
   }
