@@ -130,6 +130,9 @@ struct Opd {
   int periodParam = -1;
   bool isImm = false;
   float imm = 0.0f;
+  // what the value depends on: 0 the element, 1 nothing (a scalar in every
+  // element), 2 the row (a per-row value; la = one word per row)
+  uint8_t uni = 0;
 };
 
 // a VE instruction being built: y = FUNC(OP(s1', s2) * A + B)
@@ -431,6 +434,9 @@ private:
   }
   bool stridedSource(const Source &s) const { return s.dynDim && s.after == 1 && s.before > 1 && s.before <= 16; }
 
+  // loads of the same bytes share one local copy
+  std::map<std::tuple<int, uint32_t, int64_t, const void *>, Local> regionLocals;
+
   // LD of a source into a packed local
   std::optional<Local> materialize(Value v) {
     void *key = v.getAsOpaquePointer();
@@ -438,6 +444,19 @@ private:
     auto sit = sources.find(key);
     if (sit == sources.end()) return fail("tensor is neither loaded nor computed"), std::nullopt;
     Source &s = sit->second;
+    auto rkey = std::make_tuple(s.r.base, s.r.off, s.n, s.type.getAsOpaquePointer());
+    if (!s.dynN) {
+      if (auto it = regionLocals.find(rkey); it != regionLocals.end()) {
+        locals[key] = it->second;
+        return it->second;
+      }
+    }
+    auto l = materializeLoad(v, s);
+    if (l && !s.dynN) regionLocals[rkey] = *l;
+    return l;
+  }
+  std::optional<Local> materializeLoad(Value v, Source &s) {
+    void *key = v.getAsOpaquePointer();
     Type et = s.type.getElementType();
     auto vt = vtOf(et);
     int64_t n = s.n;
@@ -863,6 +882,7 @@ bool Gen::genericOp(linalg::GenericOp g, const RowSel *sel) {
       if (!b) return false;
       e.kind = EV::Mem;
       e.opd = {la(*b), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+      e.opd.uni = 1;
     } else if (m.isIdentity() || (m.getNumResults() == unsigned(nloops) && m.isMinorIdentity())) {
       auto l = materialize(in);
       if (!l) return false;
@@ -888,7 +908,11 @@ bool Gen::genericOp(linalg::GenericOp g, const RowSel *sel) {
       if (!b) return false;
       e.kind = EV::Mem;
       e.opd = {la(*b), ::sa::VT_F32, ::sa::IDX_DIV, wordsPerRow, rowParam};
-      if (sel) e.opd = {la(*b) + uint32_t(sel->row), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+      e.opd.uni = 2;
+      if (sel) {
+        e.opd = {la(*b) + uint32_t(sel->row), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+        e.opd.uni = 1;
+      }
     } else if (nloops == 2 && m.getNumResults() == 1 && isa<AffineDimExpr>(m.getResult(0)) &&
                cast<AffineDimExpr>(m.getResult(0)).getPosition() == 1) {
       // the same vector for every row
@@ -1020,9 +1044,43 @@ bool Gen::genericOp(linalg::GenericOp g, const RowSel *sel) {
   });
 
   std::vector<Pend> pends;
+  auto uniOf = [](const Opd &o) -> int { return o.isImm ? 1 : o.uni; };
   auto mem = [&](EV &x) -> std::optional<Opd> {
     if (x.kind == EV::Mem) return x.opd;
     if (x.kind == EV::Pending) {
+      Pend &p = pends[x.pend];
+      int u = uniOf(p.s1);
+      if (p.s2) {
+        int u2 = uniOf(*p.s2);
+        u = (u == 0 || u2 == 0) ? 0 : std::max(u, u2);
+      }
+      if (u != 0 && p.validParam < 0 && !p.swapneg && (u == 1 || (!sel && nloops == 2))) {
+        // the same value for every element (u = 1) or row (u = 2): compute it
+        // once per scalar / row, as broadcast words
+        int64_t words = u == 1 ? 1 : ranges[0];
+        Local t = newLocal(::sa::VT_F32, words, Layout::Bcast);
+        Pend q = p;
+        auto perWord = [&](Opd &o) {
+          if (o.uni == 2) {
+            o.mode = ::sa::IDX_LIN;       // the per-row array itself, word r = row r
+            o.period = 0;
+            o.periodParam = -1;
+          }
+        };
+        perWord(q.s1);
+        if (q.s2) perWord(*q.s2);
+        Geo gw;
+        gw.n = words * d;
+        gw.inner = gw.n;
+        gw.singleRow = true;
+        emitPend(q, la(t), ::sa::VT_F32, gw);
+        Opd o = u == 1 ? Opd{la(t), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF}
+                       : Opd{la(t), ::sa::VT_F32, ::sa::IDX_DIV, wordsPerRow, rowParam};
+        o.uni = uint8_t(u);
+        x.kind = EV::Mem;
+        x.opd = o;
+        return o;
+      }
       Local t = newLocal(::sa::VT_F32, geo.reduction ? geo.n : geo.n);
       emitPend(pends[x.pend], la(t), ::sa::VT_F32, geo);
       Opd o{la(t), ::sa::VT_F32, ::sa::IDX_LIN, 0};
@@ -1288,6 +1346,7 @@ bool Gen::genericOp(linalg::GenericOp g, const RowSel *sel) {
           p.s2 = Opd{};
           p.s2->isImm = true;
           p.s2->imm = c;
+          p.s2->uni = 1;
           evOf(res) = newPend(p);
         }
         continue;
