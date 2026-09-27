@@ -577,9 +577,9 @@ C4 的做法，按收益排序：
 
 ### 8.1 目标、范围与验收
 
-C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层、注意力、scatter 各有一段专用的 C++，只认得 stories15M 里出现的那几种 dispatch 形式。C5 把它换成一条通用的 MLIR 流水线：dispatch 的 linalg IR → 分块 → 布局 → 缓冲化 → `sa` 方言 → 内存分配、流水、调度 → 描述符。新的模型结构不必再写模板。
+C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层、注意力、scatter 各有一段专用的 C++，只认得 stories15M 里出现的那几种 dispatch 形式。C5 把它换成一条通用的 MLIR 流水线：dispatch 的 linalg IR → 分块 → 布局 → 缓冲化 → `sahl`（tile 级）→ `sahw`（命令级）→ 内存分配、流水、调度 → 描述符（§8.3）。新的模型结构不必再写模板。
 
-模板**不删除**，而是改写成 `sa` 层的**微内核**（§8.8）：通用代码生成保证什么都能编译，手写的微内核负责最关键、值得手工调的算子（与 IREE 的 ukernel、cuBLAS 与 Triton 并存同理）。
+模板**不删除**，而是改写成 `sahl` 层的**微内核**（§8.8）：通用代码生成保证什么都能编译，手写的微内核负责最关键、值得手工调的算子（与 IREE 的 ukernel、cuBLAS 与 Triton 并存同理）。
 
 **不变的部分**：前端与导出（C0）、预处理（权重打包、`CloneCheapProducers`）、sa-desc v3 格式、驱动与列表调度（C1、C4）、数值约定（§3.2）、全部测试工具。硬件不变。
 
@@ -592,58 +592,78 @@ C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层�
 
 | C3/C4 的部分（`plugins/sa/target/`） | C5 |
 |---|---|
-| push constant 分析 `Lin`（含 64 位拼接、`util.assume.int`）、装载表 | 保留为分析，由 `sa-legalize-dynamic` 与 `sa-assign-registers` 使用 |
-| binding 区域、BASE / PARAM 分配（PARAM 从 0 往上、私有的从 7 往下、BASE15 留给前缀） | `sa-assign-registers` |
-| 片上张量的两种布局（packed、广播字）与行步长（动态 T） | 布局属性 `#sa.layout` + `sa-layout` 传播 + `sa-allocate` |
-| VE 表达式编译器（每条 VE = `FUNC(OP(s1', s2)·A + B)`，to_i8 链、前缀掩码 VALID、gather 下标判定、SWAPNEG） | 拆成两步：逐个运算降级成单级 `sa.ve`（`sa-lower`），再由 `sa-fuse-ve` 合并成多级；规则不变 |
-| `emitLinear`（分块、双缓冲、逐块尾部） | 分块（`sa-tile`）+ A / B 条带布局 + `sa.ex` + 软件流水（`sa-pipeline`）；另外改写成 `linear` 微内核（§8.8） |
+| push constant 分析 `Lin`（含 64 位拼接、`util.assume.int`）、装载表 | 保留为分析，由 `sahw-legalize-dynamic` 与 `sahw-assign-registers` 使用 |
+| binding 区域、BASE / PARAM 分配（PARAM 从 0 往上、私有的从 7 往下、BASE15 留给前缀） | `sahw-assign-registers` |
+| 片上张量的两种布局（packed、广播字）与行步长（动态 T） | 布局属性 `#sa.layout` + `sa-layout` 传播 + `sahl-plan-memory` / `sahw-allocate` |
+| VE 表达式编译器（每条 VE = `FUNC(OP(s1', s2)·A + B)`，to_i8 链、前缀掩码 VALID、gather 下标判定、SWAPNEG） | 拆成两步：`sahl.elementwise` 的运算体逐个降级成单级 `sahw.ve`（`sahl-to-sahw`），再由 `sahw-fuse-ve` 合并成多级；规则不变 |
+| `emitLinear`（分块、双缓冲、逐块尾部） | 分块（`sa-tile`）+ A / B 条带布局 + `sahl.matmul` + 软件流水（`sahl-pipeline`）；另外改写成 `linear` 微内核（§8.8） |
 | 注意力模板（Kᵀ 条带、按行的动态长度） | `batch_matmul` 走同一条 contraction 路径，Kᵀ 由布局传播插入 TRANSPOSE；原模板改写成微内核（§8.8） |
-| scatter、gather、i64 标量 | `sa-lower` 的降级模式（LDPARAM、动态 DDR 地址、SWAPNEG 技巧） |
-| 按行处理（每条描述符最多 2 个动态字段） | `sa-legalize-dynamic`：超过就切成行循环 |
-| 只算一次的标量 / 按行值、相同 LD 共用（C4 步骤 3） | `sa-uniform`（带内存效果的 CSE） |
-| 前缀、head（C4 步骤 5） | `sa-schedule` 的输出 |
-| abs-max 折半树（C4 步骤 6） | `sa-lower` 里归约的一种降级方式，由代价模型选择 |
-| `DescList`、sa-desc v3 序列化 | 保留，改为从 `sa` 方言序列化 |
+| scatter、gather、i64 标量 | `sahl.gather / scatter / scalar`，降级到 `sahw`（LDPARAM、动态 DDR 地址、SWAPNEG 技巧） |
+| 按行处理（每条描述符最多 2 个动态字段） | `sahw-legalize-dynamic`：超过就切成行循环 |
+| 只算一次的标量 / 按行值、相同 LD 共用（C4 步骤 3） | `sahl-uniform`（带内存效果的 CSE） |
+| 前缀、head（C4 步骤 5） | `sahl-schedule` 选出，`sahw.template` 表示 |
+| abs-max 折半树（C4 步骤 6） | `sahl-to-sahw` 里 max 归约的一种降级方式，由代价模型选择 |
+| `DescList`、sa-desc v3 序列化 | 保留，改为从 `sahw` 序列化 |
 
-### 8.3 `sa` 方言
+### 8.3 两层方言：`sahl` 与 `sahw`
 
-一个操作对应一条描述符，外加几种结构操作。操作数是 memref：DDR 一侧是 binding 的 subspan，片上一侧是带内存空间的 memref。
+```
+linalg / scf（IREE 的 dispatch）
+  → sahl：tile 级，按硬件语义，与命令编码无关
+  → sahw：命令级，一个操作 = 加速器的一条命令
+      ├→ 描述符序列化（sa-desc v3；C5）
+      └→ LLVM dialect → LLVM IR → riscv32 目标文件（PicoRV32 用 PCPI 指令发命令；C7，§8.10）
+```
 
-- **属性**：
-  - `#sa.mem<spad_a | spad_b | acc>`：片上内存空间；分配后带上 bank 与字偏移。
-  - `#sa.layout<packed | bcast | a_strip | b_strip | kt_strip>`：LLM plan §10.3 的布局类型（紧凑向量、广播字、A / B 条带、Kᵀ 条带）。
-  - VE 的级：`op`、`func`、`m1 / m2 / p1 / period`、`A`、`B`、`imm`、`swapneg`、`reduce`、`rowlen`、`valid`，以及输入 / 输出类型。
-- **操作**：
-  - `sa.ld`、`sa.st`：rows、row bytes、pitch、mode（LINEAR / INTERLEAVE）；
-  - `sa.ex`：kt、accumulate、repeat、B / C 步长、C 行数；
-  - `sa.ve`、`sa.transpose`；
-  - `sa.ldparam`、`sa.fence`；
-  - `sa.loop`（带区域，降级成 LOOP_END 与 PARAM 步长）；
-  - `sa.template { sa.prefix {…} sa.head {…} sa.body {…} }`：一个 export 的结构，对应 sa-desc v3 的前缀、head、主体。
-- **动态值**：大小和偏移是 `index` 类型的 SSA 值，来自 push constant。`sa-legalize-dynamic` 之后，每个操作最多带 2 个动态字段，这一点由 verifier 检查。
-- **接口**：
-  - 内存效果：读写哪个片上 bank 的哪段、哪个 binding，供 `sa-uniform`、`sa-schedule` 使用；
-  - 代价：估计周期，见 §8.5。
+分两层的理由：高层的决定（布局、分块后的 tile 运算、内存规划、流水、微内核）与命令的编码细节（VE 的级、每条最多 2 个动态字段、寄存器、LOOP_END）分开。硬件换代（D、VE 的级数、动态字段数）主要改 `sahw` 和目标配置；微内核写在 `sahl` 上，不绑定编码；同一组命令既可以编成描述符，也可以由 RISC-V 代码逐条发出。描述符路径不经过 LLVM IR，LLVM 只用于在处理器上运行的代码。
+
+**共用的属性**：
+- `#sa.mem<spad_a | spad_b | acc>`：片上内存空间（`sahl` 上带 bank 规划，`sahw` 上带字偏移）。
+- `#sa.layout<packed | bcast | a_strip | b_strip | kt_strip>`：LLM plan §10.3 的布局类型（紧凑向量、广播字、A / B 条带、Kᵀ 条带），是片上 memref 类型的一部分。
+- 目标配置（§8.9 第 1 项）：两层的 verifier 与 pass 都从这里取容量和能力。
+
+**`sahl`（tile 级）**：操作数是 memref（DDR 一侧是 binding 的 subspan，片上一侧带 `#sa.mem` 与 `#sa.layout`），循环仍用 scf。
+- `sahl.load`、`sahl.store`：DDR 与片上 tile 之间搬运（任意形状与步长，布局由目标 memref 决定）；
+- `sahl.matmul`：int8 tile 矩阵乘，int32 累加（可选累加到已有结果）；
+- `sahl.elementwise`：带 region 的逐元素运算，region 里是原来的 arith / math，indexing map 保留；
+- `sahl.reduce`：sum / max 归约（顺序按 §3.2）；
+- `sahl.relayout`：布局转换（转置、DIV-D 复制、打包成广播字）；
+- `sahl.gather`、`sahl.scatter`：由数据决定地址的读写（嵌入行、KV 写入）；
+- `sahl.scalar`：i64 标量运算（位置、行号）。
+
+**`sahw`（命令级）**：一个操作对应一条命令，外加结构操作。
+- `sahw.ld`、`sahw.st`：rows、row bytes、pitch、mode（LINEAR / INTERLEAVE）；
+- `sahw.ex`：kt、accumulate、repeat、B / C 步长、C 行数；
+- `sahw.ve`（级：`op`、`func`、`m1 / m2 / p1 / period`、`A`、`B`、`imm`、`swapneg`、`reduce`、`rowlen`、`valid`、输入 / 输出类型）、`sahw.transpose`；
+- `sahw.ldparam`、`sahw.fence`、`sahw.setreg`；
+- `sahw.loop`（带区域，降级成 LOOP_END 与 PARAM 步长；RISC-V 后端则是真正的循环）；
+- `sahw.template { sahw.prefix {…} sahw.head {…} sahw.body {…} }`：一个 export 的结构，对应 sa-desc v3 的前缀、head、主体。
+- **动态值**：大小和偏移是 `index` 类型的 SSA 值，来自 push constant。描述符后端要求每个操作最多 2 个动态字段（`sahw-legalize-dynamic` 之后由 verifier 检查）；RISC-V 后端没有这个限制。
+
+**接口**（两层都实现）：内存效果（读写哪个片上 bank 的哪段、哪个 binding），供 CSE 与调度使用；代价（估计周期，§8.5）。
 
 ### 8.4 流水线（`buildTranslationPassPipeline`）
 
-序列化器只把 `sa.template` 翻译成字节，所有决定都在 pass 里完成，每个 pass 都可以用 `iree-opt` 单独运行和测试。
+序列化器只把 `sahw.template` 翻译成字节，所有决定都在 pass 里完成，每个 pass 都可以用 `iree-opt` 单独运行和测试。
 
-| # | pass | 输入 → 输出 | 要点 |
+| # | 层 | pass | 要点 |
 |---|---|---|---|
-| 1 | `sa-normalize` | dispatch 的 linalg | 具名算子泛化（batch_matmul、fill）；extsi / trunci 折进 contraction；识别 i8 × i8 → i32 的 contraction |
-| 2 | `sa-tile` | linalg → scf.for + 切片 | TilingInterface（`scf::tileConsumerAndFuseProducersUsingSCF`）：contraction 按 N 分块，块大小由 SPAD_B bank 与 ACC 暂存区决定（同 `Layout.chunk_tiles`），尾部融进每块；K 放不进一个 B 条带时按 K 分块，EX 用累加标志跨块累加（int32，结果与顺序无关）；过长的向量切段；所有容量来自目标配置（§8.9），块大小可由代价模型选 |
-| 3 | `sa-layout` | 张量加布局 | contraction 的 A → A 条带（由 packed x 做 DIV-D 复制），B → B 条带（打包后的权重直接 LD），Kᵀ → TRANSPOSE，标量 → 广播字，其余 packed；在布局不一致处插入转换 |
-| 4 | 缓冲化 | tensor → memref | 先试 IREE 的 one-shot bufferize（片上缓冲 = 带 `#sa.mem` 的 alloc）；不顺利就用自己的缓冲化（C3 已有同样的分析），见 §8.11 |
-| 5 | `sa-lower` | memref 上的 linalg / copy → `sa` | copy → `sa.ld / sa.st`；contraction → `sa.ex`；逐元素和归约的每个 arith / math → 单级 `sa.ve`（indexing map → LIN / MOD / DIV / IMM）；scatter / gather → LDPARAM + 动态地址；i64 标量运算 |
-| 6 | `sa-fuse-ve` | 单级 → 多级 `sa.ve` | C3 的折叠规则：常数乘 → A，常数加 → B，SFU 函数 → FUNC，取负 → A = −1，恒等的 B 用 −0；to_i8 链 → I8 输出；前缀掩码 → VALID。只做不改变舍入的合并 |
-| 7 | `sa-uniform` | `sa` | 标量 / 按行的值只算一次，相同的 LD 共用 |
-| 8 | `sa-legalize-dynamic` | `sa` | 动态值 → PARAM（装载表或私有 PARAM 的 `SETREG +=`）；超过 2 个动态字段就切成行循环 |
-| 9 | `sa-allocate` | 片上 alloc → 固定地址 | 按活跃区间分配，考虑 bank（记分板按 bank 判断依赖）；双缓冲的块放在不同 bank；放不下时报错，并给出建议的块大小 |
-| 10 | `sa-pipeline` | 块循环 | 两级软件流水：第 i 块 EX 之后 LD 第 i+1 块，放进另一个 bank（即模板的双缓冲）；次数多的循环 → `sa.loop`，少的展开 |
-| 11 | `sa-schedule` | 直线代码 | 按记分板模型做表调度：按序派发、引擎队列、bank 冲突；提前独立的 LD，把 VE 插进 EX 之间；分出 prefix / head |
-| 12 | `sa-assign-registers` | `sa` + 装载表 | BASE / PARAM 分配与装载表（§4.4） |
-| 13 | 序列化 | `sa.template` → sa-desc v3 | 经 `DescList` |
+| 1 | linalg | `sa-normalize` | 具名算子泛化（batch_matmul、fill）；extsi / trunci 折进 contraction；识别 i8 × i8 → i32 的 contraction |
+| 2 | linalg | `sa-tile` | TilingInterface（`scf::tileConsumerAndFuseProducersUsingSCF`）：contraction 按 N 分块，块大小由 SPAD_B bank 与 ACC 暂存区决定（同 `Layout.chunk_tiles`），尾部融进每块；K 放不进一个 B 条带时按 K 分块，EX 用累加标志跨块累加（int32，结果与顺序无关）；过长的向量切段；所有容量来自目标配置（§8.9），块大小可由代价模型选 |
+| 3 | linalg | `sa-layout` | contraction 的 A → A 条带（由 packed x 做 DIV-D 复制），B → B 条带（打包后的权重直接 LD），Kᵀ → 转置，标量 → 广播字，其余 packed；布局不一致处插入转换 |
+| 4 | linalg | 缓冲化 | tensor → memref。先试 IREE 的 one-shot bufferize（片上缓冲 = 带 `#sa.mem` 的 alloc）；不顺利就用自己的缓冲化（C3 已有同样的分析），见 §8.11 |
+| 5 | linalg → sahl | `sa-to-sahl` | copy → `sahl.load / store`；contraction → `sahl.matmul`；逐元素 / 归约 → `sahl.elementwise / reduce`（运算体原样保留）；scatter / gather / i64 标量；**微内核在这里选择**（§8.8） |
+| 6 | sahl | `sahl-uniform` | 标量 / 按行的值只算一次，相同的 load 共用（带内存效果的 CSE） |
+| 7 | sahl | `sahl-plan-memory` | 按 bank 规划片上缓冲（记分板按 bank 判断依赖），双缓冲的块放在不同 bank，检查容量；放不下时报错并给出建议的块大小 |
+| 8 | sahl | `sahl-pipeline` | 两级软件流水：第 i 块 matmul 之后 load 第 i+1 块到另一个 bank（即模板的双缓冲） |
+| 9 | sahl | `sahl-schedule` | 粗粒度调度：提前独立的 load；选出 prefix（可提前的权重 load）与 head |
+| 10 | sahl → sahw | `sahl-to-sahw` | 运算体的每个 arith / math → 单级 `sahw.ve`（indexing map → LIN / MOD / DIV / IMM）；matmul → `sahw.ex`；relayout → TRANSPOSE / DIV-D 复制；gather / scatter → LDPARAM + 动态地址；max 归约可选折半树（代价模型选择） |
+| 11 | sahw | `sahw-fuse-ve` | C3 的折叠规则：常数乘 → A，常数加 → B，SFU 函数 → FUNC，取负 → A = −1，恒等的 B 用 −0；to_i8 链 → I8 输出；前缀掩码 → VALID。只做不改变舍入的合并 |
+| 12 | sahw | `sahw-legalize-dynamic` | 动态值 → PARAM（装载表或私有 PARAM 的 `SETREG +=`）；超过 2 个动态字段就切成行循环（描述符后端） |
+| 13 | sahw | `sahw-allocate` | 片上最终字偏移（含 VE 的中间值），遵守 `sahl-plan-memory` 的 bank 规划 |
+| 14 | sahw | `sahw-schedule` | 细粒度表调度：按序派发、引擎队列、bank 冲突；把 VE 插进 EX 之间；次数多的循环 → `sahw.loop`，少的展开 |
+| 15 | sahw | `sahw-assign-registers` | BASE / PARAM 分配与装载表（§4.4），BASE15 留给前缀 |
+| 16 | sahw → 字节 | 序列化 | `sahw.template` → sa-desc v3，经 `DescList`（RISC-V 后端改为 `sahw-to-llvm`，§8.10） |
 
 ### 8.5 代价模型
 
@@ -654,7 +674,7 @@ C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层�
   - EX：kt × repeat；
   - VE：流水模式每组约 2 周期（lane 折叠），多拍模式每组的固定代价（EXP、RECIP、RSQRT、REDUCE 各不相同）；
   - 每条命令的启动延迟。
-- **dispatch 的估计**：一个按序派发、带引擎队列和 bank 记分板的小模拟器，是 C++ 实现，在 `sa` 层运行。
+- **dispatch 的估计**：一个按序派发、带引擎队列和 bank 记分板的小模拟器，是 C++ 实现，在 `sahl` 与 `sahw` 上运行（`sahl` 用于分块、流水与微内核的选择，`sahw` 用于细粒度调度）。
 - **校准**：C4 已有 58 个 export 的逐 dispatch 板上周期（`SA_PROFILE=1`）。再加一组微基准列表，放进 `board_profile` 的同一套流程测。目标是每个 dispatch 误差 ±10%。
 - 估计值写进 sa-desc 入口点表的“估计周期”字段，驱动以后可以用来选宿主 dispatch。
 
@@ -673,11 +693,11 @@ C3/C4 的代码生成器是“模板库 + VE 表达式编译器”：线性层�
 
 | 步骤 | 内容 | 验收 | 工作量 |
 |---|---|---|---|
-| **C5.0 基础设施** | 方言（ODS / TableGen）、verifier、序列化器、`--iree-sa-codegen` 开关、流水线骨架、FileCheck；现有代码生成器改为输出 `sa` 操作，然后由新的 `sa-schedule`（prefix / head）、`sa-assign-registers` 和序列化器完成；**目标配置**（§8.9 第 1 项）：`#hal.executable.target` 的 config 带全部硬件参数，新代码只从这里读 | 58 个 dispatch 的 sa-desc 与 C4 **逐字节相同**（先验证后半条流水线） | 中 |
-| **C5.1 逐元素与归约** | 流水线前半：normalize、layout（packed / 广播字）、缓冲化、lower、fuse-ve、uniform、legalize-dynamic、allocate；funcsim 与 `dispatch_check` 支持目标配置的参数（D、SPAD / ACC 大小） | 约 40 个非 contraction 的 dispatch 用新路径全部通过 `dispatch_check`（D = 8，并用 D = 16 等配置交叉验证）；混合路径端到端 sim 逐位一致；逐 dispatch 周期不高于 C4 | 大 |
-| **C5.2 线性层** | contraction 分块（N，以及 K 放不下时按 K 分块、跨块累加）、A / B 条带、尾部按块融合、软件流水、`sa.loop`、prefix | 5 种线性层通过；另加 K = 8192 等单独的线性层测试（覆盖 K 分块）；板上逐 dispatch 周期与 C4 相差 ≤ 1%（模板的调度就是参照） | 大 |
+| **C5.0 基础设施** | `sahw` 方言（ODS / TableGen）、verifier、序列化器、`--iree-sa-codegen` 开关、流水线骨架、FileCheck；现有代码生成器改为输出 `sahw` 操作，然后由新的 `sahw-assign-registers` 和序列化器完成（prefix / head 暂由现有代码给出）；**目标配置**（§8.9 第 1 项）：`#hal.executable.target` 的 config 带全部硬件参数，新代码只从这里读 | 58 个 dispatch 的 sa-desc 与 C4 **逐字节相同**（先验证后半条流水线） | 中 |
+| **C5.1 逐元素与归约** | `sahl` 方言；流水线：normalize、layout（packed / 广播字）、缓冲化、`sa-to-sahl`、`sahl-uniform`、`sahl-plan-memory`、`sahl-to-sahw`、`sahw-fuse-ve`、`sahw-legalize-dynamic`、`sahw-allocate`、`sahw-schedule`；funcsim 与 `dispatch_check` 支持目标配置的参数（D、SPAD / ACC 大小） | 约 40 个非 contraction 的 dispatch 用新路径全部通过 `dispatch_check`（D = 8，并用 D = 16 等配置交叉验证）；混合路径端到端 sim 逐位一致；逐 dispatch 周期不高于 C4 | 大 |
+| **C5.2 线性层** | contraction 分块（N，以及 K 放不下时按 K 分块、跨块累加）、A / B 条带、尾部按块融合、软件流水（`sahl-pipeline`）、`sahw.loop`、prefix / head（`sahl-schedule`） | 5 种线性层通过；另加 K = 8192 等单独的线性层测试（覆盖 K 分块）；板上逐 dispatch 周期与 C4 相差 ≤ 1%（模板的调度就是参照） | 大 |
 | **C5.3 注意力、scatter、gather、i64 标量** | batch_matmul（Kᵀ 条带、TRANSPOSE）、动态 T 的行循环、带掩码的 softmax、KV 写入（LDPARAM）、嵌入 gather；GQA 的下标映射（KV 头 = Q 头 / 组大小）按设计实现 | 58 个 dispatch 全部走新路径；GQA 用单独的注意力测试覆盖 | 大 |
-| **C5.4 模板改成微内核** | 线性层、注意力的模板改写成输出 `sa` 操作的微内核（§8.8），加 `--iree-sa-ukernels`；旧的直接生成描述符的路径与 `--iree-sa-codegen` 开关退役；板上验收 | §8.1 的 1、2（两种配置） | 中 |
+| **C5.4 模板改成微内核** | 线性层、注意力的模板改写成输出 `sahl` 操作的微内核（§8.8），加 `--iree-sa-ukernels`；旧的直接生成描述符的路径与 `--iree-sa-codegen` 开关退役；板上验收 | §8.1 的 1、2（两种配置） | 中 |
 | **C5.5 通用性** | 下面两个模型；前端（HuggingFace 导入、通用量化、QK-norm 等结构）、运行时（设备窗口可配置、分配器到 GB 级）、按 torch 误差验收的端到端测试 | §8.1 的 3；SmolLM2-135M 上板 | 中 |
 
 前端（§8.9 第 2 项）是独立的 Python 工作，与代码生成无关，可以在 C5.1–C5.3 期间穿插先做：先用现有的模板路径试编 SmolLM2 / Qwen3，看会暴露哪些不支持的 dispatch，反过来检查 C5 的覆盖面。
@@ -690,8 +710,8 @@ C5.5 的模型（§8.9 的第一步）：
 ### 8.8 扩展点与微内核
 
 **微内核**（ukernel）：
-- 一个微内核 = 一个匹配条件 + 一个 C++ 函数，把匹配到的 linalg 算子（带它的尾部）改写成一段 `sa` 操作。它**不**直接输出描述符，之后照常经过 `sa-allocate`（或声明自己占用的片上区域）、`sa-schedule`、`sa-assign-registers`、序列化，所以同样受 verifier、`dispatch_check`、驱动的前缀预取与 FENCE 规则约束。
-- 选择在 `sa-lower`：对每个算子先查微内核表，匹配就用，否则走通用降级；两者都可用时由代价模型或开关决定。开关 `--iree-sa-ukernels=all|none|<名字,…>`。
+- 一个微内核 = 一个匹配条件 + 一个 C++ 函数，把匹配到的 linalg 算子（带它的尾部）改写成一段 `sahl` 操作（需要时也可以直接给出 `sahw` 片段）。它**不**直接输出描述符，之后照常经过内存规划（或声明自己占用的片上区域）、调度、`sahl-to-sahw`、寄存器分配、序列化，所以同样受 verifier、`dispatch_check`、驱动的前缀预取与 FENCE 规则约束。
+- 选择在 `sa-to-sahl`：对每个算子先查微内核表，匹配就用，否则走通用降级；两者都可用时由代价模型或开关决定。开关 `--iree-sa-ukernels=all|none|<名字,…>`。
 - 初始的微内核：`linear`（`emitLinear`：分块、双缓冲、逐块尾部，C2 起的字节比对测试保留）、`attention`（scores / P·V）。以后值得手工调的算子（例如 C4 续的 W13 + SiLU 交错循环）只需加一个微内核。
 - 每个微内核要有对照数据：与通用路径逐位一致，并记录周期差。
 
@@ -701,7 +721,8 @@ C5.5 的模型（§8.9 的第一步）：
 |---|---|---|---|
 | 预处理（全局，dispatch 形成之前） | 整个模型的 linalg | 控制融合、自行组 dispatch region、常量打包 | `iree-sa-pack-linear-weights`、`iree-sa-clone-cheap-producers` |
 | linalg 层（`sa-tile` 前后） | 单个 dispatch 的 linalg / scf | 分块策略、算子改写、微内核选择 | — |
-| `sa` 层（`sa-lower` 之后） | `sa` 方言 | 调度、窥孔优化、预取、VE 级合并 | abs-max 折半树（C4 步骤 6，C5 中移到这里） |
+| `sahl` 层 | tile 级运算 | 内存规划、流水、粗粒度调度、预取、tile 级改写 | — |
+| `sahw` 层 | 命令 | 细粒度调度、窥孔优化、VE 级合并 | abs-max 折半树（C4 步骤 6，C5 中移到 `sahl-to-sahw`） |
 | 驱动（运行时） | 一个命令缓冲的整张列表 | 跨 dispatch 调度 | C4 步骤 5 的列表调度 |
 
 - 实验时不必改流水线：`iree-opt --pass-pipeline=...` 可以在任一阶段导出的 IR 上直接试。
@@ -772,6 +793,13 @@ C5.5 的模型（§8.9 的第一步）：
 
 - **C4 续**：在 C5 的调度器和代价模型上做暂缓的融合。W13 + SiLU 由预处理组成一个 dispatch region，模板内交错；量化链合并成一个 dispatch；`enable-aggressive-reshape-movement`。目标仍是与手写路径相差 ≤ 10%。
 - 可选扩展（§10）：批处理 decode、prefill、更大的模型。
+- **C7 RISC-V 后端**（可选，C5 之后任何时候，不影响 C5 / C6 主线）：
+  - 同一组加速器命令有两种发出方式：ARM 构建描述符列表由取指单元执行，或 PicoRV32 用 PCPI 自定义指令（custom-0，funct7 = 1 矩阵 / DMA、funct7 = 2 向量）逐条发出。两者的命令字段基本相同，所以 `sahw` 可以接第二个后端：`sahw` + scf / arith → LLVM dialect（命令用 `.insn` 内联汇编）→ LLVM IR → riscv32 目标文件。
+  - 价值是灵活性：完整的控制流和标量计算（依赖数据的循环与分支、设备上的 argmax / top-k 采样），没有“每条最多 2 个动态字段”的限制；也为以后配有更强 RISC-V 核的硬件做准备。
+  - 加速器做不了、要在 RISC-V 上算的通用运算，不走这条路径，而是复用 IREE 的 llvm-cpu 后端（linalg → vector → LLVM，支持 riscv32 / riscv64）。
+  - PYNQ-Z1 上的限制：PicoRV32 是 rv32imc，程序存储器只有 8 KB BRAM，只能放小内核（能否从 DDR 取指需要核实）；逐条发 PCPI 比描述符 DMA 慢（M5：小算子 1.2–4.2 倍），所以在这块板上不是提速手段。
+  - 前提：现在的 iree-compile 没有带 llvm-cpu，LLVM 的 RISC-V 目标可能没编进去，需要核实，必要时重新构建编译器（约 2 小时）。
+  - 验收：一个 dispatch 由 PicoRV32 代码发 PCPI 指令执行，结果与描述符路径逐位一致；另用 IREE llvm-cpu 编一个 riscv32 的 dispatch 作为演示。
 
 ### 8.11 风险与对策
 
@@ -810,9 +838,11 @@ C5.5 的模型（§8.9 的第一步）：
 | **C2 第一条纵向切片** | 从源码构建带插件的 iree-compile；插件只支持量化线性层一种 dispatch，其余报错；用一个“单线性层”的 torch 模型测试 | torch → iree-compile → .vmfb → sim 与板上，结果与 `DeviceModel.linear` 逐位一致。**已完成**（§6.7） | 中（构建环境是主要难点） |
 | **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致。**已完成**（§6.9，板上 12.6 tok/s） | 大 |
 | **C4 性能** | 精简 FENCE、跨 dispatch 预取、更大的 dispatch、代价模型 | 每 token 周期与手写路径相差 ≤ 10%。**部分完成，暂缓**（§7.1：差 13%，板上 17.7 tok/s） | 中 |
-| **C5 代码生成** | sa 方言与完整流水线（§8），模板改成 `sa` 层微内核，分步 C5.0–C5.5（§8.7） | 只用通用代码生成（`--iree-sa-ukernels=none`）也能编译 stories15M，结果与 C3 一致；默认配置每 token 周期不高于 C4；一个模型变体编译通过（§8.1） | 大 |
+| **C5 代码生成** | `sahl` / `sahw` 两层方言与完整流水线（§8），模板改成 `sahl` 层微内核，分步 C5.0–C5.5（§8.7） | 只用通用代码生成（`--iree-sa-ukernels=none`）也能编译 stories15M，结果与 C3 一致；默认配置每 token 周期不高于 C4；一个模型变体编译通过（§8.1） | 大 |
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板 | 大 |
+
+| **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。
 - **每一步都在主机上先过**（sim 传输层），再上板；上板通过后提交，与现有约定一致。
@@ -831,9 +861,10 @@ compiler/
   plugins/sa/             sa 目标后端插件（C++，经 IREE_CMAKE_PLUGIN_PATHS 编进 iree-compile）
     target/               TargetDevice / TargetBackend、预处理（权重打包）、匹配、C++ 模板与 DescList、sa-desc-v1 序列化（C2）
     templates/            模板的 Python 参考（reference.py，C++ 输出须与之逐字节相同）
-    dialect/              sa 方言：ODS、属性、操作、接口（C5，§8.3）
+    dialect/              sahl、sahw 两层方言：ODS、属性、操作、接口（C5，§8.3）
     transforms/           C5 的流水线（§8.4）与代价模型（§8.5）
-    ukernels/             sa 层微内核（linear、attention，§8.8）
+    ukernels/             sahl 层微内核（linear、attention，§8.8）
+    riscv/                sahw → LLVM 的 RISC-V 后端（C7，§8.10）
     test/                 lit 测试（iree-opt + FileCheck）
   frontend/               C0：qllama.py（量化模型）、export.py（iree-turbine 导出）、对比脚本
   runtime/                C1：sa HAL 驱动（C，sa/），传输层 board / sim；tools/（sa-desc-v1）；test/
@@ -869,3 +900,4 @@ build/iree/               不入库：IREE 源码、Python 环境、编译器构
 5. **C4 的跨 dispatch 调度放在哪里**：驱动（录制命令缓冲时看到相邻的 dispatch）还是编译器（链接阶段）。原本倾向编译器；**已定为驱动**（§7.1），编译器经 sa-desc v3 提供信息。
 6. **C5 的缓冲化**：IREE 的 one-shot bufferize（带 `#sa.mem` 内存空间），还是自己的缓冲化。先试前者（§8.4 第 4 步、§8.11）。
 7. **C5.5 的模型变体**：**已定**：SmolLM2-135M（板上）与 Qwen3 结构的小配置（sim）（§8.7、§8.9）。
+8. **C5 的方言分层**：**已定**：两层，`sahl`（tile 级）与 `sahw`（命令级）；`sahw` 接描述符与 RISC-V（C7）两个后端（§8.3、§8.10）。
