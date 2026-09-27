@@ -83,6 +83,8 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
       for (OpOperand *in : dps.getDpsInputOperands()) {
         Value v = in->get();
         if (!isa<MemRefType>(v.getType()) || !ddrRoot(v)) continue;
+        // i64 scalars (positions) stay in DDR: the lowering reads them through LDPARAM
+        if (cast<MemRefType>(v.getType()).getElementType().isInteger(64)) continue;
         Value l = loaded.lookup(v);
         if (!l) {
           l = localFor(b, op->getLoc(), v);
