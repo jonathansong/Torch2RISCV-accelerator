@@ -390,7 +390,7 @@ C4 的做法，按收益排序：
 
 | 阶段 | 内容 | 验收 | 工作量（相对 L1–L5） |
 |---|---|---|---|
-| **C0 前端** | 量化 torch 模型；iree-turbine 导出；`llvm-cpu` 在主机和板上运行；dispatch 清单 | §3.4；清单与手写片段的对照表 | 小 |
+| **C0 前端** | 量化 torch 模型；iree-turbine 导出；`llvm-cpu` 在主机和板上运行；dispatch 清单（环境已就绪，见 `compiler/README.md`） | §3.4；清单与手写片段的对照表 | 小 |
 | **C1 驱动** | sa HAL 驱动（board、sim 两种传输层）；模拟器服务；sa-desc-v1 读写 | §5.6：手工封装的模板在 sim 与板上与 `DeviceModel` 逐位一致 | 中 |
 | **C2 第一条纵向切片** | 从源码构建带插件的 iree-compile；插件只支持量化线性层一种 dispatch，其余报错；用一个“单线性层”的 torch 模型测试 | torch → iree-compile → .vmfb → sim 与板上，结果与 `DeviceModel.linear` 逐位一致 | 中（构建环境是主要难点） |
 | **C3 模板库** | §6.4 的全部模板；VE 表达式编译器；数据分块与权重打包；KV cache 原地更新 | IREE 编译的 stories15M 在板上生成的文本与 L5 手写路径完全相同，logits 逐位一致 | 大 |
@@ -405,22 +405,25 @@ C4 的做法，按收益排序：
 
 ## 11. 目录结构
 
+所有编译器相关的代码放在仓库顶层的 `compiler/`（环境与构建方法见 [`../compiler/README.md`](../compiler/README.md)）：
+
 ```
-iree-sa/
-  l0/                     已有：armv7 工具链验证
-  frontend/               C0：qllama.py（量化模型）、export.py（iree-turbine 导出）、对比脚本
-  compiler/               C2–C5：iree-compile 插件（C++，CMake 外部插件目录）
-    target/               TargetDevice / TargetBackend、sa-desc-v1 序列化
-    templates/            模板生成器（移植自 compile_layer / compile_model）
-    ve_expr/              VE 表达式编译器
-    dialect/              C5：sa 方言与流水线
+compiler/
+  env.sh                  路径与设置（IREE 版本、源码、构建目录、Python 环境）
+  scripts/                拉取 IREE 编译器的子模块；从源码构建带插件的 iree-compile
+  plugins/sa/             sa 目标后端插件（C++，经 IREE_CMAKE_PLUGIN_PATHS 编进 iree-compile）
+    target/               TargetDevice / TargetBackend、sa-desc-v1 序列化（C2）
+    templates/            模板生成器（移植自 compile_layer / compile_model，C3）
+    ve_expr/              VE 表达式编译器（C3）
+    dialect/              sa 方言与流水线（C5）
     test/                 lit 测试
+  frontend/               C0：qllama.py（量化模型）、export.py（iree-turbine 导出）、对比脚本
   runtime/                C1：sa HAL 驱动（C），传输层 board / sim
   sim/                    模拟器服务（Python，基于 llm/sa_funcsim.py）
   tests/                  端到端测试（主机 sim、板上脚本）
+iree-sa/l0/               已有：armv7 工具链验证（L0）
+build/iree/               不入库：IREE 源码、Python 环境、编译器构建目录
 ```
-
----
 
 ## 12. 风险与对策
 
