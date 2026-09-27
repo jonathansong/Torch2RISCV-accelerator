@@ -21,9 +21,13 @@ iree_cc_library(
     "PackLinearWeights.cpp"
     "SATarget.cpp"
     "Templates.cpp"
+    "../transforms/SaLin.cpp"
     "../transforms/SahwPasses.cpp"
     "../transforms/SahwRaise.cpp"
     "../transforms/SahwSerialize.cpp"
+    "../transforms/SaToSahl.cpp"
+    "../transforms/SahlToSahw.cpp"
+    "../transforms/SahlPipeline.cpp"
   DEPS
     sa::SahwDialect
     LLVMSupport
@@ -34,6 +38,8 @@ iree_cc_library(
     MLIRIR
     MLIRLinalgDialect
     MLIRLinalgTransforms
+    MLIRMemRefDialect
+    iree::compiler::Codegen::Common
     MLIRPass
     MLIRSupport
     MLIRTensorDialect

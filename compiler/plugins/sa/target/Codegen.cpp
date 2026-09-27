@@ -34,6 +34,7 @@
 
 #include "DescList.h"
 #include "Templates.h"
+#include "../transforms/SaLin.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
@@ -56,56 +57,6 @@ using ::sa::VType;
 namespace {
 
 constexpr float NEG0 = -0.0f;
-
-// ---------------------------------------------------------------- scalars
-// ((C * mul) >> shift) + add, C = push constant `ord` (or none: add only).
-struct Lin {
-  int ord = -1;
-  int64_t mul = 1;
-  int shift = 0;
-  int64_t add = 0;
-  bool isConst() const { return ord < 0; }
-  bool operator<(const Lin &o) const {
-    return std::tie(ord, mul, shift, add) < std::tie(o.ord, o.mul, o.shift, o.add);
-  }
-  bool operator==(const Lin &o) const { return !(*this < o) && !(o < *this); }
-};
-
-std::optional<Lin> linOf(Value v) {
-  if (auto c = getConstantIntValue(v)) return Lin{-1, 1, 0, *c};
-  Operation *op = v.getDefiningOp();
-  if (!op) return std::nullopt;
-  if (auto load = dyn_cast<IREE::HAL::InterfaceConstantLoadOp>(op))
-    return Lin{int(load.getOrdinal().getZExtValue()), 1, 0, 0};
-  if (isa<arith::IndexCastUIOp, arith::IndexCastOp, arith::ExtUIOp, arith::ExtSIOp, arith::TruncIOp>(op))
-    return linOf(op->getOperand(0));
-  if (auto a = dyn_cast<IREE::Util::AssumeIntOp>(op)) return linOf(a.getOperand(cast<OpResult>(v).getResultNumber()));
-  if (isa<IREE::TensorExt::DispatchWorkloadOrdinalOp>(op)) return linOf(op->getOperand(0));
-  if (auto o = dyn_cast<arith::OrIOp>(op)) {
-    // lo | (hi << 32): a 64-bit value from two push constants; the device is
-    // 32-bit, the high word is 0 (the runtime values here are offsets / lengths)
-    for (int i = 0; i < 2; ++i) {
-      if (auto sh = op->getOperand(1 - i).getDefiningOp<arith::ShLIOp>()) {
-        auto amount = getConstantIntValue(sh.getRhs());
-        if (amount && *amount == 32) return linOf(op->getOperand(i));
-      }
-    }
-    return std::nullopt;
-  }
-  if (auto m = dyn_cast<arith::MulIOp>(op)) {
-    for (int i = 0; i < 2; ++i)
-      if (auto c = getConstantIntValue(op->getOperand(1 - i)))
-        if (auto l = linOf(op->getOperand(i)); l && l->shift == 0) return Lin{l->ord, l->mul * *c, 0, l->add * *c};
-    return std::nullopt;
-  }
-  if (isa<arith::AddIOp>(op)) {
-    for (int i = 0; i < 2; ++i)
-      if (auto c = getConstantIntValue(op->getOperand(1 - i)))
-        if (auto l = linOf(op->getOperand(i))) return Lin{l->ord, l->mul, l->shift, l->add + *c};
-    return std::nullopt;
-  }
-  return std::nullopt;
-}
 
 // ---------------------------------------------------------------- local tensors
 enum class Layout { Packed, Bcast };

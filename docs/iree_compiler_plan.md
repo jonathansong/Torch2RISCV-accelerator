@@ -715,6 +715,12 @@ C5.5 的模型（§8.9 的第一步）：
 - 开关 `--iree-sa-codegen=dialect|templates`（默认 dialect）。
 - 验收（`tests/test_c50.py`）：lit 测试（`plugins/sa/test/`：方言往返、两个 pass）通过；stories15M 的 58 个可执行体两条路径**逐字节相同**；C2（D = 8、16）、C3（58 个 dispatch、12/12 步逐位一致）在新路径上通过。可执行体与板上验证过的 C4 相同，不需要重新上板。
 
+**C5.1a（2026-09-27，进行中）**：
+- 流水线：IREE 的 comprehensive bufferize（§13 第 6 条：直接可用）→ `iree-sa-to-sahl`（DDR 读写显式化：计算只读写片上缓冲，`sahl.load` / `sahl.store`）→ `iree-sahl-to-sahw`（片上缓冲分配、DDR 视图 → BASE + 偏移、每个 arith / math 运算一条单级 VE、只依赖标量 / 行的值只算一次、归约、abs-max 折半树、int8 / int32 输出转换）→ `iree-sahw-fuse-ve`（按 C3 的折叠规则把单级 VE 合并成多级，含 REDUCE 与输出类型转换）。
+- 计算仍用片上 memref 上的 `linalg.generic` 表示，`sahl` 目前只有 load / store 两个操作。
+- 驱动：每个 dispatch 先试新流水线，失败则用 C3/C4 生成器（`--iree-sa-new-codegen=on|only|off`，`--iree-sa-codegen-report`）。
+- 结果（`tests/test_c51.py`）：stories15M 的 58 个可执行体中 23 个走新流水线，58 个全部通过 `dispatch_check`，端到端 sim 12/12 步逐位一致。描述符 / VE 数与 C3/C4 相同，dispatch 5、30 各少一条 VE（REDUCE 合并进了折半的最后一步）。其余 35 个待 C5.1b–C5.3：动态形状（14）、i64 标量（8）、三层以上循环（6，scatter / 注意力相关）、线性层（5）等。
+
 ### 8.8 扩展点与微内核
 
 **微内核**（ukernel）：

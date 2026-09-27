@@ -5,8 +5,8 @@ executables as the C3/C4 path.
   1. lit tests of the sa plugin (compiler/plugins/sa/test: the sahw dialect
      parses / prints, sahw-split-head, sahw-assign-registers);
   2. an exported model (default: build/c4/fuse, stories15M) compiled twice,
-     --iree-sa-codegen=templates and =dialect: every executable (sa-desc)
-     byte for byte equal.
+     --iree-sa-codegen=templates and =dialect (with the C5 pipeline off: the
+     C3/C4 generator raised into sahw): every executable byte for byte equal.
 
     python3 compiler/tests/test_c50.py [--model build/c4/fuse]
 """
@@ -49,7 +49,7 @@ def main():
             r = subprocess.run([os.path.join(COMPILER, "scripts", "compile_sa.sh"), d,
                                 f"--iree-hal-dump-executable-binaries-to={bins[mode]}"],
                                capture_output=True, text=True,
-                               env=dict(os.environ, SA_COMPILE_FLAGS=f"--iree-sa-codegen={mode}"))
+                               env=dict(os.environ, SA_COMPILE_FLAGS=f"--iree-sa-codegen={mode} --iree-sa-new-codegen=off"))
             if r.returncode:
                 print(f"compile ({mode}) failed:\n{r.stderr[-3000:]}")
                 return 1

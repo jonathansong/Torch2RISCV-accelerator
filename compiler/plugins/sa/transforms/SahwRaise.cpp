@@ -8,8 +8,11 @@
 #include <set>
 
 #include "../target/DescList.h"
+#include "SahlPasses.h"
 #include "SahwPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/IR/Builders.h"
 
 namespace mlir::iree_compiler::sa {
@@ -206,14 +209,56 @@ struct Raiser {
 struct SahwLegacyCodegenPass
     : public PassWrapper<SahwLegacyCodegenPass, OperationPass<IREE::HAL::ExecutableVariantOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SahwLegacyCodegenPass)
-  explicit SahwLegacyCodegenPass(bool allowUnsupported = false) : allowUnsupported(allowUnsupported) {}
-  SahwLegacyCodegenPass(const SahwLegacyCodegenPass &o) : PassWrapper(o), allowUnsupported(o.allowUnsupported) {}
+  explicit SahwLegacyCodegenPass(bool allowUnsupported = false, std::string newCodegen = "off", bool report = false)
+      : allowUnsupported(allowUnsupported), newCodegen(std::move(newCodegen)), report(report) {}
+  SahwLegacyCodegenPass(const SahwLegacyCodegenPass &o)
+      : PassWrapper(o), allowUnsupported(o.allowUnsupported), newCodegen(o.newCodegen), report(o.report) {}
 
   StringRef getArgument() const override { return "iree-sahw-legacy-codegen"; }
   StringRef getDescription() const override {
-    return "Generates every export with the C3/C4 code generator and raises it into sahw.template";
+    return "Generates every export (the C5 pipeline, or the C3/C4 code generator raised) into sahw.template";
   }
-  void getDependentDialects(DialectRegistry &registry) const override { registry.insert<sahw::SahwDialect>(); }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<sahw::SahwDialect>();
+    OpPassManager pm(ModuleOp::getOperationName());
+    buildSahlPipeline(pm, TargetConfig());
+    pm.getDependentDialects(registry);
+  }
+
+  // The C5 pipeline on a copy of the function (in a module nested in the
+  // inner module); the template moves into the inner module on success.
+  bool tryNew(ModuleOp inner, FunctionOpInterface func, const TargetConfig &cfg, int64_t bindings, int64_t constants,
+              std::string &why) {
+    OpBuilder mb = OpBuilder::atBlockEnd(inner.getBody());
+    auto tmp = ModuleOp::create(mb, func.getLoc());
+    OpBuilder tb = OpBuilder::atBlockEnd(tmp.getBody());
+    tb.clone(*func.getOperation());
+    OpPassManager pm(ModuleOp::getOperationName());
+    buildSahlPipeline(pm, cfg);
+    bool ok;
+    {
+      ScopedDiagnosticHandler h(func.getContext(), [&](Diagnostic &dg) {
+        if (why.empty()) why = dg.str();
+        return success();
+      });
+      ok = succeeded(runPipeline(pm, tmp));
+    }
+    sahw::TemplateOp t;
+    if (ok)
+      for (auto x : tmp.getOps<sahw::TemplateOp>()) t = x;
+    if (ok && t) {
+      t->moveBefore(tmp);
+      Builder b(t.getContext());
+      t.setBindingsAttr(b.getI64IntegerAttr(bindings));
+      t.setConstantsAttr(b.getI64IntegerAttr(constants));
+      t->setAttr("sa.codegen", b.getStringAttr("sahl"));
+    } else if (ok) {
+      why = "no template";
+      ok = false;
+    }
+    tmp.erase();
+    return ok;
+  }
 
   void runOnOperation() override {
     auto variant = getOperation();
@@ -228,6 +273,18 @@ struct SahwLegacyCodegenPass
         return signalPassFailure();
       }
       auto layout = exportOp.getLayout();
+      if (newCodegen != "off") {
+        std::string why;
+        if (tryNew(inner, func, cfg, int64_t(layout.getBindings().size()), int64_t(layout.getConstants()), why)) {
+          if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": sahl\n";
+          continue;
+        }
+        if (newCodegen == "only") {
+          exportOp.emitError() << "sa: the C5 pipeline failed: " << why;
+          return signalPassFailure();
+        }
+        if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": legacy (" << why << ")\n";
+      }
       Generated gen;
       std::string why;
       bool ok = generateDispatch(func, cfg.codegenOptions(), gen, why);
@@ -288,12 +345,15 @@ struct SahwLegacyCodegenPass
   }
 
   bool allowUnsupported;
+  std::string newCodegen;
+  bool report;
 };
 
 }  // namespace
 
-std::unique_ptr<Pass> createSahwLegacyCodegenPass(bool allowUnsupported) {
-  return std::make_unique<SahwLegacyCodegenPass>(allowUnsupported);
+std::unique_ptr<Pass> createSahwLegacyCodegenPass(bool allowUnsupported, const std::string &newCodegen,
+                                                  bool report) {
+  return std::make_unique<SahwLegacyCodegenPass>(allowUnsupported, newCodegen, report);
 }
 
 void registerSahwLegacyCodegenPass() { PassRegistration<SahwLegacyCodegenPass>(); }

@@ -21,6 +21,7 @@
 #include "SAPasses.h"
 #include "Templates.h"
 #include "../transforms/SahwPasses.h"
+#include "../transforms/SahlPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetDevice.h"
@@ -47,6 +48,10 @@ struct SAOptions {
   bool allowUnsupported = false;
   // Code generation path: "dialect" (sahw) or "templates" (C3/C4, direct).
   std::string codegen = "dialect";
+  // C5.1: the C5 pipeline per dispatch ("on": with the C3/C4 generator as the
+  // fallback, "only", "off"), and a per-dispatch report on stderr.
+  std::string newCodegen = "on";
+  bool codegenReport = false;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -58,6 +63,10 @@ struct SAOptions {
                      llvm::cl::desc("Warn instead of failing on dispatches without a template (development)."));
     binder.opt<std::string>("iree-sa-codegen", codegen, llvm::cl::cat(category),
                             llvm::cl::desc("Code generation path: dialect (sahw, default) or templates (C3/C4)."));
+    binder.opt<std::string>("iree-sa-new-codegen", newCodegen, llvm::cl::cat(category),
+                            llvm::cl::desc("C5 pipeline per dispatch: on (fallback to C3/C4), only, off."));
+    binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
+                     llvm::cl::desc("Print which code generator each dispatch used."));
   }
 };
 
@@ -110,13 +119,23 @@ public:
     executableTargetAttrs.push_back(getSAExecutableTarget(context, options));
   }
 
+  // the dialects the translation pipeline (and the C5 pipeline it runs per
+  // dispatch) creates
+  void getDependentDialects(DialectRegistry &registry) const override {
+    OpPassManager pm(IREE::HAL::ExecutableVariantOp::getOperationName());
+    pm.addPass(sa::createSahwLegacyCodegenPass(false, "on"));
+    pm.addPass(sa::createSahwFuseVePass());
+    pm.getDependentDialects(registry);
+  }
+
   void buildTranslationPassPipeline(IREE::HAL::ExecutableTargetAttr targetAttr,
                                     OpPassManager &passManager) override {
     // Every export becomes a single workgroup. The dialect path generates the
     // templates here (sahw); the templates path at serialization.
     passManager.addPass(sa::createLowerWorkgroupCountPass());
     if (options.codegen == "dialect") {
-      passManager.addPass(sa::createSahwLegacyCodegenPass(options.allowUnsupported));
+      passManager.addPass(
+          sa::createSahwLegacyCodegenPass(options.allowUnsupported, options.newCodegen, options.codegenReport));
       passManager.addPass(sa::createSahwSplitHeadPass());
       passManager.addPass(sa::createSahwAssignRegistersPass());
     }

@@ -1,5 +1,6 @@
 // sahw passes (docs/iree_compiler_plan.md §8.4) and the target configuration.
 #include "SahwPasses.h"
+#include "SahlPasses.h"
 
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "mlir/IR/Builders.h"
@@ -135,6 +136,9 @@ std::unique_ptr<Pass> createSahwAssignRegistersPass() { return std::make_unique<
 void registerSahwLegacyCodegenPass();
 void registerSahwPasses() {
   registerSahwLegacyCodegenPass();
+  registerSaToSahlPass();
+  registerSahlToSahwPass();
+  registerSahwFuseVePass();
   PassRegistration<SahwSplitHeadPass>();
   PassRegistration<SahwAssignRegistersPass>();
 }
