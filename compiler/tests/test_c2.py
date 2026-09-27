@@ -158,15 +158,17 @@ def main():
                 print(f"{name}: {len(sadescs)} executables (expected 1)")
                 ok = False
             else:
-                dd, _, exps = sadesc.read(open(sadescs[0], "rb").read())
-                got = exps[0][1].tobytes() if len(exps) == 1 else b""
+                blob = open(sadescs[0], "rb").read()
+                dd, _, exps = sadesc.read(blob)
+                got = exps[0][1] if len(exps) == 1 else np.zeros((0, 8), np.uint64)
+                prefix = sadesc.read_ext(blob)[0]["prefix"] if len(exps) == 1 else 0
                 match = None
                 for perm in itertools.permutations(range(5)):
-                    if reference.qlinear(d, k, n, x_i32, *perm).array().tobytes() == got:
+                    if same_template(reference.qlinear(d, k, n, x_i32, *perm).array(), got, prefix):
                         match = perm
                         break
                 print(f"{name}: k={k} n={n} x={'i32' if x_i32 else 'i8'}: executable D={dd}, "
-                      f"{len(exps)} export(s) '{exps[0][0] if exps else ''}', {len(got) // 64} descriptors; "
+                      f"{len(exps)} export(s) '{exps[0][0] if exps else ''}', {len(got)} descriptors ({prefix} in the prefix); "
                       + (f"template == reference (bindings x,W,s_w,s_x,y = {match})" if match else
                          "template DIFFERENT from the reference"))
                 ok &= match is not None and dd == d
@@ -195,6 +197,23 @@ def main():
     if not args.keep:
         shutil.rmtree(work, ignore_errors=True)
     return 1 if fails else 0
+
+
+def same_template(ref, got, prefix):
+    """got == ref, up to the prefix: the template's first prefix - 1 descriptors
+    (then RET) are descriptors of ref moved to the front (the loads the driver
+    may run early). The tags (w0[63:32], the index) are not compared."""
+    # the prefix loads through BASE15 instead of their own register
+    strip = lambda rows, base=False: [tuple(int(x) for x in r[1:]) + (int(r[0]) & (0xFFFF99FF if base else 0xFFFFFFFF),)
+                                      for r in rows]
+    ref0 = ref
+    body, refb = strip(ref), strip(ref0, True)
+    for row in strip(got[:max(0, prefix - 1)], True):
+        if row not in refb:
+            return False
+        del body[refb.index(row)]
+        del refb[refb.index(row)]
+    return strip(got[prefix:]) == body
 
 
 def stage(work, dst):

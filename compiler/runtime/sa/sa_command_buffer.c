@@ -168,6 +168,7 @@ static iree_status_t sa_command_buffer_dispatch(iree_hal_command_buffer_t* base,
   if (constants.data_length % 4) return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "constants not 4-byte");
   if (bindings.count > 16) return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa: more than 16 bindings");
   void* ptrs[16];
+  iree_device_size_t lengths[16];
   for (iree_host_size_t i = 0; i < bindings.count; ++i) {
     if (!bindings.values[i].buffer) {
       return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "binding %u is NULL", (unsigned)i);
@@ -177,8 +178,9 @@ static iree_status_t sa_command_buffer_dispatch(iree_hal_command_buffer_t* base,
                                                    IREE_HAL_MEMORY_ACCESS_ANY, bindings.values[i].offset,
                                                    bindings.values[i].length, &mapping));
     ptrs[i] = mapping.contents.data;
+    lengths[i] = mapping.contents.data_length;
   }
-  return sa_executable_append(executable, export_ordinal, (uint32_t)bindings.count, ptrs,
+  return sa_executable_append(executable, export_ordinal, (uint32_t)bindings.count, ptrs, lengths,
                               (uint32_t)(constants.data_length / 4), (const uint32_t*)constants.data);
 }
 

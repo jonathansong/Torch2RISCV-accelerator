@@ -26,6 +26,20 @@ struct SetupEntry {
 struct Generated {
   std::string templ;                 // descriptor bytes (ends with RET)
   std::vector<SetupEntry> setup;
+  // sa-desc version 3 (compiler/runtime/tools/sadesc.py): the template may start with a prefix (prefix
+  // descriptors, its RET included; the body follows) of loads that the driver
+  // may run before the FENCE ordering the dispatch after the previous one,
+  // when the bindings it reads (prefixReads) were not written since the last
+  // FENCE. writes: the bindings the dispatch stores to.
+  uint32_t prefix = 0, prefixReads = 0, writes = 0;
+  // the bindings loaded from (LD, LDPARAM); head: the body's leading loads
+  // (descriptors, RET included; 0: none) callable on their own, the rest
+  // follows; usesSpadB: the dispatch touches SPAD_B (where prefixes load);
+  // prefixReg: the BASE register the prefix loads were generated for (they
+  // use BASE15, which the driver sets to its value)
+  uint32_t reads = 0, head = 0;
+  bool usesSpadB = false;
+  int prefixReg = -1;
 };
 
 struct CodegenOptions {

@@ -191,6 +191,7 @@ private:
   int64_t d;
   ::sa::Layout lay;
   ::sa::DescList dl;
+  ::sa::DescList pre;                           // the prefix (Generated::prefix)
   std::vector<SetupEntry> setup;
   std::string err;
   std::vector<Operation *> handledStores, skipOps;
@@ -213,7 +214,7 @@ private:
     Lin key = off.isConst() ? Lin{-1, 1, 0, 0} : off;
     auto it = bases.find({binding, key});
     if (it != bases.end()) return it->second;
-    if (nextBase >= 16) return fail("more than 16 base registers"), 0;
+    if (nextBase >= 15) return fail("more than 15 base registers (BASE15: the driver's prefetches)"), 0;
     int r = nextBase++;
     bases[{binding, key}] = r;
     setup.push_back({SetupEntry::BASE, uint8_t(r), uint8_t(binding), int16_t(key.ord), int32_t(key.mul),
@@ -1597,6 +1598,9 @@ bool Gen::qlinear(linalg::GenericOp con, linalg::GenericOp epi) {
   if (!yspan) return false;
   // --- prologue (reference.qlinear with regions)
   if (kk % d || n % d) return fail("k, n not multiples of D");
+  // the first chunk's weights may be loaded early (the prefix) when nothing
+  // precedes the linear layer in the dispatch
+  bool hoist = dl.size() == 0;
   uint32_t sx;
   if (xI32) {
     uint32_t xa = lay.acc0;
@@ -1626,7 +1630,8 @@ bool Gen::qlinear(linalg::GenericOp con, linalg::GenericOp epi) {
                           sws->second.r.off, yspan->r.off};
   int pf = privateParam(), pw = privateParam();      // PARAM7, PARAM6 (reference.qlinear: w = 6, f = 7)
   uint32_t nc = ::sa::emitLinear(dl, lay, uint32_t(kk), uint32_t(n), sx + 1, place, uint32_t(pw), uint32_t(pf),
-                                 ectx.steps.empty() ? 1 : 2, ectx.steps.empty() ? nullptr : epilogueHook, &ectx);
+                                 ectx.steps.empty() ? 1 : 2, ectx.steps.empty() ? nullptr : epilogueHook, &ectx,
+                                 hoist ? &pre : nullptr);
   if (nc == 0) return fail("linear layer does not fit the local memories");
   handledStores.push_back(store.getOperation());
   return err.empty();
@@ -1928,7 +1933,68 @@ bool Gen::run(Generated &out, std::string &why) {
   }
   if (!err.empty()) return why = err, false;
   dl.ret();
-  out.templ = dl.bytes();
+  // the bindings behind the BASE registers (the setup table; default BASE i = binding i)
+  using Row = ::sa::DescList::Row;
+  auto baseOf = [](const Row &w) { return int((w[0] >> 9 & 3) | (w[0] >> 13 & 3) << 2); };
+  auto bindingOf = [&](const Row &w) {
+    int b = baseOf(w);
+    for (const SetupEntry &e : setup)
+      if (e.kind == SetupEntry::BASE && e.reg == b) return int(e.binding);
+    return b;
+  };
+  auto reloc = [](const Row &w) { return (w[0] >> 8 & 1) != 0; };
+  auto opOf = [](const Row &w) { return uint32_t(w[0] & 0xFF); };
+  auto inSpadB = [](uint64_t a) { return (a & 0xFFFFFFFFull) >> 28 == ::sa::MEM_SPAD_B; };
+  const auto &rows = dl.array();
+  for (const Row &w : rows) {
+    uint32_t op = opOf(w);
+    if (op == ::sa::DescList::ST && reloc(w)) out.writes |= 1u << bindingOf(w);
+    if ((op == ::sa::DescList::LD || op == ::sa::DescList::LDPARAM) && reloc(w)) out.reads |= 1u << bindingOf(w);
+    // SPAD_B: any EX (its B operand), a DMA or VE operand there
+    if (op == ::sa::DescList::EX || ((op == ::sa::DescList::LD || op == ::sa::DescList::ST) && inSpadB(w[2])) ||
+        (op == ::sa::DescList::VE && (inSpadB(w[1]) || inSpadB(w[1] >> 32) || inSpadB(w[2]))))
+      out.usesSpadB = true;
+  }
+  out.templ.clear();
+  if (pre.size()) {
+    // the prefix loads through BASE15 (the driver sets it to the value of the
+    // register they were generated for)
+    out.prefixReg = -1;
+    ::sa::DescList p;
+    for (Row w : pre.array()) {
+      if (!reloc(w) || (out.prefixReg >= 0 && out.prefixReg != baseOf(w))) return why = "prefix operands", false;
+      out.prefixReg = baseOf(w);
+      out.prefixReads |= 1u << bindingOf(w);
+      w[0] |= uint64_t(3) << 9 | uint64_t(3) << 13;
+      p.raw(w);
+    }
+    out.reads |= out.prefixReads;
+    p.ret();
+    out.prefix = uint32_t(p.size());
+    out.templ = p.bytes();
+  }
+  // the body's leading loads, callable on their own (the head): the driver
+  // may run another dispatch's prefix between them and the rest
+  size_t h = 0;
+  while (h < rows.size() && opOf(rows[h]) == ::sa::DescList::LD) ++h;
+  for (size_t i = 0; i < rows.size(); ++i)          // no loop may start inside the head
+    if (opOf(rows[i]) == ::sa::DescList::LOOP_END) {
+      int64_t t = int64_t(i) + int32_t(uint32_t(rows[i][1]));
+      if (t < int64_t(h)) h = size_t(std::max<int64_t>(t, 0));
+    }
+    else if (opOf(rows[i]) == ::sa::DescList::JUMP || opOf(rows[i]) == ::sa::DescList::CALL)
+      h = 0;
+  if (!out.usesSpadB && h > 0 && h < rows.size()) {
+    ::sa::DescList b;
+    for (size_t i = 0; i < rows.size(); ++i) {
+      if (i == h) b.ret();
+      b.raw(rows[i]);
+    }
+    out.head = uint32_t(h + 1);
+    out.templ += b.bytes();
+  } else {
+    out.templ += dl.bytes();
+  }
   out.setup = setup;
   return true;
 }

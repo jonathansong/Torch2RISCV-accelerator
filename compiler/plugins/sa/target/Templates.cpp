@@ -28,7 +28,7 @@ uint32_t Layout::chunkTiles(uint32_t k, uint32_t nt, uint32_t rows) const {
 
 uint32_t emitLinear(DescList &dl, const Layout &lay, uint32_t k, uint32_t nOut, uint32_t sX,
                     const LinearPlace &place, uint32_t pw, uint32_t pf, uint32_t scratchRows,
-                    LinearEpilogue epilogue, void *epilogueCtx) {
+                    LinearEpilogue epilogue, void *epilogueCtx, DescList *pre) {
   const uint32_t d = lay.d, sb = lay.sbank, cb = lay.cbank;
   const uint32_t nt = nOut / d, nc = lay.chunkTiles(k, nt, scratchRows);
   if (nc == 0) return 0;
@@ -40,7 +40,7 @@ uint32_t emitLinear(DescList &dl, const Layout &lay, uint32_t k, uint32_t nOut, 
   auto dynOf = [](bool dyn, uint32_t p) { return dyn ? std::vector<Dyn>{{DYN_DMA_DDR, p, true}} : std::vector<Dyn>{}; };
   auto load = [&](uint32_t i, bool dyn) {
     uint32_t p = i & 1, j = i;
-    dl.ld(place.wOff + j * wbytes, laddr(MEM_SPAD_B, p * sb), nc, k * d, k * d, place.wBase, 0, false, dynOf(dyn, pw));
+    (i == 0 && pre ? *pre : dl).ld(place.wOff + j * wbytes, laddr(MEM_SPAD_B, p * sb), nc, k * d, k * d, place.wBase, 0, false, dynOf(dyn, pw));
     dl.ld(place.sOff + j * fbytes, acc(p * cb + oSw), 1, fbytes, fbytes, place.sBase, 0, false, dynOf(dyn, pf));
   };
   auto chunk = [&](uint32_t i, bool dyn, bool prefetch) {

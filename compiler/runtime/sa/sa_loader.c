@@ -28,7 +28,8 @@ typedef struct sa_file_header_t {
   char magic[8];
   uint32_t version, d, caps, export_count, export_offset;
   uint32_t templates_offset, templates_bytes, strings_offset, strings_bytes;
-  uint32_t reserved[5];
+  uint32_t ext_offset;      // version 3: the export extensions
+  uint32_t reserved[4];
 } sa_file_header_t;
 static_assert(sizeof(sa_file_header_t) == 64, "sa-desc-v1 header");
 
@@ -38,6 +39,15 @@ typedef struct sa_file_export_t {
   uint32_t setup_count, est_cycles, setup_offset;
 } sa_file_export_t;
 static_assert(sizeof(sa_file_export_t) == 32, "sa-desc export entry");
+
+// version 3, per export (compiler/runtime/tools/sadesc.py): the prefix
+// (descriptors, its RET included; 0: none), the bindings it reads, the
+// bindings written / read, the head (descriptors, RET included; 0: none),
+// flags (bit 0: touches SPAD_B), the register the prefix was generated for
+typedef struct sa_file_ext_t {
+  uint32_t prefix_count, prefix_reads, writes, reads, head_count, flags, prefix_reg, reserved;
+} sa_file_ext_t;
+static_assert(sizeof(sa_file_ext_t) == 32, "sa-desc export extension");
 
 enum { SA_SETUP_BASE = 0, SA_SETUP_PARAM = 1 };
 typedef struct sa_setup_t {
@@ -55,7 +65,12 @@ static_assert(sizeof(sa_setup_t) == 16, "sa-desc setup entry");
 
 typedef struct sa_export_t {
   iree_string_view_t name;  // points into the executable's copy of the strings
-  uint32_t entry_phys;
+  uint32_t prefix_phys;      // 0: no prefix
+  uint32_t head_phys;        // 0: no head
+  uint32_t entry_phys;       // the body (after the head)
+  uint32_t prefix_reads, writes, reads;   // binding masks
+  uint32_t prefix_reg;
+  bool spad_b;
   uint32_t descriptor_count;
   uint32_t est_cycles;
   uint32_t setup_count;     // 0: the default setup
@@ -117,12 +132,45 @@ static iree_status_t sa_export_regs(sa_executable_t* e, const sa_export_t* x, ui
 }
 
 // One dispatch submitted and waited for (inline execution; profiling).
+// The dispatch of export x with these registers and bindings (ranges: 48 entries of scratch).
+static void sa_export_dispatch(const sa_export_t* x, uint32_t n, const uint32_t* regs, const uint32_t* vals,
+                               uint32_t binding_count, void* const* binding_ptrs,
+                               const iree_device_size_t* binding_lengths, sa_range_t* ranges, sa_dispatch_t* out) {
+  memset(out, 0, sizeof(*out));
+  out->prefix_phys = x->prefix_phys;
+  out->head_phys = x->head_phys;
+  out->body_phys = x->entry_phys;
+  out->count = n;
+  out->regs = regs;
+  out->values = vals;
+  out->spad_b = x->spad_b;
+  out->name = x->name;
+  for (uint32_t i = 0; i < n; ++i)
+    if (regs[i] == x->prefix_reg) out->prefix_base = vals[i];
+  sa_range_t* rd = ranges;
+  sa_range_t* wr = ranges + 16;
+  sa_range_t* pr = ranges + 32;
+  for (uint32_t i = 0; i < binding_count && i < 16; ++i) {
+    uintptr_t b = (uintptr_t)binding_ptrs[i];
+    sa_range_t r = {b, b + (uintptr_t)binding_lengths[i]};
+    if (x->reads >> i & 1) rd[out->read_count++] = r;
+    if (x->writes >> i & 1) wr[out->write_count++] = r;
+    if (x->prefix_reads >> i & 1) pr[out->prefix_read_count++] = r;
+  }
+  out->reads = rd;
+  out->writes = wr;
+  out->prefix_reads = pr;
+}
+
 static iree_status_t sa_export_run_now(sa_executable_t* e, const sa_export_t* x, uint32_t n, const uint32_t* regs,
                                        const uint32_t* vals) {
+  sa_dispatch_t dispatch;
+  sa_range_t ranges[48];
+  sa_export_dispatch(x, n, regs, vals, 0, NULL, NULL, ranges, &dispatch);
   sa_completion_t done = {0};
   struct timespec t0, t1;
   clock_gettime(CLOCK_MONOTONIC, &t0);
-  IREE_RETURN_IF_ERROR(sa_context_dispatch(e->context, x->entry_phys, n, regs, vals, &done));
+  IREE_RETURN_IF_ERROR(sa_context_dispatch(e->context, &dispatch, &done));
   clock_gettime(CLOCK_MONOTONIC, &t1);
   sa_context_profile_record(e->context, x->name, done.cycles,
                             (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(t1.tv_nsec - t0.tv_nsec));
@@ -168,7 +216,8 @@ static iree_status_t sa_executable_issue_call(iree_hal_local_executable_t* base,
 bool sa_executable_isa(iree_hal_executable_t* executable);
 
 iree_status_t sa_executable_append(iree_hal_executable_t* executable, uint32_t ordinal, uint32_t binding_count,
-                                   void* const* binding_ptrs, uint32_t constant_count, const uint32_t* constants) {
+                                   void* const* binding_ptrs, const iree_device_size_t* binding_lengths,
+                                   uint32_t constant_count, const uint32_t* constants) {
   if (!sa_executable_isa(executable)) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa: the executable is not an sa-desc executable");
   }
@@ -185,10 +234,17 @@ iree_status_t sa_executable_append(iree_hal_executable_t* executable, uint32_t o
   uint32_t regs[24], vals[24], n = 0;
   IREE_RETURN_IF_ERROR(
       sa_export_regs(e, x, binding_count, binding_ptrs, constant_count, constants, regs, vals, &n));
-  static int immediate = -1;                     // SA_PROFILE / SA_NO_BATCH: one list per dispatch
-  if (immediate < 0) immediate = getenv("SA_PROFILE") || getenv("SA_NO_BATCH");
+  // SA_NO_BATCH, SA_PROFILE (except SA_PROFILE=batch): one list per dispatch
+  static int immediate = -1;
+  if (immediate < 0) {
+    const char* profile = getenv("SA_PROFILE");
+    immediate = getenv("SA_NO_BATCH") || (profile && strcmp(profile, "batch") != 0);
+  }
   if (immediate) return sa_export_run_now(e, x, n, regs, vals);
-  return sa_context_batch_add(e->context, x->entry_phys, n, regs, vals, x->name);
+  sa_dispatch_t dispatch;
+  sa_range_t ranges[48];
+  sa_export_dispatch(x, n, regs, vals, binding_count, binding_ptrs, binding_lengths, ranges, &dispatch);
+  return sa_context_batch_add(e->context, &dispatch);
 }
 
 static iree_host_size_t sa_executable_export_count(iree_hal_executable_t* base) {
@@ -258,8 +314,8 @@ static iree_status_t sa_executable_create(sa_context_t* context, iree_const_byte
   IREE_RETURN_IF_ERROR(sa_check_range(data, 0, sizeof(sa_file_header_t), "header"));
   sa_file_header_t h;
   memcpy(&h, data.data, sizeof(h));
-  if (memcmp(h.magic, sa_magic, 8) != 0 || h.version < 1 || h.version > 2) {
-    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "not an sa-desc executable (version 1 or 2)");
+  if (memcmp(h.magic, sa_magic, 8) != 0 || h.version < 1 || h.version > 3) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "not an sa-desc executable (version 1 to 3)");
   }
   if (h.d != context->transport->d) {
     return iree_make_status(IREE_STATUS_INCOMPATIBLE,
@@ -270,6 +326,10 @@ static iree_status_t sa_executable_create(sa_context_t* context, iree_const_byte
       sa_check_range(data, h.export_offset, (uint64_t)h.export_count * sizeof(sa_file_export_t), "export table"));
   IREE_RETURN_IF_ERROR(sa_check_range(data, h.templates_offset, h.templates_bytes, "templates"));
   IREE_RETURN_IF_ERROR(sa_check_range(data, h.strings_offset, h.strings_bytes, "strings"));
+  if (h.version >= 3) {
+    IREE_RETURN_IF_ERROR(
+        sa_check_range(data, h.ext_offset, (uint64_t)h.export_count * sizeof(sa_file_ext_t), "export extensions"));
+  }
   if (h.export_count == 0 || h.templates_bytes == 0 || h.templates_bytes % 64) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa-desc-v1: empty or misaligned templates");
   }
@@ -338,7 +398,22 @@ static iree_status_t sa_executable_create(sa_context_t* context, iree_const_byte
     e->exports[i].setup = setups;
     setups += nsetup;
     e->exports[i].name = iree_make_string_view(e->strings + x.name_offset, x.name_length);
-    e->exports[i].entry_phys = tmpl_phys + x.template_offset;
+    // before version 3: no prefix or head, every binding read and written, SPAD_B used
+    sa_file_ext_t ext = {0, 0, 0xFFFF, 0xFFFF, 0, 1, 0, 0};
+    if (h.version >= 3) memcpy(&ext, data.data + h.ext_offset + i * sizeof(ext), sizeof(ext));
+    if ((uint64_t)ext.prefix_count + ext.head_count >= x.descriptor_count || ext.prefix_reg > 14) {
+      status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa-desc: export %u, bad prefix / head", i);
+      break;
+    }
+    uint32_t t = tmpl_phys + x.template_offset;
+    e->exports[i].prefix_phys = ext.prefix_count ? t : 0;
+    e->exports[i].head_phys = ext.head_count ? t + 64 * ext.prefix_count : 0;
+    e->exports[i].entry_phys = t + 64 * (ext.prefix_count + ext.head_count);
+    e->exports[i].prefix_reads = ext.prefix_reads;
+    e->exports[i].writes = ext.writes;
+    e->exports[i].reads = ext.reads;
+    e->exports[i].prefix_reg = ext.prefix_reg;
+    e->exports[i].spad_b = (ext.flags & 1) != 0;
     e->exports[i].descriptor_count = x.descriptor_count;
     e->exports[i].est_cycles = x.est_cycles;
     e->attrs[i].binding_count = (uint8_t)x.binding_count;

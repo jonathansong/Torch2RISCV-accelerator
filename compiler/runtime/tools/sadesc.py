@@ -13,7 +13,8 @@ File layout (little-endian):
     0  magic "SADESC1\\0"      8  u32 version = 1     12 u32 D
     16 u32 required CAPS bits  20 u32 export count    24 u32 export table offset
     28 u32 templates offset (64-aligned)  32 u32 templates bytes
-    36 u32 strings offset      40 u32 strings bytes   44..63 reserved (0)
+    36 u32 strings offset      40 u32 strings bytes
+    44 u32 export extensions offset (version 3)       48..63 reserved (0)
   export table, 32 bytes per export:
     0  u32 name offset (in strings)   4  u32 name length
     8  u32 template offset (bytes, from the templates start, 64-aligned)
@@ -28,14 +29,24 @@ File layout (little-endian):
     0 u8 kind (0 BASE, 1 PARAM)  1 u8 register  2 u8 binding  3 u8 0
     4 i16 push constant ordinal (-1: none)  6 u16 0
     8 i32 mul  12 i32 add   (the divisor is a power of two: kind | log2(div) << 4)
+  export extensions (version 3), 32 bytes per export, u32 each:
+    0 prefix descriptors (its RET included; 0: none)   4 bindings read by the prefix (mask)
+    8 bindings written (mask, ST)   12 bindings read (mask, LD / LDPARAM, the prefix included)
+    16 head descriptors (the body's leading loads and a RET; 0: none)
+    20 flags (bit 0: the export touches SPAD_B)   24 the prefix's register   28 0
   value = ((constant * mul) >> log2(div)) + add, and for BASE + the binding's
   physical address. The default setup (no table) is BASE i = binding i,
   PARAM j = push constant j. With a table, dynamic binding offsets (IREE
   passes them as push constants), lengths derived from push constants and
   constants beyond six are handled by the driver; the template only has
   static offsets.
-
-The C loader (compiler/runtime/sa/sa_loader.c) reads the same layout.
+  The prefix (version 3): a template may start with loads (ending with RET,
+  through BASE15, which the driver sets to the value of the prefix's register)
+  that the driver may run early: before the FENCE ordering the dispatch after
+  the previous ones, or inside an earlier dispatch that does not touch SPAD_B,
+  between its head and the rest, when the bindings they read are not written
+  in the list. The body follows the prefix; with a head, the body is head +
+  RET + the rest. Without extensions every binding counts as read and written.
 """
 import os
 import struct
@@ -49,11 +60,12 @@ sys.path.insert(0, os.path.join(REPO, "driver"))
 from pynq_matmul import DescList  # noqa: E402
 
 MAGIC = b"SADESC1\0"
-VERSION = 2
+VERSION = 2                          # written by Executable (no prefixes); read: 1..3
 SETUP = struct.Struct("<4BhH2i")
 SETUP_BASE, SETUP_PARAM = 0, 1
-HDR = struct.Struct("<8s9I20x")         # 64 bytes
+HDR = struct.Struct("<8s10I16x")         # 64 bytes
 EXP = struct.Struct("<4I2H3I")
+EXT = struct.Struct("<8I")
 MAX_CONSTANTS = 6                    # PARAM0..5; PARAM6 / 7 belong to the template
 MAX_BINDINGS = 16                    # BASE0..15
 CAPS_DESC, CAPS_NOTIFY, CAPS_FPVE, CAPS_CMDX = 1 << 21, 1 << 22, 1 << 23, 1 << 24
@@ -119,7 +131,7 @@ class Executable:
                 setups += SETUP.pack(kind | (div.bit_length() - 1) << 4, reg, binding, 0, const, 0, mul, add)
             t += rows.nbytes
             s += len(nb)
-        hdr = HDR.pack(MAGIC, VERSION, self.d, self.caps, n, exp_off, tmpl_off, len(tmpl), str_off, len(strings))
+        hdr = HDR.pack(MAGIC, VERSION, self.d, self.caps, n, exp_off, tmpl_off, len(tmpl), str_off, len(strings), 0)
         blob = hdr + table
         blob += b"\0" * (tmpl_off - len(blob))
         blob += tmpl + strings
@@ -135,8 +147,8 @@ def read(data):
     """bytes -> (D, caps, [(name, rows uint64 (n, 8), bindings, constants, est_cycles, setup)]);
     setup: [(kind, reg, binding, const, mul, div, add)] (empty: the default)."""
     f = HDR.unpack_from(data, 0)
-    if f[0] != MAGIC or f[1] not in (1, 2):
-        raise ValueError("not an sa-desc executable (version 1 or 2)")
+    if f[0] != MAGIC or f[1] not in (1, 2, 3):
+        raise ValueError("not an sa-desc executable (version 1 to 3)")
     d, caps, n, exp_off, tmpl_off, tmpl_bytes, str_off, str_bytes = f[2:10]
     out = []
     for i in range(n):
@@ -149,6 +161,20 @@ def read(data):
             setup.append((kd & 15, reg, binding, const, mul, 1 << (kd >> 4), add))
         out.append((name, rows, b, c, cyc, setup))
     return d, caps, out
+
+
+def read_ext(data):
+    """bytes -> [dict(prefix, prefix_reads, writes, reads, head, spad_b, prefix_reg)]
+    per export (version 3; before: none, every binding read and written)."""
+    f = HDR.unpack_from(data, 0)
+    n = f[4]
+    if f[1] < 3:
+        return [dict(prefix=0, prefix_reads=0, writes=0xFFFF, reads=0xFFFF, head=0, spad_b=True, prefix_reg=0)] * n
+    out = []
+    for i in range(n):
+        p, pr, w, r, h, fl, reg, _ = EXT.unpack_from(data, f[10] + EXT.size * i)
+        out.append(dict(prefix=p, prefix_reads=pr, writes=w, reads=r, head=h, spad_b=bool(fl & 1), prefix_reg=reg))
+    return out
 
 
 def setup_values(setup, binding_phys, constants):
@@ -166,13 +192,21 @@ def setup_values(setup, binding_phys, constants):
     return regs
 
 
-def dispatch_list(entry_phys, binding_phys, constants, setup=None):
+def dispatch_list(entry_phys, binding_phys, constants, setup=None, ext=None):
     """The list the sa HAL driver submits for one dispatch (sa_context.c builds the
-    same): SETREG of the register values (setup_values), CALL the export's
-    template, END."""
+    same): SETREG of the register values (setup_values; BASE15 for a prefix),
+    CALL the export's prefix, head and rest, END."""
     regs = setup_values(setup, binding_phys, constants)
+    ext = ext or {}
+    prefix, head = ext.get("prefix", 0), ext.get("head", 0)
+    if prefix:
+        regs.append((15, dict(regs)[ext["prefix_reg"]]))
     dl = DescList()
     for i in range(0, len(regs), 3):
         dl.setreg(*regs[i:i + 3])
-    dl.call(entry_phys)
+    if prefix:
+        dl.call(entry_phys)
+    if head:
+        dl.call(entry_phys + 64 * prefix)
+    dl.call(entry_phys + 64 * (prefix + head))
     return dl.end(0x5A)

@@ -202,24 +202,37 @@ iree_status_t sa_context_get(sa_context_t** out_context) {
   return iree_ok_status();
 }
 
-iree_status_t sa_context_dispatch(sa_context_t* c, uint32_t entry_phys, uint32_t n, const uint32_t* regs,
-                                  const uint32_t* vals, sa_completion_t* out) {
-  if (n > 24 || (n + 2) / 3 + 2 > c->list_capacity) {
+// SETREGs of n registers at w; returns the descriptors written.
+static uint32_t sa_emit_setregs(uint64_t* w, uint32_t n, const uint32_t* regs, const uint32_t* vals) {
+  uint32_t k = 0;
+  for (uint32_t i = 0; i < n; i += 3, ++k) sa_desc_setreg(w + 8 * k, n - i < 3 ? n - i : 3, regs + i, vals + i);
+  return k;
+}
+
+static void sa_emit(uint64_t* w, uint32_t* k, uint32_t op, uint64_t w1) {
+  uint64_t* d = w + 8 * *k;
+  sa_desc_clear(d);
+  d[0] = op;
+  d[1] = w1;
+  ++*k;
+}
+
+iree_status_t sa_context_dispatch(sa_context_t* c, const sa_dispatch_t* x, sa_completion_t* out) {
+  uint32_t n = x->count;
+  if (n > 24 || (n + 3) / 3 + 4 > c->list_capacity) {
     return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa: %u register values (at most 24)", n);
   }
   iree_slim_mutex_lock(&c->mutex);
   uint64_t* w = c->list;
-  uint32_t k = 0;
-  for (uint32_t i = 0; i < n; i += 3, ++k) {
-    sa_desc_setreg(w + 8 * k, n - i < 3 ? n - i : 3, regs + i, vals + i);
+  uint32_t k = sa_emit_setregs(w, n, x->regs, x->values);
+  if (x->prefix_phys) {
+    uint32_t r = 15;
+    k += sa_emit_setregs(w + 8 * k, 1, &r, &x->prefix_base);
+    sa_emit(w, &k, SA_OP_CALL, x->prefix_phys);
   }
-  sa_desc_clear(w + 8 * k);
-  w[8 * k] = SA_OP_CALL;
-  w[8 * k + 1] = entry_phys;
-  ++k;
-  sa_desc_clear(w + 8 * k);
-  w[8 * k] = SA_OP_END;
-  w[8 * k + 1] = 0x5A;
+  if (x->head_phys) sa_emit(w, &k, SA_OP_CALL, x->head_phys);
+  sa_emit(w, &k, SA_OP_CALL, x->body_phys);
+  sa_emit(w, &k, SA_OP_END, 0x5A);
   __sync_synchronize();
   iree_status_t status = c->transport->run(c->transport, c->list_phys, out);
   c->dispatches++;
@@ -232,30 +245,78 @@ iree_status_t sa_context_dispatch(sa_context_t* c, uint32_t entry_phys, uint32_t
 static const char* sa_engine_names[] = {"LD", "ST", "EX", "VE", "FETCH"};
 static const char* sa_error_names[] = {"none", "shape", "range", "read response", "write response"};
 
-iree_status_t sa_context_batch_add(sa_context_t* c, uint32_t entry_phys, uint32_t n, const uint32_t* regs,
-                                   const uint32_t* vals, iree_string_view_t name) {
-  uint32_t need = (n + 2) / 3 + 3;              // SETREGs, FENCE, CALL, END
-  if (c->batch_count + need > c->batch_capacity || c->batch_dispatches == 1024) {
+// A recorded dispatch (sa_context_batch_add).
+typedef struct sa_batch_entry_t {
+  sa_dispatch_t d;                 // its arrays point into this entry
+  uint32_t regs[24], vals[24];
+  sa_range_t ranges[48];           // reads, writes, prefix reads
+  bool barrier;                    // a barrier before it
+  int host;                        // the dispatch whose prefix runs inside it (-1: none)
+  bool hosted;                     // its prefix runs inside an earlier dispatch
+} sa_batch_entry_t;
+
+// A set of DDR ranges (overflow: everything).
+typedef struct sa_range_set_t {
+  sa_range_t r[256];
+  uint32_t n;
+  bool all;
+} sa_range_set_t;
+
+static void sa_set_add(sa_range_set_t* s, const sa_range_t* r, uint32_t n) {
+  for (uint32_t i = 0; i < n && !s->all; ++i) {
+    if (s->n == IREE_ARRAYSIZE(s->r)) s->all = true;
+    else s->r[s->n++] = r[i];
+  }
+}
+
+static bool sa_set_overlaps(const sa_range_set_t* s, const sa_range_t* r, uint32_t n) {
+  if (n == 0) return false;
+  if (s->all) return true;
+  for (uint32_t i = 0; i < n; ++i)
+    for (uint32_t j = 0; j < s->n; ++j)
+      if (r[i].begin < s->r[j].end && s->r[j].begin < r[i].end) return true;
+  return false;
+}
+
+static uint32_t sa_entry_descriptors(const sa_dispatch_t* x) {
+  return (x->count + 3) / 3 + 1 /* FENCE */ + 3 /* CALLs */ + 2 /* a hosted prefix: SETREG, CALL */;
+}
+
+iree_status_t sa_context_batch_add(sa_context_t* c, const sa_dispatch_t* x) {
+  if (x->count > 24 || x->read_count > 16 || x->write_count > 16 || x->prefix_read_count > 16) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa: dispatch '%.*s' too large for a batch",
+                            (int)x->name.size, x->name.data);
+  }
+  if (!c->entries) {
+    c->entry_capacity = IREE_ARRAYSIZE(c->batch_names);
+    c->entries = (sa_batch_entry_t*)calloc(c->entry_capacity, sizeof(sa_batch_entry_t));
+    if (!c->entries) return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "sa: no memory for the batch");
+  }
+  uint32_t need = sa_entry_descriptors(x);
+  if (c->entry_count == c->entry_capacity || c->entry_descriptors + need + 1 > c->batch_capacity) {
     IREE_RETURN_IF_ERROR(sa_context_batch_flush(c));
   }
   iree_slim_mutex_lock(&c->mutex);
-  uint64_t* w = c->batch;
-  uint32_t k = c->batch_count;
-  if (c->batch_fence && k > 0) {
-    sa_desc_clear(w + 8 * k);
-    w[8 * k] = SA_OP_FENCE;
-    ++k;
-  }
+  sa_batch_entry_t* e = &c->entries[c->entry_count++];
+  e->d = *x;
+  memcpy(e->regs, x->regs, x->count * sizeof(uint32_t));
+  memcpy(e->vals, x->values, x->count * sizeof(uint32_t));
+  e->d.regs = e->regs;
+  e->d.values = e->vals;
+  sa_range_t* r = e->ranges;
+  memcpy(r, x->reads, x->read_count * sizeof(*r));
+  e->d.reads = r;
+  r += x->read_count;
+  memcpy(r, x->writes, x->write_count * sizeof(*r));
+  e->d.writes = r;
+  r += x->write_count;
+  memcpy(r, x->prefix_reads, x->prefix_read_count * sizeof(*r));
+  e->d.prefix_reads = r;
+  e->barrier = c->batch_fence;
+  e->host = -1;
+  e->hosted = false;
   c->batch_fence = false;
-  c->batch_names[c->batch_dispatches].first = k;
-  c->batch_names[c->batch_dispatches].name = name.data;
-  c->batch_names[c->batch_dispatches].name_len = (uint32_t)name.size;
-  c->batch_dispatches++;
-  for (uint32_t i = 0; i < n; i += 3, ++k) sa_desc_setreg(w + 8 * k, n - i < 3 ? n - i : 3, regs + i, vals + i);
-  sa_desc_clear(w + 8 * k);
-  w[8 * k] = SA_OP_CALL;
-  w[8 * k + 1] = entry_phys;
-  c->batch_count = k + 1;
+  c->entry_descriptors += need;
   c->dispatches++;
   iree_slim_mutex_unlock(&c->mutex);
   return iree_ok_status();
@@ -263,24 +324,102 @@ iree_status_t sa_context_batch_add(sa_context_t* c, uint32_t entry_phys, uint32_
 
 void sa_context_batch_barrier(sa_context_t* c) { c->batch_fence = true; }
 
+// Builds the list of the recorded dispatches (sa_context_batch_add); returns
+// the descriptor count (END included).
+static uint32_t sa_batch_build(sa_context_t* c) {
+  sa_batch_entry_t* e = c->entries;
+  uint32_t m = c->entry_count;
+  static sa_range_set_t written_all, reads, writes;     // under c->mutex
+  // where the prefixes run: inside the earliest dispatch with a head after
+  // the last one touching SPAD_B, if nothing in the list writes what they read
+  written_all.n = 0;
+  written_all.all = false;
+  for (uint32_t i = 0; i < m; ++i) sa_set_add(&written_all, e[i].d.writes, e[i].d.write_count);
+  for (uint32_t k = 0; k < m; ++k) {
+    if (!e[k].d.prefix_phys || sa_set_overlaps(&written_all, e[k].d.prefix_reads, e[k].d.prefix_read_count))
+      continue;
+    int best = -1;
+    for (int j = (int)k - 1; j >= 0 && !e[j].d.spad_b; --j)
+      if (e[j].d.head_phys && e[j].host < 0) best = j;
+    if (best >= 0) {
+      e[best].host = (int)k;
+      e[k].hosted = true;
+    }
+  }
+  uint64_t* w = c->batch;
+  uint32_t k = 0, r15 = 15;
+  reads.n = writes.n = 0;
+  reads.all = writes.all = false;
+  for (uint32_t i = 0; i < m; ++i) {
+    const sa_dispatch_t* x = &e[i].d;
+    bool early = false;                 // the prefix before the FENCE
+    if (e[i].barrier && i > 0) {
+      c->batch_barriers++;
+      uint32_t mask = 0;                // FENCE engines: bit 0 LD, bit 1 ST
+      if (sa_set_overlaps(&writes, x->reads, x->read_count) || sa_set_overlaps(&writes, x->writes, x->write_count))
+        mask |= 2;
+      if (sa_set_overlaps(&reads, x->writes, x->write_count)) mask |= 1;
+      if (mask && x->prefix_phys && !e[i].hosted &&
+          !sa_set_overlaps(&writes, x->prefix_reads, x->prefix_read_count)) {
+        early = true;
+        k += sa_emit_setregs(w + 8 * k, 1, &r15, &x->prefix_base);
+        sa_emit(w, &k, SA_OP_CALL, x->prefix_phys);
+        sa_set_add(&reads, x->prefix_reads, x->prefix_read_count);
+        c->batch_hoisted++;
+      }
+      if (mask) {
+        sa_emit(w, &k, SA_OP_FENCE, mask);
+        c->batch_fences++;
+        if (mask & 2) writes.n = 0, writes.all = false;
+        if (mask & 1) reads.n = 0, reads.all = false;
+      }
+    }
+    if (i < IREE_ARRAYSIZE(c->batch_names)) {
+      c->batch_names[i].first = k;
+      c->batch_names[i].name = x->name.data;
+      c->batch_names[i].name_len = (uint32_t)x->name.size;
+    }
+    k += sa_emit_setregs(w + 8 * k, x->count, x->regs, x->values);
+    if (x->prefix_phys && !e[i].hosted && !early) {
+      k += sa_emit_setregs(w + 8 * k, 1, &r15, &x->prefix_base);
+      sa_emit(w, &k, SA_OP_CALL, x->prefix_phys);
+    }
+    if (x->head_phys) {
+      sa_emit(w, &k, SA_OP_CALL, x->head_phys);
+      if (e[i].host >= 0) {             // another dispatch's prefix, during this one's compute
+        const sa_dispatch_t* p = &e[e[i].host].d;
+        k += sa_emit_setregs(w + 8 * k, 1, &r15, &p->prefix_base);
+        sa_emit(w, &k, SA_OP_CALL, p->prefix_phys);
+        sa_set_add(&reads, p->prefix_reads, p->prefix_read_count);
+        c->batch_hosted++;
+      }
+    }
+    sa_emit(w, &k, SA_OP_CALL, x->body_phys);
+    sa_set_add(&reads, x->reads, x->read_count);
+    sa_set_add(&writes, x->writes, x->write_count);
+  }
+  sa_emit(w, &k, SA_OP_END, 0x5A);
+  return k;
+}
+
 iree_status_t sa_context_batch_flush(sa_context_t* c) {
   iree_slim_mutex_lock(&c->mutex);
-  if (c->batch_dispatches == 0) {
+  if (c->entry_count == 0) {
     c->batch_fence = false;
     iree_slim_mutex_unlock(&c->mutex);
     return iree_ok_status();
   }
-  uint64_t* w = c->batch + 8 * c->batch_count;
-  sa_desc_clear(w);
-  w[0] = SA_OP_END;
-  w[1] = 0x5A;
+  sa_batch_build(c);
   __sync_synchronize();
   sa_completion_t done = {0};
+  uint64_t t0 = iree_time_now();
   iree_status_t status = c->transport->run(c->transport, c->batch_phys, &done);
+  uint64_t host_ns = (uint64_t)(iree_time_now() - t0);
   c->lists++;
-  uint32_t ndisp = c->batch_dispatches;
-  c->batch_count = 0;
-  c->batch_dispatches = 0;
+  uint32_t ndisp = c->entry_count;
+  if (ndisp > IREE_ARRAYSIZE(c->batch_names)) ndisp = IREE_ARRAYSIZE(c->batch_names);
+  c->entry_count = 0;
+  c->entry_descriptors = 0;
   c->batch_fence = false;
   if (iree_status_is_ok(status) && done.status != 0) {
     // the dispatch holding the failing descriptor (descriptors decoded count
@@ -307,7 +446,7 @@ iree_status_t sa_context_batch_flush(sa_context_t* c) {
     status = iree_make_status(IREE_STATUS_INTERNAL, "sa: batch ended with %#x (expected 0x5a)", done.end);
   }
   iree_slim_mutex_unlock(&c->mutex);
-  if (iree_status_is_ok(status) && done.cycles) sa_context_profile_record(c, IREE_SV("(batch)"), done.cycles, 0);
+  if (iree_status_is_ok(status)) sa_context_profile_record(c, IREE_SV("(list of dispatches)"), done.cycles, host_ns);
   return status;
 }
 

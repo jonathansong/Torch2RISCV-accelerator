@@ -131,6 +131,7 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
     if len(exps) != 1:
         return f"{len(exps)} exports"
     name, rows, nb, nc, cyc, setup = exps[0]
+    ext = sadesc.read_ext(blob)[0]
     if cyc == 0xFFFFFFFF:
         return "UNSUPPORTED"
     consts = push_constants(func, t, site)
@@ -157,7 +158,7 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
         phys[b] = a
         sim.ddr_write(a, bytes(bufs[b]))
         a += -(-len(bufs[b]) // 4096) * 4096
-    lst = sadesc.dispatch_list(base, phys, consts, setup)
+    lst = sadesc.dispatch_list(base, phys, consts, setup, ext)
     lst_addr = base + size - 0x10000
     sim.ddr_write(lst_addr, lst.array().tobytes())
     try:

@@ -87,6 +87,11 @@ public:
                    uint32_t addMask = 0);
   DescList &loopEnd(int32_t offset, uint32_t count, uint32_t k1, uint32_t s1, uint32_t k2, uint32_t s2);
   DescList &ret();
+  // Appends an encoded descriptor as is.
+  DescList &raw(const Row &w) {
+    rows.push_back(w);
+    return *this;
+  }
 
   size_t size() const { return rows.size(); }
   const std::vector<Row> &array() const { return rows; }

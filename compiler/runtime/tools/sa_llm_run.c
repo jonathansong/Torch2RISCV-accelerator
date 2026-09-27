@@ -158,10 +158,16 @@ static iree_status_t run(iree_allocator_t host) {
   if (iree_status_is_ok(status) && steps > 1 && getenv("SA_PROFILE")) {
     uint64_t nd, cyc, ns;
     sa_context_profile_totals(&nd, &cyc, &ns);
-    printf("per step (after the first): %.1f dispatches, device %.2f ms (%.0f cycles at 50 MHz), "
+    printf("per step (after the first): %.1f %s, device %.2f ms (%.0f cycles at 50 MHz), "
            "submissions %.2f ms, rest of the runtime %.2f ms\n",
-           nd / (double)(steps - 1), cyc / (steps - 1) / 50e3, cyc / (double)(steps - 1),
+           nd / (double)(steps - 1), strcmp(getenv("SA_PROFILE"), "batch") ? "dispatches" : "lists", cyc / (steps - 1) / 50e3, cyc / (double)(steps - 1),
            ns / 1e6 / (steps - 1), 1e3 * total / (steps - 1) - ns / 1e6 / (steps - 1));
+    sa_context_t* sc = NULL;
+    if (iree_status_is_ok(sa_context_get(&sc)))
+      printf("per step: %.1f barriers -> %.1f FENCEs; prefixes run inside an earlier dispatch %.1f, before "
+             "their FENCE %.1f\n",
+             sc->batch_barriers / (double)steps, sc->batch_fences / (double)steps, sc->batch_hosted / (double)steps,
+             sc->batch_hoisted / (double)steps);
     sa_context_profile_report(stdout, steps - 1);
   }
   if (lf) fclose(lf);

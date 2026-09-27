@@ -118,6 +118,7 @@ public:
       std::string templ;
       uint32_t bindings, constants, cycles;
       std::vector<sa::SetupEntry> setup;
+      uint32_t prefix, prefixReads, writes, reads, head, flags, prefixReg;
     };
     SmallVector<std::pair<uint64_t, Export>> exports;
     auto innerModule = variantOp.getInnerModule();
@@ -147,15 +148,21 @@ public:
         bad.ret();
         gen.templ = bad.bytes();
         gen.setup.clear();
+        gen.prefix = gen.prefixReads = gen.head = 0;
+        gen.writes = gen.reads = 0;              // it faults before any access
+        gen.usesSpadB = true;
         cycles = 0xFFFFFFFFu;                    // marks the export as unsupported
       }
       uint64_t ordinal = exportOp.getOrdinal() ? exportOp.getOrdinal()->getZExtValue() : exports.size();
-      exports.push_back({ordinal, {exportOp.getSymName().str(), gen.templ, bindings, constants, cycles, gen.setup}});
+      exports.push_back({ordinal, {exportOp.getSymName().str(), gen.templ, bindings, constants, cycles, gen.setup,
+                                   gen.prefix, gen.prefixReads, gen.writes, gen.reads, gen.head,
+                                   gen.usesSpadB ? 1u : 0u, uint32_t(gen.prefixReg < 0 ? 0 : gen.prefixReg)}});
     }
     llvm::sort(exports, [](auto &a, auto &b) { return a.first < b.first; });
 
-    // sa-desc version 2 (compiler/runtime/tools/sadesc.py): header, export
-    // table, templates (64-byte aligned), names, register setup tables
+    // sa-desc version 3 (compiler/runtime/tools/sadesc.py): header, export
+    // table, templates (64-byte aligned), names, register setup tables, the
+    // export extensions (prefix, head, bindings read / written, SPAD_B use)
     constexpr uint32_t CAPS = (1u << 21) | (1u << 23) | (1u << 24);   // DESC, FPVE, CMDX
     uint32_t n = exports.size(), expOff = 64;
     uint32_t tmplOff = (expOff + 32 * n + 63) / 64 * 64;
@@ -166,6 +173,7 @@ public:
     }
     uint32_t strOff = tmplOff + tmpl.size();
     uint32_t setupOff = (strOff + strings.size() + 15) / 16 * 16;
+    std::string ext;
     auto u32 = [](std::string &s, uint32_t v) { s.append(reinterpret_cast<const char *>(&v), 4); };
     auto u16 = [](std::string &s, uint16_t v) { s.append(reinterpret_cast<const char *>(&v), 2); };
     uint32_t tpos = 0, spos = 0;
@@ -189,22 +197,24 @@ public:
         u32(setups, uint32_t(st.mul));
         u32(setups, uint32_t(st.add));
       }
+      for (uint32_t v : {e.prefix, e.prefixReads, e.writes, e.reads, e.head, e.flags, e.prefixReg, 0u}) u32(ext, v);
       tpos += e.templ.size();
       spos += e.name.size();
     }
     std::string blob("SADESC1\0", 8);
-    for (uint32_t v : {2u, uint32_t(d), CAPS, n, expOff, tmplOff, uint32_t(tmpl.size()), strOff,
-                       uint32_t(strings.size())})
+    uint32_t extOff = (setupOff + setups.size() + 15) / 16 * 16;
+    for (uint32_t v : {3u, uint32_t(d), CAPS, n, expOff, tmplOff, uint32_t(tmpl.size()), strOff,
+                       uint32_t(strings.size()), extOff})
       u32(blob, v);
     blob.resize(64, '\0');
     blob += table;
     blob.resize(tmplOff, '\0');
     blob += tmpl;
     blob += strings;
-    if (!setups.empty()) {
-      blob.resize(setupOff, '\0');
-      blob += setups;
-    }
+    blob.resize(setupOff, '\0');
+    blob += setups;
+    blob.resize(extOff, '\0');
+    blob += ext;
 
     if (!serOptions.dumpBinariesPath.empty()) {
       dumpDataToPath(serOptions.dumpBinariesPath, serOptions.dumpBaseName, variantOp.getName(), ".sadesc",
