@@ -880,7 +880,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | 步骤 | 内容 | 验收 | 状态 |
 |---|---|---|---|
-| **C6.0 清理** | 共享的嵌入存了两份（分类层的打包权重在参数文件里，gather 用的原始表作为常量在 vmfb 里）：gather 直接读打包布局，或把原始表也导出成参数 | SmolLM2 板上仍逐位一致，窗口变小（Qwen3 省 155 MB，SmolLM2 省 28 MB） | 下一步 |
+| **C6.0 清理** | 共享的嵌入存了两份（分类层的打包权重在参数文件里，gather 用的原始表作为常量在 vmfb 里）：gather 直接读打包布局，或把原始表也导出成参数 | SmolLM2 板上仍逐位一致，窗口变小（Qwen3 省 155 MB，SmolLM2 省 28 MB） | **完成**（sim；板上待验，见下） |
 | **C6.1 Qwen3-0.6B 全 28 层** | 导出、编译、逐 dispatch 检查、sim 端到端几步（估计每 token 约 40 s） | 全部 dispatch 逐位一致；argmax 与 eager 模型（设备 SFU）相同、相关 > 0.99；生成的文本通顺 | |
 | **C6.2 量化质量** | 用 fp32 参照测 top-1 一致率与困惑度；不够再加 SmoothQuant 一类的离群值处理（scale 折进相邻算子，硬件不变） | 与 fp32 的 top-1、困惑度在可接受范围内 | |
 | **C6.3 K 分块** | 通用收缩按 K 块累加；线性层微内核放不下时交给通用降级 | 合成模型 K = 16384 逐 dispatch 与端到端逐位一致 | **已完成**（§8.9 补做） |
@@ -888,6 +888,12 @@ C5.5 的模型（§8.9 的第一步）：
 | **C6.5 注意力按 T 分块** | 在线 softmax 由预处理显式写进 IR（§3.2），oracle 相应支持；KV cache 长度与 `max-dynamic` 由模型配置决定 | T = 2048 时逐 dispatch 一致 | |
 | **C6.6 目标配置交叉验证** | funcsim 按目标配置参数化；同一模型用不同的 D、SPAD / ACC 编译并验证 | `test_c5.py --configs` 全部逐位一致 | **已完成**（§8.9 补做） |
 | C6.7（可选） | 批量 prefill：M > 1 的矩阵乘；权重打包从向量×矩阵推广到矩阵乘 | 与逐 token decode 结果一致 | |
+
+**C6.0 结果（2026-09-28）**：gather 读打包布局（反过来让分类层读原始布局，要每 token 多一次整表 TRANSPOSE，stories15M 约 +40% 周期）。
+- 预处理（`target/PackLinearWeights.cpp`）：每个常量权重只打包一次（放在它的定义之后）；它的 gather（`tensor.extract W[r, c]`）改成读打包的副本 `Wp[r / D, c, r % D]`，原始表没有读者，不再进 vmfb。条件：K × D ≤ 65535（LDPARAM 的 16 位乘数、一条 DMA 行）。
+- 降级（`sahl-to-sahw` 的 `packedRowGather`）：命令处理器不会除法，r / D 与 r % D 由 VE 算（fp32 精确：`round(r / D − (D − 1) / 2D)`），经本 dispatch 结果的 DDR（最后被结果覆盖）写出、FENCE、LDPARAM 读成 PARAM；按 PARAM 加载 tile（K 个字）；one-hot 字由 VALID 做（两字前缀之差 `prefix(D + l + 1) − prefix(D + l)`，因为 VALID = 0 表示全部有效）；tile 乘 one-hot 后每字 REDUCE（只有一个非零 lane，求和精确），`packBcast` 把 K 个标量装回 K / D 个字。stories15M 的嵌入 dispatch 56 条描述符。
+- 结果：vmfb stories15M 10.3 → 1.1 MB、SmolLM2 30.6 → 2.2 MB、Qwen3 157.3 → 1.7 MB；设备内存峰值 SmolLM2 160.6 → 133.6 MB（窗口 168 → 144 MB）、Qwen3（2 层）330.5 → 182.1 MB。stories15M 58 个 dispatch 与 sim 12/12 步与 DeviceModel 逐位一致；SmolLM2 230 个、Qwen3 42 个 dispatch 在 T = 16 / 80 / 256 下逐位一致，端到端通过；配置交叉检查（两种微内核设置 × 4 种硬件配置）全部通过。
+- 长时间测试：`compiler/scripts/run_tests.sh [-j 作业数] [-t 每个测试的线程数] 测试…`（每个测试一个日志；从 Claude Code 会话启动的进程会随会话结束，所以在自己的终端里运行）。
 
 **顺序**：C6.0 → C6.1 → C6.2 → C6.4 → C6.5，C6.7 视需要。C6.0–C6.2 只需 Qwen3、不需要新的代码生成，最快看到完整大模型的结果；C6.5 是剩下唯一的编译器新功能。Python 的 funcsim 每 token 的耗时与模型大小成正比（Qwen3-0.6B 估计约 40 s，Llama-1B 约 80 s），端到端只跑几步还可以接受，C 版 funcsim 等确实太慢再做。
 

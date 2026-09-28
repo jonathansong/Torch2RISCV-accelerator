@@ -662,6 +662,77 @@ private:
     return true;
   }
 
+  // A row gathered from a packed weight (plan §8.12 C6.0): element k of row r
+  // of Wp i8[R, K, D] at Wp[r / D, k, r % D] (the embedding of a model whose
+  // classifier shares the table). The tile r / D is K contiguous words; lane
+  // r % D of each word is picked by a one-hot word and a REDUCE per word, the
+  // K scalars packed into K / D words. r / D and r % D come from the VE
+  // (exact in fp32: round(r / D - (D - 1) / 2D)), through the result's DDR
+  // (overwritten by the result later) into PARAMs.
+  template <typename FlatIndex>
+  std::optional<Val> packedRowGather(linalg::GenericOp g, memref::LoadOp ld, MemRefType mt,
+                                     ArrayRef<SmallVector<int64_t>> dom, int scalarArgNo, FlatIndex flatIndex) {
+    const int64_t K = int64_t(dom.size());
+    bool packed = mt.getRank() == 3 && mt.getDimSize(1) == K && mt.getDimSize(2) == d && K % d == 0 &&
+                  mt.getElementType().isInteger(8) && g.getNumLoops() == 1;
+    for (int64_t sv : {0, 1, 7, 8, 13, 21, 1000})
+      for (int64_t pi = 0; pi < K && packed; ++pi) {
+        auto f = flatIndex(dom[pi], sv);
+        packed = f && *f == (sv / d) * K * d + pi * d + sv % d;
+      }
+    if (!packed) return fail("gather index is not row * C + iteration index"), std::nullopt;
+    if (K * d > 65535) return fail("packed gather: a tile beyond one DMA row / LDPARAM factor"), std::nullopt;
+    auto sym = ddrOf(g.getDpsInputs()[scalarArgNo]);
+    auto src = ddrOf(ld.getMemRef());
+    std::optional<Ddr> yd;
+    for (Operation *u : g.getDpsInits()[0].getUsers())
+      if (auto st = dyn_cast<sahl::StoreOp>(u); st && st.getSrc() == g.getDpsInits()[0]) yd = ddrOf(st.getDst());
+    if (!sym || !src || !yd) return fail("packed gather: operands / result not in DDR"), std::nullopt;
+    if (yd->n * esize(yd->et) < 16 || yd->off % 8 || src->off % 8 || sym->off % 8)
+      return fail("packed gather: result too small or unaligned for the scratch words"), std::nullopt;
+    // the token as (lo, hi) in lanes 0, 1 of a zeroed word (junk * 0 is 0: read as i32, finite)
+    LocalBuf w0 = newLocal(::sa::VT_I32, d);
+    ve({w0.la, ::sa::VT_I32}, std::nullopt, w0.la, ::sa::VT_I32, d, ::sa::VOP_COPY, 0.0f, 0.0f);
+    sahw::LdOp::create(bb, loc, sym->base, sym->off, int64_t(w0.la), 1, 8, 8, 0, ValueRange{});
+    // t = r / D, l = r - t * D in lane 0
+    LocalBuf wt = newLocal(::sa::VT_I32, d), wtd = newLocal(::sa::VT_F32, d), wl = newLocal(::sa::VT_I32, d);
+    ve({w0.la, ::sa::VT_I32}, std::nullopt, wt.la, ::sa::VT_I32, d, ::sa::VOP_COPY, 1.0f / float(d),
+       -float(d - 1) / float(2 * d));
+    ve({wt.la, ::sa::VT_I32}, std::nullopt, wtd.la, ::sa::VT_F32, d, ::sa::VOP_COPY, float(d));
+    ve({w0.la, ::sa::VT_I32}, Opd{wtd.la, ::sa::VT_F32}, wl.la, ::sa::VT_I32, d, ::sa::VOP_SUB);
+    // through DDR (the result's first 16 bytes) into PARAMs
+    sahw::StOp::create(bb, loc, yd->base, yd->off, int64_t(wt.la), 1, 8, 8, ValueRange{});
+    sahw::StOp::create(bb, loc, yd->base, yd->off + 8, int64_t(wl.la), 1, 8, 8, ValueRange{});
+    sahw::FenceOp::create(bb, loc, int64_t(0));
+    Value pT = privateParam(), pV1 = privateParam(), pV0 = privateParam();
+    sahw::LdParamOp::create(bb, loc, yd->base, pT, yd->off, K * d, 0, ValueRange{});
+    sahw::LdParamOp::create(bb, loc, yd->base, pV1, yd->off + 8, 1, d + 1, ValueRange{});
+    sahw::LdParamOp::create(bb, loc, yd->base, pV0, yd->off + 8, 1, d, ValueRange{});
+    // one-hot(l) = the second word of prefix(D + l + 1) - prefix(D + l) over two words of ones
+    LocalBuf ones = newLocal(::sa::VT_F32, 2 * d), p1 = newLocal(::sa::VT_F32, 2 * d),
+             p0 = newLocal(::sa::VT_F32, 2 * d), oh = newLocal(::sa::VT_F32, 2 * d);
+    ve({ones.la, ::sa::VT_I32}, std::nullopt, ones.la, ::sa::VT_F32, 2 * d, ::sa::VOP_COPY, 0.0f, 1.0f);
+    ve({ones.la}, std::nullopt, p1.la, ::sa::VT_F32, 2 * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
+       ::sa::RED_NONE, 0, 1, {{::sa::DYN_VE_VALID, pV1, false}});
+    ve({ones.la}, std::nullopt, p0.la, ::sa::VT_F32, 2 * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
+       ::sa::RED_NONE, 0, 1, {{::sa::DYN_VE_VALID, pV0, false}});
+    ve({p1.la}, Opd{p0.la}, oh.la, ::sa::VT_F32, 2 * d, ::sa::VOP_SUB);
+    // the tile, lane l of each word (one nonzero lane: the sum is exact), packed
+    LocalBuf tile = newLocal(::sa::VT_I8, K * d);
+    auto lt = sahw::LdOp::create(bb, loc, src->base, src->off, int64_t(tile.la), 1, K * d, K * d, 0,
+                                 ValueRange{pT});
+    lt.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
+    lt.setDynAdd(ArrayRef<bool>{true});
+    LocalBuf red = newLocal(::sa::VT_F32, K, /*bcast=*/true);
+    ve({tile.la, ::sa::VT_I8}, Opd{oh.la + 1, ::sa::VT_F32, ::sa::IDX_MOD, 1}, red.la, ::sa::VT_F32, K * d,
+       ::sa::VOP_MUL, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_SUM, 1);
+    LocalBuf row = packBcast(red);
+    Val e;
+    e.kind = Val::Mem;
+    e.o = {row.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
+    return e;
+  }
+
   // ------------------------------------------------------------ VE
   uint32_t types(const Opd &s1, const std::optional<Opd> &s2, VType out) {
     uint32_t t = ::sa::vtypes(s1.vt, out);
@@ -2131,7 +2202,13 @@ private:
           else if (!C) C = *f1 - *f0;
           else if (*C != *f1 - *f0) rowGather = false;
         }
-        if (!rowGather || !C) return fail("gather index is not row * C + iteration index");
+        if (!rowGather || !C) {
+          auto pe = packedRowGather(g, ld, mt, dom, scalarArgNo, flatIndex);
+          if (!pe) return false;
+          vals[ld.getResult()] = *pe;
+          skip.push_back(ld);
+          continue;
+        }
         auto sym = ddrOf(g.getDpsInputs()[scalarArgNo]);
         auto src = ddrOf(t);
         if (!sym || !src) return fail("gather through buffers not in DDR");

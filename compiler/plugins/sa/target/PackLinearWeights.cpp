@@ -11,7 +11,11 @@
 //     acc = linalg.generic (t, j, k): out[t, j] += ext(x[k]) * ext(Wp[t, k, j])
 //     y   = tensor.collapse_shape acc [[0, 1]]
 // with the same arithmetic as the vecmat (inputs sign-extended to the
-// accumulator type). Wp depends on constants only: IREE hoists it and, with
+// accumulator type). Each weight is packed once (after its definition), and
+// its other readers that gather elements (tensor.extract W[r, c], the
+// embedding of a model whose classifier shares it) read the packed copy
+// instead, Wp[r / D, c, r % D] (plan §8.12 C6.0): the unpacked table is then
+// dead, so it is stored once. Wp depends on constants only: IREE hoists it and, with
 // the parameters imported (--iree-parameter-import), evaluates it at compile
 // time, so the packed weights land in the module or in an exported parameter
 // archive and the dispatch reads them directly; nothing is repacked at run time.
@@ -29,6 +33,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/MapVector.h"
 
 namespace mlir::iree_compiler::sa {
 namespace {
@@ -58,8 +63,41 @@ static bool isConstantWeight(Value v) {
   return isa<arith::ConstantOp>(def);
 }
 
+// The packed copy of W (one per weight, right after its definition).
+static Value packOf(RewriterBase &rewriter, Value w, int64_t d, llvm::MapVector<Value, Value> &packs) {
+  if (auto it = packs.find(w); it != packs.end()) return it->second;
+  OpBuilder::InsertionGuard guard(rewriter);
+  if (Operation *def = w.getDefiningOp()) rewriter.setInsertionPointAfter(def);
+  else rewriter.setInsertionPointToStart(cast<BlockArgument>(w).getOwner());
+  SmallVector<OpFoldResult> tiles = {rewriter.getIndexAttr(d)};
+  Value dest = linalg::PackOp::createDestinationTensor(rewriter, w.getLoc(), w, tiles, {0}, {});
+  Value wp = linalg::PackOp::create(rewriter, w.getLoc(), w, dest, {0}, tiles).getResult();
+  packs[w] = wp;
+  return wp;
+}
+
+// The gathers of W (tensor.extract W[r, c]) -> Wp[r / D, c, r % D]. The device
+// needs the tile's byte offset (r / D) * K * D as a 16-bit LDPARAM factor.
+static void redirectGathers(RewriterBase &rewriter, Value w, Value wp, int64_t d) {
+  auto wType = cast<RankedTensorType>(w.getType());
+  if (wType.getRank() != 2 || wType.getDimSize(1) * d > 65535) return;
+  SmallVector<tensor::ExtractOp> extracts;
+  for (Operation *u : w.getUsers())
+    if (auto ex = dyn_cast<tensor::ExtractOp>(u); ex && ex.getTensor() == w) extracts.push_back(ex);
+  for (tensor::ExtractOp ex : extracts) {
+    rewriter.setInsertionPoint(ex);
+    Location loc = ex.getLoc();
+    Value r = ex.getIndices()[0], c = ex.getIndices()[1];
+    Value dv = arith::ConstantIndexOp::create(rewriter, loc, d);
+    Value t = arith::DivSIOp::create(rewriter, loc, r, dv);
+    Value l = arith::RemSIOp::create(rewriter, loc, r, dv);
+    rewriter.replaceOpWithNewOp<tensor::ExtractOp>(ex, wp, ValueRange{t, c, l});
+  }
+}
+
 // vecmat(x, transpose(extsi(W))) -> pack + generic + collapse_shape.
-static LogicalResult rewriteVecmat(RewriterBase &rewriter, linalg::VecmatOp mm, int64_t d) {
+static LogicalResult rewriteVecmat(RewriterBase &rewriter, linalg::VecmatOp mm, int64_t d,
+                                   llvm::MapVector<Value, Value> &packs) {
   Value x = mm.getDpsInputs()[0], rhs = mm.getDpsInputs()[1], init = mm.getDpsInits()[0];
   auto tr = rhs.getDefiningOp<linalg::TransposeOp>();
   if (!tr || tr.getPermutation() != ArrayRef<int64_t>{1, 0}) return failure();
@@ -79,11 +117,9 @@ static LogicalResult rewriteVecmat(RewriterBase &rewriter, linalg::VecmatOp mm, 
   if (n % d || k % d) return failure();
 
   Location loc = mm.getLoc();
-  rewriter.setInsertionPoint(mm);
   // Wp = pack(W): [N, K] -> [N/D, K, D]
-  SmallVector<OpFoldResult> tiles = {rewriter.getIndexAttr(d)};
-  Value dest = linalg::PackOp::createDestinationTensor(rewriter, loc, w, tiles, {0}, {});
-  Value wp = linalg::PackOp::create(rewriter, loc, w, dest, {0}, tiles).getResult();
+  Value wp = packOf(rewriter, w, d, packs);
+  rewriter.setInsertionPoint(mm);
   // the accumulator as [N/D, D]
   auto acc2Type = RankedTensorType::get({n / d, d}, outElem);
   SmallVector<ReassociationIndices> reassoc = {{0, 1}};
@@ -147,10 +183,15 @@ struct PackLinearWeightsPass : public PassWrapper<PackLinearWeightsPass, Operati
     SmallVector<linalg::VecmatOp> ops;
     module.walk([&](linalg::VecmatOp op) { ops.push_back(op); });
     IRRewriter rewriter(&getContext());
-    for (linalg::VecmatOp op : ops) (void)rewriteVecmat(rewriter, op, d);
+    llvm::MapVector<Value, Value> packs;
+    for (linalg::VecmatOp op : ops) (void)rewriteVecmat(rewriter, op, d, packs);
+    if (gathers)
+      for (auto &[w, wp] : packs) redirectGathers(rewriter, w, wp, d);
   }
 
   Option<int64_t> d{*this, "d", llvm::cl::desc("Array size D"), llvm::cl::init(8)};
+  Option<bool> gathers{*this, "gathers", llvm::cl::desc("Gathers of packed weights read the packed copy"),
+                       llvm::cl::init(true)};
   Option<bool> force{*this, "force", llvm::cl::desc("Run without an sa device target (tests)"),
                      llvm::cl::init(false)};
 };

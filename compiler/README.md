@@ -181,15 +181,18 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   DMA row or the strip's source range accumulates K blocks in ACC); also
   DMAs beyond 64 KB and element-wise dispatches too large for ACC (lowered in
   pieces). A random-weight model with K = 16384 is bit-exact per dispatch and
-  end to end. Next: C6.0 (the shared embedding stored once), C6.1 (Qwen3-0.6B,
-  all 28 layers).
+  end to end. C6.0: the embedding shared with the classifier is stored once
+  (its gather reads the packed classifier weights): SmolLM2 peaks at 133.6 MB
+  (window 144 MB), Qwen3 no longer carries a 155 MB copy. Next: C6.1
+  (Qwen3-0.6B, all 28 layers).
 
   ```sh
   python3 compiler/tests/test_c5.py                  # lit, both configurations, dispatch_check at T = 16, 80, 256
   python3 compiler/tests/test_c5.py --configs        # + other hardware (D = 16, larger SPAD / ACC: --iree-sa-d / -spad-kb / -acc-kb)
+  compiler/scripts/run_tests.sh -j 1 smollm2 qwen3l2 c5cfg   # long runs: a bounded number of jobs, a log each (build/c6/logs)
   python3 compiler/frontend/export_hf.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2
   python3 compiler/tests/test_c55.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2 --check
-  compiler/scripts/deploy_c55.sh                     # board: python3 board_llm.py (window 168 MB; the board needs cma=320M in uEnv.txt, see the plan §8.7)
+  compiler/scripts/deploy_c55.sh                     # board: python3 board_llm.py (window 144 MB; the board needs cma=320M in uEnv.txt, see the plan §8.7)
   # interactive generation on the board (either bundle: deploy_c3 = stories15M, deploy_c55 = SmolLM2-135M):
   #   python3 board_generate.py [--max-new 64] [--prompt "..."]   (a prompt per line; tokens printed as they come)
   python3 compiler/frontend/export_hf.py --model build/llm_cache/Qwen3-0.6B --out build/c55/qwen3_l2 --layers 2
