@@ -23,6 +23,7 @@
 #include "SaLin.h"
 #include "SahlDialect.h"
 #include "SahlKernels.h"
+#include "SahlLocalMemory.h"
 #include "SahlPasses.h"
 #include "SahwPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
@@ -99,9 +100,7 @@ class Lowerer {
 public:
   Lowerer(func::FuncOp f, const TargetConfig &cfg, sahw::TemplateOp t, sahw::BodyOp body)
       : f(f), cfg(cfg), d(cfg.d), lay(uint32_t(cfg.d), uint32_t(cfg.spadBytes), uint32_t(cfg.accBytes)),
-        regB(body), bb(OpBuilder::atBlockEnd(&body.getRegion().front())), loc(f.getLoc()), km(cfg) {
-    accTop[0] = lay.acc0;
-    accTop[1] = lay.acc1;
+        regB(body), bb(OpBuilder::atBlockEnd(&body.getRegion().front())), loc(f.getLoc()), mem(lay), km(cfg) {
   }
 
   bool run() {
@@ -127,14 +126,11 @@ public:
       Operation *op = &opRef;
       loc = op->getLoc();
       if (auto sc = dyn_cast<sahl::ScopeOp>(op)) {   // a piece (sahl-tile): its local memory released after it
-        uint32_t savedTop[2] = {accTop[0], accTop[1]};
-        uint32_t savedSpad = spadTop;
+        auto mark = mem.mark();
         locals = reserved;
         bcastOf.clear();
         if (!lowerBlock(sc.getBody().front())) return false;
-        accTop[0] = savedTop[0];
-        accTop[1] = savedTop[1];
-        spadTop = savedSpad;
+        mem.release(mark);
         continue;
       }
       if (auto rs = dyn_cast<sahl::ReserveOp>(op)) {  // a buffer shared by the pieces: allocated now
@@ -200,8 +196,7 @@ private:
   llvm::DenseMap<Value, LocalBuf> locals;
   llvm::DenseMap<Value, LocalBuf> bcastOf;
   llvm::DenseMap<Value, float> fills;
-  uint32_t accTop[2];
-  uint32_t spadTop = 0;
+  LocalMemory mem;                               // SPAD_A / ACC words of this template (SahlLocalMemory.h)
   Operation *lastVe = nullptr;
   std::map<Lin, Value> params;
   Value rowAcc;                                  // the row loops' DDR offset
@@ -237,24 +232,6 @@ private:
 
   // ------------------------------------------------------------ local memory
   llvm::DenseMap<Value, LocalBuf> reserved;      // sahl.reserve: shared by the pieces (sahl.scope)
-  int preferBank = -1;                           // ACC temps of a linear chunk: its bank
-  std::optional<uint32_t> allocAcc(uint32_t words) {
-    if (preferBank >= 0 && accTop[preferBank] + words <= uint32_t(preferBank + 1) * lay.cbank) {
-      uint32_t w = accTop[preferBank];
-      accTop[preferBank] += words;
-      return w;
-    }
-    for (int b = 0; b < 2; ++b) {
-      uint32_t end = (b + 1) * lay.cbank;
-      if (accTop[b] + words <= end) {
-        uint32_t w = accTop[b];
-        accTop[b] += words;
-        return w;
-      }
-    }
-    fail("ACC full");
-    return std::nullopt;
-  }
   LocalBuf newLocal(VType vt, int64_t n, bool bcast = false) {
     LocalBuf l;
     l.vt = vt;
@@ -262,11 +239,13 @@ private:
     l.bcast = bcast;
     uint32_t words = std::max<uint32_t>(bcast ? uint32_t(n) : uint32_t((n + d - 1) / d), 1);
     if (vt == ::sa::VT_I8) {
-      if (spadTop + words > 2 * lay.sbank) fail("SPAD_A full");
-      l.la = ::sa::laddr(::sa::MEM_SPAD_A, spadTop);
-      spadTop += words;
+      auto w = mem.allocSpad(words);
+      if (!w) fail("SPAD_A full");
+      l.la = ::sa::laddr(::sa::MEM_SPAD_A, w.value_or(0));
     } else {
-      l.la = ::sa::acc(allocAcc(words).value_or(0));
+      auto w = mem.allocAcc(words);
+      if (!w) fail("ACC full");
+      l.la = ::sa::acc(w.value_or(0));
     }
     return l;
   }
@@ -752,7 +731,7 @@ private:
   bool attention(AttnPlan &p) {
     const int64_t H = p.H, hs = p.hs, T = cfg.maxDynamic;
     if (T % d || hs % d) return fail("attention: T and head size must be multiples of D");
-    if (spadTop != 0) return fail("attention after other SPAD_A buffers");
+    if (mem.spadUsed()) return fail("attention after other SPAD_A buffers");
     int logd = int(std::log2(double(d)));
     auto par = [&](int64_t mul, int shift) {
       Lin l = p.T;
@@ -768,7 +747,7 @@ private:
     if (uint32_t(T) * hw > sb) return fail("attention: K rows do not fit a SPAD bank");
     // SPAD_A: the A strip at 0, the raw K rows in bank 1; SPAD_B: K^T at 0, V in bank 1 (as C3)
     const uint32_t strip = 0, kraw = sb, kt = 0, vb = sb;
-    spadTop = 2 * sb;
+    mem.takeSpad(2 * sb);
     if (yd->second % 8 || cache->second % 8) return fail("unaligned attention operand");
     auto dyn = [](auto op, SmallVector<std::pair<int32_t, Value>> f) {
       SmallVector<Value> vs;
@@ -902,8 +881,8 @@ private:
       return paramFor(x);
     };
     bool xRows = (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0) || (p.gLoop >= 0 && p.x.coef[p.gLoop] < 0);
-    if (spadTop != 0) return fail("contraction after other SPAD_A buffers");
-    spadTop = 2 * sb;                                      // the A strip at 0, raw rows in bank 1
+    if (mem.spadUsed()) return fail("contraction after other SPAD_A buffers");
+    mem.takeSpad(2 * sb);                                      // the A strip at 0, raw rows in bank 1
     const uint32_t strip = 0, raw = sb;
     auto xs = ddrStart(p.x.view, esize(p.x.et)), ms = ddrStart(p.m.view, 1), ys = ddrStart(p.store.getDst(), 4);
     if (!xs || !ms || !ys) return fail("contraction: operands not in DDR");
@@ -1109,7 +1088,7 @@ private:
         for (int64_t g = 0; g < G; ++g) {
           if (G > 1 && !loadStrip(b, g)) return false;
           // the chunk's accumulator and epilogue buffers: released after its store
-          uint32_t savedTop[2] = {accTop[0], accTop[1]};
+          auto savedTop = mem.mark();
           LocalBuf acc = newLocal(::sa::VT_I32, int64_t(nc) * d);
           uint32_t cw = acc.la & 0xFFFFFFF;
           if (nk == 1) {
@@ -1129,8 +1108,7 @@ private:
             if (yoff % 8) return fail("contraction: unaligned result");
             sahw::StOp::create(bb, loc, ys->first, yoff, int64_t(::sa::acc(cw)), 1, int64_t(nc) * d * 4,
                                int64_t(nc) * d * 4, ValueRange{});
-            accTop[0] = savedTop[0];
-            accTop[1] = savedTop[1];
+            mem.releaseAcc(savedTop);
             continue;
           }
           // the epilogue on this chunk: n elements at (b, g, c0)
@@ -1188,8 +1166,7 @@ private:
             if (yoff % 8) return fail("contraction: unaligned result");
             sahw::StOp::create(bb, loc, ys->first, yoff, int64_t(out.la), 1, ch.n * 4, ch.n * 4, ValueRange{});
           }
-          accTop[0] = savedTop[0];
-          accTop[1] = savedTop[1];
+          mem.releaseAcc(savedTop);
         }
       }
     }
@@ -1281,11 +1258,11 @@ private:
     };
     loadChunk(0);
     for (int64_t c0 = 0, ci = 0; c0 < nt; c0 += nc, ++ci) {
-      uint32_t savedTop[2] = {accTop[0], accTop[1]};
+      auto savedTop = mem.mark();
       uint32_t bw = uint32_t(ci & 1) * sb;
       const SmallVector<LocalBuf> &cl = colSets[ci & 1];
       for (int64_t rb = 0; rb < nb; ++rb) {
-        uint32_t savedRb[2] = {accTop[0], accTop[1]};
+        auto savedRb = mem.mark();
         const int64_t n = d * nc * d;
         LocalBuf acc = newLocal(::sa::VT_I32, n);
         sahw::ExOp::create(bb, loc, int64_t(strips[rb] & 0xFFFFFFF), int64_t(bw), int64_t(acc.la & 0xFFFFFFF),
@@ -1294,8 +1271,7 @@ private:
         if (!p.epi) {                                 // the accumulator itself
           sahw::StOp::create(bb, loc, yd->base, yd->off + (rb * d * N + c0 * d) * 4, int64_t(acc.la), d, nc * d * 4,
                              N * 4, ValueRange{});
-          accTop[0] = savedRb[0];
-          accTop[1] = savedRb[1];
+          mem.releaseAcc(savedRb);
           continue;
         }
         Chunk ch;
@@ -1341,11 +1317,9 @@ private:
         }
         if (!generic(p.epi, nullptr, &ch)) return false;
         sahw::StOp::create(bb, loc, yd->base, yd->off + off, int64_t(out.la), d, nc * d * 4, N * 4, ValueRange{});
-        accTop[0] = savedRb[0];
-        accTop[1] = savedRb[1];
+        mem.releaseAcc(savedRb);
       }
-      accTop[0] = savedTop[0];
-      accTop[1] = savedTop[1];
+      mem.releaseAcc(savedTop);
     }
     return err.empty();
   }
@@ -1440,9 +1414,9 @@ private:
         a.o = {::sa::acc(c + slot(m)), ::sa::VT_F32, ::sa::IDX_LIN, 0};
         ch.inputs[p.chunked[m].first] = a;
       }
-      preferBank = int(bank);
+      mem.preferBank = int(bank);
       bool ok = generic(p.epi, nullptr, &ch);
-      preferBank = -1;
+      mem.preferBank = -1;
       if (!ok) return false;
       dynAdd(sahw::StOp::create(bb, loc, yd->base, yd->off + int64_t(i) * fbytes, int64_t(ch.outLa), 1, fbytes,
                                 fbytes, dyn ? ValueRange{pf} : ValueRange{}),
@@ -1641,13 +1615,12 @@ private:
       for (int64_t r = 0; r < H; ++r) {
         // a row's temps are released after it, unless it allocated something
         // later rows use (a buffer's local, a broadcast: usually the first row)
-        uint32_t savedTop[2] = {accTop[0], accTop[1]};
+        auto savedTop = mem.mark();
         size_t nLocals = locals.size(), nBcast = bcastOf.size();
         RowSel rs{r, *dynInner};
         if (!generic(g, &rs)) return false;
         if (locals.size() == nLocals && bcastOf.size() == nBcast) {
-          accTop[0] = savedTop[0];
-          accTop[1] = savedTop[1];
+          mem.releaseAcc(savedTop);
         }
       }
       curLen = Value();
