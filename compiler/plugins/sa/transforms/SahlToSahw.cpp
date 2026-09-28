@@ -1202,7 +1202,11 @@ private:
       if (!l) return false;
       locals[in] = *l;
       epiLocal[i] = *l;
+      // broadcasts now: the chunk buffers below are released after each chunk,
+      // so nothing cached may be allocated there
+      AffineMap em = p.epi.getIndexingMapsArray()[i];
       if (mt.getRank() == 0 && !scalarBcast(in, *l)) return false;
+      if (em.getNumResults() == 1 && p.bLoop >= 0 && !em.isIdentity() && !perElementBcast(in, *l, H)) return false;
     }
     uint32_t xes = esize(p.x.et);
     bool xI32 = p.x.et.isInteger(32);

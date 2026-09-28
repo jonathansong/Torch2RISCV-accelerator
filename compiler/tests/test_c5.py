@@ -6,7 +6,8 @@
      micro-kernels (--iree-sa-ukernels=all) and without (=none, the generic
      lowering only; dispatches it cannot compile are reported and compiled
      as faulting exports);
-  3. every dispatch of both: dispatch_check.py (oracle vs functional simulator);
+  3. every dispatch of both: dispatch_check.py (oracle vs functional simulator)
+     at dynamic lengths T = 16, 80, 256;
   4. descriptor / VE counts where the two differ (the micro-kernels' effect;
      the board profile is the measure).
 
@@ -81,15 +82,17 @@ def main():
                 print(f"  {c:3d} not compiled: {why}")
             ok &= not failed or mode == "none"
             d = os.path.join(work, mode)
-            r = subprocess.run([sys.executable, os.path.join(HERE, "dispatch_check.py"), os.path.join(d, "sa_sources"),
-                                os.path.join(d, "bin")], capture_output=True, text=True)
-            last = r.stdout.strip().splitlines()[-1]
-            print(f"  per-dispatch differential check: {last}")
-            bad = [l for l in r.stdout.splitlines() if not l.endswith(" OK") and "UNSUPPORTED" not in l and
-                   not re.match(r"^(OK|FAIL|UNSUPPORTED) ", l)]
-            if [l for l in bad if "FAIL" in l or "differ" in l or "error" in l]:
-                print("\n".join(bad))
-                ok = False
+            # dynamic lengths: short, past a few tiles, the maximum (buffers reused across chunks / heads)
+            for t in (16, 80, 256):
+                r = subprocess.run([sys.executable, os.path.join(HERE, "dispatch_check.py"), os.path.join(d, "sa_sources"),
+                                    os.path.join(d, "bin"), "--t", str(t)], capture_output=True, text=True)
+                last = r.stdout.strip().splitlines()[-1]
+                print(f"  per-dispatch differential check, T = {t}: {last}")
+                bad = [l for l in r.stdout.splitlines() if not l.endswith(" OK") and "UNSUPPORTED" not in l and
+                       not re.match(r"^(OK|FAIL|UNSUPPORTED) ", l)]
+                if [l for l in bad if "FAIL" in l or "differ" in l or "error" in l]:
+                    print("\n".join(bad))
+                    ok = False
         if len(modes) == 2:
             diff = []
             for f in sorted(glob.glob(os.path.join(work, "all", "bin", "*.sadesc"))):
