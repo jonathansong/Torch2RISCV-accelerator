@@ -194,18 +194,20 @@ public:
   }
 
   bool run() {
-    // the micro-kernels (§8.8), as --iree-sa-ukernels allows
-    if (cfg.ukernel("linear"))
-      f.walk([&](linalg::GenericOp g) {
-        if (g->getParentOp() == f.getOperation()) km.matchLinear(g);
-      });
-    if (cfg.ukernel("attention")) f.walk([&](linalg::BatchMatmulOp m) { km.matchAttention(m); });
-    // the other contractions: the generic lowering
-    f.walk([&](linalg::LinalgOp op) {
-      if (op->getParentOp() == f.getOperation() && !km.owned.contains(op.getOperation()) &&
-          (isa<linalg::BatchMatmulOp>(op) || op.getNumReductionLoops() == 1) && op.getNumDpsInputs() == 2)
-        km.matchContraction(op);
-    });
+    // the kernels sa-to-sahl grouped: each one's plan from its anchor
+    for (auto k : f.getBody().front().getOps<sahl::KernelOp>()) {
+      Operation *a = nullptr;
+      for (Operation &o : k.getBody().front())
+        if (o.hasAttr("sahl.anchor")) a = &o;
+      StringRef kind = k.getKind();
+      bool ok = false;
+      if (!a) ok = false;
+      else if (kind == "linear") ok = isa<linalg::GenericOp>(a) && km.matchLinear(cast<linalg::GenericOp>(a));
+      else if (kind == "attention") ok = isa<linalg::BatchMatmulOp>(a) && km.matchAttention(cast<linalg::BatchMatmulOp>(a));
+      else if (kind == "contraction") ok = isa<linalg::LinalgOp>(a) && km.matchContraction(cast<linalg::LinalgOp>(a));
+      if (!ok) return fail("sahl.kernel \"" + kind.str() + "\": no plan for its operations");
+      anchorOf[k] = a;
+    }
     // an element-wise dispatch too large for ACC: in pieces
     if (km.linears.empty() && km.attns.empty() && km.contracts.empty()) {
       if (auto n = pieceable(); n && pieceWords(*n) > 2 * (lay.cbank - lay.scr)) {
@@ -412,19 +414,17 @@ public:
     for (Operation &opRef : f.getBody().front()) {
       Operation *op = &opRef;
       loc = op->getLoc();
-      if (auto it = km.linears.find(op); it != km.linears.end()) {
-        if (!linear(it->second)) return false;
+      if (auto k = dyn_cast<sahl::KernelOp>(op)) {
+        Operation *a = anchorOf.lookup(k);
+        if (auto it = km.linears.find(a); it != km.linears.end()) {
+          if (!linear(it->second)) return false;
+        } else if (auto it = km.attns.find(a); it != km.attns.end()) {
+          if (!attention(it->second)) return false;
+        } else if (!contraction(km.contracts[a])) {
+          return false;
+        }
         continue;
       }
-      if (auto it = km.attns.find(op); it != km.attns.end()) {
-        if (!attention(it->second)) return false;
-        continue;
-      }
-      if (auto it = km.contracts.find(op); it != km.contracts.end()) {
-        if (!contraction(it->second)) return false;
-        continue;
-      }
-      if (km.owned.contains(op)) continue;
       if (isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CastOp,
               memref::DimOp, IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp,
               IREE::TensorExt::DispatchWorkloadOrdinalOp, func::ReturnOp>(op))
@@ -479,7 +479,8 @@ private:
   Value curLen;                                  // row mode: the dynamic LEN of full-length VEs
   int64_t curLenStatic = -1;
   std::map<std::pair<void *, int>, Value> validParams;   // (i64 scalar, predicate) -> VALID count
-  KernelMatcher km;                              // the micro-kernel / contraction matches (SahlKernels.h)
+  KernelMatcher km;                              // the plans of the kernels (SahlKernels.h)
+  llvm::DenseMap<Operation *, Operation *> anchorOf;   // sahl.kernel -> its anchor
 
   bool fail(const std::string &m) {
     if (err.empty()) err = m;

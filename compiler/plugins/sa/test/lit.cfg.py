@@ -1,6 +1,6 @@
 # lit configuration of the sa plugin's pass tests (docs/iree_compiler_plan.md §8.6):
 #   $IREE_BUILD/llvm-project/bin/llvm-lit -v compiler/plugins/sa/test
-# (compiler/tests/test_c50.py runs it). Tools come from $IREE_BUILD.
+# (compiler/scripts/run_tests.sh golden runs it). Tools come from $IREE_BUILD.
 import os
 
 import lit.formats

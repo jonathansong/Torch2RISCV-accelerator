@@ -15,8 +15,9 @@ struct TargetConfig;
 // The DDR binding subspan a memref view comes from (null: not DDR).
 Value ddrRoot(Value v);
 
-// Bufferized dispatch -> linalg on local buffers + sahl.load / sahl.store.
-std::unique_ptr<Pass> createSaToSahlPass();
+// Bufferized dispatch -> linalg on local buffers + sahl.load / sahl.store; the
+// operations of each micro-kernel / generic contraction grouped into a sahl.kernel.
+std::unique_ptr<Pass> createSaToSahlPass(const TargetConfig &config);
 void registerSaToSahlPass();
 // sahl -> one sahw.template per function (the lowering: registers, local
 // memory, one single-stage VE per arith / math operation).

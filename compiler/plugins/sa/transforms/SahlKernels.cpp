@@ -30,6 +30,26 @@ std::optional<Lin> dynLin(Value size) {
   return linOf(size);
 }
 
+void KernelMatcher::matchAll(func::FuncOp f) {
+  // the micro-kernels (§8.8), as --iree-sa-ukernels allows
+  if (cfg.ukernel("linear"))
+    f.walk([&](linalg::GenericOp g) {
+      if (g->getParentOp() == f.getOperation()) matchLinear(g);
+    });
+  if (cfg.ukernel("attention")) f.walk([&](linalg::BatchMatmulOp m) { matchAttention(m); });
+  // the other contractions: the generic lowering
+  f.walk([&](linalg::LinalgOp op) {
+    if (op->getParentOp() == f.getOperation() && !owned.contains(op.getOperation()) &&
+        (isa<linalg::BatchMatmulOp>(op) || op.getNumReductionLoops() == 1) && op.getNumDpsInputs() == 2)
+      matchContraction(op);
+  });
+}
+
+void KernelMatcher::record(Operation *anchor, ArrayRef<Operation *> ops) {
+  for (Operation *o : ops) owned.insert(o);
+  covers[anchor].assign(ops.begin(), ops.end());
+}
+
 sahl::LoadOp loadInto(Value local) {
   for (Operation *u : local.getUsers())
     if (auto l = dyn_cast<sahl::LoadOp>(u); l && l.getDst() == local) return l;
@@ -225,7 +245,7 @@ bool KernelMatcher::matchContraction(linalg::LinalgOp op) {
     p.epiLoads.push_back({i, l.getSrc()});
     cover.push_back(l);
   }
-  for (Operation *o : cover) owned.insert(o);
+  record(op, cover);
   contracts[op.getOperation()] = p;
   return true;
 }
@@ -310,7 +330,7 @@ bool KernelMatcher::matchAttention(linalg::BatchMatmulOp bmm) {
     if (auto s = dyn_cast<sahl::StoreOp>(u); s && s.getSrc() == out) p.store = s;
   if (!p.store) return false;
   cover.push_back(p.store);
-  for (Operation *o : cover) owned.insert(o);
+  record(bmm, cover);
   attns[bmm.getOperation()] = p;
   return true;
 }
@@ -396,9 +416,8 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
     if (p.epi) return false;
     const int64_t kk = cast<MemRefType>(p.w.getType()).getDimSize(1);
     if (kk * d > 65535 || (p.rows / d) * kk > 2 * int64_t(lay.sbank)) return false;
-    for (Operation *o : {con.getOperation(), fill.getOperation(), p.store.getOperation(), lx.getOperation(),
-                         lw.getOperation()})
-      owned.insert(o);
+    record(con, {con.getOperation(), fill.getOperation(), p.store.getOperation(), lx.getOperation(),
+                 lw.getOperation()});
     linears[con.getOperation()] = p;
     return true;
   }
@@ -444,7 +463,7 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
       lay.acc0 + k / d + 2 > lay.cbank)
     return false;
   if (rows4 && (p.rows / d) * k > 2 * int64_t(lay.sbank)) return false;   // the strips of all row blocks
-  for (Operation *o : cover) owned.insert(o);
+  record(con, cover);
   linears[con.getOperation()] = p;
   return true;
 }

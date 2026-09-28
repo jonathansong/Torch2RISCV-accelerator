@@ -14,6 +14,7 @@
 #include "SahwPasses.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 
 namespace mlir::iree_compiler::sa {
@@ -93,6 +94,10 @@ class KernelMatcher {
   explicit KernelMatcher(const TargetConfig &cfg)
       : cfg(cfg), d(cfg.d), lay(uint32_t(cfg.d), uint32_t(cfg.spadBytes), uint32_t(cfg.accBytes)) {}
 
+  // Every match of a function, in the lowering's order: the linear layers and
+  // attention (as the target configuration's micro-kernels allow), then the
+  // other contractions.
+  void matchAll(func::FuncOp f);
   // Each records its plan and the operations it covers (nothing else may use its buffers).
   bool matchLinear(linalg::GenericOp con);
   bool matchAttention(linalg::BatchMatmulOp bmm);
@@ -106,8 +111,10 @@ class KernelMatcher {
   llvm::DenseMap<Operation *, AttnPlan> attns;
   llvm::DenseMap<Operation *, ContractPlan> contracts;
   llvm::DenseSet<Operation *> owned;
+  llvm::DenseMap<Operation *, SmallVector<Operation *>> covers;   // anchor -> the operations of its match
 
  private:
+  void record(Operation *anchor, ArrayRef<Operation *> ops);
   TargetConfig cfg;
   int64_t d;
   ::sa::Layout lay;

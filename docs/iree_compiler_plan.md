@@ -1055,6 +1055,16 @@ C5.5 的模型（§8.9 的第一步）：
   - 新 lit 测试：`sa_to_sahl.mlir`，以及 `sahl_to_sahw.mlir`（单级 VE、融合后、D = 16 三种配置；exp 与按行量化两个函数）。
 - **发现的旧缺口**：`--iree-sa-ukernels=none` 时，prefill 的 5 个多行线性层编不了（`contraction epilogue input layout`：通用 contraction 的尾部不支持按行的输入）。§8.7 说“不用微内核也能编译全部”只对 decode 成立。语料里把它们记为“预期失败”；R2 把微内核改成 `sahl` 层展开时一并解决。
 
+**R1 的拆分与进度**：
+- **R1a 内核分组（完成，2026-09-29）**：
+  - 三个匹配器（线性层、注意力、通用 contraction）从 `Lowerer` 抽到 `SahlKernels.{h,cpp}` 的 `KernelMatcher`，两个 pass 共用；
+  - 新操作 `sahl.kernel "linear" | "attention" | "contraction"`：`sa-to-sahl` 跑匹配器，把每个匹配的操作按原顺序移进一个 `sahl.kernel`，放在其 contraction（标 `sahl.anchor`）的位置；之后的操作用到的分配、dim、常数、视图提到内核之前（这些不生成命令）；
+  - `sa-to-sahl` 也有目标配置的 pass 选项（与 `sahl-to-sahw` 相同）；
+  - `sahl-to-sahw` 不再自己在整个函数里找内核，只从每个 `sahl.kernel` 的锚点得到计划；
+  - 结果：用哪个微内核、哪些操作一起降级，在 IR 上可见（例如同一个 W13 默认是 `"linear"`，`ukernels=none` 时是 `"contraction"`）；黄金语料逐字节相同；新 lit 测试 `sahl_kernels.mlir`；`SahlToSahw.cpp` 3052 → 2579 行。
+- **R1b**：逐元素运算的分类（纯逐元素、按行归约、带 gather、i64 标量）成为 `sahl.elementwise`、`sahl.reduce`、`sahl.gather`、`sahl.scalar`，`generic()` 按操作种类拆开。
+- **R1c**：scatter → `sahl.scatter`；relayout（转置、DIV-D 复制、打包成广播字）作为显式操作。
+
 **顺序与依赖**：R0 → R1 → R2 → R3 → R4 → R5 → R6，每步单独提交。R1 是最大的一步（识别逻辑全部搬家）；R3 与 R4 是 C6.5（T 分块注意力）与代价模型的前提。
 
 **风险**：
@@ -1094,7 +1104,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
-| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**进行中**（R0 完成） | 大 |
+| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**进行中**（R0、R1a 完成） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。
