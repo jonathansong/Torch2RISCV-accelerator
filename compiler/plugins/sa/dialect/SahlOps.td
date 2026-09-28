@@ -69,6 +69,23 @@ def Sahl_ScatterOp : Sahl_Op<"scatter"> {
   let assemblyFormat = "$updates `,` $indices `,` $dest attr-dict `:` type($updates) `,` type($indices) `,` type($dest)";
 }
 
+def Sahl_ScopeOp : Sahl_Op<"scope", [SingleBlock, NoTerminator]> {
+  let summary = "A piece of a dispatch: the local memory allocated inside is released at its end";
+  let description = [{
+    sahl-tile splits an element-wise dispatch too large for ACC into pieces,
+    one sahl.scope each: its operations work on views and local buffers of the
+    piece. Buffers shared by the pieces are allocated before them (sahl.reserve).
+  }];
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "attr-dict-with-keyword $body";
+}
+
+def Sahl_ReserveOp : Sahl_Op<"reserve"> {
+  let summary = "Allocates a local buffer now (shared by the sahl.scope pieces that follow)";
+  let arguments = (ins AnyMemRef:$buffer, UnitAttr:$bcast);
+  let assemblyFormat = "$buffer attr-dict `:` type($buffer)";
+}
+
 def Sahl_KernelOp : Sahl_Op<"kernel", [SingleBlock, NoTerminator]> {
   let summary = "Operations lowered together: a micro-kernel or a generic contraction";
   let description = [{

@@ -19,6 +19,9 @@ Value ddrRoot(Value v);
 // operations of each micro-kernel / generic contraction grouped into a sahl.kernel.
 std::unique_ptr<Pass> createSaToSahlPass(const TargetConfig &config);
 void registerSaToSahlPass();
+// Splits an element-wise dispatch too large for ACC into pieces (sahl.scope).
+std::unique_ptr<Pass> createSahlTilePass(const TargetConfig &config);
+void registerSahlTilePass();
 // sahl -> one sahw.template per function (the lowering: registers, local
 // memory, one single-stage VE per arith / math operation).
 std::unique_ptr<Pass> createSahlToSahwPass(const TargetConfig &config);
