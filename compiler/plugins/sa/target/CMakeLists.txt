@@ -29,6 +29,8 @@ iree_cc_library(
     "../transforms/SahlPlanMemory.cpp"
     "../transforms/SahlSchedule.cpp"
     "../transforms/SahlToSahw.cpp"
+    "../transforms/SahlLowerGeneric.cpp"
+    "../transforms/SahlLowerKernels.cpp"
     "../transforms/SahlPipeline.cpp"
   DEPS
     sa::SahwDialect
