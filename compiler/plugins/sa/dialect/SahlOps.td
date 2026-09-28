@@ -43,6 +43,19 @@ def Sahl_ToI8Op : Sahl_Op<"to_i8", [Pure]> {
   let assemblyFormat = "$x attr-dict";
 }
 
+def Sahl_GatherOp : Sahl_Op<"gather"> {
+  let summary = "A data-dependent read inside a linalg body";
+  let description = [{
+    Element `indices` of `source` (a buffer captured by the body), the indices
+    computed from the body's iteration indices and an i64 scalar input. `kind`
+    is the form sa-to-sahl chose (gatherForm in SahlKernels.h): "row",
+    "scalar", "packed", "swap", or "none" (no form: the lowering reports why).
+  }];
+  let arguments = (ins Arg<AnyMemRef, "the table", [MemRead]>:$source, Variadic<Index>:$indices, StrAttr:$kind);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$kind $source `[` $indices `]` attr-dict `:` type($source) `->` type($result)";
+}
+
 def Sahl_KernelOp : Sahl_Op<"kernel", [SingleBlock, NoTerminator]> {
   let summary = "Operations lowered together: a micro-kernel or a generic contraction";
   let description = [{

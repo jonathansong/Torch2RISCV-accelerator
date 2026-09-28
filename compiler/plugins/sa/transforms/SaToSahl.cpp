@@ -5,7 +5,8 @@
 // sahl.load before (inputs, and outputs whose old value is read) and a
 // sahl.store after (outputs); an identity copy into DDR becomes a sahl.store.
 // Computation then only touches local buffers. Each to_i8 chain inside a
-// body becomes one sahl.to_i8. Then the kernel matcher
+// body becomes one sahl.to_i8, each gather (a memref.load in a body) a
+// sahl.gather with the form the lowering will use. Then the kernel matcher
 // (SahlKernels.h) decides which operations are lowered together: each match
 // (a linear layer or attention micro-kernel, a generic contraction) moves into a
 // sahl.kernel at the position of its contraction (the anchor).
@@ -62,6 +63,32 @@ void replaceToI8(func::FuncOp f) {
     chain.pop_back();                             // (the fptosi)
     for (Operation *o : chain)                    // consumers first
       if (o->use_empty()) o->erase();
+  }
+}
+
+// Each memref.load inside a linalg body (a gather) -> sahl.gather with its form.
+void replaceGathers(func::FuncOp f, const TargetConfig &cfg) {
+  SmallVector<linalg::GenericOp> gs;
+  f.walk([&](linalg::GenericOp g) { gs.push_back(g); });
+  for (linalg::GenericOp g : gs) {
+    Block &body = g.getRegion().front();
+    SmallVector<memref::LoadOp> lds(body.getOps<memref::LoadOp>());
+    if (lds.empty()) continue;
+    int nloops = 0;
+    auto dom = gatherDomain(g, cfg, nloops);
+    bool hasScalar = false;
+    for (Value in : g.getDpsInputs())
+      if (auto mt = dyn_cast<MemRefType>(in.getType()); mt && mt.getElementType().isInteger(64)) hasScalar = true;
+    for (memref::LoadOp ld : lds) {
+      OpBuilder b(ld);
+      auto ga = sahl::GatherOp::create(b, ld.getLoc(), ld.getType(), ld.getMemRef(), ld.getIndices(), "none");
+      ld.getResult().replaceAllUsesWith(ga.getResult());
+      ld.erase();
+      if (!dom) continue;
+      SmallVector<SmallVector<int64_t>> d0 = nloops ? *dom : SmallVector<SmallVector<int64_t>>{{}};
+      GatherForm gf = gatherForm(ga, d0, nloops, hasScalar, cfg.d, g.getNumLoops());
+      if (!gf.kind.empty()) ga.setKind(gf.kind);
+    }
   }
 }
 
@@ -223,6 +250,7 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
       cfg.ukernels = optUkernels;
     }
     replaceToI8(f);
+    replaceGathers(f, cfg);
     if (failed(groupKernels(f, cfg))) return signalPassFailure();
   }
 };

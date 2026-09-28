@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <functional>
 
 #include "SahlPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
@@ -91,6 +92,170 @@ Value matchToI8(arith::FPToSIOp f, SmallVectorImpl<Operation *> &chain) {
   if (!sel(s1, arith::CmpFPredicate::UNE, 0, true, 0.0f, x)) return {};
   chain.push_back(f);
   return x;
+}
+
+// Integer value of an index computation inside a linalg body at iteration
+// point idx, with the scalar block argument(s) = sym (C3's evalInt).
+std::optional<int64_t> evalInt(Value v, ArrayRef<int64_t> idx, int64_t sym) {
+  if (auto c = getConstantIntValue(v)) return *c;
+  if (isa<BlockArgument>(v)) return sym;
+  Operation *op = v.getDefiningOp();
+  if (!op) return std::nullopt;
+  if (auto ix = dyn_cast<linalg::IndexOp>(op)) return idx[ix.getDim()];
+  if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(op))
+    return evalInt(op->getOperand(0), idx, sym);
+  if (op->getNumOperands() != 2) return std::nullopt;
+  auto a = evalInt(op->getOperand(0), idx, sym), b = evalInt(op->getOperand(1), idx, sym);
+  if (!a || !b) return std::nullopt;
+  if (isa<arith::AddIOp>(op)) return *a + *b;
+  if (isa<arith::SubIOp>(op)) return *a - *b;
+  if (isa<arith::MulIOp>(op)) return *a * *b;
+  if (isa<arith::DivSIOp>(op)) return *b ? std::optional<int64_t>(*a / *b) : std::nullopt;
+  if (isa<arith::RemSIOp>(op)) return *b ? std::optional<int64_t>(*a % *b) : std::nullopt;
+  if (auto c = dyn_cast<arith::CmpIOp>(op)) {
+    switch (c.getPredicate()) {
+    case arith::CmpIPredicate::eq: return *a == *b;
+    case arith::CmpIPredicate::ne: return *a != *b;
+    case arith::CmpIPredicate::slt: return *a < *b;
+    case arith::CmpIPredicate::sle: return *a <= *b;
+    case arith::CmpIPredicate::sgt: return *a > *b;
+    case arith::CmpIPredicate::sge: return *a >= *b;
+    default: return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+// Every point of an iteration space (row-major).
+SmallVector<SmallVector<int64_t>> points(ArrayRef<int64_t> ranges) {
+  SmallVector<SmallVector<int64_t>> out;
+  int64_t n = 1;
+  for (int64_t r : ranges) n *= r;
+  if (n > 65536) return out;
+  for (int64_t e = 0; e < n; ++e) {
+    SmallVector<int64_t> p(ranges.size());
+    int64_t x = e;
+    for (int i = int(ranges.size()) - 1; i >= 0; --i) {
+      p[i] = x % ranges[i];
+      x /= ranges[i];
+    }
+    out.push_back(p);
+  }
+  return out;
+}
+
+GatherForm gatherForm(sahl::GatherOp ga, ArrayRef<SmallVector<int64_t>> dom, int nloops, bool hasScalar, int64_t d,
+                      int64_t genericLoops) {
+  GatherForm r;
+  Block &body = *ga->getBlock();
+  auto mt = cast<MemRefType>(ga.getSource().getType());
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (!mt.hasStaticShape() || failed(mt.getStridesAndOffset(strides, offset))) return r.why = "gather source layout", r;
+  if (dom.empty()) return r.why = "gather over a large iteration space", r;
+  auto idx = ga.getIndices();
+  auto flatIndex = [&](ArrayRef<int64_t> pt, int64_t sym) -> std::optional<int64_t> {
+    int64_t f = 0;
+    for (unsigned i = 0; i < idx.size(); ++i) {
+      auto v = evalInt(idx[i], pt, sym);
+      if (!v) return std::nullopt;
+      f += *v * strides[i];
+    }
+    return f;
+  };
+  bool usesSym = false;
+  for (Value iv : idx) {
+    std::function<bool(Value)> hasArg = [&](Value v) -> bool {
+      if (isa<BlockArgument>(v)) return true;
+      Operation *o = v.getDefiningOp();
+      if (!o || o->getBlock() != &body) return false;
+      return llvm::any_of(o->getOperands(), hasArg);
+    };
+    usesSym |= hasArg(iv);
+  }
+  if (!usesSym) {
+    // a fixed permutation of a small tensor: the pair swap
+    for (size_t pi = 0; pi < dom.size(); ++pi) {
+      auto f = flatIndex(dom[pi], 0);
+      if (!f || *f != int64_t(pi ^ 1)) return r.why = "gather with a fixed index pattern other than the pair swap", r;
+    }
+    return r.kind = "swap", r;
+  }
+  if (!hasScalar) return r.why = "gather index from a non-scalar input", r;
+  // rows: index = scalar * C + iteration point
+  std::optional<int64_t> C;
+  bool rowGather = true;
+  for (size_t pi = 0; pi < dom.size() && rowGather; ++pi) {
+    auto f0 = flatIndex(dom[pi], 0), f1 = flatIndex(dom[pi], 1), f7 = flatIndex(dom[pi], 7);
+    if (!f0 || !f1 || !f7 || *f0 != int64_t(pi) || *f7 - *f0 != 7 * (*f1 - *f0)) rowGather = false;
+    else if (!C) C = *f1 - *f0;
+    else if (*C != *f1 - *f0) rowGather = false;
+  }
+  // one element for the whole iteration space (the index depends on the
+  // scalar only): the scalar gather, its value in every element
+  bool uniform = true;
+  auto u0 = flatIndex(dom.front(), 0), u1 = flatIndex(dom.front(), 1);
+  for (size_t pi = 0; pi < dom.size() && uniform; ++pi)
+    uniform = u0 && u1 && flatIndex(dom[pi], 0) == u0 && flatIndex(dom[pi], 1) == u1;
+  if (uniform && *u0 == 0 && *u1 > 0) {
+    rowGather = true;
+    C = *u1;
+  } else {
+    uniform = false;
+  }
+  if (rowGather && C) {
+    r.kind = nloops == 0 || uniform ? "scalar" : "row";
+    r.rowElems = *C;
+    return r;
+  }
+  // a row of a packed weight: Wp[r / D, k, r % D] over the K points
+  const int64_t K = int64_t(dom.size());
+  bool packed = mt.getRank() == 3 && mt.getDimSize(1) == K && mt.getDimSize(2) == d && K % d == 0 &&
+                mt.getElementType().isInteger(8) && genericLoops == 1;
+  for (int64_t sv : {0, 1, 7, 8, 13, 21, 1000})
+    for (int64_t pi = 0; pi < K && packed; ++pi) {
+      auto f = flatIndex(dom[pi], sv);
+      packed = f && *f == (sv / d) * K * d + pi * d + sv % d;
+    }
+  if (!packed) return r.why = "gather index is not row * C + iteration index", r;
+  return r.kind = "packed", r;
+}
+
+std::optional<SmallVector<SmallVector<int64_t>>> gatherDomain(linalg::GenericOp g, const TargetConfig &cfg, int &nloops) {
+  auto iters = g.getIteratorTypesArray();
+  auto maps = g.getIndexingMapsArray();
+  nloops = int(iters.size());
+  SmallVector<int64_t> ranges(nloops, -1);
+  bool dyn = false;
+  for (int i = 0; i < int(g->getNumOperands()); ++i) {
+    auto mt = dyn_cast<MemRefType>(g->getOperand(i).getType());
+    if (!mt) continue;
+    for (unsigned r = 0; r < maps[i].getNumResults(); ++r) {
+      auto de = dyn_cast<AffineDimExpr>(maps[i].getResult(r));
+      if (!de) continue;
+      int L = int(de.getPosition());
+      if (!mt.isDynamicDim(r)) ranges[L] = mt.getDimSize(r);
+      else if (ranges[L] < 0) ranges[L] = cfg.maxDynamic, dyn = true;
+    }
+  }
+  for (int64_t r : ranges)
+    if (r < 0) return std::nullopt;
+  Block &b = g.getRegion().front();
+  bool noIndex = b.getOps<linalg::IndexOp>().empty();
+  bool red = llvm::any_of(iters, [](utils::IteratorType t) { return t == utils::IteratorType::reduction; });
+  bool allId = llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); });
+  if (nloops > 2) {                               // (as the lowering: one flat loop, else none with a gather)
+    if (!(allId && !red && noIndex) || dyn) return std::nullopt;
+    int64_t prod = 1;
+    for (int64_t r : ranges) prod *= r;
+    ranges = {prod};
+    nloops = 1;
+  }
+  if (nloops == 2 && allId && !red && noIndex && !dyn && ranges.back() % cfg.d) {
+    ranges = {ranges[0] * ranges[1]};
+    nloops = 1;
+  }
+  return points(ranges);
 }
 
 sahl::LoadOp loadInto(Value local) {

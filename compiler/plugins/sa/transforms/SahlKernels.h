@@ -7,6 +7,7 @@
 #define SA_TRANSFORMS_SAHLKERNELS_H_
 
 #include <optional>
+#include <string>
 
 #include "../target/Layout.h"
 #include "SaLin.h"
@@ -27,6 +28,29 @@ bool isF32Const(Value v, float want);
 // qllama.to_i8 = clamp(round(nan_to_num(x)), -127, 127).to(i8) ending in fptosi:
 // x and the chain's operations, consumers first (the fptosi last).
 Value matchToI8(arith::FPToSIOp f, SmallVectorImpl<Operation *> &chain);
+// Integer value of an index computation inside a linalg body at iteration
+// point idx, with the scalar block argument(s) = sym (C3's evalInt).
+std::optional<int64_t> evalInt(Value v, ArrayRef<int64_t> idx, int64_t sym);
+// Every point of an iteration space (row-major); none beyond 65536 points.
+SmallVector<SmallVector<int64_t>> points(ArrayRef<int64_t> ranges);
+
+// The form of a sahl.gather over the iteration points `dom` of its body
+// (nloops loops after the lowering's flattening; {{}} for none), the index
+// evaluated at every point with the i64 scalar at a few values:
+//   "row"     index = scalar * C + point: one row, a DMA from a PARAM address;
+//   "scalar"  index = scalar * C for every point: one element (LDPARAM, DYN_VE_A);
+//   "packed"  element k of row `scalar` of a packed weight Wp[r / D, k, r % D] (C6.0);
+//   "swap"    no scalar: the pair swap (point ^ 1) of a small tensor (RoPE).
+// kind empty: none of them (why).
+struct GatherForm {
+  std::string kind, why;
+  int64_t rowElems = 0;                          // row / scalar: C
+};
+GatherForm gatherForm(sahl::GatherOp ga, ArrayRef<SmallVector<int64_t>> dom, int nloops, bool hasScalar, int64_t d,
+                      int64_t genericLoops);
+// The iteration points of a generic with a gather, as the lowering flattens it
+// (nullopt: a form the lowering rejects anyway); nloops set.
+std::optional<SmallVector<SmallVector<int64_t>>> gatherDomain(linalg::GenericOp g, const TargetConfig &cfg, int &nloops);
 // The Lin of a dynamic size (a push constant, possibly through memref.dim of a binding).
 std::optional<Lin> dynLin(Value size);
 // The sahl.load that fills a local buffer (null if none).

@@ -1062,7 +1062,14 @@ C5.5 的模型（§8.9 的第一步）：
   - `sa-to-sahl` 也有目标配置的 pass 选项（与 `sahl-to-sahw` 相同）；
   - `sahl-to-sahw` 不再自己在整个函数里找内核，只从每个 `sahl.kernel` 的锚点得到计划；
   - 结果：用哪个微内核、哪些操作一起降级，在 IR 上可见（例如同一个 W13 默认是 `"linear"`，`ukernels=none` 时是 `"contraction"`）；黄金语料逐字节相同；新 lit 测试 `sahl_kernels.mlir`；`SahlToSahw.cpp` 3052 → 2579 行。
-- **R1b**：逐元素运算的分类（纯逐元素、按行归约、带 gather、i64 标量）成为 `sahl.elementwise`、`sahl.reduce`、`sahl.gather`、`sahl.scalar`，`generic()` 按操作种类拆开。
+- **R1b 运算体里的模式（完成，2026-09-29）**：
+  - 逐元素运算与归约继续用 `linalg.generic` 表示：它本身就是 §8.3 设想的“带 region 与 indexing map 的逐元素操作”，另造 `sahl.elementwise` 只是换名。真正需要变成显式的，是降级在运算体里做的两类模式判断：
+  - **`sahl.to_i8`**：`qllama.to_i8` 的整条链（NaN、±inf、舍入、截断、fptosi，12 个操作）在 `sa-to-sahl` 里换成一个操作，降级直接当作 VE 的 int8 输出转换；
+  - **`sahl.gather "row" | "scalar" | "packed" | "swap"`**：运算体里的 memref.load 换成带种类的 gather。种类由共享的 `gatherForm`（`SahlKernels.cpp`）在 `sa-to-sahl` 里按降级将用的迭代空间决定；降级按种类生成命令，并核对自己的迭代空间得到同样的种类，不一致就报错；
+  - 语料中：gather 整行 70、单个标量 63、打包的行 60、成对交换 118；to_i8 1148；内核 linear 59、attention 60、contraction 179（按每个 dispatch 的函数计）；
+  - 黄金语料逐字节相同；新 lit 测试 `sahl_gather.mlir`，`sa_to_sahl.mlir` 加了 to_i8。
+  - **为保持字节不变留下的一处**：平坦分片的容量估计（`pieceWords`）原来按运算体的操作数计，`sahl.to_i8` 仍按它替换的 12 个操作计。按 1 个计会让 2 个 dispatch 不再分片（描述符变小，可能是改进），留给 R4 的内存规划一起处理。
+  - **没有做成操作的**：形状的归一化（多层循环压平、按行合并、动态长度逐行）属于 R3 的分块；i64 标量的 `x + c` 仍是一个 generic（只有位置计算用到，价值小）。
 - **R1c**：scatter → `sahl.scatter`；relayout（转置、DIV-D 复制、打包成广播字）作为显式操作。
 
 **顺序与依赖**：R0 → R1 → R2 → R3 → R4 → R5 → R6，每步单独提交。R1 是最大的一步（识别逻辑全部搬家）；R3 与 R4 是 C6.5（T 分块注意力）与代价模型的前提。
@@ -1104,7 +1111,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
-| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**进行中**（R0、R1a 完成） | 大 |
+| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**进行中**（R0、R1a、R1b 完成） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。

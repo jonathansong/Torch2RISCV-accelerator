@@ -41,56 +41,6 @@ namespace {
 using ::sa::VType;
 constexpr float NEG0 = -0.0f;
 
-// Integer value of an index computation inside a linalg body at iteration
-// point idx, with the scalar block argument(s) = sym (C3's evalInt).
-std::optional<int64_t> evalInt(Value v, ArrayRef<int64_t> idx, int64_t sym) {
-  if (auto c = getConstantIntValue(v)) return *c;
-  if (isa<BlockArgument>(v)) return sym;
-  Operation *op = v.getDefiningOp();
-  if (!op) return std::nullopt;
-  if (auto ix = dyn_cast<linalg::IndexOp>(op)) return idx[ix.getDim()];
-  if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(op))
-    return evalInt(op->getOperand(0), idx, sym);
-  if (op->getNumOperands() != 2) return std::nullopt;
-  auto a = evalInt(op->getOperand(0), idx, sym), b = evalInt(op->getOperand(1), idx, sym);
-  if (!a || !b) return std::nullopt;
-  if (isa<arith::AddIOp>(op)) return *a + *b;
-  if (isa<arith::SubIOp>(op)) return *a - *b;
-  if (isa<arith::MulIOp>(op)) return *a * *b;
-  if (isa<arith::DivSIOp>(op)) return *b ? std::optional<int64_t>(*a / *b) : std::nullopt;
-  if (isa<arith::RemSIOp>(op)) return *b ? std::optional<int64_t>(*a % *b) : std::nullopt;
-  if (auto c = dyn_cast<arith::CmpIOp>(op)) {
-    switch (c.getPredicate()) {
-    case arith::CmpIPredicate::eq: return *a == *b;
-    case arith::CmpIPredicate::ne: return *a != *b;
-    case arith::CmpIPredicate::slt: return *a < *b;
-    case arith::CmpIPredicate::sle: return *a <= *b;
-    case arith::CmpIPredicate::sgt: return *a > *b;
-    case arith::CmpIPredicate::sge: return *a >= *b;
-    default: return std::nullopt;
-    }
-  }
-  return std::nullopt;
-}
-
-// Every point of an iteration space (row-major).
-SmallVector<SmallVector<int64_t>> points(ArrayRef<int64_t> ranges) {
-  SmallVector<SmallVector<int64_t>> out;
-  int64_t n = 1;
-  for (int64_t r : ranges) n *= r;
-  if (n > 65536) return out;
-  for (int64_t e = 0; e < n; ++e) {
-    SmallVector<int64_t> p(ranges.size());
-    int64_t x = e;
-    for (int i = int(ranges.size()) - 1; i >= 0; --i) {
-      p[i] = x % ranges[i];
-      x /= ranges[i];
-    }
-    out.push_back(p);
-  }
-  return out;
-}
-
 std::optional<VType> vtOf(Type t) {
   if (t.isF32()) return ::sa::VT_F32;
   if (t.isInteger(32)) return ::sa::VT_I32;
@@ -257,7 +207,7 @@ public:
         if (!shapeOk(fl.getDpsInits()[0])) return std::nullopt;
       } else if (auto g = dyn_cast<linalg::GenericOp>(&op)) {
         Block &b = g.getRegion().front();
-        if (!b.getOps<linalg::IndexOp>().empty() || !b.getOps<memref::LoadOp>().empty()) return std::nullopt;
+        if (!b.getOps<linalg::IndexOp>().empty() || !b.getOps<sahl::GatherOp>().empty()) return std::nullopt;
         auto iters = g.getIteratorTypesArray();
         auto maps = g.getIndexingMapsArray();
         if (iters.size() == 2) {
@@ -330,7 +280,7 @@ public:
         if (!size(st.getSrc(), true) || !size(st.getDst(), true)) return std::nullopt;
       } else if (auto g = dyn_cast<linalg::GenericOp>(&op)) {
         if (!g.getRegion().front().getOps<linalg::IndexOp>().empty() ||
-            !g.getRegion().front().getOps<memref::LoadOp>().empty())
+            !g.getRegion().front().getOps<sahl::GatherOp>().empty())
           return std::nullopt;
         if (g.getNumReductionLoops()) {
           // a max of the whole vector into a scalar (the pieces' maxima combine in any order)
@@ -778,21 +728,11 @@ private:
   // K scalars packed into K / D words. r / D and r % D come from the VE
   // (exact in fp32: round(r / D - (D - 1) / 2D)), through the result's DDR
   // (overwritten by the result later) into PARAMs.
-  template <typename FlatIndex>
-  std::optional<Val> packedRowGather(linalg::GenericOp g, memref::LoadOp ld, MemRefType mt,
-                                     ArrayRef<SmallVector<int64_t>> dom, int scalarArgNo, FlatIndex flatIndex) {
-    const int64_t K = int64_t(dom.size());
-    bool packed = mt.getRank() == 3 && mt.getDimSize(1) == K && mt.getDimSize(2) == d && K % d == 0 &&
-                  mt.getElementType().isInteger(8) && g.getNumLoops() == 1;
-    for (int64_t sv : {0, 1, 7, 8, 13, 21, 1000})
-      for (int64_t pi = 0; pi < K && packed; ++pi) {
-        auto f = flatIndex(dom[pi], sv);
-        packed = f && *f == (sv / d) * K * d + pi * d + sv % d;
-      }
-    if (!packed) return fail("gather index is not row * C + iteration index"), std::nullopt;
+  // (the index pattern is checked by gatherForm)
+  std::optional<Val> packedRowGather(linalg::GenericOp g, sahl::GatherOp ga, int64_t K, int scalarArgNo) {
     if (K * d > 65535) return fail("packed gather: a tile beyond one DMA row / LDPARAM factor"), std::nullopt;
     auto sym = ddrOf(g.getDpsInputs()[scalarArgNo]);
-    auto src = ddrOf(ld.getMemRef());
+    auto src = ddrOf(ga.getSource());
     std::optional<Ddr> yd;
     for (Operation *u : g.getDpsInits()[0].getUsers())
       if (auto st = dyn_cast<sahl::StoreOp>(u); st && st.getSrc() == g.getDpsInits()[0]) yd = ddrOf(st.getDst());
@@ -1786,7 +1726,7 @@ private:
         AffineExpr r0 = getAffineDimExpr(0, ctx), r1 = getAffineDimExpr(1, ctx);
         bool ok = false;
         for (split = nloops - 1; split >= 1 && !ok; --split) {
-          ok = g.getRegion().front().getOps<memref::LoadOp>().empty();
+          ok = g.getRegion().front().getOps<sahl::GatherOp>().empty();
           // indices: only of the last loop (it stays the last)
           for (linalg::IndexOp ix : g.getRegion().front().getOps<linalg::IndexOp>())
             ok &= int(ix.getDim()) == nloops - 1 && split == nloops - 1;
@@ -1988,78 +1928,38 @@ private:
     };
     SmallVector<Operation *> skip;
 
-    // gathers: memref.load of a buffer captured from outside the body, the
-    // index evaluated at every point of the (small) iteration space
+    // gathers (sahl.gather: sa-to-sahl chose the form, gatherForm; checked
+    // here against the iteration space this lowering uses)
     auto domain = points(ranges);
     if (domain.size() > 65536) domain.clear();          // (prefill: M rows of a table)
-    for (memref::LoadOp ld : body.getOps<memref::LoadOp>()) {
-      Value t = ld.getMemRef();
+    for (sahl::GatherOp ga : body.getOps<sahl::GatherOp>()) {
+      Value t = ga.getSource();
       auto mt = cast<MemRefType>(t.getType());
-      SmallVector<int64_t> strides;
-      int64_t offset;
-      if (!mt.hasStaticShape() || failed(mt.getStridesAndOffset(strides, offset))) return fail("gather source layout");
-      if (domain.empty() && nloops) return fail("gather over a large iteration space");
       SmallVector<SmallVector<int64_t>> dom = nloops ? domain : SmallVector<SmallVector<int64_t>>{{}};
-      auto flatIndex = [&](ArrayRef<int64_t> pt, int64_t sym) -> std::optional<int64_t> {
-        int64_t f = 0;
-        for (unsigned i = 0; i < ld.getIndices().size(); ++i) {
-          auto v = evalInt(ld.getIndices()[i], pt, sym);
-          if (!v) return std::nullopt;
-          f += *v * strides[i];
-        }
-        return f;
-      };
-      bool usesSym = false;
-      for (Value iv : ld.getIndices()) {
-        std::function<bool(Value)> hasArg = [&](Value v) -> bool {
-          if (isa<BlockArgument>(v)) return true;
-          Operation *o = v.getDefiningOp();
-          if (!o || o->getBlock() != &body) return false;
-          return llvm::any_of(o->getOperands(), hasArg);
-        };
-        usesSym |= hasArg(iv);
-      }
+      GatherForm gf = gatherForm(ga, dom, nloops, scalarArgNo >= 0, d, g.getNumLoops());
+      if (gf.kind.empty()) return fail(gf.why);
+      if (gf.kind != ga.getKind()) return fail("gather: sa-to-sahl chose " + ga.getKind().str() + ", the lowering " + gf.kind);
       Type et = mt.getElementType();
       auto vt = vtOf(et);
       uint32_t es = esize(et);
       if (!vt) return fail("gather element type");
       Val e;
-      if (usesSym) {
-        if (scalarArgNo < 0) return fail("gather index from a non-scalar input");
-        std::optional<int64_t> C;
-        bool rowGather = true;
-        for (size_t pi = 0; pi < dom.size() && rowGather; ++pi) {
-          auto f0 = flatIndex(dom[pi], 0), f1 = flatIndex(dom[pi], 1), f7 = flatIndex(dom[pi], 7);
-          if (!f0 || !f1 || !f7 || *f0 != int64_t(pi) || *f7 - *f0 != 7 * (*f1 - *f0)) rowGather = false;
-          else if (!C) C = *f1 - *f0;
-          else if (*C != *f1 - *f0) rowGather = false;
-        }
-        // one element for the whole iteration space (the index depends on the
-        // scalar only): the scalar gather, its value in every element
-        bool uniform = !dom.empty();
-        auto u0 = flatIndex(dom.front(), 0), u1 = flatIndex(dom.front(), 1);
-        for (size_t pi = 0; pi < dom.size() && uniform; ++pi)
-          uniform = u0 && u1 && flatIndex(dom[pi], 0) == u0 && flatIndex(dom[pi], 1) == u1;
-        if (uniform && *u0 == 0 && *u1 > 0) {
-          rowGather = true;
-          C = *u1;
-        } else {
-          uniform = false;
-        }
-        if (!rowGather || !C) {
-          auto pe = packedRowGather(g, ld, mt, dom, scalarArgNo, flatIndex);
-          if (!pe) return false;
-          vals[ld.getResult()] = *pe;
-          skip.push_back(ld);
-          continue;
-        }
+      if (gf.kind == "packed") {
+        auto pe = packedRowGather(g, ga, int64_t(dom.size()), scalarArgNo);
+        if (!pe) return false;
+        vals[ga.getResult()] = *pe;
+        skip.push_back(ga);
+        continue;
+      }
+      if (gf.kind == "row" || gf.kind == "scalar") {
+        const int64_t C = gf.rowElems;
         auto sym = ddrOf(g.getDpsInputs()[scalarArgNo]);
         auto src = ddrOf(t);
         if (!sym || !src) return fail("gather through buffers not in DDR");
         Value p = privateParam();
-        if (*C * es > 0xFFFF) return fail("gather row larger than 64 KB");
-        sahw::LdParamOp::create(bb, loc, sym->base, p, sym->off, *C * es, 0, ValueRange{});
-        if (nloops == 0 || uniform) {
+        if (C * es > 0xFFFF) return fail("gather row larger than 64 KB");
+        sahw::LdParamOp::create(bb, loc, sym->base, p, sym->off, C * es, 0, ValueRange{});
+        if (gf.kind == "scalar") {
           // one element: its bits into a PARAM, then a word of it (1.0 * v + -0 = v exactly)
           if (*vt != ::sa::VT_F32) return fail("scalar gather of a non-fp32 value");
           Value p2 = privateParam();
@@ -2077,7 +1977,7 @@ private:
         } else {
           LocalBuf row = newLocal(*vt, int64_t(dom.size()));
           uint32_t bytes = uint32_t((dom.size() * es + 7) / 8 * 8);
-          if (src->off % 8 || (*C * es) % 8) return fail("gathered rows not 8-byte aligned");
+          if (src->off % 8 || (C * es) % 8) return fail("gathered rows not 8-byte aligned");
           auto l = sahw::LdOp::create(bb, loc, src->base, src->off, int64_t(row.la), 1, int64_t(bytes),
                                       int64_t(bytes), 0, ValueRange{p});
           l.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
@@ -2086,21 +1986,14 @@ private:
           e.o = {row.la, *vt, ::sa::IDX_LIN, 0};
           e.fresh = true;
         }
-      } else {
-        // a fixed permutation of a small tensor: the pair swap
-        bool swap = !dom.empty();
-        for (size_t pi = 0; pi < dom.size() && swap; ++pi) {
-          auto f = flatIndex(dom[pi], 0);
-          if (!f || *f != int64_t(pi ^ 1)) swap = false;
-        }
-        if (!swap) return fail("gather with a fixed index pattern other than the pair swap");
+      } else {                                           // "swap": the pair swap of a small tensor
         auto l = materialize(t);
         if (!l) return false;
         e.kind = Val::SwapSrc;
         e.o = {l->la, l->vt, ::sa::IDX_LIN, 0};
       }
-      vals[ld.getResult()] = e;
-      skip.push_back(ld);
+      vals[ga.getResult()] = e;
+      skip.push_back(ga);
     }
 
     // a new fp32 value: of the whole iteration space, or computed once per
