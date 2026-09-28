@@ -351,3 +351,68 @@ class QModel(torch.nn.Module):
             x = x + qlinear(hq, s_h, self.w2[l], self.s_w2[l])
         xq, s_x = quant_act(self.rmsnorm(x, self.rms_final))
         return qlinear(xq, s_x, self.cls_q, self.cls_s)
+
+    # ------------------------------------------------------------ prefill (plan §8.13)
+    def attention_rows(self, l, q, T, posv):
+        """attention of M rows q (M, q_dim) at positions posv (M,): row m sees the
+        positions <= posv[m] (the per-row causal mask); each row as in attention()."""
+        c = self.cfg
+        Hk, hs, G = c.kv_heads, c.head_size, c.heads // c.kv_heads
+        M = q.shape[0]
+        r0 = l * c.seq_len
+        kh = self.kc[r0:r0 + T].to(torch.int32).reshape(T, Hk, hs).permute(1, 2, 0)   # (Hk, hs, T)
+        vh = self.vc[r0:r0 + T].to(torch.int32).reshape(T, Hk, hs).permute(1, 0, 2)   # (Hk, T, hs)
+        qq, s_q = quant_act(q.reshape(M, Hk, G, hs))                                  # (M, Hk, G, hs), (M, Hk, G, 1)
+        qq = qq.permute(1, 0, 2, 3).reshape(Hk, M * G, hs)
+        s_q = s_q.permute(1, 0, 2, 3).reshape(Hk, M * G, 1)
+        sc = torch.matmul(qq.to(torch.int32), kh)                                    # (Hk, M*G, T) int32
+        sc = (sc.to(F32) * s_q) * self.a_k[l]
+        mask = torch.arange(T)[None, :] <= posv.repeat_interleave(G)[:, None]        # (M*G, T)
+        m = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
+        e = torch.where(mask, sfu_exp(sc - m), torch.tensor(0.0))
+        r = sfu_recip(torch.sum(e, dim=-1, keepdim=True))
+        pq = to_i8((e * r) * 127.0).to(torch.int32)                                 # (Hk, M*G, T)
+        att = torch.matmul(pq, vh)                                                   # (Hk, M*G, hs) int32
+        att = (att.to(F32) * self.a_v[l]).reshape(Hk, M, G, hs).permute(1, 0, 2, 3)
+        return att.reshape(M, c.q_dim)
+
+    def prefill(self, tokens, start, valid):
+        """A chunk of M prompt tokens at positions start .. start + M - 1 (start: [1]):
+        their KV rows written, the logits of the last one returned. valid[T] only
+        carries the padded attention length (T >= start + M). Each row is computed
+        as forward() computes a decode step. A prompt of P >= M tokens runs in
+        chunks at 0, M, 2M, ... and a last one at P - M (it recomputes rows of the
+        one before: the same KV values), so the last row is always the prompt's
+        last token; a shorter prompt runs as decode steps."""
+        c = self.cfg
+        M, T, hs = tokens.shape[0], valid.shape[0], c.head_size
+        posv = start + torch.arange(M)                                               # (M,)
+        x = self.emb_q.index_select(0, tokens).to(F32) * self.emb_s.index_select(0, tokens).unsqueeze(-1)
+        cos = self.rope_cos.index_select(0, posv).unsqueeze(1)                       # (M, 1, hs)
+        sin = self.rope_sin.index_select(0, posv).unsqueeze(1)
+        rope = lambda v: v * cos + swapneg(v) * sin
+        for l in range(c.layers):
+            xq, s_x = quant_act(self.rmsnorm(x, self.rms_att[l]))
+            qkv = qlinear(xq, s_x, self.wqkv[l], self.s_wqkv[l])                     # (M, q + 2 kv)
+            q = qkv[:, :c.q_dim].reshape(M, c.heads, hs)
+            k = qkv[:, c.q_dim:c.q_dim + c.kv_dim].reshape(M, c.kv_heads, hs)
+            v = qkv[:, c.q_dim + c.kv_dim:]
+            if c.qk_norm:
+                q = self.rmsnorm(q, self.q_norm[l])
+                k = self.rmsnorm(k, self.k_norm[l])
+            q = rope(q).reshape(M, -1)
+            k = rope(k).reshape(M, -1)
+            rows = posv + l * c.seq_len
+            self.kc.index_copy_(0, rows, to_i8(k * self.inv_sk[l]))
+            self.vc.index_copy_(0, rows, to_i8(v * self.inv_sv[l]))
+            att = self.attention_rows(l, q, T, posv)
+            aq, s_a = quant_act(att)
+            x = x + qlinear(aq, s_a, self.wo[l], self.s_wo[l])
+            xq, s_x = quant_act(self.rmsnorm(x, self.rms_ffn[l]))
+            h13 = qlinear(xq, s_x, self.w13[l], self.s_w13[l])
+            h1, h3 = h13[:, :c.hidden], h13[:, c.hidden:]
+            u = (h1 * sfu_recip(1.0 + sfu_exp(h1 * -1.0))) * h3
+            hq, s_h = quant_act(u)
+            x = x + qlinear(hq, s_h, self.w2[l], self.s_w2[l])
+        xq, s_x = quant_act(self.rmsnorm(x[M - 1], self.rms_final))
+        return qlinear(xq, s_x, self.cls_q, self.cls_s)

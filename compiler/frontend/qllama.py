@@ -211,6 +211,59 @@ class QLlama(torch.nn.Module):
         xq, s_x = quant_act(self.rmsnorm(x, self.rms_final))
         return qlinear(xq, s_x, self.cls_q, self.cls_s)
 
+    # ------------------------------------------------------------ prefill (plan §8.13)
+    def attention_rows(self, l, q, T, posv):
+        """attention of M rows q (M, dim) at positions posv (M,): row m sees the
+        positions <= posv[m]; each row as attention() computes it."""
+        c = self.cfg
+        H, hs = c.heads, c.head_size
+        M = q.shape[0]
+        r0 = l * c.seq_len
+        kh = self.kc[r0:r0 + T].to(torch.int32).reshape(T, H, hs).permute(1, 2, 0)    # (H, hs, T)
+        vh = self.vc[r0:r0 + T].to(torch.int32).reshape(T, H, hs).permute(1, 0, 2)    # (H, T, hs)
+        qq, s_q = quant_act(q.reshape(M, H, hs))                                      # (M, H, hs), (M, H, 1)
+        sc = torch.matmul(qq.permute(1, 0, 2).to(torch.int32), kh)                    # (H, M, T) int32
+        sc = (sc.to(F32) * s_q.permute(1, 0, 2)) * self.a_k[l]
+        mask = torch.arange(T)[None, :] <= posv[:, None]                             # (M, T)
+        m = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
+        e = torch.where(mask, torch.exp(sc - m), torch.tensor(0.0))
+        r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
+        pq = to_i8((e * r) * 127.0).to(torch.int32)                                 # (H, M, T)
+        att = torch.matmul(pq, vh)                                                   # (H, M, hs) int32
+        return (att.to(F32) * self.a_v[l]).permute(1, 0, 2).reshape(M, c.dim)
+
+    def prefill(self, tokens, start, valid):
+        """A chunk of M prompt tokens at positions start .. start + M - 1 (start: [1]):
+        their KV rows written, the logits of the last one returned; valid[T] only
+        carries the padded attention length. Each row as forward() computes a
+        decode step (chunking: compiler/frontend/export.py prefill_starts)."""
+        c = self.cfg
+        M, T = tokens.shape[0], valid.shape[0]
+        posv = start + torch.arange(M)
+        x = self.emb_q.index_select(0, tokens).to(F32) * self.emb_s.index_select(0, tokens).unsqueeze(-1)
+        cos = self.rope_cos.index_select(0, posv)                                    # (M, dim)
+        sin = self.rope_sin.index_select(0, posv)
+        for l in range(c.layers):
+            xq, s_x = quant_act(self.rmsnorm(x, self.rms_att[l]))
+            qkv = qlinear(xq, s_x, self.wqkv[l], self.s_wqkv[l])
+            q = self.rope(qkv[:, :c.dim], cos, sin)
+            k = self.rope(qkv[:, c.dim:c.dim + c.kv_dim], cos, sin)
+            v = qkv[:, c.dim + c.kv_dim:]
+            rows = posv + l * c.seq_len
+            self.kc.index_copy_(0, rows, to_i8(k * self.inv_sk[l]))
+            self.vc.index_copy_(0, rows, to_i8(v * self.inv_sv[l]))
+            att = self.attention_rows(l, q, T, posv)
+            aq, s_a = quant_act(att)
+            x = x + qlinear(aq, s_a, self.wo[l], self.s_wo[l])
+            xq, s_x = quant_act(self.rmsnorm(x, self.rms_ffn[l]))
+            h13 = qlinear(xq, s_x, self.w13[l], self.s_w13[l])
+            h1, h3 = h13[:, :c.hidden], h13[:, c.hidden:]
+            u = (h1 * torch.reciprocal(1.0 + torch.exp(h1 * -1.0))) * h3
+            hq, s_h = quant_act(u)
+            x = x + qlinear(hq, s_h, self.w2[l], self.s_w2[l])
+        xq, s_x = quant_act(self.rmsnorm(x[M - 1], self.rms_final))
+        return qlinear(xq, s_x, self.cls_q, self.cls_s)
+
 
 def step_inputs(token, pos, d, static_len=None):
     """(token, pos, valid) tensors of one decode step. static_len: valid has this

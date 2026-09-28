@@ -63,13 +63,44 @@ def load_model(args):
     return name, cfg, w, kv
 
 
-def export(m, cfg, d, out, static_len=None):
+def prefill_inputs(tokens, start, d):
+    """(tokens, start, valid) of a prefill chunk (plan §8.13): valid's length is
+    the chunk's end rounded up to D."""
+    n = start + len(tokens)
+    return torch.tensor(tokens), torch.tensor([start]), torch.zeros((n + d - 1) // d * d, dtype=torch.float32)
+
+
+def prefill_starts(P, M):
+    """Chunk starts of a P-token prompt (P >= M): 0, M, 2M, ... and P - M last
+    (it recomputes rows of the one before, so its last row is the prompt's last)."""
+    return list(range(0, P - M, M)) + [P - M]
+
+
+def export(m, cfg, d, out, static_len=None, prefill=0):
     """static_len: attention over a fixed number of positions (valid[static_len],
-    masked by pos) instead of a dynamic T; the sa backend's form."""
+    masked by pos) instead of a dynamic T; the sa backend's form. prefill = M:
+    also prefill(tokens[M], start, valid[T]) (m.prefill), sharing the parameters
+    and the KV cache with main (decode)."""
     import iree.turbine.aot as aot
     aot.externalize_module_parameters(m, external_scope="model")
     t0 = time.time()
-    if static_len:
+    if prefill:
+        fxb = aot.FxProgramsBuilder(m)
+        T = torch.export.Dim("T", min=1, max=cfg.seq_len)
+        T2 = torch.export.Dim("T2", min=1, max=cfg.seq_len)
+
+        @fxb.export_program(name="main", args=Q.step_inputs(1, 0, d),
+                            dynamic_shapes={"token": None, "pos": None, "valid": {0: T}}, strict=False)
+        def _decode(module, token, pos, valid):
+            return module(token, pos, valid)
+
+        @fxb.export_program(name="prefill", args=prefill_inputs([1] * prefill, 0, d),
+                            dynamic_shapes={"tokens": None, "start": None, "valid": {0: T2}}, strict=False)
+        def _prefill(module, tokens, start, valid):
+            return module.prefill(tokens, start, valid)
+
+        exp = aot.export(fxb)
+    elif static_len:
         exp = aot.export(m, args=Q.step_inputs(1, 0, d, static_len))
     else:
         T = torch.export.Dim("T", min=1, max=cfg.seq_len)
@@ -117,6 +148,42 @@ class IreeModel:
 
     def __call__(self, token, pos, valid):
         return self.main.main(token.numpy(), pos.numpy(), valid.numpy()).to_host()
+
+    def prefill(self, tokens, start, valid):
+        return self.main.prefill(tokens.numpy(), start.numpy(), valid.numpy()).to_host()
+
+
+def check_prefill(vmfb, irpa, eager, prompt, M, d, step, gen=4):
+    """The prompt through prefill chunks and through decode steps, each on a fresh
+    module: the same last-position argmax, correlation >= 0.9999, the same greedy
+    tokens after it; eager prefill (eager: a fresh model) for reference
+    (correlation > 0.98, as decode). step(token, pos, d): decode inputs."""
+    P = len(prompt)
+    if P < M:
+        print(f"prefill: a prompt of {P} tokens is shorter than a chunk ({M})")
+        return False
+    t0 = time.time()
+    dec, pre, e = IreeModel(vmfb, irpa), IreeModel(vmfb, irpa), eager
+    with torch.no_grad():
+        for pos, t in enumerate(prompt):
+            last = dec(*step(t, pos, d))
+        for s in prefill_starts(P, M):
+            a = prefill_inputs(prompt[s:s + M], s, d)
+            got, ref = pre.prefill(*a), e.prefill(*a).numpy()
+        seqs = []
+        for model, first in ((pre, got), (dec, last)):
+            seq = [int(first.argmax())]
+            for i in range(gen):
+                seq.append(int(model(*step(seq[-1], P + i, d)).argmax()))
+            seqs.append(seq)
+    corr_d, corr_e = float(np.corrcoef(got, last)[0, 1]), float(np.corrcoef(got, ref)[0, 1])
+    exact = got.tobytes() == last.tobytes()
+    ok = got.argmax() == last.argmax() and corr_d >= 0.9999 and corr_e > 0.98 and seqs[0] == seqs[1]
+    print(f"prefill (M = {M}, chunks at {prefill_starts(P, M)}) in {time.time() - t0:.1f} s: last-position logits vs "
+          f"decode only: argmax {got.argmax()} / {last.argmax()}, correlation {corr_d:.6f}"
+          f"{' (bit-exact)' if exact else ''}; vs eager prefill {corr_e:.5f}; then {seqs[0]} "
+          f"({'=' if seqs[0] == seqs[1] else '!='} decode only)")
+    return bool(ok)
 
 
 def compare(name, cfg, w, kv, d, iree_model, tokens, static_len=None):
@@ -249,12 +316,13 @@ def main():
     ap.add_argument("--static-len", action="store_true",
                     help="attention over seq_len positions masked by pos (static shapes; the sa backend's form)")
     ap.add_argument("--armv7", action="store_true", help="also compile for the board and stage build/deploy_c0")
+    ap.add_argument("--prefill", type=int, default=0, help="also export prefill with chunks of this many tokens")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     name, cfg, w, kv = load_model(args)
     m = Q.QLlama(cfg, w, kv, args.d).eval()
     static_len = cfg.seq_len if args.static_len else None
-    mlir_path, irpa_path = export(m, cfg, args.d, args.out, static_len)
+    mlir_path, irpa_path = export(m, cfg, args.d, args.out, static_len, prefill=args.prefill)
     vmfb_path, disp = compile_host(mlir_path, args.out)
     rng = np.random.default_rng(5)
     if args.tiny:
@@ -264,6 +332,9 @@ def main():
         tok = Tokenizer(os.path.join(os.path.dirname(args.checkpoint), "tokenizer.bin"), cfg.vocab)
         tokens = tok.encode("Once upon a time, there was a little girl named Lily. She")[:args.tokens]
     ok = compare(name, cfg, w, kv, args.d, IreeModel(vmfb_path, irpa_path), tokens, static_len)
+    if args.prefill:
+        ok &= check_prefill(vmfb_path, irpa_path, Q.QLlama(cfg, w, kv, args.d).eval(), tokens, args.prefill,
+                            args.d, Q.step_inputs)
     inventory(disp, args.out)
     if args.armv7:
         board_bundle(mlir_path, irpa_path, vmfb_path, cfg, args.d, args.out, os.path.join(REPO, "build", "deploy_c0"))

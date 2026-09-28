@@ -902,7 +902,24 @@ C5.5 的模型（§8.9 的第一步）：
 - sim 端到端：第一步相对误差 2.1e-6，argmax 8/8 与 eager 模型（设备 SFU）相同，最小相关 0.9937，生成 “Once upon a time, there was a man”；设备内存峰值 587.4 MB（窗口 768 MB），sim 24 s / token。
 - 测试的内存：oracle 原来一次性在整个迭代空间上求值，分类层（155M 点）的检查要 5 GB 以上，桌面的 systemd-oomd 在会话内存压力超过 50% 时连终端一起杀掉（此前几次“终端退出”都是它）；oracle 改为按最外层并行循环分片求值（归约的顺序不变），降到 2 GB；`run_tests.sh -m` 给每个测试一个有内存上限的 systemd scope。
 
-**顺序**：C6.0 → C6.1 → C6.2 → C6.4 → C6.5，C6.7 视需要。C6.0–C6.2 只需 Qwen3、不需要新的代码生成，最快看到完整大模型的结果；C6.5 是剩下唯一的编译器新功能。Python 的 funcsim 每 token 的耗时与模型大小成正比（Qwen3-0.6B 估计约 40 s，Llama-1B 约 80 s），端到端只跑几步还可以接受，C 版 funcsim 等确实太慢再做。
+**顺序**：C6.0 → C6.1 → **C6.P（prefill，§8.13，提前做：先完整编译一个 LLM）** → C6.2 → C6.4 → C6.5。C6.0–C6.2 只需 Qwen3、不需要新的代码生成，最快看到完整大模型的结果；C6.5 是剩下唯一的编译器新功能。Python 的 funcsim 每 token 的耗时与模型大小成正比（Qwen3-0.6B 估计约 40 s，Llama-1B 约 80 s），端到端只跑几步还可以接受，C 版 funcsim 等确实太慢再做。
+
+### 8.13 C6.P prefill：完整编译一个 LLM（prefill + decode）
+
+**目标**：一个模块里有 prefill 与 decode 两个函数，共用参数与 KV cache；prompt 按块做 prefill（权重读一次服务 M 个 token，D×D 阵列用满），之后逐 token decode。原计划的可选项（§8.9 第 6 项、C6.7），提到 C6.2 之前做。
+
+**设计**：
+- **固定块长 M**（导出参数，默认 16）：长度 P 的 prompt 分 ⌈P / M⌉ 块，最后一块用填充 token 补齐；填充行写的 KV 在位置 ≥ P，decode 在读之前会覆盖、注意力也按位置屏蔽，所以无害。这样 T 仍是唯一的动态维（不碰“每条描述符最多 2 个动态字段”）。
+- `prefill(tokens[M], start, valid[T])`：第 i 行的因果掩码是位置 ≤ start + i；一次写 M 行 KV；只算最后一行的 logits（分类层是最大的一层）。两个函数用 iree-turbine 的 `CompiledModule` 导出，KV cache 是共享的可变全局量。
+- **验收的主要依据**：设备上 prefill 最后一个位置的 logits 与只用 decode 的路径逐位一致（线性层每行的运算相同：int32 累加精确、反量化逐元素；注意力在 T 的填充相同时求和顺序相同）。
+
+| 步骤 | 内容 | 验收 |
+|---|---|---|
+| **P0 前端** | QModel 加 `prefill`（逐行因果掩码、M 行 KV、只输出最后一行的 logits）；`prefill`、`decode` 两个函数导出成一个模块 | eager 的 prefill + decode 与只用 decode 生成的 token 相同；IREE llvm-cpu 与 eager 一致 |
+| **P1 线性层** | 打包 pass 也认 matmul（打包的权重与 decode 共用，C6.0 的“只打包一次”）；A 条带由 X 的 M 行经 TRANSPOSE 得到；微内核与通用降级 | 逐 dispatch 逐位一致；每块 EX 的效率 |
+| **P2 注意力与其余** | M 行的分数 / P·V；softmax 的掩码按行（第 i 行有效长度 start + i + 1，LDPARAM 的加数）；RoPE 取 M 行；KV cache 一次写 M 行 | 逐 dispatch 逐位一致，T 扫描 |
+| **P3 运行时** | `sa-llm-run` 先分块 prefill 再 decode；`board_generate.py` 用它 | sim：与只用 decode 的 token 相同，最后位置的 logits 逐位一致 |
+| **P4 板上** | stories15M、SmolLM2；M = 8 / 16 / 32 对比 | 逐位一致；prompt 的 tok/s（预计比逐 token 快 5–10 倍） |
 
 ## 9. 验证体系
 
