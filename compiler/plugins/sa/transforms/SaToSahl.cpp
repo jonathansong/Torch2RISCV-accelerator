@@ -79,6 +79,14 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
       }
       auto dps = dyn_cast<DestinationStyleOpInterface>(op);
       if (!dps || !isa<linalg::LinalgOp>(op)) continue;
+      // attention: the batch matmul and the extension of its cache operand stay
+      // as they are (lowered together, reading the cache in DDR)
+      if (isa<linalg::BatchMatmulOp>(op)) continue;
+      if (auto g = dyn_cast<linalg::GenericOp>(op);
+          g && g.getNumDpsInits() == 1 && llvm::any_of(g.getDpsInits()[0].getUsers(), [](Operation *u) {
+            return isa<linalg::BatchMatmulOp>(u);
+          }))
+        continue;
       if (auto g = dyn_cast<linalg::GenericOp>(op); g && isIdentityCopy(g) && ddrRoot(g.getDpsInits()[0]) &&
                                                     !ddrRoot(g.getDpsInputs()[0])) {
         OpBuilder b(g);

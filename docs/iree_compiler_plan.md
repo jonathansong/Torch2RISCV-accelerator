@@ -729,6 +729,11 @@ C5.5 的模型（§8.9 的第一步）：
 - 降级：分块（块大小按 SPAD_B bank 与 ACC 暂存区，容量来自目标配置）；A 条带由 x 做 DIV-D 复制；第 i 块 EX 之后预取第 i+1 块的权重和尾部的逐块输入（另一个 bank）；尾部按块走 C5.1 的逐元素降级（任意逐元素运算，不再限于模板的几种形式），临时缓冲放在本块的 bank；块数多时用 LOOP_END 循环一对块；第 0 块权重放进前缀。
 - 结果：5 种线性层全部通过 `dispatch_check`；命令的种类、顺序与数量与模板相同（分类层的循环结构一致），差别只在尾部中间结果的位置、残差随下一块预取、寄存器编号。
 - 调试工具：`compiler/runtime/tools/sadis.py`（sa-desc 反汇编）。
+- 板上：逐 dispatch 周期与模板相同或略少（33：−1,071；22：−582，残差预取），整体 2,588,992 周期 / token。**C5.2 验收通过。**
+
+**C5.3（2026-09-28，待板上验收）**：注意力与 KV 写入走新流水线，stories15M 的 58 个可执行体全部由 C5 流水线生成（`--iree-sa-new-codegen=only` 可以编译）。
+- scatter（KV 写入）：LDPARAM（位置 × 行字节数）+ 带动态 DDR 地址的 ST；“把 cache 拷给自己”的写回在 `sa-to-sahl` 中删去；只有恒等映射的多层逐元素循环压平成一维。
+- 注意力：`sa-to-sahl` 保留 batch_matmul 与缓存切片的扩展 generic；`sahl-to-sahw` 把“扩展 + batch_matmul + 尾部 + 写回”作为一个结构，按 C3 的方式逐头降级（分数：K 行 → TRANSPOSE → Kᵀ 块、q 复制成 A 条带、EX、`×s_q[h]×a_k`；P·V：p 复制成 A 条带、V 按 INTERLEAVE 加载、EX、`×a_v`；T 动态）。这实际上是把注意力模板移植到了新流水线，C5.4 中成为 `attention` 微内核；batch_matmul 的通用降级（Kᵀ 布局由布局传播插入）暂缓。
 
 ### 8.8 扩展点与微内核
 

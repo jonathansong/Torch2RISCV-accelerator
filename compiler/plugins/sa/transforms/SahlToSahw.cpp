@@ -200,11 +200,16 @@ public:
     f.walk([&](linalg::GenericOp g) {
       if (g->getParentOp() == f.getOperation()) matchLinear(g);
     });
+    f.walk([&](linalg::BatchMatmulOp m) { matchAttention(m); });
     for (Operation &opRef : f.getBody().front()) {
       Operation *op = &opRef;
       loc = op->getLoc();
       if (auto it = linears.find(op); it != linears.end()) {
         if (!linear(it->second)) return false;
+        continue;
+      }
+      if (auto it = attns.find(op); it != attns.end()) {
+        if (!attention(it->second)) return false;
         continue;
       }
       if (owned.contains(op)) continue;
@@ -657,6 +662,248 @@ private:
                                  ValueRange{p});
     st.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
     st.setDynAdd(ArrayRef<bool>{true});
+    return err.empty();
+  }
+
+  // ------------------------------------------------------------ attention (C5.3)
+  // scores: bmm(ext(K^T), q) -> [H, T, 1], epilogue (f32(acc) * s_q[h]) * a_k;
+  // P V:    bmm(p, ext(V))   -> [H, 1, hs], epilogue f32(acc) * a_v;
+  // K / V: i8 [T, H, hs], a slice of the KV cache in DDR, through an extsi
+  // generic with map (t, h, j) -> (h, t, j). Per head, as C3 (compile_model.
+  // attention): K rows -> TRANSPOSE -> K^T tiles, or V rows loaded interleaved;
+  // q_h or p_h as a replicated int8 A strip; EX; one VE for the epilogue. T
+  // is dynamic (PARAMs from push constants).
+  struct AttnPlan {
+    linalg::BatchMatmulOp bmm;
+    bool scores = false;
+    Value cache;                                 // the cache view (DDR)
+    Lin T;                                       // its (dynamic) length
+    Value small;                                 // q [H, hs, 1] or p [H, 1, T] (DDR)
+    Value sq;                                    // scores: s_q [H] (DDR)
+    float scale = 0;
+    sahl::StoreOp store;
+    int64_t H = 0, hs = 0;
+  };
+  llvm::DenseMap<Operation *, AttnPlan> attns;
+
+  // the byte offset of a DDR view with static offsets from its binding subspan
+  std::optional<std::pair<Value, int64_t>> ddrStart(Value v, int64_t es) {
+    int64_t elem = 0;
+    Value cur = v;
+    while (auto s = cur.getDefiningOp<memref::SubViewOp>()) {
+      SmallVector<int64_t> ss;
+      int64_t so;
+      if (failed(s.getSourceType().getStridesAndOffset(ss, so))) return std::nullopt;
+      for (auto [o, str] : llvm::zip(s.getStaticOffsets(), ss)) {
+        if (ShapedType::isDynamic(o) || ShapedType::isDynamic(str)) return std::nullopt;
+        elem += o * str;
+      }
+      cur = s.getSource();
+    }
+    auto sub = cur.getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+    if (!sub) return std::nullopt;
+    Lin off{-1, 1, 0, 0};
+    if (Value o = sub.getByteOffset()) {
+      auto l = linOf(o);
+      if (!l) return std::nullopt;
+      off = *l;
+    }
+    return std::make_pair(baseFor(int(sub.getBinding().getZExtValue()), off), (off.isConst() ? off.add : 0) + elem * es);
+  }
+
+  bool matchAttention(linalg::BatchMatmulOp bmm) {
+    MLIRContext *ctx = bmm.getContext();
+    Value a = bmm.getDpsInputs()[0], b = bmm.getDpsInputs()[1];
+    AttnPlan p;
+    p.bmm = bmm;
+    p.scores = a.getDefiningOp<memref::AllocOp>() != nullptr;
+    Value ext = p.scores ? a : b;
+    p.small = p.scores ? b : a;
+    linalg::GenericOp eg;
+    for (Operation *u : ext.getUsers())
+      if (auto g = dyn_cast<linalg::GenericOp>(u); g && g.getDpsInits()[0] == ext) eg = g;
+    if (!eg || eg.getNumDpsInputs() != 1) return false;
+    AffineExpr t, h, j;
+    bindDims(ctx, t, h, j);
+    auto m = eg.getIndexingMapsArray();
+    if (m[0] != AffineMap::get(3, 0, {t, h, j}, ctx) || m[1] != AffineMap::get(3, 0, {h, t, j}, ctx)) return false;
+    p.cache = eg.getDpsInputs()[0];
+    auto ct = cast<MemRefType>(p.cache.getType());
+    if (ct.getRank() != 3 || !ct.getElementType().isInteger(8) || !ct.isDynamicDim(0) || ct.isDynamicDim(1) ||
+        ct.isDynamicDim(2))
+      return false;
+    auto sv = p.cache.getDefiningOp<memref::SubViewOp>();
+    if (!sv || sv.getSizes().size() != 1) return false;
+    auto tl = linOf(sv.getSizes()[0]);
+    if (!tl) return false;
+    p.T = *tl;
+    p.H = ct.getDimSize(1);
+    p.hs = ct.getDimSize(2);
+    if (!ddrRoot(p.small)) return false;
+    Value acc = bmm.getDpsInits()[0];
+    linalg::FillOp fill;
+    linalg::GenericOp epi;
+    for (Operation *u : acc.getUsers()) {
+      if (u == bmm.getOperation()) continue;
+      if (auto f = dyn_cast<linalg::FillOp>(u)) fill = f;
+      else if (auto g = dyn_cast<linalg::GenericOp>(u); g && !epi) epi = g;
+      else if (!isa<memref::DeallocOp>(u)) return false;
+    }
+    if (!fill || !epi || epi.getNumDpsInits() != 1) return false;
+    Block &body = epi.getRegion().front();
+    SmallVector<Operation *> ops;
+    for (Operation &o : body.without_terminator()) ops.push_back(&o);
+    SmallVector<Operation *> cover = {bmm, eg, fill, epi};
+    if (p.scores) {
+      if (ops.size() != 4 || !isa<arith::TruncIOp>(ops[0]) || !isa<arith::SIToFPOp>(ops[1]) ||
+          !isa<arith::MulFOp>(ops[2]) || !isa<arith::MulFOp>(ops[3]))
+        return false;
+      Value o2 = ops[2]->getOperand(0) == ops[1]->getResult(0) ? ops[2]->getOperand(1) : ops[2]->getOperand(0);
+      Value o3 = ops[3]->getOperand(0) == ops[2]->getResult(0) ? ops[3]->getOperand(1) : ops[3]->getOperand(0);
+      auto ba = dyn_cast<BlockArgument>(o2);
+      auto c = constF32(o3);
+      if (!ba || !c) return false;
+      Value sqLocal = epi.getDpsInputs()[ba.getArgNumber()];
+      auto maps = epi.getIndexingMapsArray();
+      if (maps[ba.getArgNumber()].getNumResults() != 1 || maps[ba.getArgNumber()].getResult(0) != getAffineDimExpr(0, ctx))
+        return false;
+      auto l = loadInto(sqLocal);
+      if (!l) return false;
+      p.sq = l.getSrc();
+      p.scale = *c;
+      cover.push_back(l);
+    } else {
+      if (ops.size() != 3 || !isa<arith::TruncIOp>(ops[0]) || !isa<arith::SIToFPOp>(ops[1]) ||
+          !isa<arith::MulFOp>(ops[2]))
+        return false;
+      Value o2 = ops[2]->getOperand(0) == ops[1]->getResult(0) ? ops[2]->getOperand(1) : ops[2]->getOperand(0);
+      auto c = constF32(o2);
+      if (!c) return false;
+      p.scale = *c;
+    }
+    Value out = epi.getDpsInits()[0];
+    for (Operation *u : out.getUsers())
+      if (auto s = dyn_cast<sahl::StoreOp>(u); s && s.getSrc() == out) p.store = s;
+    if (!p.store) return false;
+    cover.push_back(p.store);
+    for (Operation *o : cover) owned.insert(o);
+    attns[bmm.getOperation()] = p;
+    return true;
+  }
+
+  bool attention(AttnPlan &p) {
+    const int64_t H = p.H, hs = p.hs, T = cfg.maxDynamic;
+    if (T % d || hs % d) return fail("attention: T and head size must be multiples of D");
+    if (spadTop != 0) return fail("attention after other SPAD_A buffers");
+    int logd = int(std::log2(double(d)));
+    auto par = [&](int64_t mul, int shift) {
+      Lin l = p.T;
+      l.mul *= mul;
+      l.add *= mul;
+      l.shift += shift;
+      return paramFor(l);
+    };
+    auto cache = ddrStart(p.cache, 1);
+    auto yd = ddrStart(p.store.getDst(), 4);
+    if (!cache || !yd) return fail("attention: operands not in DDR");
+    const uint32_t hw = uint32_t(hs / d), tiles = uint32_t(T / d), sb = lay.sbank;
+    if (uint32_t(T) * hw > sb) return fail("attention: K rows do not fit a SPAD bank");
+    // SPAD_A: the A strip at 0, the raw K rows in bank 1; SPAD_B: K^T at 0, V in bank 1 (as C3)
+    const uint32_t strip = 0, kraw = sb, kt = 0, vb = sb;
+    spadTop = 2 * sb;
+    if (yd->second % 8 || cache->second % 8) return fail("unaligned attention operand");
+    auto dyn = [](auto op, SmallVector<std::pair<int32_t, Value>> f) {
+      SmallVector<Value> vs;
+      SmallVector<int32_t> fs;
+      SmallVector<bool> as;
+      for (auto &[field, v] : f) vs.push_back(v), fs.push_back(field), as.push_back(false);
+      op.getDynMutable().assign(vs);
+      op.setDynFields(fs);
+      op.setDynAdd(as);
+    };
+    auto word = [](uint32_t la) { return int64_t(la & 0xFFFFFFF); };
+    if (p.scores) {
+      auto q = ddrOf(p.small);
+      auto sqr = ddrOf(p.sq);
+      if (!q || !sqr) return false;
+      LocalBuf sqRaw = newLocal(::sa::VT_F32, H);
+      sahw::LdOp::create(bb, loc, sqr->base, sqr->off, int64_t(sqRaw.la), 1, int64_t((H * 4 + 7) / 8 * 8),
+                         int64_t((H * 4 + 7) / 8 * 8), 0, ValueRange{});
+      auto sq = perElementBcast(p.sq, sqRaw, H);
+      if (!sq) return false;
+      Value pT = par(1, 0), pThs = par(hs, 0), pTiles = par(1, logd);
+      LocalBuf srcw = newLocal(::sa::VT_I32, hs);
+      LocalBuf c = newLocal(::sa::VT_I32, int64_t(d) * tiles * d);
+      LocalBuf res = newLocal(::sa::VT_F32, int64_t(tiles) * H * d);
+      for (int64_t h = 0; h < H; ++h) {
+        auto l = sahw::LdOp::create(bb, loc, cache->first, cache->second + h * hs,
+                                    int64_t(::sa::laddr(::sa::MEM_SPAD_A, kraw)), T, hs, H * hs, 0, ValueRange{});
+        dyn(l, {{::sa::DYN_DMA_ROWS, pT}});
+        auto tr = sahw::TransposeOp::create(bb, loc, int64_t(::sa::laddr(::sa::MEM_SPAD_A, kraw)),
+                                            int64_t(::sa::laddr(::sa::MEM_SPAD_B, kt)), T * hs,
+                                            int64_t(::sa::vtypes(::sa::VT_I8, ::sa::VT_I8)), int64_t(hw), ValueRange{});
+        dyn(tr, {{::sa::DYN_VE_LEN, pThs}});
+        sahw::LdOp::create(bb, loc, q->base, q->off + h * hs * 4, int64_t(srcw.la), 1, hs * 4, hs * 4, 0, ValueRange{});
+        ve({srcw.la, ::sa::VT_I32, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt, ::sa::laddr(::sa::MEM_SPAD_A, strip),
+           ::sa::VT_I8, hs * d, ::sa::VOP_COPY);
+        auto ex = sahw::ExOp::create(bb, loc, int64_t(strip), int64_t(kt), word(c.la), int64_t(hw), false,
+                                     int64_t(tiles), hs, 1, int64_t(tiles), ValueRange{});
+        dyn(ex, {{::sa::DYN_EX_REPEAT, pTiles}});
+        ve({c.la, ::sa::VT_I32}, Opd{sq->la + uint32_t(h), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF},
+           res.la + uint32_t(h) * tiles, ::sa::VT_F32, T, ::sa::VOP_MUL, p.scale, NEG0, ::sa::FUNC_NONE,
+           ::sa::RED_NONE, 0, 0, {{::sa::DYN_VE_LEN, pT, false}});
+      }
+      // the scores of each head: a row of T
+      Value bp = par(4, 0);
+      rowLoop(H, bp, [&](int64_t h) {
+        auto st = sahw::StOp::create(bb, loc, yd->first, yd->second, int64_t(res.la) + h * tiles, 1, T * 4, T * 4,
+                                     ValueRange{});
+        dyn(st, {{::sa::DYN_DMA_DDR, rowAcc}, {::sa::DYN_DMA_ROW_BYTES, bp}});
+        SmallVector<bool> a = {true, false};
+        st.setDynAdd(a);
+      });
+    } else {
+      // p: [H, 1, T'] i32 in DDR (T' the same length, from its own push constant), one row per head
+      auto pm = cast<MemRefType>(p.small.getType());
+      auto psub = ddrRoot(p.small).getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+      auto ps = ddrStart(p.small, 4);
+      if (!ps || !psub || psub.getDynamicDims().size() != 1 || pm.getRank() != 3 || pm.getDimSize(1) != 1)
+        return fail("attention p layout");
+      auto plen = linOf(psub.getDynamicDims()[0]);
+      if (!plen) return fail("attention p length");
+      Lin pb = *plen;
+      pb.mul *= 4;
+      pb.add *= 4;
+      Value pBytes = paramFor(pb);
+      uint32_t stride = uint32_t(T / d);
+      LocalBuf pl = newLocal(::sa::VT_I32, int64_t(stride) * H * d);
+      if (ps->second % 8) return fail("attention p not 8-byte aligned");
+      rowLoop(H, pBytes, [&](int64_t h) {
+        auto l = sahw::LdOp::create(bb, loc, ps->first, ps->second, int64_t(pl.la) + h * stride, 1, T * 4, T * 4, 0,
+                                    ValueRange{});
+        dyn(l, {{::sa::DYN_DMA_DDR, rowAcc}, {::sa::DYN_DMA_ROW_BYTES, pBytes}});
+        SmallVector<bool> a = {true, false};
+        l.setDynAdd(a);
+      });
+      Value pT = par(1, 0), pTd = par(d, 0), pTiles = par(1, logd);
+      LocalBuf c = newLocal(::sa::VT_I32, int64_t(d) * hw * d);
+      LocalBuf res = newLocal(::sa::VT_F32, hs);
+      for (int64_t h = 0; h < H; ++h) {
+        ve({pl.la + uint32_t(h) * stride, ::sa::VT_I32, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt,
+           ::sa::laddr(::sa::MEM_SPAD_A, strip), ::sa::VT_I8, T * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
+           ::sa::RED_NONE, 0, 0, {{::sa::DYN_VE_LEN, pTd, false}});
+        auto l = sahw::LdOp::create(bb, loc, cache->first, cache->second + h * hs,
+                                    int64_t(::sa::laddr(::sa::MEM_SPAD_B, vb)), T, hs, H * hs, /*INTERLEAVE=*/1,
+                                    ValueRange{});
+        dyn(l, {{::sa::DYN_DMA_ROWS, pT}});
+        auto ex = sahw::ExOp::create(bb, loc, int64_t(strip), int64_t(vb), word(c.la), int64_t(tiles), false,
+                                     int64_t(hw), T, 1, int64_t(hw), ValueRange{});
+        dyn(ex, {{::sa::DYN_EX_KT, pTiles}, {::sa::DYN_EX_BSTEP, pT}});
+        ve({c.la, ::sa::VT_I32}, std::nullopt, res.la, ::sa::VT_F32, hs, ::sa::VOP_COPY, p.scale, NEG0);
+        sahw::StOp::create(bb, loc, yd->first, yd->second + h * hs * 4, int64_t(res.la), 1, hs * 4, hs * 4,
+                           ValueRange{});
+      }
+    }
     return err.empty();
   }
 
