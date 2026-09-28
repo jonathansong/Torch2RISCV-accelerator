@@ -110,7 +110,7 @@ def fill(rng, et, n, t):
     if et == "f32":
         return rng.standard_normal(n).astype(np.float32).tobytes()
     if et in ("i8", "i32", "i16"):
-        return rng.integers(-127, 128, n).astype(O.NP[et]).tobytes()
+        return rng.integers(-127, 128, n, dtype=O.NP[et]).tobytes()      # no int64 temporary
     if et == "i64":
         return np.full(n, max(0, t - 3), np.int64).tobytes()     # pos + 1 < T: partly masked rows
     return bytes(n)

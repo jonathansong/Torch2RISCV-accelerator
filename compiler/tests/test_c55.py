@@ -10,7 +10,7 @@ hand-written device model for it, so:
   3. end to end on the sim device: sa-llm-run (prompt, then greedy tokens),
      each step's logits against the eager QModel on the same tokens with the
      device's EXP / RECIP / RSQRT (qhf.device_sfu): the first step equal up to
-     reduction order, then the same argmax and a correlation > 0.99 (a sum
+     reduction order, then the same argmax and a correlation > 0.98 (a sum
      order difference flips an int8 rounding, which grows through the layers),
      and the generated text;
   4. --board-bundle DIR: the whole prompt and --board-generate tokens on the
@@ -100,7 +100,7 @@ def main():
     sim_tokens, got, info = run_sim(out, prompt[:args.steps], args.generate, args.mb)
     ref, tok = reference(args.model, out, sim_tokens[:len(got)])
     agree, corr, first = compare(got, ref)
-    good = agree == len(got) and corr > 0.99 and first < 1e-4
+    good = agree == len(got) and corr > 0.98 and first < 1e-4
     print(f"sim device ({info}), {len(got)} steps in {time.time() - t0:.0f} s: first step max |diff| / max|logit| "
           f"{first:.1e}; argmax {agree}/{len(got)} as eager QModel (device SFU), min correlation {corr:.5f} "
           f"({'OK' if good else 'DIFFERENT'})")

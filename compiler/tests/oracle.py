@@ -368,6 +368,10 @@ class Interp:
         pass
 
     # ---------------------------------------------------------------- linalg.generic
+    # iteration points evaluated at once: a larger generic runs in slices of its
+    # outermost parallel loop (one the output keeps); reductions keep their order
+    GRID_LIMIT = 1 << 22
+
     def op_linalg_generic(self, op):
         maps = [ir.AffineMapAttr(m).value for m in ir.ArrayAttr(op.attributes["indexing_maps"])]
         iters = [str(i) for i in ir.ArrayAttr(op.attributes["iterator_types"])]
@@ -385,12 +389,39 @@ class Interp:
         if any(r is None for r in ranges):
             raise NotImplementedError("oracle: loop range not given by an operand dimension")
         red = [i for i, it in enumerate(iters) if "reduction" in it]
-        grid = np.indices(ranges) if nloops else np.zeros((0,), np.int64)
+        total = int(np.prod(ranges)) if nloops else 1
+        cand = []
+        if nloops and total > self.GRID_LIMIT:
+            omaps = [[str(e) for e in m.results] for m in maps[len(ins):]]
+            cand = [i for i in range(nloops) if i not in red and all(f"d{i}" in r for r in omaps)]
+        if not cand:
+            for r, t in zip(op.results, self._generic(op, maps, ins, outs, ranges, red, None)[0]):
+                self.set(r, t)
+            return
+        L = cand[0]
+        step = max(1, ranges[L] * self.GRID_LIMIT // total)
+        parts, axes = [], None
+        for s0 in range(0, ranges[L], step):
+            res, axes = self._generic(op, maps, ins, outs, ranges, red, (L, s0, min(step, ranges[L] - s0)))
+            parts.append(res)
+        for i, r in enumerate(op.results):
+            self.set(r, T(np.concatenate([p[i].arr for p in parts], axis=axes[i]), parts[0][i].et))
+
+    def _generic(self, op, maps, ins, outs, ranges, red, sl):
+        """The generic over `ranges`, or over the slice sl = (loop, start, length):
+        (results, the result axis of that loop)."""
+        nloops = len(ranges)
+        rng = list(ranges)
+        if sl:
+            rng[sl[0]] = sl[2]
+        grid = np.indices(rng) if nloops else np.zeros((0,), np.int64)
+        if sl:
+            grid[sl[0]] += sl[1]
         self.index_vals = [grid[i] for i in range(nloops)]
 
         def gather(t, m):
             if len(m.results) == 0:
-                return np.broadcast_to(t.arr, ranges) if nloops else t.arr
+                return np.broadcast_to(t.arr, rng) if nloops else t.arr
             idx = []
             for e in m.results:
                 s = str(e)
@@ -399,26 +430,29 @@ class Interp:
                 idx.append(self.index_vals[int(s[1:])])
             return t.arr[tuple(idx)]
 
+        def out_slice(arr, res):
+            """The output's slice sl (its axis of the sliced loop)."""
+            if not sl:
+                return arr, None
+            ax = res.index(f"d{sl[0]}")
+            return np.take(arr, np.arange(sl[1], sl[1] + sl[2]), axis=ax), ax
+
         block = op.regions[0].blocks[0]
         args = list(block.arguments)
         for a, t, m in zip(args, ins + outs, maps):
             self.set(a, T(gather(t, m), t.et))
         if not red:
             self.run_block(block)
-            outs_new = []
+            outs_new, axes = [], []
             for y, t, m in zip(self.yielded, outs, maps[len(ins):]):
-                arr = np.broadcast_to(np.asarray(y.arr), ranges) if nloops else np.asarray(y.arr)
+                arr = np.broadcast_to(np.asarray(y.arr), rng) if nloops else np.asarray(y.arr)
                 res = [str(e) for e in m.results]
-                if res == [f"d{i}" for i in range(nloops)]:
-                    outs_new.append(T(arr.copy(), y.et))
-                    continue
                 if sorted(res) != [f"d{i}" for i in range(nloops)]:
                     raise NotImplementedError("oracle: output map is not a permutation")
                 perm = [int(r[1:]) for r in res]              # out[d_perm0, d_perm1, ...] = value(d)
                 outs_new.append(T(np.transpose(arr, perm).copy(), y.et))
-            for r, t in zip(op.results, outs_new):
-                self.set(r, t)
-            return
+                axes.append(res.index(f"d{sl[0]}") if sl else None)
+            return outs_new, axes
         # reduction: out = combiner(elem, out); elem computed over the whole grid
         yops = list(block.operations)
         yieldop = yops[-1].operation
@@ -435,27 +469,28 @@ class Interp:
                 continue
             self.run_op(o.operation)
         elem = self.val(elem_v[0])
-        earr = np.broadcast_to(np.asarray(elem.arr), ranges)
+        earr = np.broadcast_to(np.asarray(elem.arr), rng)
         out = outs[0]
         omap = maps[-1]
         keep = [int(str(e)[1:]) for e in omap.results]
+        oarr, ax = out_slice(np.asarray(out.arr), [str(e) for e in omap.results])
         # move reduced dims last, in loop order, and flatten them
         perm = keep + red
-        e2 = np.transpose(earr, perm).reshape([ranges[k] for k in keep] + [-1])
+        e2 = np.transpose(earr, perm).reshape([rng[k] for k in keep] + [-1])
         name = comb.name
         if name == "arith.addf":
             acc = red_sum(e2, self.d)
-            acc = F.add(acc, np.asarray(out.arr, np.uint32)) if not np.all(np.asarray(out.arr) == 0) else acc
+            acc = F.add(acc, np.asarray(oarr, np.uint32)) if not np.all(oarr == 0) else acc
         elif name == "arith.maximumf":
             acc = e2[..., 0]
             for i in range(1, e2.shape[-1]):
                 acc = F.fmax(acc, e2[..., i])
-            acc = F.fmax(acc, np.asarray(out.arr, np.uint32))
+            acc = F.fmax(acc, np.asarray(oarr, np.uint32))
         elif name == "arith.addi":
-            acc = wrap(np.sum(np.asarray(e2, np.int64), axis=-1) + np.asarray(out.arr, np.int64), out.et)
+            acc = wrap(np.sum(np.asarray(e2, np.int64), axis=-1) + np.asarray(oarr, np.int64), out.et)
         else:
             raise NotImplementedError(f"oracle: reduction with {name}")
-        self.set(op.results[0], T(np.asarray(acc).reshape(out.arr.shape), out.et))
+        return [T(np.asarray(acc).reshape(oarr.shape), out.et)], [ax]
 
     def op_linalg_batch_matmul(self, op):
         a, b, c = (self.val(o) for o in op.operands)
