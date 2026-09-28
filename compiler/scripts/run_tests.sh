@@ -3,7 +3,7 @@
 # runs from your own terminal (processes started by a Claude Code session end
 # with it).
 #   compiler/scripts/run_tests.sh [-j JOBS] [-t THREADS] [-o LOGDIR] TEST...
-# TEST: c3 | c5 | c5cfg | smollm2 | qwen3l2 | synth | "any command line"
+# TEST: c3 | c5 | c5cfg | smollm2 | qwen3l2 | synth | qwen3export | qwen3 | "any command line"
 #   -j JOBS     tests at a time (default 1)
 #   -t THREADS  threads per test: OpenMP / BLAS, and iree-compile
 #               single-threaded when 1 (default 2)
@@ -34,6 +34,9 @@ declare -A cmd=(
   [smollm2]="$SA_PY -u $T/test_c55.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2 --check --steps 6 --generate 2 --flags '$flags'"
   [qwen3l2]="$SA_PY -u $T/test_c55.py --model build/llm_cache/Qwen3-0.6B --out build/c55/qwen3_l2 --check --steps 6 --generate 2 --mb 384 --flags '$flags'"
   [synth]="$SA_PY -u $T/test_c55.py --model build/llm_cache/synth-k16k --out build/c6/k16k --check --mb 64 --flags '$flags'"
+  # C6.1: Qwen3-0.6B, all 28 layers (export once, then compile / check / sim)
+  [qwen3export]="$SA_PY -u compiler/frontend/export_hf.py --model build/llm_cache/Qwen3-0.6B --out build/c6/qwen3 --tokens 8"
+  [qwen3]="$SA_PY -u $T/test_c55.py --model build/llm_cache/Qwen3-0.6B --out build/c6/qwen3 --check --steps 6 --generate 2 --mb 768 --flags '$flags'"
 )
 run() {
   local name=$1 c=${cmd[$1]:-$1}
