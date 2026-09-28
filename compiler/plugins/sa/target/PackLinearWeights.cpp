@@ -33,7 +33,9 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 
 namespace mlir::iree_compiler::sa {
 namespace {
@@ -64,14 +66,51 @@ static bool isConstantWeight(Value v) {
 }
 
 // The packed copy of W (one per weight, right after its definition).
+// The packed copy of W, one per weight. An immutable global's is a global of
+// its own, W$packed, set by an initializer (IREE evaluates it at compile time):
+// every function (prefill and decode) and every load of W shares it. Other
+// weights are packed right after their definition.
+static llvm::DenseMap<Operation *, IREE::Util::GlobalOp> packedGlobals;
+
 static Value packOf(RewriterBase &rewriter, Value w, int64_t d, llvm::MapVector<Value, Value> &packs) {
   if (auto it = packs.find(w); it != packs.end()) return it->second;
   OpBuilder::InsertionGuard guard(rewriter);
+  SmallVector<OpFoldResult> tiles = {rewriter.getIndexAttr(d)};
+  Location loc = w.getLoc();
+  if (auto load = w.getDefiningOp<IREE::Util::GlobalLoadOpInterface>()) {
+    auto global = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(load, load.getGlobalAttr());
+    if (global && !global.isGlobalMutable()) {
+      IREE::Util::GlobalOp &pg = packedGlobals[global.getOperation()];
+      if (!pg) {
+        OpBuilder mb(global);
+        mb.setInsertionPointAfter(global);
+        auto wType = cast<RankedTensorType>(w.getType());
+        auto pType = RankedTensorType::get({wType.getDimSize(0) / d, wType.getDimSize(1), d}, wType.getElementType());
+        auto module = global->getParentOfType<ModuleOp>();
+        std::string name = (global.getSymName() + "$packed").str();
+        for (int i = 1; SymbolTable::lookupSymbolIn(module, name); ++i)
+          name = (global.getSymName() + "$packed" + std::to_string(i)).str();
+        pg = IREE::Util::GlobalOp::create(mb, loc, name, /*isMutable=*/false, pType);
+        pg.setPrivate();
+        mb.setInsertionPointAfter(pg);
+        auto init = IREE::Util::InitializerOp::create(mb, loc);
+        OpBuilder ib = OpBuilder::atBlockBegin(init.addEntryBlock());
+        Value src = global.createLoadOp(loc, ib).getLoadedGlobalValue();
+        Value dest = linalg::PackOp::createDestinationTensor(ib, loc, src, tiles, {0}, {});
+        Value packed = linalg::PackOp::create(ib, loc, src, dest, {0}, tiles).getResult();
+        pg.createStoreOp(loc, packed, ib);
+        IREE::Util::ReturnOp::create(ib, loc);
+      }
+      rewriter.setInsertionPointAfter(load);
+      Value wp = pg.createLoadOp(loc, rewriter).getLoadedGlobalValue();
+      packs[w] = wp;
+      return wp;
+    }
+  }
   if (Operation *def = w.getDefiningOp()) rewriter.setInsertionPointAfter(def);
   else rewriter.setInsertionPointToStart(cast<BlockArgument>(w).getOwner());
-  SmallVector<OpFoldResult> tiles = {rewriter.getIndexAttr(d)};
-  Value dest = linalg::PackOp::createDestinationTensor(rewriter, w.getLoc(), w, tiles, {0}, {});
-  Value wp = linalg::PackOp::create(rewriter, w.getLoc(), w, dest, {0}, tiles).getResult();
+  Value dest = linalg::PackOp::createDestinationTensor(rewriter, loc, w, tiles, {0}, {});
+  Value wp = linalg::PackOp::create(rewriter, loc, w, dest, {0}, tiles).getResult();
   packs[w] = wp;
   return wp;
 }
@@ -272,10 +311,24 @@ struct PackLinearWeightsPass : public PassWrapper<PackLinearWeightsPass, Operati
     module.walk([&](linalg::MatmulOp op) { mms.push_back(op); });
     IRRewriter rewriter(&getContext());
     llvm::MapVector<Value, Value> packs;
+    packedGlobals.clear();
     for (linalg::VecmatOp op : ops) (void)rewriteVecmat(rewriter, op, d, packs);
     for (linalg::MatmulOp op : mms) (void)rewriteMatmul(rewriter, op, d, packs);
-    if (gathers)
+    if (gathers) {
+      // by global: a gather of any load of a packed global (another function's,
+      // e.g. prefill and decode, or a second load) reads a packed copy of it
+      llvm::DenseSet<Attribute> globals;
+      for (auto &[w, wp] : packs)
+        if (auto load = w.getDefiningOp<IREE::Util::GlobalLoadOpInterface>()) globals.insert(load.getGlobalAttr());
+      llvm::SetVector<Value> loads;
+      module.walk([&](tensor::ExtractOp ex) {
+        if (auto load = ex.getTensor().getDefiningOp<IREE::Util::GlobalLoadOpInterface>();
+            load && globals.contains(load.getGlobalAttr()))
+          loads.insert(ex.getTensor());
+      });
+      for (Value v : loads) packOf(rewriter, v, d, packs);
       for (auto &[w, wp] : packs) redirectGathers(rewriter, w, wp, d);
+    }
   }
 
   Option<int64_t> d{*this, "d", llvm::cl::desc("Array size D"), llvm::cl::init(8)};
