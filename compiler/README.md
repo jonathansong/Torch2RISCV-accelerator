@@ -183,8 +183,16 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   pieces). A random-weight model with K = 16384 is bit-exact per dispatch and
   end to end. C6.0: the embedding shared with the classifier is stored once
   (its gather reads the packed classifier weights): SmolLM2 peaks at 133.6 MB
-  (window 144 MB), Qwen3 no longer carries a 155 MB copy. Next: C6.1
-  (Qwen3-0.6B, all 28 layers).
+  (window 144 MB), Qwen3 no longer carries a 155 MB copy. C6.1: Qwen3-0.6B,
+  all 28 layers, with no compiler change: 276 dispatches bit-exact at
+  T = 16 / 80 / 256, end to end on sim with the eager model's argmax (first
+  step within 2e-6), "Once upon a time, there was a man" (587 MB of device
+  memory, 24 s per token on the sim). Next: C6.2 (quantization quality: the
+  W8A8 Qwen3 agrees with fp32 on 5/8 top-1).
+
+  ```sh
+  compiler/scripts/run_tests.sh -m 10G qwen3export qwen3   # C6.1 (from your own terminal)
+  ```
 
   ```sh
   python3 compiler/tests/test_c5.py                  # lit, both configurations, dispatch_check at T = 16, 80, 256
