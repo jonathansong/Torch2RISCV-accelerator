@@ -933,6 +933,18 @@ C5.5 的模型（§8.9 的第一步）：
 7. 零碎：i32 的 fill、对齐。
 另：两个函数的 dispatch 源文件各自编号（`module_main$…_N`、`module_prefill$…_N`），`dispatch_check` 要按函数名配二进制。
 
+**P1–P3 结果（2026-09-28）**：
+- **做法的调整**：注意力、gather（嵌入、scale、RoPE 表）、scatter（KV 行）和 HF 模型的 QK-norm / RoPE 在前端逐行做，每行正是 decode 一步的形式（标量下标 `positions[m:m+1]`、`tokens[m:m+1]`），复用验证过的 decode 降级；批量做的是线性层（收益所在）与逐行的逐元素、归一化。上面第 3–5 项因此不用做，逐行带来的 dispatch 数量以后可以再合并。
+- **编译器**：
+  - 打包 pass 认 `matmul(X, Wᵀ)`（第 1 项）；一个权重全局量只打包一次：`W$packed` 全局量由 initializer 设置，IREE 编译时求值，prefill 与 decode、同一权重的每次 load 都用它（原来两个函数各打包一份，SmolLM2 的参数成了 272 MB）；打包全局量的 gather 按全局量名改读打包的副本（C6.0 在两个函数的模块里也成立）。
+  - 多行线性层微内核 `linearRows`（第 2 项）：一条 INTERLEAVE LD 装 D 行 X 的 A 条带，D×D 阵列一次算 D 行；尾部按列（MOD nc）、按行（DIV nc）的输入；没有尾部时直接存累加器。串行调度，还没有预取。
+  - 两层循环的合并可以在任意位置分开（行 [0, s)、内层 [s, n)）；按行跨步的 DDR 视图（第 6 项，只在 load / store）；4 字节对齐的 fp32 标量经 LDPARAM；循环内的标量 gather；打包 gather 的结果是精确的整数值（sitofp 直接通过）；广播布局的缓冲被逐元素结果复用时换成紧凑的新缓冲；**按行分片**：逐行的 dispatch 放不下 ACC 时按行分组（每组偶数行）。
+  - `sa-llm-run --prefill=M`；`dispatch_check` 按函数名配二进制；`test_c6p.py`（两种运行的 logits 逐位比较）；`deploy_c6p.sh stories|smollm2`，板上 `board_llm.py [--decode-only]`、`board_generate.py` 用 prefill。
+- **结果**（sim，M = 8）：
+  - stories15M：181 个可执行体（decode + prefill）全部与 oracle 逐位一致；16 个 token 的 prompt 分 2 块 prefill，prompt 最后位置与之后 4 步的 logits 与只用 decode 逐位一致，token 相同；参数 16.1 MB（一份）。
+  - SmolLM2-135M：777 个可执行体在 T = 16 / 80 / 256 下全部逐位一致；14 个 token 的 prompt，prefill + decode 与只用 decode 逐位一致（5/5 行），token 相同；参数 137.4 MB（一份）。
+  - 主机 llvm-cpu 上 prefill 与只用 decode 只按相关比较：llvm-cpu 对 prefill 的形状生成的代码不同（向量化的求和），int8 舍入翻转会让接近的 argmax 变；sa 设备上要求逐位一致。
+
 ## 9. 验证体系
 
 | 层次 | 内容 | 工具 |
