@@ -69,12 +69,15 @@ def _s32(x):
 
 
 class SaFuncSim:
-    def __init__(self, d=8, ddr_base=0, ddr_bytes=1 << 20):
+    def __init__(self, d=8, ddr_base=0, ddr_bytes=1 << 20, spad_bytes=131072, acc_bytes=262144):
+        """spad_bytes (each of SPAD_A / SPAD_B), acc_bytes: the local memories
+        (the L2 hardware: 128 KB, 256 KB). Local addresses are 16-bit words."""
         assert d in (8, 16)
         self.d = d
         self.logd = d.bit_length() - 1
-        self.spad_words = 131072 // d
-        self.acc_words = 262144 // (4 * d)
+        self.spad_words = spad_bytes // d
+        self.acc_words = acc_bytes // (4 * d)
+        assert 0 < self.spad_words <= 1 << 16 and 0 < self.acc_words <= 1 << 16, "local addresses are 16-bit words"
         self.mem = {MEM_SPAD_A: np.zeros(self.spad_words * d, np.uint8),
                     MEM_SPAD_B: np.zeros(self.spad_words * d, np.uint8),
                     MEM_ACC: np.zeros(self.acc_words * 4 * d, np.uint8)}

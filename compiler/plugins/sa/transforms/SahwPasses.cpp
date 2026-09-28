@@ -24,6 +24,16 @@ TargetConfig TargetConfig::fromAttr(DictionaryAttr config) {
   return c;
 }
 
+std::string TargetConfig::invalid() const {
+  auto pow2 = [](int64_t v) { return v > 0 && (v & (v - 1)) == 0; };
+  if (d != 8 && d != 16) return "d must be 8 or 16";
+  if (!pow2(spadBytes) || spadBytes / d > (1 << 16) || spadBytes / d < 2 * maxDynamic)
+    return "spad_bytes must be a power of two, at most 2^16 words of D bytes";
+  if (!pow2(accBytes) || accBytes / (4 * d) > (1 << 16) || accBytes / (4 * d) < 64)
+    return "acc_bytes must be a power of two, at most 2^16 words of 4 * D bytes";
+  return "";
+}
+
 void TargetConfig::addTo(Builder &b, SmallVectorImpl<NamedAttribute> &attrs) const {
   auto add = [&](StringRef name, int64_t v) { attrs.emplace_back(b.getStringAttr(name), b.getI64IntegerAttr(v)); };
   add("d", d);

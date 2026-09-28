@@ -40,6 +40,8 @@ struct SAOptions {
   int d = 8;
   // Upper bound of dynamic dimensions (local memory planning): the sequence length.
   int maxDynamic = 256;
+  // Local memories (the L2 hardware: 128 KB per SPAD, 256 KB ACC).
+  int spadKB = 128, accKB = 256;
   // Development: a dispatch without a template becomes a warning and an export
   // that faults when run (so a partial module compiles for per-dispatch tests).
   bool allowUnsupported = false;
@@ -55,6 +57,10 @@ struct SAOptions {
                     llvm::cl::desc("Array size D of the accelerator (8 or 16)."));
     binder.opt<int>("iree-sa-max-dynamic", maxDynamic, llvm::cl::cat(category),
                     llvm::cl::desc("Upper bound of dynamic dimensions (the sequence length)."));
+    binder.opt<int>("iree-sa-spad-kb", spadKB, llvm::cl::cat(category),
+                    llvm::cl::desc("Size of each SPAD (A, B) in KB."));
+    binder.opt<int>("iree-sa-acc-kb", accKB, llvm::cl::cat(category),
+                    llvm::cl::desc("Size of ACC in KB."));
     binder.opt<bool>("iree-sa-allow-unsupported", allowUnsupported, llvm::cl::cat(category),
                      llvm::cl::desc("Warn instead of failing on dispatches without a template (development)."));
     binder.opt<std::string>("iree-sa-ukernels", ukernels, llvm::cl::cat(category),
@@ -71,6 +77,8 @@ getSAExecutableTarget(MLIRContext *context, const SAOptions &options) {
   sa::TargetConfig tc;
   tc.d = options.d;
   tc.maxDynamic = options.maxDynamic;
+  tc.spadBytes = int64_t(options.spadKB) << 10;
+  tc.accBytes = int64_t(options.accKB) << 10;
   tc.addTo(b, config);
   return b.getAttr<IREE::HAL::ExecutableTargetAttr>(
       b.getStringAttr("sa"), b.getStringAttr("sa-desc-v1"),

@@ -209,6 +209,98 @@ public:
           (isa<linalg::BatchMatmulOp>(op) || op.getNumReductionLoops() == 1) && op.getNumDpsInputs() == 2)
         matchContraction(op);
     });
+    // an element-wise dispatch too large for ACC: in pieces
+    if (linears.empty() && attns.empty() && contracts.empty()) {
+      if (auto n = pieceable(); n && pieceWords(*n) > 2 * (lay.cbank - lay.scr)) {
+        int64_t pieces = (pieceWords(*n) + 2 * (lay.cbank - lay.scr) - 1) / (2 * (lay.cbank - lay.scr));
+        int64_t len = ((*n + pieces - 1) / pieces + d - 1) / d * d;
+        pieceN = *n;
+        // the reductions' results live across the pieces (allocated first)
+        llvm::DenseMap<Value, LocalBuf> keep;
+        for (auto g : f.getBody().front().getOps<linalg::GenericOp>())
+          if (g.getNumReductionLoops()) {
+            auto l = bufOf(g.getDpsInits()[0], /*bcast=*/true);
+            if (!l) return false;
+            keep[g.getDpsInits()[0]] = *l;
+          }
+        for (int64_t off = 0; off < *n; off += len) {
+          uint32_t savedTop[2] = {accTop[0], accTop[1]};
+          uint32_t savedSpad = spadTop;
+          locals = keep;
+          bcastOf.clear();
+          piece = std::make_pair(off, std::min(len, *n - off));
+          if (!lowerBody()) return false;
+          accTop[0] = savedTop[0];
+          accTop[1] = savedTop[1];
+          spadTop = savedSpad;
+        }
+        piece.reset();
+        return err.empty();
+      }
+    }
+    return lowerBody();
+  }
+
+  // An element-wise dispatch (static contiguous loads / stores, generics with
+  // identity maps over N elements, scalar inputs): N, else nothing.
+  std::optional<int64_t> pieceable() {
+    int64_t n = -1;
+    auto size = [&](Value v, bool scalarOk) {
+      auto mt = dyn_cast<MemRefType>(v.getType());
+      if (!mt || !mt.hasStaticShape()) return false;
+      if (mt.getRank() == 0 || (scalarOk && mt.getNumElements() == 1)) return scalarOk;
+      if (n < 0) n = mt.getNumElements();
+      return mt.getNumElements() == n;
+    };
+    for (Operation &op : f.getBody().front()) {
+      if (auto l = dyn_cast<sahl::LoadOp>(&op)) {
+        if (!size(l.getSrc(), true) || !size(l.getDst(), true)) return std::nullopt;
+      } else if (auto st = dyn_cast<sahl::StoreOp>(&op)) {
+        if (!size(st.getSrc(), true) || !size(st.getDst(), true)) return std::nullopt;
+      } else if (auto g = dyn_cast<linalg::GenericOp>(&op)) {
+        if (!g.getRegion().front().getOps<linalg::IndexOp>().empty() ||
+            !g.getRegion().front().getOps<memref::LoadOp>().empty())
+          return std::nullopt;
+        if (g.getNumReductionLoops()) {
+          // a max of the whole vector into a scalar (the pieces' maxima combine in any order)
+          auto maps = g.getIndexingMapsArray();
+          auto yield = cast<linalg::YieldOp>(g.getRegion().front().getTerminator());
+          if (g.getNumLoops() != 1 || g.getNumDpsInputs() != 1 || g.getNumDpsInits() != 1 ||
+              !maps[0].isIdentity() || maps[1].getNumResults() != 0 || !size(g.getDpsInputs()[0], false) ||
+              !yield.getOperand(0).getDefiningOp<arith::MaximumFOp>())
+            return std::nullopt;
+          continue;
+        }
+        for (auto [v, m] : llvm::zip(g->getOperands(), g.getIndexingMapsArray()))
+          if (!(m.isIdentity() && size(v, false)) && !(m.getNumResults() == 0 && size(v, true))) return std::nullopt;
+      } else if (auto fl = dyn_cast<linalg::FillOp>(&op)) {
+        if (!size(fl.getDpsInits()[0], true)) return std::nullopt;
+      } else if (!isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CastOp,
+                      IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp, func::ReturnOp,
+                      arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp, arith::OrIOp>(op) &&
+                 !(op.getDialect() && op.getDialect()->getNamespace() == "util")) {
+        return std::nullopt;
+      }
+    }
+    if (n <= 0) return std::nullopt;
+    return n;
+  }
+  // ACC words an element-wise dispatch of n elements may need at once (an upper
+  // bound: every N-element buffer, one temp per operation of a generic)
+  int64_t pieceWords(int64_t n) {
+    int64_t bufs = 0;
+    for (Operation &op : f.getBody().front()) {
+      if (auto a = dyn_cast<memref::AllocOp>(&op)) {
+        auto mt = cast<MemRefType>(a.getType());
+        if (mt.getNumElements() == n && !mt.getElementType().isInteger(8)) ++bufs;
+      } else if (auto g = dyn_cast<linalg::GenericOp>(&op)) {
+        bufs += int64_t(llvm::range_size(g.getRegion().front().without_terminator()));
+      }
+    }
+    return bufs * ((n + d - 1) / d);
+  }
+
+  bool lowerBody() {
     for (Operation &opRef : f.getBody().front()) {
       Operation *op = &opRef;
       loc = op->getLoc();
@@ -319,6 +411,10 @@ private:
   }
 
   // ------------------------------------------------------------ local memory
+  // piece mode (an element-wise dispatch too large for ACC): N, and the piece
+  // (first element, length) being lowered
+  int64_t pieceN = -1;
+  std::optional<std::pair<int64_t, int64_t>> piece;
   int preferBank = -1;                           // ACC temps of a linear chunk: its bank
   std::optional<uint32_t> allocAcc(uint32_t words) {
     if (preferBank >= 0 && accTop[preferBank] + words <= uint32_t(preferBank + 1) * lay.cbank) {
@@ -379,6 +475,7 @@ private:
       locals[v] = l;
       return l;
     }
+    if (piece && mt.getNumElements() == pieceN) n = piece->second;
     LocalBuf l = newLocal(*vt, n, bcast);
     locals[v] = l;
     return l;
@@ -465,6 +562,10 @@ private:
       if (!es) return fail("DDR element type"), std::nullopt;
       r.off = (off.isConst() ? off.add : 0) + elem * es;
       r.n = mt.getNumElements();
+      if (piece && r.n == pieceN) {
+        r.off += piece->first * es;
+        r.n = piece->second;
+      }
       return r;
     }
   }
@@ -519,6 +620,21 @@ private:
     return true;
   }
 
+  // A contiguous DMA of `bytes` (a multiple of 8) between DDR and local memory:
+  // one row, or beyond the 16-bit row length rows of the largest multiple of
+  // the local word (so the rows are contiguous there too) and a tail.
+  void contiguousDma(bool isLoad, Value base, int64_t off, uint32_t la, uint32_t bytes) {
+    uint32_t wb = (la >> 28) == uint32_t(::sa::MEM_ACC) ? 4 * uint32_t(d) : uint32_t(d);
+    uint32_t rb = bytes <= 65535 ? bytes : 65535 / wb * wb;
+    uint32_t rows = bytes / rb, rest = bytes - rows * rb;
+    auto one = [&](int64_t o, uint32_t a, uint32_t n, uint32_t b) {
+      if (isLoad) sahw::LdOp::create(bb, loc, base, o, int64_t(a), n, int64_t(b), int64_t(b), 0, ValueRange{});
+      else sahw::StOp::create(bb, loc, base, o, int64_t(a), n, int64_t(b), int64_t(b), ValueRange{});
+    };
+    one(off, la, rows, rb);
+    if (rest) one(off + int64_t(rows) * rb, la + rows * (rb / wb), 1, rest);
+  }
+
   bool load(sahl::LoadOp l) {
     auto r = ddrOf(l.getSrc());
     if (!r) return false;
@@ -528,8 +644,7 @@ private:
     if (r->dyn) return dynamicDma(*r, *dst, true);
     uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
     if (r->off % 8) return fail("load not 8-byte aligned");
-    if (bytes > 65535) return fail("load larger than 64 KB");
-    sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(dst->la), 1, int64_t(bytes), int64_t(bytes), 0, ValueRange{});
+    contiguousDma(true, r->base, r->off, dst->la, bytes);
     return true;
   }
 
@@ -543,8 +658,7 @@ private:
     if (l.bcast && l.n > 1) l = packBcast(l);
     uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
     if (r->off % 8) return fail("store not 8-byte aligned");
-    if (bytes > 65535) return fail("store larger than 64 KB");
-    sahw::StOp::create(bb, loc, r->base, r->off, int64_t(l.la), 1, int64_t(bytes), int64_t(bytes), ValueRange{});
+    contiguousDma(false, r->base, r->off, l.la, bytes);
     return true;
   }
 
@@ -1185,16 +1299,7 @@ private:
       x.shift += shift;
       return paramFor(x);
     };
-    // chunks of output tiles: the B tiles of a chunk in one SPAD_B bank (a dynamic N: all tiles, one chunk)
-    uint32_t nc = nt;
-    if (!Nr.dyn) {
-      uint32_t cap = std::max<uint32_t>(sb / uint32_t(K), 1);
-      for (nc = std::min(cap, nt); nc > 1 && nt % nc; --nc) {
-      }
-    }
-    if (uint32_t(K) * nc > sb) return fail("contraction: one chunk of B tiles does not fit a SPAD bank");
     bool xRows = (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0) || (p.gLoop >= 0 && p.x.coef[p.gLoop] < 0);
-    if (xRows && nc != nt) return fail("contraction: x rows of a dynamic length and several chunks");
     if (spadTop != 0) return fail("contraction after other SPAD_A buffers");
     spadTop = 2 * sb;                                      // the A strip at 0, raw rows in bank 1
     const uint32_t strip = 0, raw = sb;
@@ -1271,6 +1376,29 @@ private:
     uint32_t xes = esize(p.x.et);
     bool xI32 = p.x.et.isInteger(32);
     LocalBuf xl = newLocal(xI32 ? ::sa::VT_I32 : ::sa::VT_I8, K);
+    // K blocks: the A strip of a block (kc words) in one SPAD_A bank, one B tile of it
+    // in one SPAD_B bank and in one DMA row (16-bit length: kc * D bytes), and the
+    // strip's DIV-mode source range (the VE checks kc words from the source start,
+    // no divider) inside x's memory; a longer K accumulates the blocks in ACC
+    uint32_t xDepth = (xl.la >> 28) == uint32_t(::sa::MEM_ACC) ? 2 * lay.cbank : 2 * sb;
+    int64_t xRoom = int64_t(xDepth) - int64_t(xl.la & 0xFFFF) - K / d;
+    uint32_t kmax = std::min<uint32_t>(sb, 65535 / uint32_t(d) / uint32_t(d) * uint32_t(d));
+    kmax = uint32_t(std::min<int64_t>(kmax, xRoom / d * d));
+    if (kmax < uint32_t(d)) return fail("contraction: x leaves no room for a K block");
+    const uint32_t kc = uint32_t(K) > kmax ? kmax : uint32_t(K);
+    const uint32_t nk = uint32_t((K + kc - 1) / kc);
+    if (nk > 1 && (Kr.dyn || Nr.dyn || G != 1 || xRows))
+      return fail("contraction: K blocks with a dynamic K / N or several rows of x");
+    // chunks of output tiles: the B tiles of a chunk (of a K block) in one SPAD_B bank
+    // (a dynamic N: all tiles, one chunk)
+    uint32_t nc = nt;
+    if (!Nr.dyn) {
+      uint32_t cap = std::max<uint32_t>(sb / kc, 1);
+      for (nc = std::min(cap, nt); nc > 1 && nt % nc; --nc) {
+      }
+    }
+    if (kc * nc > sb) return fail("contraction: one chunk of B tiles does not fit a SPAD bank");
+    if (xRows && nc != nt) return fail("contraction: x rows of a dynamic length and several chunks");
     Value pK = Kr.dyn ? parOf(*Kr.dyn, 1, 0) : Value();
     Value pN = Nr.dyn ? parOf(*Nr.dyn, 1, 0) : Value();
     if (xRows || Nr.dyn) {
@@ -1284,12 +1412,15 @@ private:
     };
     // x_(b, g) -> the A strip (each element over the D rows); with one row
     // per batch (G = 1) once per batch, else per chunk and row
-    auto loadStrip = [&](int64_t b, int64_t g) -> bool {
-      // x_(b, g) -> the A strip (each element over the D rows)
+    auto loadX = [&](int64_t b, int64_t g) -> bool {
       int64_t xoff = xs->second;
       if (!xRows) xoff += ((p.bLoop >= 0 ? b * p.x.coef[p.bLoop] : 0) + (p.gLoop >= 0 ? g * p.x.coef[p.gLoop] : 0)) *
                           int64_t(xes);
       if (xoff % 8) return fail("contraction: unaligned x");
+      if (!xRows && !Kr.dyn) {                             // static: rows of at most 64 KB
+        contiguousDma(true, xs->first, xoff, xl.la, uint32_t(K * xes));
+        return true;
+      }
       auto lx = sahw::LdOp::create(bb, loc, xs->first, xoff, int64_t(xl.la), 1, K * xes, K * xes, 0, ValueRange{});
       if (xRows) {
         Value xb = parOf(*Kr.dyn, xes, 0);
@@ -1298,50 +1429,77 @@ private:
       } else if (Kr.dyn) {
         dyn(lx, {{::sa::DYN_DMA_ROW_BYTES, parOf(*Kr.dyn, xes, 0), false}});
       }
-      ve({xl.la, xl.vt, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt, ::sa::laddr(::sa::MEM_SPAD_A, strip),
-         ::sa::VT_I8, K * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_NONE, 0, 0,
+      return true;
+    };
+    // x[k0, k0 + kl) -> the A strip (each element over the D rows)
+    auto replicate = [&](int64_t k0, int64_t kl) {
+      ve({xl.la + uint32_t(k0 / d), xl.vt, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt,
+         ::sa::laddr(::sa::MEM_SPAD_A, strip), ::sa::VT_I8, kl * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
+         ::sa::RED_NONE, 0, 0,
          Kr.dyn ? SmallVector<DynF>{{::sa::DYN_VE_LEN, parOf(*Kr.dyn, d, 0), false}} : SmallVector<DynF>{});
+    };
+    auto loadStrip = [&](int64_t b, int64_t g) -> bool {
+      if (!loadX(b, g)) return false;
+      replicate(0, K);
       return true;
     };
     for (int64_t b = 0; b < H; ++b) {
       int64_t moff = ms->second + (p.bLoop >= 0 ? b * p.m.coef[p.bLoop] : 0);
       if (moff % 8) return fail("contraction: unaligned matrix");
-      if (G == 1 && !loadStrip(b, 0)) return false;
-      for (uint32_t c0 = 0; c0 < nt; c0 += nc) {
-        uint32_t bank = (c0 / nc) & 1, bw = bank * sb;
+      if (G == 1 && !(nk == 1 ? loadStrip(b, 0) : loadX(b, 0))) return false;
+      uint32_t step = 0;                                   // B loads so far: the SPAD_B bank alternates
+      // the B tiles of chunk c0, K range [k0, k0 + kl) -> a SPAD_B bank; returns its word address
+      auto loadB = [&](uint32_t c0, int64_t k0, int64_t kl) -> uint32_t {
+        uint32_t bw = (step++ & 1) * sb;
         uint32_t la = ::sa::laddr(::sa::MEM_SPAD_B, bw);
-        // the B tiles of this chunk (shared by the rows of x)
         if (p.layout == MatLayout::Packed) {
-          sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * K * d, int64_t(la), nc, K * d, K * d, 0,
-                             ValueRange{});
+          sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * K * d + k0 * d, int64_t(la), nc, kl * d,
+                             K * d, 0, ValueRange{});
         } else if (p.layout == MatLayout::RowsK) {
           int64_t sN = p.m.coef[p.nLoop];
-          auto l = sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * d * sN,
-                                      int64_t(::sa::laddr(::sa::MEM_SPAD_A, raw)), int64_t(nc) * d, K, sN, 0,
+          auto l = sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * d * sN + k0,
+                                      int64_t(::sa::laddr(::sa::MEM_SPAD_A, raw)), int64_t(nc) * d, kl, sN, 0,
                                       ValueRange{});
           auto t = sahw::TransposeOp::create(bb, loc, int64_t(::sa::laddr(::sa::MEM_SPAD_A, raw)), int64_t(la),
-                                             int64_t(nc) * d * K, int64_t(::sa::vtypes(::sa::VT_I8, ::sa::VT_I8)),
-                                             K / d, ValueRange{});
+                                             int64_t(nc) * d * kl, int64_t(::sa::vtypes(::sa::VT_I8, ::sa::VT_I8)),
+                                             kl / d, ValueRange{});
           if (Nr.dyn) {
             dyn(l, {{::sa::DYN_DMA_ROWS, pN, false}});
             dyn(t, {{::sa::DYN_VE_LEN, parOf(*Nr.dyn, K, 0), false}});
           }
         } else {
           int64_t sK = p.m.coef[p.kLoop];
-          auto l = sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * d, int64_t(la), K,
+          auto l = sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * d + k0 * sK, int64_t(la), kl,
                                       int64_t(nc) * d, sK, /*INTERLEAVE=*/1, ValueRange{});
           if (Kr.dyn) dyn(l, {{::sa::DYN_DMA_ROWS, pK, false}});
         }
+        return bw;
+      };
+      auto exOp = [&](uint32_t bw, uint32_t cw, int64_t kl, bool accumulate) {
+        auto ex = sahw::ExOp::create(bb, loc, int64_t(strip), int64_t(bw), int64_t(cw), kl / d, accumulate,
+                                     int64_t(nc), kl, 1, int64_t(nc), ValueRange{});
+        if (Kr.dyn) dyn(ex, {{::sa::DYN_EX_KT, parOf(*Kr.dyn, 1, logd), false}, {::sa::DYN_EX_BSTEP, pK, false}});
+        if (Nr.dyn) dyn(ex, {{::sa::DYN_EX_REPEAT, parOf(*Nr.dyn, 1, logd), false}});
+      };
+      for (uint32_t c0 = 0; c0 < nt; c0 += nc) {
+        // one K block: the B tiles of this chunk, shared by the rows of x
+        uint32_t bw = nk == 1 ? loadB(c0, 0, K) : 0;
         for (int64_t g = 0; g < G; ++g) {
           if (G > 1 && !loadStrip(b, g)) return false;
           // the chunk's accumulator and epilogue buffers: released after its store
           uint32_t savedTop[2] = {accTop[0], accTop[1]};
           LocalBuf acc = newLocal(::sa::VT_I32, int64_t(nc) * d);
           uint32_t cw = acc.la & 0xFFFFFFF;
-          auto ex = sahw::ExOp::create(bb, loc, int64_t(strip), int64_t(bw), int64_t(cw), K / d, false, int64_t(nc),
-                                       K, 1, int64_t(nc), ValueRange{});
-          if (Kr.dyn) dyn(ex, {{::sa::DYN_EX_KT, parOf(*Kr.dyn, 1, logd), false}, {::sa::DYN_EX_BSTEP, pK, false}});
-          if (Nr.dyn) dyn(ex, {{::sa::DYN_EX_REPEAT, parOf(*Nr.dyn, 1, logd), false}});
+          if (nk == 1) {
+            exOp(bw, cw, K, false);
+          } else {
+            for (uint32_t kb = 0; kb < nk; ++kb) {
+              int64_t k0 = int64_t(kb) * kc, kl = std::min<int64_t>(kc, K - k0);
+              uint32_t bwk = loadB(c0, k0, kl);
+              replicate(k0, kl);
+              exOp(bwk, cw, kl, kb > 0);
+            }
+          }
           // the epilogue on this chunk: n elements at (b, g, c0)
           int64_t row = b * G + g;
           Chunk ch;
@@ -1527,6 +1685,12 @@ private:
       }
       cover.push_back(l);
     }
+    // a K the micro-kernel's schedule cannot hold (one weight tile per SPAD_B bank,
+    // x and its strip in SPAD_A, x in the ACC scratch): the generic lowering (K blocks)
+    const int64_t k = cast<MemRefType>(p.w.getType()).getDimSize(1);
+    if (k > int64_t(lay.sbank) || k * d > 65535 || k + k / d > 2 * int64_t(lay.sbank) ||
+        lay.acc0 + k / d + 2 > lay.cbank)
+      return false;
     for (Operation *o : cover) owned.insert(o);
     linears[con.getOperation()] = p;
     return true;
@@ -1799,6 +1963,10 @@ private:
       ranges = {chunk->n};
       nloops = 1;
       dynInner.reset();
+    }
+    if (piece) {                                          // piece mode: identity maps, this piece flat
+      ranges = {piece->second};
+      nloops = 1;
     }
     // a dynamic innermost length: one row at a time (each VE then needs only a
     // dynamic LEN, and VALID for a mask)
@@ -2302,6 +2470,18 @@ private:
       auto out = bufOf(init, /*bcast=*/true);
       if (!out) return false;
       if (!out->bcast) return fail("reduction result used before");
+      // piece mode: a later piece's maximum into a temp word, then into the result
+      uint32_t dst = out->la;
+      if (piece && piece->first > 0) {
+        if (rk != ::sa::RED_MAX) return fail("a sum over pieces");
+        dst = newLocal(::sa::VT_F32, 1, /*bcast=*/true).la;
+      }
+      auto combine = [&]() {
+        if (dst != out->la)
+          ve(Opd{out->la, ::sa::VT_F32, ::sa::IDX_LIN, 0}, Opd{dst, ::sa::VT_F32, ::sa::IDX_LIN, 0}, out->la,
+             ::sa::VT_F32, d, ::sa::VOP_MAX);
+        return err.empty();
+      };
       int64_t groups = n / d;
       auto absOp = elem.getDefiningOp<math::AbsFOp>();
       if (!sel && rk == ::sa::RED_MAX && absOp && elem.hasOneUse() && e.producer && e.uni == 0 && nloops == 1 &&
@@ -2315,18 +2495,18 @@ private:
              ::sa::VOP_MAX);
           groups = h;
         }
-        ve(e.o, std::nullopt, out->la, ::sa::VT_F32, groups * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, rk,
+        ve(e.o, std::nullopt, dst, ::sa::VT_F32, groups * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, rk,
            uint32_t(groups));
-        return err.empty();
+        return combine();
       }
       if (sel) {                                         // this row's word
         ve(e.o, std::nullopt, out->la + uint32_t(sel->row), ::sa::VT_F32, n, ::sa::VOP_COPY, 1.0f, NEG0,
            ::sa::FUNC_NONE, rk, 0);
         return err.empty();
       }
-      ve(e.o, std::nullopt, out->la, ::sa::VT_F32, n, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, rk,
+      ve(e.o, std::nullopt, dst, ::sa::VT_F32, n, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, rk,
          uint32_t(inner / d));
-      return err.empty();
+      return combine();
     }
     if (chunk && (reduction || g.getNumDpsInits() != 1)) return fail("linear epilogue with a reduction or two results");
     for (unsigned r = 0; r < unsigned(g.getNumDpsInits()); ++r) {

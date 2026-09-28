@@ -15,7 +15,9 @@ values (util.assume.int); dynamic lengths (workload ordinals) take --t;
 fp32 data is normal(0, 1), int8 / int32 data int8-valued, i64 scalars
 (token, position, row) --t - 3 (rows partly masked).
 
-    python3 compiler/tests/dispatch_check.py <sources dir> <binaries dir> [--d 8] [--t 16] [numbers...]
+    python3 compiler/tests/dispatch_check.py <sources dir> <binaries dir> [--d D] [--t 16] [numbers...]
+
+The simulator takes D and the local memory sizes from the dispatches' target configuration.
 """
 import argparse
 import glob
@@ -152,7 +154,10 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
     tsize = -(-max(rows.nbytes, 0x10000) // 0x10000) * 0x10000          # the template, whole 64 KB pages
     size = max(0x800000, -(-(tsize + sum(-(-len(b) // 4096) * 4096 for b in bufs.values())) // 0x100000) * 0x100000
                + 0x800000)
-    sim = SaFuncSim(d, base, size)
+    cfg = target_config(src)
+    if cfg.get("d", d) != d:
+        return f"compiled for D = {cfg['d']}, checked with D = {d}"
+    sim = SaFuncSim(d, base, size, spad_bytes=cfg.get("spad_bytes", 131072), acc_bytes=cfg.get("acc_bytes", 262144))
     sim.ddr_write(base, rows.tobytes())
     phys, a = [0] * max(nb, max(bufs, default=0) + 1), base + tsize
     for b in sorted(bufs):
@@ -184,11 +189,18 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
     return "; ".join(bad) if bad else "OK"
 
 
+def target_config(path):
+    """The integer fields of the dispatch's #hal.executable.target config (d, spad_bytes, ...)."""
+    text = open(path).read()
+    m = re.search(r'<"sa", "[^"]*", \{([^}]*)\}>', text)
+    return {k: int(v) for k, v in re.findall(r"(\w+) = (\d+) : i64", m.group(1))} if m else {}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("sources")
     ap.add_argument("binaries")
-    ap.add_argument("--d", type=int, default=8)
+    ap.add_argument("--d", type=int, help="default: the D the dispatches were compiled for")
     ap.add_argument("--t", type=int, default=16)
     ap.add_argument("numbers", nargs="*")
     args = ap.parse_args()
@@ -209,7 +221,7 @@ def main():
                 blob = open(bins[0], "rb").read()
                 res = "OK"
                 for site in range(call_sites(keep[2])):      # every call site's offsets
-                    r = check(p, blob, args.d, args.t, site=site)
+                    r = check(p, blob, args.d or target_config(p).get("d", 8), args.t, site=site)
                     if r != "OK":
                         res = f"call site {site}: {r}"
                         break

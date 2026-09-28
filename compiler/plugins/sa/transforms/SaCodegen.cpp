@@ -71,6 +71,10 @@ struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL
     if (!inner) return;
     TargetConfig cfg = TargetConfig::fromAttr(variant.getTarget().getConfiguration());
     cfg.ukernels = ukernels;
+    if (std::string why = cfg.invalid(); !why.empty()) {
+      variant.emitError() << "sa: invalid target configuration: " << why;
+      return signalPassFailure();
+    }
     for (auto exportOp : variant.getBlock().getOps<IREE::HAL::ExecutableExportOp>()) {
       auto func = inner.lookupSymbol<FunctionOpInterface>(exportOp.getSymName());
       if (!func) {

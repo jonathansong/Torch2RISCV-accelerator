@@ -9,9 +9,13 @@
   3. every dispatch of both: dispatch_check.py (oracle vs functional simulator)
      at dynamic lengths T = 16, 80, 256;
   4. descriptor / VE counts where the two differ (the micro-kernels' effect;
-     the board profile is the measure).
+     the board profile is the measure);
+  5. --configs: the target configuration cross-check (§8.9 item 1): the model
+     compiled for other hardware (D = 16, larger SPAD / ACC), every dispatch
+     checked on a functional simulator of that configuration (dispatch_check
+     takes it from the dispatch's target).
 
-    python3 compiler/tests/test_c5.py [--model build/c4/fuse] [--only all|none]
+    python3 compiler/tests/test_c5.py [--model build/c4/fuse] [--only all|none] [--configs]
 """
 import argparse
 import collections
@@ -28,6 +32,12 @@ COMPILER = os.path.abspath(os.path.join(HERE, ".."))
 REPO = os.path.abspath(os.path.join(COMPILER, ".."))
 sys.path.insert(0, os.path.join(COMPILER, "runtime", "tools"))
 import sadesc  # noqa: E402
+
+
+# other hardware for the cross-check (the L2 board: D = 8, 128 KB per SPAD, 256 KB ACC)
+CONFIGS = [("d16", "--iree-sa-d=16"),
+           ("big", "--iree-sa-spad-kb=256 --iree-sa-acc-kb=512"),
+           ("d16-big", "--iree-sa-d=16 --iree-sa-spad-kb=512 --iree-sa-acc-kb=1024")]
 
 
 def compile_to(model, d, flags):
@@ -52,6 +62,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", default=os.path.join(REPO, "build", "c4", "fuse"))
     ap.add_argument("--only", choices=["all", "none"])
+    ap.add_argument("--configs", action="store_true", help="also the target configuration cross-check")
     args = ap.parse_args()
     build = os.environ.get("IREE_BUILD", os.path.join(REPO, "build", "iree", "build-compiler"))
     ok = True
@@ -65,10 +76,12 @@ def main():
     work = tempfile.mkdtemp(prefix="sa_c5_")
     try:
         modes = [args.only] if args.only else ["all", "none"]
-        for mode in modes:
+        runs = [(m, f"--iree-sa-ukernels={m}") for m in modes]
+        if args.configs:
+            runs += [(f"{m}-{name}", f"--iree-sa-ukernels={m} {flags}") for m in modes for name, flags in CONFIGS]
+        for mode, flags in runs:
             log = compile_to(args.model, os.path.join(work, mode),
-                             f"--iree-sa-ukernels={mode} --iree-sa-codegen-report --iree-sa-allow-unsupported "
-                             "--mlir-disable-threading")
+                             f"{flags} --iree-sa-codegen-report --iree-sa-allow-unsupported --mlir-disable-threading")
             failed = collections.Counter()
             n = 0
             for line in log.splitlines():
@@ -77,13 +90,13 @@ def main():
                     n += 1
                     if m.group(2) == "failed":
                         failed[m.group(3)] += 1
-            print(f"--iree-sa-ukernels={mode}: {n - sum(failed.values())} of {n} executables compiled")
+            print(f"{flags}: {n - sum(failed.values())} of {n} executables compiled")
             for why, c in failed.most_common():
                 print(f"  {c:3d} not compiled: {why}")
-            ok &= not failed or mode == "none"
+            ok &= not failed or mode.startswith("none")
             d = os.path.join(work, mode)
             # dynamic lengths: short, past a few tiles, the maximum (buffers reused across chunks / heads)
-            for t in (16, 80, 256):
+            for t in (16, 80, 256) if mode in modes else (16, 256):
                 r = subprocess.run([sys.executable, os.path.join(HERE, "dispatch_check.py"), os.path.join(d, "sa_sources"),
                                     os.path.join(d, "bin"), "--t", str(t)], capture_output=True, text=True)
                 last = r.stdout.strip().splitlines()[-1]

@@ -35,6 +35,9 @@ struct TargetConfig {
   int64_t dynFields = 2;             // dynamic fields per descriptor
   int64_t bases = 16, params = 8;    // BASE / PARAM registers (BASE15: prefixes)
   static TargetConfig fromAttr(DictionaryAttr config);
+  // What the command encoding allows (empty if valid): D 8 or 16, the local
+  // memories powers of two of at most 2^16 words (16-bit local addresses).
+  std::string invalid() const;
   void addTo(Builder &b, SmallVectorImpl<NamedAttribute> &attrs) const;
   // not a hardware parameter: the micro-kernels sahl-to-sahw may use (§8.8)
   bool ukernel(StringRef name) const;

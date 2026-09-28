@@ -18,7 +18,7 @@ Protocol (one text line each way, one client at a time):
       record); cycles are 0 (no timing model)
   client -> server:             QUIT          (the server keeps listening)
 
-    python3 compiler/sim/sa_sim_server.py [--d 8] [--mb 64] [--socket /tmp/sa_sim.sock]
+    python3 compiler/sim/sa_sim_server.py [--d 8] [--spad-kb 128] [--acc-kb 256] [--mb 64] [--socket /tmp/sa_sim.sock]
 """
 import argparse
 import os
@@ -48,14 +48,14 @@ def serve(args):
     with open(shm, "wb") as f:
         f.truncate(size)
     ddr = np.memmap(shm, np.uint8, "r+", shape=(size,))
-    sim = SaFuncSim(args.d, BASE, size)
+    sim = SaFuncSim(args.d, BASE, size, spad_bytes=args.spad_kb << 10, acc_bytes=args.acc_kb << 10)
     sim.ddr = ddr                                       # the list and all buffers live in the shared file
     if os.path.exists(args.socket):
         os.remove(args.socket)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(args.socket)
     srv.listen(1)
-    print(f"sa sim: D = {args.d}, {args.mb} MB at {BASE:#x} in {shm}, socket {args.socket}", flush=True)
+    print(f"sa sim: D = {args.d}, SPAD {args.spad_kb} KB, ACC {args.acc_kb} KB, {args.mb} MB at {BASE:#x} in {shm}, socket {args.socket}", flush=True)
     runs = 0
     try:
         while True:
@@ -100,6 +100,8 @@ def serve(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--d", type=int, default=8)
+    ap.add_argument("--spad-kb", type=int, default=128, help="each SPAD (the executables' spad_bytes)")
+    ap.add_argument("--acc-kb", type=int, default=256, help="ACC (the executables' acc_bytes)")
     ap.add_argument("--mb", type=int, default=64, help="size of the simulated DDR window")
     ap.add_argument("--socket", default="/tmp/sa_sim.sock")
     ap.add_argument("--shm", help="shared-memory file (default /dev/shm/sa_ddr_<pid>)")
