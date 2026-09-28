@@ -196,9 +196,17 @@ public:
   }
 
   bool run() {
+    f.walk([&](linalg::GenericOp g) {
+      if (g->getParentOp() == f.getOperation()) matchLinear(g);
+    });
     for (Operation &opRef : f.getBody().front()) {
       Operation *op = &opRef;
       loc = op->getLoc();
+      if (auto it = linears.find(op); it != linears.end()) {
+        if (!linear(it->second)) return false;
+        continue;
+      }
+      if (owned.contains(op)) continue;
       if (isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CastOp,
               memref::DimOp, IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp,
               IREE::TensorExt::DispatchWorkloadOrdinalOp, func::ReturnOp>(op))
@@ -289,7 +297,13 @@ private:
   }
 
   // ------------------------------------------------------------ local memory
+  int preferBank = -1;                           // ACC temps of a linear chunk: its bank
   std::optional<uint32_t> allocAcc(uint32_t words) {
+    if (preferBank >= 0 && accTop[preferBank] + words <= uint32_t(preferBank + 1) * lay.cbank) {
+      uint32_t w = accTop[preferBank];
+      accTop[preferBank] += words;
+      return w;
+    }
     for (int b = 0; b < 2; ++b) {
       uint32_t end = (b + 1) * lay.cbank;
       if (accTop[b] + words <= end) {
@@ -612,6 +626,232 @@ private:
     return p;
   }
 
+  // ------------------------------------------------------------ linear layers (C5.2)
+  // y = epilogue(sum_k x[k] * W[n, k], ...): a contraction generic with the
+  // packed weights (i8 [N / D, K, D], iree-sa-pack-linear-weights) and x (i8 or
+  // int8 values in i32), its int32 accumulator consumed by one element-wise
+  // epilogue generic [N / D, D] whose result is stored. Lowered as C3's
+  // qlinear schedule (compile_layer.linear): chunks of output tiles, the
+  // weights of chunk i + 1 loaded into the other SPAD_B bank while chunk i
+  // computes, each chunk's epilogue through the element-wise lowering, many
+  // chunks as a LOOP_END loop over pairs, chunk 0's weights in the prefix.
+  struct LinearPlan {
+    linalg::GenericOp con, epi;
+    Value x, w;                                  // DDR sources
+    Value acc;                                   // the accumulator buffer
+    sahl::StoreOp store;
+    SmallVector<std::pair<int, Value>> chunked;  // epilogue inputs [N / D, D]: (input, DDR source)
+    SmallVector<std::pair<int, Value>> whole;    // other epilogue inputs: (input, DDR source)
+  };
+  llvm::DenseMap<Operation *, LinearPlan> linears;
+  llvm::DenseSet<Operation *> owned;
+
+  static sahl::LoadOp loadInto(Value local) {
+    for (Operation *u : local.getUsers())
+      if (auto l = dyn_cast<sahl::LoadOp>(u); l && l.getDst() == local) return l;
+    return {};
+  }
+
+  // the pattern (nothing else may use its buffers); records the operations it covers
+  bool matchLinear(linalg::GenericOp con) {
+    MLIRContext *ctx = con.getContext();
+    AffineExpr d0, d1, d2;
+    bindDims(ctx, d0, d1, d2);
+    auto maps = con.getIndexingMapsArray();
+    auto it = con.getIteratorTypesArray();
+    if (con.getNumDpsInputs() != 2 || con.getNumDpsInits() != 1 || it.size() != 3 ||
+        it[2] != utils::IteratorType::reduction || maps[0] != AffineMap::get(3, 0, {d2}, ctx) ||
+        maps[1] != AffineMap::get(3, 0, {d0, d2, d1}, ctx) || maps[2] != AffineMap::get(3, 0, {d0, d1}, ctx))
+      return false;
+    Block &b = con.getRegion().front();
+    auto y = cast<linalg::YieldOp>(b.getTerminator());
+    auto add = y.getOperand(0).getDefiningOp<arith::AddIOp>();
+    if (!add) return false;
+    Value prod = add.getLhs() == b.getArgument(2) ? add.getRhs() : add.getLhs();
+    auto mul = prod.getDefiningOp<arith::MulIOp>();
+    if (!mul) return false;
+    auto isExt = [&](Value v, int arg) {
+      auto e = v.getDefiningOp<arith::ExtSIOp>();
+      return e && e.getIn() == b.getArgument(arg);
+    };
+    if (!(isExt(mul.getLhs(), 0) && isExt(mul.getRhs(), 1)) && !(isExt(mul.getLhs(), 1) && isExt(mul.getRhs(), 0)))
+      return false;
+    LinearPlan p;
+    p.con = con;
+    auto lx = loadInto(con.getDpsInputs()[0]), lw = loadInto(con.getDpsInputs()[1]);
+    if (!lx || !lw) return false;
+    p.x = lx.getSrc();
+    p.w = lw.getSrc();
+    auto wt = cast<MemRefType>(p.w.getType());
+    auto xt = cast<MemRefType>(p.x.getType());
+    if (!wt.getElementType().isInteger(8) || wt.getRank() != 3 || wt.getDimSize(2) != d ||
+        !(xt.getElementType().isInteger(8) || xt.getElementType().isInteger(32)))
+      return false;
+    p.acc = con.getDpsInits()[0];
+    linalg::FillOp fill;
+    for (Operation *u : p.acc.getUsers()) {
+      if (u == con.getOperation()) continue;
+      if (auto f = dyn_cast<linalg::FillOp>(u)) fill = f;
+      else if (auto e = dyn_cast<linalg::GenericOp>(u); e && !p.epi) p.epi = e;
+      else if (!isa<memref::DeallocOp>(u)) return false;
+    }
+    if (!fill || !p.epi || !getConstantIntValue(fill.getDpsInputs()[0]) ||
+        *getConstantIntValue(fill.getDpsInputs()[0]) != 0)
+      return false;
+    linalg::GenericOp e = p.epi;
+    if (e.getNumDpsInits() != 1 || e.getNumReductionLoops() || e.getNumLoops() != 2 ||
+        !e.getIndexingMapsArray().back().isIdentity())
+      return false;
+    Value out = e.getDpsInits()[0];
+    for (Operation *u : out.getUsers()) {
+      if (u == e.getOperation()) continue;
+      if (auto s = dyn_cast<sahl::StoreOp>(u); s && s.getSrc() == out && !p.store) p.store = s;
+      else if (!isa<memref::DeallocOp>(u)) return false;
+    }
+    if (!p.store || !cast<MemRefType>(out.getType()).getElementType().isF32()) return false;
+    SmallVector<Operation *> cover = {con, fill, e, p.store, lx, lw};
+    for (int i = 0; i < e.getNumDpsInputs(); ++i) {
+      Value in = e.getDpsInputs()[i];
+      if (in == p.acc) continue;
+      auto l = loadInto(in);
+      if (!l) return false;
+      for (Operation *u : in.getUsers())
+        if (u != e.getOperation() && u != l.getOperation() && !isa<memref::DeallocOp>(u)) return false;
+      if (e.getIndexingMapsArray()[i].isIdentity()) {
+        if (!cast<MemRefType>(in.getType()).getElementType().isF32()) return false;
+        p.chunked.push_back({i, l.getSrc()});
+      } else {
+        p.whole.push_back({i, l.getSrc()});
+      }
+      cover.push_back(l);
+    }
+    for (Operation *o : cover) owned.insert(o);
+    linears[con.getOperation()] = p;
+    return true;
+  }
+
+  bool linear(LinearPlan &p) {
+    auto wt = cast<MemRefType>(p.w.getType());
+    const uint32_t k = uint32_t(wt.getDimSize(1)), nt = uint32_t(wt.getDimSize(0));
+    const uint32_t sb = lay.sbank, cb = lay.cbank;
+    if (k % d) return fail("linear: K not a multiple of D");
+    // the epilogue's extra per-chunk inputs beyond s_w need scratch words (as C3: 1 or 2 per output word)
+    uint32_t extra = p.chunked.size() > 1 ? uint32_t(p.chunked.size()) - 1 : 0;
+    uint32_t steps = 0;
+    for (Operation &o : p.epi.getRegion().front().without_terminator())
+      if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
+    uint32_t scratchRows = std::max<uint32_t>(steps > 2 ? 2 : 1, 1 + extra);
+    const uint32_t nc = lay.chunkTiles(k, nt, scratchRows);
+    if (nc == 0) return fail("linear: one weight tile does not fit a SPAD_B bank");
+    if (k + k / d > 2 * sb || lay.acc0 + k / d + 2 > cb) return fail("linear: K too large for the local memories");
+    const uint32_t nch = nt / nc, wbytes = nc * k * d, fbytes = 4 * nc * d, oSw = d * nc, oY = d * nc + nc;
+    const bool useLoop = nch > 4;
+    bool hoist = bb.getInsertionBlock()->empty();
+    auto xd = ddrOf(p.x), wd = ddrOf(p.w), yd = ddrOf(p.store.getDst());
+    if (!xd || !wd || !yd) return false;
+    SmallVector<Ddr> cd;
+    for (auto &[i, src] : p.chunked) {
+      auto r = ddrOf(src);
+      if (!r) return false;
+      cd.push_back(*r);
+    }
+    if (yd->off % 8 || wd->off % 8) return fail("linear: unaligned operand");
+    // x -> the A strip (each element over the D rows)
+    LocalBuf strip = newLocal(::sa::VT_I8, int64_t(k) * d);
+    bool xI32 = xd->et.isInteger(32);
+    LocalBuf xl = newLocal(xI32 ? ::sa::VT_I32 : ::sa::VT_I8, k);
+    uint32_t xb = xI32 ? 4 * k : k;
+    sahw::LdOp::create(bb, loc, xd->base, xd->off, int64_t(xl.la), 1, int64_t(xb), int64_t(xb), 0, ValueRange{});
+    ve({xl.la, xl.vt, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt, strip.la, ::sa::VT_I8, int64_t(k) * d,
+       ::sa::VOP_COPY);
+    // other epilogue inputs, whole (the scalar s_x: its broadcast word now, as C3)
+    for (auto &[i, src] : p.whole) {
+      Value in = p.epi.getDpsInputs()[i];
+      auto l = materialize(src);
+      if (!l) return false;
+      locals[in] = *l;
+      if (cast<MemRefType>(in.getType()).getRank() == 0 && !scalarBcast(in, *l)) return false;
+    }
+    Value pw = privateParam(), pf = privateParam();
+    auto dynAdd = [](auto op, bool dyn) {
+      if (!dyn) return;
+      op.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
+      op.setDynAdd(ArrayRef<bool>{true});
+    };
+    auto slot = [&](size_t m) { return m == 0 ? oSw : oY + nc * uint32_t(m); };
+    auto load = [&](uint32_t i, bool dyn) {
+      uint32_t bank = i & 1;
+      OpBuilder *wb = &bb;
+      std::optional<OpBuilder> pb;
+      if (i == 0 && hoist) {
+        auto pre = sahw::PrefixOp::create(regB, loc);
+        pb.emplace(OpBuilder::atBlockEnd(&pre.getRegion().emplaceBlock()));
+        wb = &*pb;
+      }
+      dynAdd(sahw::LdOp::create(*wb, loc, wd->base, wd->off + int64_t(i) * wbytes,
+                                int64_t(::sa::laddr(::sa::MEM_SPAD_B, bank * sb)), nc, int64_t(k) * d,
+                                int64_t(k) * d, 0, dyn ? ValueRange{pw} : ValueRange{}),
+             dyn);
+      for (size_t m = 0; m < cd.size(); ++m)
+        dynAdd(sahw::LdOp::create(bb, loc, cd[m].base, cd[m].off + int64_t(i) * fbytes,
+                                  int64_t(::sa::acc(bank * cb + slot(m))), 1, fbytes, fbytes, 0,
+                                  dyn ? ValueRange{pf} : ValueRange{}),
+               dyn);
+    };
+    auto chunkAt = [&](uint32_t i, bool dyn, bool prefetch) -> bool {
+      uint32_t bank = i & 1, c = bank * cb;
+      sahw::ExOp::create(bb, loc, int64_t(strip.la & 0xFFFFFFF), int64_t(bank * sb), int64_t(c), int64_t(k / d),
+                         false, int64_t(nc), int64_t(k), 1, int64_t(nc), ValueRange{});
+      if (prefetch) load(i + 1, dyn);
+      Chunk ch;
+      ch.n = int64_t(nc) * d;
+      ch.outLa = ::sa::acc(c + oY);
+      for (int in = 0; in < p.epi.getNumDpsInputs(); ++in)
+        if (p.epi.getDpsInputs()[in] == p.acc) {
+          Val a;
+          a.kind = Val::Mem;
+          a.o = {::sa::acc(c), ::sa::VT_I32, ::sa::IDX_LIN, 0};
+          ch.inputs[in] = a;
+        }
+      for (size_t m = 0; m < p.chunked.size(); ++m) {
+        Val a;
+        a.kind = Val::Mem;
+        a.o = {::sa::acc(c + slot(m)), ::sa::VT_F32, ::sa::IDX_LIN, 0};
+        ch.inputs[p.chunked[m].first] = a;
+      }
+      preferBank = int(bank);
+      bool ok = generic(p.epi, nullptr, &ch);
+      preferBank = -1;
+      if (!ok) return false;
+      dynAdd(sahw::StOp::create(bb, loc, yd->base, yd->off + int64_t(i) * fbytes, int64_t(ch.outLa), 1, fbytes,
+                                fbytes, dyn ? ValueRange{pf} : ValueRange{}),
+             dyn);
+      return true;
+    };
+    load(0, false);
+    uint32_t j = 0;
+    if (useLoop) {
+      uint32_t pairs = (nch - 1) / 2;            // the prefetch of the last pair stays in range
+      if (pairs) {
+        sahw::SetRegOp::create(bb, loc, ValueRange{pw, pf}, ArrayRef<int64_t>{0, 0}, 0, ValueRange{});
+        Block *blk = bb.getInsertionBlock();
+        Operation *before = blk->empty() ? nullptr : &blk->back();
+        if (!chunkAt(0, true, true) || !chunkAt(1, true, true)) return false;
+        auto loop = sahw::LoopOp::create(bb, loc, int64_t(pairs), pw, int64_t(2 * wbytes), pf, int64_t(2 * fbytes));
+        Block *lb = &loop.getRegion().emplaceBlock();
+        SmallVector<Operation *> moved;
+        for (Operation *o = before ? before->getNextNode() : &blk->front(); o && o != loop.getOperation();
+             o = o->getNextNode())
+          moved.push_back(o);
+        for (Operation *o : moved) o->moveBefore(lb, lb->end());
+        j = 2 * pairs;
+      }
+    }
+    for (uint32_t jj = j; jj < nch; ++jj)
+      if (!chunkAt(jj, false, jj + 1 < nch)) return false;
+    return err.empty();
+  }
+
   // ------------------------------------------------------------ linalg.generic
   // an i64 scalar: x + c (positions), as C3: the value v in every lane, then
   // (swapneg(v) - v) * -0.5 = [v, 0, v, 0, ...], the i64 (v, 0) in lanes 0, 1
@@ -657,7 +897,15 @@ private:
     Lin len;
   };
 
-  bool generic(linalg::GenericOp g, const RowSel *sel = nullptr) {
+  // a chunk of a linear layer's epilogue: the inputs given, n elements, the
+  // result into outLa
+  struct Chunk {
+    std::map<int, Val> inputs;
+    int64_t n = 0;
+    uint32_t outLa = 0;
+  };
+
+  bool generic(linalg::GenericOp g, const RowSel *sel = nullptr, const Chunk *chunk = nullptr) {
     auto iters = g.getIteratorTypesArray();
     int nloops = int(iters.size());
     SmallVector<AffineMap> maps = g.getIndexingMapsArray();
@@ -691,6 +939,10 @@ private:
     }
     for (int64_t r : ranges)
       if (r < 0) return fail("loop range not given by an operand");
+    if (chunk) {
+      if (nloops != 2 || dynInner) return fail("linear epilogue other than [N / D, D]");
+      ranges = {chunk->n / d, d};
+    }
     // a dynamic innermost length: one row at a time (each VE then needs only a
     // dynamic LEN, and VALID for a mask)
     if (dynInner && !sel) {
@@ -726,6 +978,10 @@ private:
     // inputs
     for (int i = 0; i < nin; ++i) {
       Value in = g.getDpsInputs()[i];
+      if (chunk && chunk->inputs.count(i)) {
+        vals[body.getArgument(i)] = chunk->inputs.at(i);
+        continue;
+      }
       AffineMap m = maps[i];
       auto mt = dyn_cast<MemRefType>(in.getType());
       if (!mt) return fail("scalar generic input");
@@ -1052,6 +1308,13 @@ private:
         vals[res] = v;
         continue;
       }
+      if (auto tr = dyn_cast<arith::TruncIOp>(op)) {
+        Val x = valOf(tr.getIn());
+        if (x.kind != Val::Mem || x.o.vt == ::sa::VT_F32 || !tr.getType().isInteger(32))
+          return fail("trunci other than of an accumulator");
+        vals[res] = x;                                   // the accumulator is int32 on the device
+        continue;
+      }
       if (auto sf = dyn_cast<arith::SIToFPOp>(op)) {
         Val x = valOf(sf.getIn());
         if (x.kind != Val::Mem || x.o.vt == ::sa::VT_F32) return fail("sitofp of a computed value");
@@ -1189,9 +1452,15 @@ private:
          uint32_t(inner / d));
       return err.empty();
     }
+    if (chunk && (reduction || g.getNumDpsInits() != 1)) return fail("linear epilogue with a reduction or two results");
     for (unsigned r = 0; r < unsigned(g.getNumDpsInits()); ++r) {
       Value init = g.getDpsInits()[r];
       Val y = valOf(yield.getOperand(r));
+      if (chunk) {
+        if (y.kind != Val::Mem || y.negInf) return fail("linear epilogue result");
+        ve(y.o, std::nullopt, chunk->outLa, ::sa::VT_F32, chunk->n, ::sa::VOP_COPY);
+        continue;
+      }
       if (y.negInf) return fail("-inf mask outside a max reduction");
       if (!sel && y.kind == Val::Mem && y.fresh && !locals.count(init) && init.getDefiningOp<memref::AllocOp>() &&
           vtOf(cast<MemRefType>(init.getType()).getElementType()) == y.o.vt) {
