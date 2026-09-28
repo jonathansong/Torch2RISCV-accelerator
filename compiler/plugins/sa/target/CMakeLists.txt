@@ -26,6 +26,7 @@ iree_cc_library(
     "../transforms/SaToSahl.cpp"
     "../transforms/SahlKernels.cpp"
     "../transforms/SahlTile.cpp"
+    "../transforms/SahlPlanMemory.cpp"
     "../transforms/SahlToSahw.cpp"
     "../transforms/SahlPipeline.cpp"
   DEPS

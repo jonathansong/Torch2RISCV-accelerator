@@ -22,6 +22,9 @@ void registerSaToSahlPass();
 // Splits an element-wise dispatch too large for ACC into pieces (sahl.scope).
 std::unique_ptr<Pass> createSahlTilePass(const TargetConfig &config);
 void registerSahlTilePass();
+// Places each local buffer and chooses its layout (sa.mem, sa.layout attributes).
+std::unique_ptr<Pass> createSahlPlanMemoryPass();
+void registerSahlPlanMemoryPass();
 // sahl -> one sahw.template per function (the lowering: registers, local
 // memory, one single-stage VE per arith / math operation).
 std::unique_ptr<Pass> createSahlToSahwPass(const TargetConfig &config);

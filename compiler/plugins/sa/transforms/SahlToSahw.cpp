@@ -252,15 +252,20 @@ private:
   // the local of a buffer (allocated at its first use)
   std::optional<LocalBuf> bufOf(Value v, bool bcast = false) {
     if (auto it = locals.find(v); it != locals.end()) return it->second;
-    if (!v.getDefiningOp<memref::AllocOp>()) return fail("operand is not a local buffer"), std::nullopt;
+    auto alloc = v.getDefiningOp<memref::AllocOp>();
+    if (!alloc) return fail("operand is not a local buffer"), std::nullopt;
     auto mt = cast<MemRefType>(v.getType());
     auto vt = vtOf(mt.getElementType());
+    // the plan (sahl-plan-memory): the layout; the place checked
+    if (auto pl = alloc->getAttrOfType<StringAttr>("sa.layout")) bcast |= pl.getValue() == "bcast";
+    if (auto pm = alloc->getAttrOfType<StringAttr>("sa.mem");
+        pm && (pm.getValue() == "spad_a") != mt.getElementType().isInteger(8))
+      return fail("local buffer placed in " + pm.getValue().str() + " against its type"), std::nullopt;
     int64_t n = mt.hasStaticShape() ? mt.getNumElements() : 0;
     if (mt.getElementType().isInteger(64)) vt = ::sa::VT_I32, n *= 2;       // (low, high) in two lanes
     if (!vt) return fail("local buffer type"), std::nullopt;
     if (!mt.hasStaticShape()) {
       // [?] or [H, ?]: rows of max_dynamic elements
-      auto alloc = v.getDefiningOp<memref::AllocOp>();
       if (!mt.isDynamicDim(mt.getRank() - 1) || alloc.getDynamicSizes().size() != 1)
         return fail("dynamic local buffer other than [..., ?]"), std::nullopt;
       auto dl = dynLin(alloc.getDynamicSizes()[0]);

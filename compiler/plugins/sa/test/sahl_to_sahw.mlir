@@ -3,6 +3,7 @@
 // RUN: iree-opt --split-input-file --iree-sahl-to-sahw %s | FileCheck %s --check-prefix=ONE
 // RUN: iree-opt --split-input-file --iree-sahl-to-sahw --iree-sahw-fuse-ve %s | FileCheck %s --check-prefix=FUSED
 // RUN: iree-opt --split-input-file --iree-sahl-to-sahw="d=16 acc-kb=512" --iree-sahw-fuse-ve %s | FileCheck %s --check-prefix=D16
+// RUN: iree-opt --split-input-file --iree-sahl-plan-memory %s | FileCheck %s --check-prefix=PLAN
 
 // exp(-x) over a column slice: a pitched LD of 8 rows; one single-stage VE per
 // operation, fused into one VE (A = -1, FUNC EXP); one ST.
@@ -47,6 +48,11 @@ func.func @exp_cols() {
 // vector, the scale, DIV-D replication, RECIP, then the I8 output with the
 // per-row operand in DIV mode (period = the row's words). sahl.to_i8 is the
 // whole quantization chain (sa-to-sahl makes it from arith; sa_to_sahl.mlir).
+// sahl-plan-memory: the int8 result in SPAD_A, the row maxima as broadcast words.
+// PLAN-LABEL: func.func @quant_rows
+// PLAN: memref.alloc() {sa.layout = "packed", sa.mem = "acc"} : memref<8x64xf32>
+// PLAN: memref.alloc() {sa.layout = "bcast", sa.mem = "acc"} : memref<8xf32>
+// PLAN: memref.alloc() {sa.layout = "packed", sa.mem = "spad_a"} : memref<8x64xi8>
 // FUSED-LABEL: sahw.template "quant_rows"
 // FUSED: sahw.ld %{{.+}} {ddr = 0 : i64, {{.*}}row_bytes = 2048 : i64, rows = 1 : i64}
 // FUSED-NEXT: sahw.ve {{{.*}}func = 4 : i64, {{.*}}length = 512 : i64, op = 5 : i64, reduce = 2 : i64, rowlen = 8 : i64

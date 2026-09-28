@@ -147,6 +147,7 @@ void registerSahwPasses() {
   registerSaCodegenPass();
   registerSaToSahlPass();
   registerSahlTilePass();
+  registerSahlPlanMemoryPass();
   registerSahlToSahwPass();
   registerSahwFuseVePass();
   PassRegistration<SahwSplitHeadPass>();
