@@ -68,6 +68,10 @@ def main():
     ap.add_argument("--generate", type=int, default=4)
     ap.add_argument("--mb", type=int, default=64)
     ap.add_argument("--flags", default="", help="extra iree-compile flags")
+    ap.add_argument("--model", help="the HuggingFace directory (tokenizer.json, config.json) for the board bundle; "
+                    "default stories15M")
+    ap.add_argument("--board-bundle", help="stage the board test here")
+    ap.add_argument("--board-generate", type=int, default=24)
     args = ap.parse_args()
     out = args.out
     ok = True
@@ -107,8 +111,43 @@ def main():
         if l.startswith("prefill"):
             print(f"  {l}")
     ok &= good
+    if args.board_bundle:
+        stage(args, out, prompt)
     print("C6.P PASS" if ok else "C6.P FAILED")
     return 0 if ok else 1
+
+
+def stage(args, out, prompt):
+    """Board bundle: module, packed parameters, the sim's decode-only run over the
+    prompt and --board-generate tokens (board_llm.py compares the prefill run
+    with its rows from the prompt's last position on), the tokenizer, model.json,
+    sa_args.txt (--pad=8 --prefill=M), board.txt (reference, window MB)."""
+    import json
+    dst = args.board_bundle
+    os.makedirs(dst, exist_ok=True)
+    for f in ("sa.vmfb", "sa_packed.irpa"):
+        shutil.copy(os.path.join(out, f), os.path.join(dst, f))
+    t0 = time.time()
+    tokens, logits, _ = run_sim(out, prompt, args.board_generate, args.mb)
+    np.save(os.path.join(dst, "prompt.npy"), np.array(prompt, np.int64))
+    np.save(os.path.join(dst, "expected_tokens.npy"), np.array(tokens[:len(logits)], np.int64))
+    np.save(os.path.join(dst, "expected_logits.npy"), logits.astype(np.float32))
+    if args.model:                                        # a HuggingFace decoder
+        shutil.copy(os.path.join(args.model, "tokenizer.json"), os.path.join(dst, "tokenizer.json"))
+        shutil.copy(os.path.join(COMPILER, "frontend", "hf_tokenizer.py"), os.path.join(dst, "hf_tokenizer.py"))
+        eos = json.load(open(os.path.join(args.model, "config.json"))).get("eos_token_id")
+        mj = {"tokenizer": "hf", "bos": None, "stop": eos[0] if isinstance(eos, list) else eos, "context": 256}
+    else:                                                 # stories15M (llama2.c)
+        shutil.copy(os.path.join(REPO, "build", "llm_cache", "tokenizer.bin"), os.path.join(dst, "tokenizer.bin"))
+        shutil.copy(os.path.join(REPO, "llm", "tokenizer.py"), os.path.join(dst, "tokenizer.py"))
+        mj = {"tokenizer": "llama2", "vocab": int(logits.shape[1]), "bos": 1, "stop": 1, "context": 256}
+    mj["prefill"] = args.prefill
+    json.dump(mj, open(os.path.join(dst, "model.json"), "w"))
+    with open(os.path.join(dst, "sa_args.txt"), "w") as f:
+        f.write(f"--pad=8 --prefill={args.prefill}\n")
+    with open(os.path.join(dst, "board.txt"), "w") as f:
+        f.write(f"the functional simulator {args.mb}\n")
+    print(f"board bundle: {dst} ({len(tokens)} expected tokens from the sim in {time.time() - t0:.0f} s)")
 
 
 if __name__ == "__main__":

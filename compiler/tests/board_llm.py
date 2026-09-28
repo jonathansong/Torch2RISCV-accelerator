@@ -47,6 +47,13 @@ def main():
         mb = int(mb)
     args_file = os.path.join(HERE, "sa_args.txt")
     extra = open(args_file).read().split() if os.path.exists(args_file) else []
+    if "--decode-only" in sys.argv[1:]:                  # the prompt as decode steps even with a prefill
+        extra = [a for a in extra if not a.startswith("--prefill")]
+    # prefill (plan §8.13): the logits of the prompt's last position, then of
+    # the generated steps (the reference's rows from P - 1 on)
+    M = max([int(a.split("=")[1]) for a in extra if a.startswith("--prefill=")] or [0])
+    if M and len(prompt) >= M:
+        want_logits = want_logits[len(prompt) - 1:]
     mm, buf, env = BL.start(os.path.join(HERE, "picorv32.bit"), os.path.join(HERE, "rt_fw.bin"), mb=mb, ring=16)
     try:
         cmd = [os.path.join(HERE, "sa-llm-run"), "--device=sa", f"--module={HERE}/sa.vmfb",

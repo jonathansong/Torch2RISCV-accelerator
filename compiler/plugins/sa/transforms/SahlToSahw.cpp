@@ -325,7 +325,7 @@ public:
     return std::make_pair(R, C);
   }
   // ACC words such a dispatch may need at once: every [R, C] buffer, a temp per
-  // operation of a two-loop generic
+  // fp32 operation of a two-loop generic
   int64_t pieceWords2D(int64_t R, int64_t C) {
     int64_t bufs = 0;
     for (Operation &op : f.getBody().front()) {
@@ -333,7 +333,12 @@ public:
         auto mt = cast<MemRefType>(a.getType());
         if (mt.getRank() == 2 && !mt.getElementType().isInteger(8)) ++bufs;
       } else if (auto g = dyn_cast<linalg::GenericOp>(&op); g && g.getNumLoops() == 2) {
-        bufs += int64_t(llvm::range_size(g.getRegion().front().without_terminator()));
+        // the operations that make a new fp32 value (casts, compares, selects and
+        // the to_i8 chain are stages of the VE that consumes them)
+        for (Operation &o : g.getRegion().front().without_terminator())
+          if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp, arith::MaximumFOp, arith::MinimumFOp,
+                  math::ExpOp, math::RsqrtOp, math::AbsFOp, arith::NegFOp>(o))
+            ++bufs;
       }
     }
     return bufs * ((R * C + d - 1) / d);

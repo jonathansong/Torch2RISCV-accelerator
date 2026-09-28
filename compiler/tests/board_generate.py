@@ -48,6 +48,8 @@ def generate(prompt_ids, max_new, cfg, decode, env, extra):
            f"--generate={max_new}"] + extra
     if cfg.get("stop") is not None:
         cmd.append(f"--stop_token={cfg['stop']}")
+    if cfg.get("prefill") and not any(a.startswith("--prefill") for a in cmd):
+        cmd.append(f"--prefill={cfg['prefill']}")   # prompts of >= M tokens in chunks, shorter ones as decode
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     out, cur, ids = bytearray(), b"", []
     shown = decode(prompt_ids)

@@ -369,28 +369,32 @@ class QModel(torch.nn.Module):
         # (a scalar index): only the linear layers gain from the rows
         x = torch.cat([self.emb_q.index_select(0, tokens[m:m + 1]).to(F32) *
                        self.emb_s.index_select(0, tokens[m:m + 1]).unsqueeze(-1) for m in range(M)])
-        cos = torch.cat([self.rope_cos.index_select(0, posv[m:m + 1]) for m in range(M)]).unsqueeze(1)
-        sin = torch.cat([self.rope_sin.index_select(0, posv[m:m + 1]) for m in range(M)]).unsqueeze(1)
-        rope = lambda v: v * cos + swapneg(v) * sin
+        # the RoPE rows (cos / sin broadcast over the heads: row by row as decode)
+        cs = [(self.rope_cos.index_select(0, posv[m:m + 1])[0], self.rope_sin.index_select(0, posv[m:m + 1])[0])
+              for m in range(M)]
         for l in range(c.layers):
             xq, s_x = quant_act(self.rmsnorm(x, self.rms_att[l]))
             qkv = qlinear(xq, s_x, self.wqkv[l], self.s_wqkv[l])                     # (M, q + 2 kv)
-            q = qkv[:, :c.q_dim].reshape(M, c.heads, hs)
-            k = qkv[:, c.q_dim:c.q_dim + c.kv_dim].reshape(M, c.kv_heads, hs)
-            v = qkv[:, c.q_dim + c.kv_dim:]
-            if c.qk_norm:
-                q = self.rmsnorm(q, self.q_norm[l])
-                k = self.rmsnorm(k, self.k_norm[l])
-            q = rope(q).reshape(M, -1)
-            k = rope(k).reshape(M, -1)
-            kq, vq = to_i8(k * self.inv_sk[l]), to_i8(v * self.inv_sv[l])
+            # QK-norm, RoPE, the KV row and the attention row by row, each as a
+            # decode step's (the scalar position positions[m]); the linear layers
+            # are what gain from the rows
+            att = []
             for m in range(M):
+                cos, sin = cs[m]
+                rope = lambda t: t * cos + swapneg(t) * sin
+                q = qkv[m, :c.q_dim].reshape(c.heads, hs)
+                k = qkv[m, c.q_dim:c.q_dim + c.kv_dim].reshape(c.kv_heads, hs)
+                v = qkv[m, c.q_dim + c.kv_dim:]
+                if c.qk_norm:
+                    q = self.rmsnorm(q, self.q_norm[l])
+                    k = self.rmsnorm(k, self.k_norm[l])
+                q = rope(q).reshape(-1)
+                k = rope(k).reshape(-1)
                 row = posv[m:m + 1] + l * c.seq_len
-                self.kc.index_copy_(0, row, kq[m:m + 1])
-                self.vc.index_copy_(0, row, vq[m:m + 1])
-            # attention row by row, each as a decode step's (the scalar position
-            # positions[m]); the linear layers are what gain from the rows
-            att = torch.stack([self.attention(l, q[m], T, posv[m:m + 1]) for m in range(M)])
+                self.kc.index_copy_(0, row, to_i8(k * self.inv_sk[l]).unsqueeze(0))
+                self.vc.index_copy_(0, row, to_i8(v * self.inv_sv[l]).unsqueeze(0))
+                att.append(self.attention(l, q, T, posv[m:m + 1]))
+            att = torch.stack(att)
             aq, s_a = quant_act(att)
             x = x + qlinear(aq, s_a, self.wo[l], self.s_wo[l])
             xq, s_x = quant_act(self.rmsnorm(x, self.rms_ffn[l]))
