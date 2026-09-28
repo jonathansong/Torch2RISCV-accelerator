@@ -3012,8 +3012,8 @@ private:
 struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SahlToSahwPass)
   SahlToSahwPass() = default;
-  explicit SahlToSahwPass(const TargetConfig &c) : cfg(c) {}
-  SahlToSahwPass(const SahlToSahwPass &o) : PassWrapper(o), cfg(o.cfg) {}
+  explicit SahlToSahwPass(const TargetConfig &c) : cfg(c), fromOptions(false) {}
+  SahlToSahwPass(const SahlToSahwPass &o) : PassWrapper(o), cfg(o.cfg), fromOptions(o.fromOptions) {}
   StringRef getArgument() const override { return "iree-sahl-to-sahw"; }
   StringRef getDescription() const override {
     return "Lowers each sahl function (linalg on local buffers + sahl.load / store) to a sahw.template";
@@ -3021,6 +3021,12 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
   void getDependentDialects(DialectRegistry &registry) const override { registry.insert<sahw::SahwDialect>(); }
 
   void runOnOperation() override {
+    if (fromOptions) {                         // iree-opt: the target configuration from the pass options
+      cfg.d = optD;
+      cfg.spadBytes = optSpadKB * 1024;
+      cfg.accBytes = optAccKB * 1024;
+      cfg.ukernels = optUkernels;
+    }
     ModuleOp m = getOperation();
     SmallVector<func::FuncOp> funcs(m.getOps<func::FuncOp>());
     for (func::FuncOp f : funcs) {
@@ -3040,6 +3046,12 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
   }
 
   TargetConfig cfg;
+  bool fromOptions = true;
+  Option<int64_t> optD{*this, "d", llvm::cl::desc("array size D"), llvm::cl::init(8)};
+  Option<int64_t> optSpadKB{*this, "spad-kb", llvm::cl::desc("SPAD size (KB, two banks)"), llvm::cl::init(128)};
+  Option<int64_t> optAccKB{*this, "acc-kb", llvm::cl::desc("ACC size (KB, two banks)"), llvm::cl::init(256)};
+  Option<std::string> optUkernels{*this, "ukernels", llvm::cl::desc("micro-kernels: all, none or a list"),
+                                  llvm::cl::init("all")};
 };
 
 }  // namespace

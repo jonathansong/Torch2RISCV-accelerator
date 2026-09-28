@@ -1042,6 +1042,19 @@ C5.5 的模型（§8.9 的第一步）：
 | **R6 翻译与动态值** | `sahl-to-sahw` 只做一对一翻译；动态值（行循环、动态 DMA、PARAM）挪到 `sahw-legalize-dynamic` | 逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 都有 lit 测试 |
 | R7（之后） | 代价模型（§8.5）接进 `sahl-tile` 与 `sahl-pipeline` 的选择；这时才允许输出改变（按周期验收） | 板上逐 dispatch 周期不变差 |
 
+**R0 结果（2026-09-29）**：
+- **黄金语料**：`compiler/tests/golden.py`，存在 `build/golden`（源文件去重后的副本，不受模型重新导出影响）。
+  - 9 组：stories15M M = 8（带 / 不带微内核）、stories15M M = 16、SmolLM2 M = 8 / 16、Qwen3 全 28 层、K = 16384 合成模型、D = 16、更大的 SPAD / ACC；
+  - 共 3112 个 dispatch，去重后 2959 个；
+  - 单个源文件用 `--compile-mode=hal-executable` 编译，与整模型编译导出的描述符逐字节相同（有导出的 7 组全部核对过）；
+  - 重新编译并比较只要约 20 秒（6 个并行）；两次记录结果相同；故意改坏一个期望文件能检出。
+  - `run_tests.sh golden`：先跑 lit，再比较黄金语料。
+- **pass 的单独运行**：
+  - `sahl` 方言原来没有注册到 `iree-opt`，`sahl` 层的 IR 读不进来：已注册；
+  - `iree-sahl-to-sahw` 加了目标配置的 pass 选项（`d`、`spad-kb`、`acc-kb`、`ukernels`），`iree-opt` 可以单独运行；
+  - 新 lit 测试：`sa_to_sahl.mlir`，以及 `sahl_to_sahw.mlir`（单级 VE、融合后、D = 16 三种配置；exp 与按行量化两个函数）。
+- **发现的旧缺口**：`--iree-sa-ukernels=none` 时，prefill 的 5 个多行线性层编不了（`contraction epilogue input layout`：通用 contraction 的尾部不支持按行的输入）。§8.7 说“不用微内核也能编译全部”只对 decode 成立。语料里把它们记为“预期失败”；R2 把微内核改成 `sahl` 层展开时一并解决。
+
 **顺序与依赖**：R0 → R1 → R2 → R3 → R4 → R5 → R6，每步单独提交。R1 是最大的一步（识别逻辑全部搬家）；R3 与 R4 是 C6.5（T 分块注意力）与代价模型的前提。
 
 **风险**：
@@ -1081,7 +1094,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
-| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**计划中** | 大 |
+| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**进行中**（R0 完成） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。

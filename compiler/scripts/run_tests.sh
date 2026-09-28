@@ -3,7 +3,7 @@
 # runs from your own terminal (processes started by a Claude Code session end
 # with it).
 #   compiler/scripts/run_tests.sh [-j JOBS] [-t THREADS] [-o LOGDIR] TEST...
-# TEST: c3 | c5 | c5cfg | smollm2 | qwen3l2 | synth | qwen3export | qwen3 | "any command line"
+# TEST: golden | c3 | c5 | c5cfg | smollm2 | qwen3l2 | synth | qwen3export | qwen3 | "any command line"
 #   -j JOBS     tests at a time (default 1)
 #   -t THREADS  threads per test: OpenMP / BLAS, and iree-compile
 #               single-threaded when 1 (default 2)
@@ -29,6 +29,8 @@ flags=""
 [ "$threads" = 1 ] && flags="--mlir-disable-threading"
 T=compiler/tests
 declare -A cmd=(
+  # C8 guard: the pass lit tests, then the golden corpus byte for byte (~30 s)
+  [golden]="$IREE_BUILD/llvm-project/bin/llvm-lit -q compiler/plugins/sa/test && $SA_PY -u $T/golden.py"
   [c3]="$SA_PY -u $T/test_c3.py --skip-export --out build/c4/fuse"
   [c5]="$SA_PY -u $T/test_c5.py"
   [c5cfg]="$SA_PY -u $T/test_c5.py --configs"

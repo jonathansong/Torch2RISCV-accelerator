@@ -210,6 +210,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   ```
 
   ```sh
+  compiler/scripts/run_tests.sh golden               # C8 guard: pass lit tests + the golden corpus (2959 dispatches) byte for byte, ~30 s
   python3 compiler/tests/test_c5.py                  # lit, both configurations, dispatch_check at T = 16, 80, 256
   python3 compiler/tests/test_c5.py --configs        # + other hardware (D = 16, larger SPAD / ACC: --iree-sa-d / -spad-kb / -acc-kb)
   compiler/scripts/run_tests.sh -j 1 smollm2 qwen3l2 c5cfg   # long runs: a bounded number of jobs, a log each (build/c6/logs)

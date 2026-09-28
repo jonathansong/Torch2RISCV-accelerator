@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Golden corpus of the sa code generator (docs/iree_compiler_plan.md §8.14, C8 R0).
+
+The C8 refactor must not change what the compiler emits: every dispatch of the
+corpus compiles to the same sa-desc bytes as when the corpus was recorded.
+
+A dispatch source (iree-compile --iree-hal-dump-executable-sources-to) is
+self-contained (its #hal.executable.target carries the target config), and
+`iree-compile --compile-mode=hal-executable` on it gives the same bytes as the
+whole-model compile (--iree-hal-dump-executable-binaries-to). So the corpus is
+the sources alone, copied into build/golden/src (the models' build directories
+change when they are re-exported), deduplicated by content and flags.
+
+    python3 compiler/tests/golden.py --record [-j 6]   # (re)record from the cases below
+    python3 compiler/tests/golden.py [-j 6] [--case stories_m8]   # compare
+"""
+import argparse
+import concurrent.futures as cf
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+GOLDEN = os.path.join(REPO, "build", "golden")
+IREE_BUILD = os.environ.get("IREE_BUILD", os.path.join(REPO, "build", "iree", "build-compiler"))
+COMPILE = os.path.join(IREE_BUILD, "tools", "iree-compile")
+
+# (case, the model's sa_sources, extra iree-compile flags)
+CASES = [
+    ("stories_m8", "build/c6p/stories_m8/sa_sources", []),                  # decode + prefill (M = 8)
+    ("stories_m8_none", "build/c6p/stories_m8/sa_sources", ["--iree-sa-ukernels=none"]),
+    ("stories_m16", "build/c6p/stories_m16/sa_sources", []),
+    ("smollm2_m8", "build/c6p/smollm2_m8/sa_sources", []),                  # GQA, tied embedding
+    ("smollm2_m16", "build/c6p/smollm2_m16/sa_sources", []),
+    ("qwen3", "build/c6/qwen3/sa_sources", []),                             # QK-norm, 28 layers
+    ("k16k", "build/c6/k16k/sa_sources", []),                               # K blocks
+    ("cfg_d16", "build/c6/cfg/d16/sa_sources", []),                         # other targets
+    ("cfg_big", "build/c6/cfg/big/sa_sources", []),
+]
+
+
+def key_of(text, flags):
+    return hashlib.sha256((" ".join(flags) + "\n" + text).encode()).hexdigest()[:20]
+
+
+def compile_one(src, flags, out):
+    """sa-desc bytes, or None and the error's last lines."""
+    r = subprocess.run([COMPILE, src, "--compile-mode=hal-executable", "--iree-hal-target-device=sa", *flags,
+                        "-o", out], capture_output=True, text=True, timeout=600)
+    if r.returncode:
+        return None, "\n".join(r.stderr.strip().splitlines()[-3:])
+    with open(out, "rb") as f:
+        return f.read(), ""
+
+
+def run_all(items, jobs, tmp):
+    """items: {key: (src, flags)} -> {key: (bytes or None, err)}"""
+    res = {}
+    with cf.ThreadPoolExecutor(jobs) as ex:
+        futs = {ex.submit(compile_one, src, flags, os.path.join(tmp, k + ".sadesc")): k
+                for k, (src, flags) in items.items()}
+        for i, fu in enumerate(cf.as_completed(futs), 1):
+            res[futs[fu]] = fu.result()
+            if i % 200 == 0:
+                print(f"  {i}/{len(items)}", flush=True)
+    return res
+
+
+def record(args):
+    manifest, items = {}, {}
+    for case, d, flags in CASES:
+        d = os.path.join(REPO, d)
+        if not os.path.isdir(d):
+            print(f"{case}: {d} missing, skipped")
+            continue
+        entries = []
+        for name in sorted(os.listdir(d)):
+            text = open(os.path.join(d, name)).read()
+            k = key_of(text, flags)
+            entries.append({"name": name, "key": k})
+            items.setdefault(k, (name, text, flags))
+        manifest[case] = {"flags": flags, "from": os.path.relpath(d, REPO), "entries": entries}
+    shutil.rmtree(GOLDEN, ignore_errors=True)
+    for sub in ("src", "exp"):
+        os.makedirs(os.path.join(GOLDEN, sub))
+    todo = {}
+    for k, (name, text, flags) in items.items():
+        p = os.path.join(GOLDEN, "src", k + ".mlir")
+        with open(p, "w") as f:
+            f.write(text)
+        todo[k] = (p, flags)
+    t0 = time.time()
+    res = run_all(todo, args.jobs, os.path.join(GOLDEN, "exp"))
+    errors = {}
+    for k, (data, err) in res.items():
+        if data is None:
+            errors[k] = err
+    with open(os.path.join(GOLDEN, "manifest.json"), "w") as f:
+        json.dump({"cases": manifest, "errors": errors}, f, indent=1)
+    n = sum(len(c["entries"]) for c in manifest.values())
+    print(f"recorded {len(todo)} unique dispatches ({n} in {len(manifest)} cases, {len(errors)} fail to compile) "
+          f"in {time.time() - t0:.0f} s -> {os.path.relpath(GOLDEN, REPO)}")
+    return 0
+
+
+def compare(args):
+    mf = json.load(open(os.path.join(GOLDEN, "manifest.json")))
+    cases = {c: v for c, v in mf["cases"].items() if not args.case or c in args.case}
+    keys = sorted({e["key"] for v in cases.values() for e in v["entries"]})
+    flags = {e["key"]: v["flags"] for v in cases.values() for e in v["entries"]}
+    t0 = time.time()
+    with tempfile.TemporaryDirectory(prefix="sa_golden_") as tmp:
+        res = run_all({k: (os.path.join(GOLDEN, "src", k + ".mlir"), flags[k]) for k in keys}, args.jobs, tmp)
+    bad = {}
+    for k in keys:
+        data, err = res[k]
+        if k in mf["errors"]:
+            if data is not None:
+                bad[k] = "compiles now (failed when recorded)"
+            continue
+        if data is None:
+            bad[k] = "fails to compile: " + err
+            continue
+        with open(os.path.join(GOLDEN, "exp", k + ".sadesc"), "rb") as f:
+            want = f.read()
+        if data != want:
+            at = next((i for i, (a, b) in enumerate(zip(data, want)) if a != b), min(len(data), len(want)))
+            bad[k] = f"differs ({len(data)} vs {len(want)} bytes, first at byte {at})"
+    for c, v in cases.items():
+        ks = [e for e in v["entries"] if e["key"] in bad]
+        print(f"{c}: {len(v['entries']) - len(ks)}/{len(v['entries'])} identical")
+        for e in ks[:args.show]:
+            print(f"  {e['name']} [{e['key']}]: {bad[e['key']]}")
+        if len(ks) > args.show:
+            print(f"  ... {len(ks) - args.show} more")
+    print(f"{len(keys)} unique dispatches in {time.time() - t0:.0f} s: "
+          + ("golden corpus IDENTICAL" if not bad else f"{len(bad)} DIFFER"))
+    print("golden PASS" if not bad else "golden FAIL")
+    return 1 if bad else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--record", action="store_true", help="record the corpus from CASES (replaces build/golden)")
+    ap.add_argument("--case", action="append", help="compare only these cases")
+    ap.add_argument("-j", "--jobs", type=int, default=6)
+    ap.add_argument("--show", type=int, default=10, help="differing dispatches listed per case")
+    args = ap.parse_args()
+    return record(args) if args.record else compare(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

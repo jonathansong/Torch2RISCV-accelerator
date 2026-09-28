@@ -19,6 +19,7 @@
 #include "SAPasses.h"
 #include "../transforms/SahwPasses.h"
 #include "../transforms/SahlPasses.h"
+#include "SahlDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetDevice.h"
@@ -257,7 +258,9 @@ struct SASession final
     sa::registerLowerWorkgroupCountPass();
     sa::registerSahwPasses();
   }
-  void onRegisterDialects(DialectRegistry &registry) override { registry.insert<sa::sahw::SahwDialect>(); }
+  void onRegisterDialects(DialectRegistry &registry) override {
+    registry.insert<sa::sahl::SahlDialect, sa::sahw::SahwDialect>();
+  }
   // Only acts on modules that target the sa device (the pass checks), so the
   // default behavior of the compiler is unchanged.
   void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
