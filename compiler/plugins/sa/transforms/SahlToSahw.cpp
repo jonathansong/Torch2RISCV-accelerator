@@ -25,6 +25,7 @@
 #include "SahlPasses.h"
 #include "SahwPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -229,6 +230,10 @@ public:
       }
       if (auto g = dyn_cast<linalg::GenericOp>(op)) {
         if (!generic(g)) return false;
+        continue;
+      }
+      if (auto sc = dyn_cast<IREE::LinalgExt::ScatterOp>(op)) {
+        if (!scatter(sc)) return false;
         continue;
       }
       return fail("unsupported operation " + op->getName().getStringRef().str());
@@ -626,6 +631,35 @@ private:
     return p;
   }
 
+  // ------------------------------------------------------------ scatter (C5.3)
+  // one row written at a dynamic index (the KV cache update): LDPARAM of the
+  // index * row bytes, a ST with that DDR offset
+  bool scatter(IREE::LinalgExt::ScatterOp sc) {
+    Value upd = sc.getUpdates(), idx = sc.getIndices(), orig = sc.getOriginal();
+    auto uT = cast<MemRefType>(upd.getType()), oT = cast<MemRefType>(orig.getType());
+    if (sc.getDimensionMap() != ArrayRef<int64_t>{0} || uT.getDimSize(0) != 1 || !uT.hasStaticShape() ||
+        !oT.hasStaticShape() || uT.getElementType() != oT.getElementType())
+      return fail("scatter other than one row at a dynamic index");
+    Block &b = sc.getRegion().front();
+    auto y = dyn_cast<IREE::LinalgExt::YieldOp>(b.getTerminator());
+    if (!y || y.getOperand(0) != b.getArgument(0)) return fail("scatter that does not overwrite");
+    uint32_t es = esize(uT.getElementType());
+    uint32_t rowBytes = uint32_t(uT.getNumElements() * es);
+    if (rowBytes % 8 || rowBytes > 0xFFFF) return fail("scatter row size");
+    auto u = materialize(upd);
+    auto ir = ddrOf(idx);
+    auto orr = ddrOf(orig);
+    if (!u || !ir || !orr) return false;
+    if (orr->off % 8) return fail("scatter target not 8-byte aligned");
+    Value p = privateParam();
+    sahw::LdParamOp::create(bb, loc, ir->base, p, ir->off, rowBytes, 0, ValueRange{});
+    auto st = sahw::StOp::create(bb, loc, orr->base, orr->off, int64_t(u->la), 1, int64_t(rowBytes), int64_t(rowBytes),
+                                 ValueRange{p});
+    st.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
+    st.setDynAdd(ArrayRef<bool>{true});
+    return err.empty();
+  }
+
   // ------------------------------------------------------------ linear layers (C5.2)
   // y = epilogue(sum_k x[k] * W[n, k], ...): a contraction generic with the
   // packed weights (i8 [N / D, K, D], iree-sa-pack-linear-weights) and x (i8 or
@@ -913,7 +947,15 @@ private:
     if (nloops == 0 && g.getNumDpsInits() == 1 &&
         cast<MemRefType>(g.getDpsInits()[0].getType()).getElementType().isInteger(64))
       return intScalar(g);
-    if (nloops > 2) return fail("more than two loops");
+    bool collapse = false;
+    if (nloops > 2) {
+      // an element-wise nest with identity maps only: one flat loop
+      if (!llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }) ||
+          llvm::any_of(iters, [](utils::IteratorType t) { return t == utils::IteratorType::reduction; }))
+        return fail("more than two loops");
+      if (!g.getRegion().front().getOps<linalg::IndexOp>().empty()) return fail("indices in a nest of more than two loops");
+      collapse = true;
+    }
     SmallVector<int64_t> ranges(nloops, -1);
     std::optional<Lin> dynInner;
     for (int i = 0; i < int(g->getNumOperands()); ++i) {
@@ -939,6 +981,13 @@ private:
     }
     for (int64_t r : ranges)
       if (r < 0) return fail("loop range not given by an operand");
+    if (collapse) {
+      if (dynInner) return fail("dynamic nest of more than two loops");
+      int64_t prod = 1;
+      for (int64_t r : ranges) prod *= r;
+      ranges = {prod};
+      nloops = 1;
+    }
     if (chunk) {
       if (nloops != 2 || dynInner) return fail("linear epilogue other than [N / D, D]");
       ranges = {chunk->n / d, d};

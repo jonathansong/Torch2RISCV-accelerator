@@ -72,6 +72,11 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
         c.erase();
         continue;
       }
+      // a copy of a buffer onto itself (the write-back of an in-place update): nothing to do
+      if (auto g = dyn_cast<linalg::GenericOp>(op); g && isIdentityCopy(g) && g.getDpsInputs()[0] == g.getDpsInits()[0]) {
+        g.erase();
+        continue;
+      }
       auto dps = dyn_cast<DestinationStyleOpInterface>(op);
       if (!dps || !isa<linalg::LinalgOp>(op)) continue;
       if (auto g = dyn_cast<linalg::GenericOp>(op); g && isIdentityCopy(g) && ddrRoot(g.getDpsInits()[0]) &&
