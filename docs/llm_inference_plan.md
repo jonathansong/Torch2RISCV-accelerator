@@ -5,7 +5,7 @@
 - 8 条序列批处理 63.3 tok/s（设备 77 tok/s）；
 - teacher-forced top-1 与 fp32 一致率 96.2%。
 
-L6-IREE（编译器）大部分完成：PyTorch / HuggingFace 模型经 IREE 与自己的 `sa` 后端（两层方言 sahl / sahw）编译，stories15M 与 SmolLM2-135M 在板上运行，logits 与参考逐位一致（stories15M 17.7 tok/s，SmolLM2 1.90 tok/s）；进度与剩下的工作（C4 性能、C6 更大的模型）见 [`iree_compiler_plan.md`](iree_compiler_plan.md)。
+L6-IREE（编译器）大部分完成：PyTorch / HuggingFace 模型经 IREE 与自己的 `sa` 后端（两层方言 sahl / sahw）编译，stories15M 与 SmolLM2-135M 在板上运行，logits 与参考逐位一致（stories15M 17.7 tok/s，SmolLM2 2.23 tok/s）；进度与剩下的工作（C4 性能、C6 更大的模型）见 [`iree_compiler_plan.md`](iree_compiler_plan.md)。
 
 还没做的：L5.5（75 MHz）。各级的实现记录与板上结果见
 §4（L0）、§5.5（L1）、§6.9（L2）、§7.3（L3）、§8.7（L4）、§9.3（L5）、§11.1（L5b），汇总见 §13。
@@ -1177,7 +1177,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | **L5** | Python 运行时；端到端生成文本 | Python | 否 | §9.2 的 4 项 | **完成**（89741a3；15.1 tok/s 墙钟，top-1 96.2%） |
 | L5b | 多序列并发 decode | Python | 否 | §11.1 | **完成**（faf7bc7；8 条序列 63.3 tok/s） |
 | L5.5 | 75 MHz | 时钟与少量时序修复 | 是 | §11.2 | 未做（LUT 已用 83%，时序更难收敛） |
-| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | **大部分完成**（C0–C3、C5 完成：stories15M 板上 17.7 tok/s、SmolLM2-135M 板上 1.90 tok/s，均逐位一致；C4 部分完成；C6 更大的模型进行中） |
+| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | **大部分完成**（C0–C3、C5 完成：stories15M 板上 17.7 tok/s、SmolLM2-135M 板上 2.23 tok/s，均逐位一致；C4 部分完成；C6 更大的模型进行中） |
 | L6 | 其他扩展 | — | 视情况 | 每项单独定 | 未做 |
 
 - **建议顺序**：L0 → L1 → L2 → L3 → L4 → L5 → L6-IREE，L5b 和 L5.5 可以穿插进行。

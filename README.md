@@ -181,7 +181,7 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
   templates, and a C HAL driver on the ARM that submits them through the
   command ring, in stages C0-C7. Done: a full MLIR code generator (the `sahl`
   / `sahw` dialects, templates as micro-kernels); stories15M (17.7 tok/s) and
-  HuggingFace SmolLM2-135M (1.90 tok/s) run on the board bit-exact with the
+  HuggingFace SmolLM2-135M (2.23 tok/s) run on the board bit-exact with the
   references; larger models (Qwen3, Llama 3) are the next stage (C6, on sim).
   See [compiler/README.md](compiler/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the

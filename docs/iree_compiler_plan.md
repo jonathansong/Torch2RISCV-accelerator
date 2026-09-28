@@ -1,6 +1,6 @@
 # LLM 编译器：基于 MLIR / IREE 的端到端方案（PyTorch → 描述符列表）
 
-状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 完成**（§8.7：两层方言 sahl / sahw 的完整代码生成，模板成为微内核；stories15M 板上 2.589M 周期 / token；SmolLM2-135M 板上 1.90 tok/s，Qwen3 结构 sim）；**C6 进行中**（§8.12：目标配置交叉验证与 K 分块已完成，下一步 C6.0）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
+状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 完成**（§8.7：两层方言 sahl / sahw 的完整代码生成，模板成为微内核；stories15M 板上 2.589M 周期 / token；SmolLM2-135M 板上 2.23 tok/s，Qwen3 结构 sim；两者都可在板上交互式生成）；**C6 进行中**（§8.12：目标配置交叉验证与 K 分块已完成，下一步 C6.0）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
 取代那里 §10.4、§10.5 的概要。
 
 **目标**：从一个 PyTorch 写的 llama 类模型出发，用 MLIR / IREE 自动编译，得到在 PYNQ-Z1 上运行的完整程序：
@@ -751,6 +751,7 @@ C5.5 的模型（§8.9 的第一步）：
 - 编译器：动态 T 的逐行降级在每行之后收回该行的临时缓冲（Qwen3 的 softmax 有 16 行，原来 ACC 用满）。
 - SmolLM2-135M（30 层，GQA 9/3，dim 576，词表 49152）：230 个 dispatch，T = 16 / 80 / 256 全部与 oracle 逐位一致；sim 端到端 16 步 argmax 16/16、最小相关 0.9922，生成 “Once upon a time, there was a little girl named Lily. She lived in a big house with her family, and she loved to play with her toys. …”；窗口 168 MB（峰值 160.6 MB）；sim 9 s / token。板上包：`scripts/deploy_c55.sh`（`tests/board_llm.py`：C3 与 C5.5 共用，按 sim 的结果逐位比较）。
 - **板上**：38 步 logits 与 sim 逐位一致，生成的 token 相同，1.90 tok/s（526 ms / token）。PYNQ-Z1 的 CMA 默认 128 MB，放不下窗口：启动分区加 `uEnv.txt`（`bootargs=<原命令行> cma=320M`，`boot.scr` 会导入它）；256M 时加载 overlay 后 CMA 碎片化，找不到 168 MB 的连续块（内核没有 compaction）。窗口分配失败时启动器清页缓存后重试；运行前停掉 Jupyter。
+- **重新打包与交互式生成（2026-09-28）**：用最新的编译器（K 分块、分片之后）重新打包，板上再验：stories15M 76/76 步与 DeviceModel 逐位一致，17.75 tok/s；SmolLM2 38/38 步与 sim 逐位一致，2.23 tok/s（包里加了 `--pad=8`，注意力长度随位置增长，原来按 256 算是 1.90）。`tests/board_generate.py`：overlay 启动一次，之后逐行读 prompt，在 ARM 上分词（`frontend/hf_tokenizer.py`，只用标准库），`sa-llm-run --stop_token` 生成，token 边出边打印；两个包都带 `model.json`（分词器、BOS、结束符、上下文长度）。每个 prompt 重新加载模块与参数：SmolLM2 第一个 token 前约 11 s，stories15M 0.4–1.7 s。窗口要在加载分词器之前分配：SmolLM2 的分词器在 Python 里占几十 MB，CMA 中借给内核的页迁不出去，168 MB 的连续块就分不到。
 - Qwen3-0.6B 截断到 2 层（QK-norm、head_dim 128、q_dim 2048 ≠ dim 1024、GQA 16/8、θ = 1e6、词表 151936）：42 个 dispatch 全部逐位一致；sim 8 步 argmax 8/8、相关 1.00000；峰值 330.5 MB。
 - 发现的问题（留给 C6）：共享的嵌入存了两份（分类层的打包权重在参数文件里，gather 用的原始表作为常量在 vmfb 里）：SmolLM2 多 28 MB，Qwen3 多 155 MB；可以让 gather 直接读打包布局，或把原始表也导出成参数。
 

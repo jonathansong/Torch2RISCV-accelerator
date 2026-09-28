@@ -168,7 +168,8 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   oracle, and runs end to end on sim (argmax equal to the eager quantized
   model with the device's EXP / RECIP / RSQRT); Qwen3-0.6B truncated to 2
   layers (QK-norm, head_dim 128, GQA 16/8) likewise on sim. SmolLM2 on the
-  board: bit-exact with the sim, 1.90 tok/s. The device window
+  board: bit-exact with the sim, 2.23 tok/s; both models also generate
+  interactively on the board (`board_generate.py`). The device window
   is configurable (`--mb`; SmolLM2 needs 160.5 MB: parameter loads read
   straight into device memory, `sa-llm-run` prints the peak).
 - **C6 in progress** (docs/iree_compiler_plan.md §8.12: models of the
