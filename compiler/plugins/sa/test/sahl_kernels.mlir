@@ -5,6 +5,7 @@
 // RUN: iree-opt --iree-sa-to-sahl %s | FileCheck %s --check-prefix=UK
 // RUN: iree-opt --iree-sa-to-sahl="ukernels=none" %s | FileCheck %s --check-prefix=GEN
 // RUN: iree-opt --iree-sa-to-sahl --iree-sahl-to-sahw %s | FileCheck %s --check-prefix=LOW
+// RUN: iree-opt --iree-sa-to-sahl --iree-sahl-schedule %s | FileCheck %s --check-prefix=SCHED
 
 // UK-LABEL: func.func @main$async_dispatch_28
 // UK: memref.alloc() : memref<192x8xf32>
@@ -21,6 +22,8 @@
 // UK: sahl.store
 // UK-NEXT: }
 // UK-NEXT: return
+// sahl-schedule: 192 output tiles in 8 chunks of 24 (more than 4: a LOOP_END loop over pairs).
+// SCHED: sahl.kernel "linear" attributes {chunk_tiles = 24 : i64, loop = true} {
 // GEN: sahl.kernel "contraction" {
 // GEN-NOT: sahl.kernel
 // The linear micro-kernel: chunk 0's weights, then the chunk loop with EX.

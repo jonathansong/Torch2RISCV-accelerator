@@ -180,6 +180,7 @@ void buildSahlPipeline(OpPassManager &pm, const TargetConfig &config) {
   pm.nest<func::FuncOp>().addPass(createSaToSahlPass(config));
   pm.nest<func::FuncOp>().addPass(createSahlTilePass(config));
   pm.nest<func::FuncOp>().addPass(createSahlPlanMemoryPass());
+  pm.nest<func::FuncOp>().addPass(createSahlSchedulePass(config));
   pm.addPass(createSahlToSahwPass(config));
   pm.addPass(createSahwFuseVePass());
 }

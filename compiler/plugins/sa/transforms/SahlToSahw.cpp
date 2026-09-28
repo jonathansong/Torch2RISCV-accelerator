@@ -142,7 +142,10 @@ public:
       if (auto k = dyn_cast<sahl::KernelOp>(op)) {
         Operation *a = anchorOf.lookup(k);
         if (auto it = km.linears.find(a); it != km.linears.end()) {
-          if (!linear(it->second)) return false;
+          curKernel = k;
+          bool ok = linear(it->second);
+          curKernel = {};
+          if (!ok) return false;
         } else if (auto it = km.attns.find(a); it != km.attns.end()) {
           if (!attention(it->second)) return false;
         } else if (!contraction(km.contracts[a])) {
@@ -205,6 +208,16 @@ private:
   std::map<std::pair<void *, int>, Value> validParams;   // (i64 scalar, predicate) -> VALID count
   KernelMatcher km;                              // the plans of the kernels (SahlKernels.h)
   llvm::DenseMap<Operation *, Operation *> anchorOf;   // sahl.kernel -> its anchor
+  sahl::KernelOp curKernel;                      // the kernel being lowered
+  // its schedule: as sahl-schedule chose (the attributes), else chosen here
+  KernelSchedule scheduleOf(const LinearPlan &p) {
+    KernelSchedule ks = linearSchedule(p, lay, d);
+    if (curKernel) {
+      if (auto c = curKernel->getAttrOfType<IntegerAttr>("chunk_tiles")) ks.chunkTiles = c.getInt();
+      if (auto l = curKernel->getAttrOfType<BoolAttr>("loop")) ks.loop = l.getValue();
+    }
+    return ks;
+  }
 
   bool fail(const std::string &m) {
     if (err.empty()) err = m;
@@ -1243,10 +1256,9 @@ private:
       if (!r || r->off % 8) return fail("linear rows: per-element input");
       ed.push_back(*r);
     }
-    // chunks: the B tiles in one SPAD_B bank, D x nc words per ACC buffer
-    int64_t nc = std::min<int64_t>(std::max<int64_t>(sb / k, 1), 32);
-    while (nc > 1 && nt % nc) --nc;
-    if (nc * k > int64_t(sb)) return fail("linear rows: one weight tile does not fit a SPAD_B bank");
+    // chunks (sahl-schedule): the B tiles in one SPAD_B bank, D x nc words per ACC buffer
+    const int64_t nc = scheduleOf(p).chunkTiles;
+    if (nc <= 0 || nt % nc || nc * k > int64_t(sb)) return fail("linear rows: one weight tile does not fit a SPAD_B bank");
     // chunk ci's B tiles in SPAD_B bank ci & 1, its per-column inputs in set ci & 1
     SmallVector<SmallVector<LocalBuf>> colSets(2);
     for (int set = 0; set < 2; ++set)
@@ -1335,17 +1347,13 @@ private:
     const uint32_t k = uint32_t(wt.getDimSize(1)), nt = uint32_t(wt.getDimSize(0));
     const uint32_t sb = lay.sbank, cb = lay.cbank;
     if (k % d) return fail("linear: K not a multiple of D");
-    // the epilogue's extra per-chunk inputs beyond s_w need scratch words (as C3: 1 or 2 per output word)
-    uint32_t extra = p.chunked.size() > 1 ? uint32_t(p.chunked.size()) - 1 : 0;
-    uint32_t steps = 0;
-    for (Operation &o : p.epi.getRegion().front().without_terminator())
-      if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
-    uint32_t scratchRows = std::max<uint32_t>(steps > 2 ? 2 : 1, 1 + extra);
-    const uint32_t nc = lay.chunkTiles(k, nt, scratchRows);
-    if (nc == 0) return fail("linear: one weight tile does not fit a SPAD_B bank");
+    // the schedule (sahl-schedule): chunks of nc output tiles, a LOOP_END loop over many
+    KernelSchedule ks = scheduleOf(p);
+    const uint32_t nc = uint32_t(ks.chunkTiles);
+    if (nc == 0 || nt % nc || nc * k > sb) return fail("linear: one weight tile does not fit a SPAD_B bank");
     if (k + k / d > 2 * sb || lay.acc0 + k / d + 2 > cb) return fail("linear: K too large for the local memories");
     const uint32_t nch = nt / nc, wbytes = nc * k * d, fbytes = 4 * nc * d, oSw = d * nc, oY = d * nc + nc;
-    const bool useLoop = nch > 4;
+    const bool useLoop = ks.loop;
     bool hoist = bb.getInsertionBlock()->empty();
     auto xd = ddrOf(p.x), wd = ddrOf(p.w), yd = ddrOf(p.store.getDst());
     if (!xd || !wd || !yd) return false;

@@ -119,6 +119,16 @@ struct LinearPlan {
   SmallVector<std::pair<int, Value>> cols, rowv;
 };
 
+// The schedule of a linear micro-kernel (sahl-schedule): chunks of chunkTiles
+// output tiles (the weights of a chunk in one SPAD_B bank, the next chunk's
+// loaded into the other bank while this one computes); decode's form loops
+// over pairs of chunks with LOOP_END when there are more than 4.
+struct KernelSchedule {
+  int64_t chunkTiles = 0;
+  bool loop = false;
+};
+KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int64_t d);
+
 class KernelMatcher {
  public:
   explicit KernelMatcher(const TargetConfig &cfg)

@@ -258,6 +258,29 @@ std::optional<SmallVector<SmallVector<int64_t>>> gatherDomain(linalg::GenericOp 
   return points(ranges);
 }
 
+KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int64_t d) {
+  KernelSchedule ks;
+  auto wt = cast<MemRefType>(p.w.getType());
+  const int64_t k = wt.getDimSize(1), nt = wt.getDimSize(0);
+  if (p.rows) {
+    // prefill's rows: at most 32 tiles per chunk (D x nc words per ACC buffer), a divisor of the tiles
+    int64_t nc = std::min<int64_t>(std::max<int64_t>(int64_t(lay.sbank) / k, 1), 32);
+    while (nc > 1 && nt % nc) --nc;
+    ks.chunkTiles = nc;
+    return ks;
+  }
+  // the epilogue's extra per-chunk inputs beyond s_w need scratch words (as C3: 1 or 2 per output word)
+  uint32_t extra = p.chunked.size() > 1 ? uint32_t(p.chunked.size()) - 1 : 0;
+  uint32_t steps = 0;
+  linalg::GenericOp epi = p.epi;
+  for (Operation &o : epi.getRegion().front().without_terminator())
+    if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
+  uint32_t scratchRows = std::max<uint32_t>(steps > 2 ? 2 : 1, 1 + extra);
+  ks.chunkTiles = lay.chunkTiles(uint32_t(k), uint32_t(nt), scratchRows);
+  ks.loop = ks.chunkTiles && nt / ks.chunkTiles > 4;
+  return ks;
+}
+
 sahl::LoadOp loadInto(Value local) {
   for (Operation *u : local.getUsers())
     if (auto l = dyn_cast<sahl::LoadOp>(u); l && l.getDst() == local) return l;

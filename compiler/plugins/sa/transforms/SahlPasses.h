@@ -25,6 +25,9 @@ void registerSahlTilePass();
 // Places each local buffer and chooses its layout (sa.mem, sa.layout attributes).
 std::unique_ptr<Pass> createSahlPlanMemoryPass();
 void registerSahlPlanMemoryPass();
+// The schedule of each linear micro-kernel (chunk_tiles, loop on its sahl.kernel).
+std::unique_ptr<Pass> createSahlSchedulePass(const TargetConfig &config);
+void registerSahlSchedulePass();
 // sahl -> one sahw.template per function (the lowering: registers, local
 // memory, one single-stage VE per arith / math operation).
 std::unique_ptr<Pass> createSahlToSahwPass(const TargetConfig &config);
