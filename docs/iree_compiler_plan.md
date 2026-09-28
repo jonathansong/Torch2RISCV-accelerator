@@ -1,6 +1,6 @@
 # LLM 编译器：基于 MLIR / IREE 的端到端方案（PyTorch → 描述符列表）
 
-状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 完成**（§8.7：两层方言 sahl / sahw 的完整代码生成，模板成为微内核；stories15M 板上 2.589M 周期 / token；SmolLM2-135M 板上 2.23 tok/s，Qwen3 结构 sim；两者都可在板上交互式生成）；**C6 进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层在 sim 上逐位一致已完成，下一步 C6.2 量化质量）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
+状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 完成**（§8.7：两层方言 sahl / sahw 的完整代码生成，模板成为微内核；stories15M 板上 2.589M 周期 / token；SmolLM2-135M 板上 2.23 tok/s，Qwen3 结构 sim；两者都可在板上交互式生成）；**C6 进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层在 sim 上逐位一致、C6.P prefill + decode 板上逐位一致已完成，下一步 C6.2 量化质量或 prefill 的优化）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
 取代那里 §10.4、§10.5 的概要。
 
 **目标**：从一个 PyTorch 写的 llama 类模型出发，用 MLIR / IREE 自动编译，得到在 PYNQ-Z1 上运行的完整程序：
@@ -919,7 +919,7 @@ C5.5 的模型（§8.9 的第一步）：
 | **P1 线性层** | 打包 pass 也认 matmul（打包的权重与 decode 共用，C6.0 的“只打包一次”）；A 条带由 X 的 M 行经 TRANSPOSE 得到；微内核与通用降级 | 逐 dispatch 逐位一致；每块 EX 的效率 |
 | **P2 注意力与其余** | M 行的分数 / P·V；softmax 的掩码按行（第 i 行有效长度 start + i + 1，LDPARAM 的加数）；RoPE 取 M 行；KV cache 一次写 M 行 | 逐 dispatch 逐位一致，T 扫描 |
 | **P3 运行时** | `sa-llm-run` 先分块 prefill 再 decode；`board_generate.py` 用它 | sim：与只用 decode 的 token 相同，最后位置的 logits 逐位一致 |
-| **P4 板上** | stories15M、SmolLM2；M = 8 / 16 / 32 对比 | 逐位一致；prompt 的 tok/s（预计比逐 token 快 5–10 倍） |
+| **P4 板上** | stories15M、SmolLM2；M = 8 / 16 / 32 对比 | 逐位一致；prompt 的 tok/s（预计比逐 token 快 5–10 倍）。**M = 8 完成**（见下） |
 
 **P0 结果（2026-09-28）**：`prefill(tokens[M], positions[M], valid[T])`（positions = start .. start + M − 1 由调用方给出：命令处理器不能把寄存器写回 DDR、VE 没有 iota，设备上算 i64 向量很别扭）；最后一块与前一块重叠而不是填充（从 P − M 开始，重算的行写回相同的 KV），最后一行总是 prompt 的最后一个 token。eager 的 prefill 与 decode 逐位一致（logits、KV cache）；IREE llvm-cpu 上 stories15M 的 prefill 与只用 decode 逐位一致，SmolLM2 相关 1.000000，之后生成的 token 相同。导出：`FxProgramsBuilder`，`main`（decode）与 `prefill` 共用参数与 KV 全局量。
 
@@ -944,6 +944,10 @@ C5.5 的模型（§8.9 的第一步）：
   - stories15M：181 个可执行体（decode + prefill）全部与 oracle 逐位一致；16 个 token 的 prompt 分 2 块 prefill，prompt 最后位置与之后 4 步的 logits 与只用 decode 逐位一致，token 相同；参数 16.1 MB（一份）。
   - SmolLM2-135M：777 个可执行体在 T = 16 / 80 / 256 下全部逐位一致；14 个 token 的 prompt，prefill + decode 与只用 decode 逐位一致（5/5 行），token 相同；参数 137.4 MB（一份）。
   - 主机 llvm-cpu 上 prefill 与只用 decode 只按相关比较：llvm-cpu 对 prefill 的形状生成的代码不同（向量化的求和），int8 舍入翻转会让接近的 argmax 变；sa 设备上要求逐位一致。
+- **P4 板上（2026-09-28，M = 8）**：两个模型 prefill 与只用 decode 都与 sim 逐位一致，生成的文本相同。
+  - stories15M：16 个 token 的 prompt 分 2 块，**258.6 ms（含加载）**；只用 decode 时 prompt 约 16 × 57 ms ≈ 915 ms（另加加载）：**至少 3.5 倍**。生成 17.4 tok/s（不变）。
+  - SmolLM2-135M：14 个 token 分 2 块，**2.43 s（含加载）**；只用 decode 约 14 × 456 ms ≈ 6.4 s（另加加载）：**至少 2.6 倍**。生成 2.18 tok/s（不变）。
+  - prompt 还短（2 块，第二块重叠），加载也算在 prefill 里，所以这是下限。还可以做的：`linearRows` 的预取与循环（现在是串行调度）、M = 16 / 32、逐行做的注意力和 gather / scatter 合并成批量。
 
 ## 9. 验证体系
 
