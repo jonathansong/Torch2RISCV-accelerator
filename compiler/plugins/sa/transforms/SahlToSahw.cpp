@@ -184,6 +184,7 @@ struct Val {
   int uni = 0;
   Operation *producer = nullptr;   // the VE that computed it (a fresh buffer)
   bool fresh = false;              // a buffer of its own (a gathered row): a result may use it as is
+  bool exactInt = false;           // integers held exactly as fp32 (a packed gather): sitofp is a no-op
   std::shared_ptr<Val> inner;
 };
 
@@ -237,8 +238,105 @@ public:
         piece.reset();
         return err.empty();
       }
+      if (auto rc = rowPieceable()) {
+        auto [R, C] = *rc;
+        int64_t words = pieceWords2D(R, C), cap = 2 * (lay.cbank - lay.scr);
+        if (words > cap) {
+          // rows per piece: even (the per-row vectors' DMAs stay 8-byte aligned)
+          int64_t rn = std::max<int64_t>(R * cap / words, 1) / 2 * 2;
+          if (rn < 2) return fail("ACC full (a row pair does not fit)");
+          prR = R;
+          prC = C;
+          for (int64_t r0 = 0; r0 < R; r0 += rn) {
+            uint32_t savedTop[2] = {accTop[0], accTop[1]};
+            uint32_t savedSpad = spadTop;
+            locals.clear();
+            bcastOf.clear();
+            rowPiece = std::make_pair(r0, std::min(rn, R - r0));
+            if (!lowerBody()) return false;
+            accTop[0] = savedTop[0];
+            accTop[1] = savedTop[1];
+            spadTop = savedSpad;
+          }
+          rowPiece.reset();
+          return err.empty();
+        }
+      }
     }
     return lowerBody();
+  }
+
+  // A dispatch whose operations go row by row over [R, C] (R != C): generics
+  // with maps (r, c), (r), (c) or () (reductions over c only, no indices or
+  // gathers) or over [R] / [C]; loads / stores of [R, C] (contiguous or a
+  // column slice), [R], [C] or scalars. Its rows are independent: (R, C).
+  std::optional<std::pair<int64_t, int64_t>> rowPieceable() {
+    int64_t R = -1, C = -1;
+    for (Operation &op : f.getBody().front())
+      for (Value v : op.getOperands())
+        if (auto mt = dyn_cast<MemRefType>(v.getType()); mt && mt.hasStaticShape() && mt.getRank() == 2 && R < 0 &&
+                                                            isa<linalg::GenericOp, sahl::LoadOp, sahl::StoreOp>(op)) {
+          R = mt.getDimSize(0);
+          C = mt.getDimSize(1);
+        }
+    if (R <= 1 || C <= 1 || R == C) return std::nullopt;
+    auto shapeOk = [&](Value v) {
+      auto mt = dyn_cast<MemRefType>(v.getType());
+      if (!mt || !mt.hasStaticShape()) return false;
+      if (mt.getNumElements() == 1) return true;
+      if (mt.getRank() == 2) return mt.getDimSize(0) == R && mt.getDimSize(1) == C;
+      return mt.getRank() == 1 && (mt.getDimSize(0) == R || mt.getDimSize(0) == C);
+    };
+    MLIRContext *ctx = f.getContext();
+    AffineExpr r = getAffineDimExpr(0, ctx), c = getAffineDimExpr(1, ctx);
+    for (Operation &op : f.getBody().front()) {
+      if (auto l = dyn_cast<sahl::LoadOp>(&op)) {
+        if (!shapeOk(l.getSrc()) || !shapeOk(l.getDst())) return std::nullopt;
+      } else if (auto st = dyn_cast<sahl::StoreOp>(&op)) {
+        if (!shapeOk(st.getSrc()) || !shapeOk(st.getDst())) return std::nullopt;
+      } else if (auto fl = dyn_cast<linalg::FillOp>(&op)) {
+        if (!shapeOk(fl.getDpsInits()[0])) return std::nullopt;
+      } else if (auto g = dyn_cast<linalg::GenericOp>(&op)) {
+        Block &b = g.getRegion().front();
+        if (!b.getOps<linalg::IndexOp>().empty() || !b.getOps<memref::LoadOp>().empty()) return std::nullopt;
+        auto iters = g.getIteratorTypesArray();
+        auto maps = g.getIndexingMapsArray();
+        if (iters.size() == 2) {
+          if (iters[0] != utils::IteratorType::parallel) return std::nullopt;
+          for (auto [v, m] : llvm::zip(g->getOperands(), maps)) {
+            if (!shapeOk(v)) return std::nullopt;
+            if (m != AffineMap::get(2, 0, {r, c}, ctx) && m != AffineMap::get(2, 0, {r}, ctx) &&
+                m != AffineMap::get(2, 0, {c}, ctx) && m.getNumResults() != 0)
+              return std::nullopt;
+          }
+        } else if (iters.size() == 1) {
+          for (auto [v, m] : llvm::zip(g->getOperands(), maps))
+            if (!shapeOk(v) || !(m.isIdentity() || m.getNumResults() == 0)) return std::nullopt;
+        } else {
+          return std::nullopt;
+        }
+      } else if (!isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CastOp,
+                      IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp, func::ReturnOp,
+                      arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp, arith::OrIOp>(op) &&
+                 !(op.getDialect() && op.getDialect()->getNamespace() == "util")) {
+        return std::nullopt;
+      }
+    }
+    return std::make_pair(R, C);
+  }
+  // ACC words such a dispatch may need at once: every [R, C] buffer, a temp per
+  // operation of a two-loop generic
+  int64_t pieceWords2D(int64_t R, int64_t C) {
+    int64_t bufs = 0;
+    for (Operation &op : f.getBody().front()) {
+      if (auto a = dyn_cast<memref::AllocOp>(&op)) {
+        auto mt = cast<MemRefType>(a.getType());
+        if (mt.getRank() == 2 && !mt.getElementType().isInteger(8)) ++bufs;
+      } else if (auto g = dyn_cast<linalg::GenericOp>(&op); g && g.getNumLoops() == 2) {
+        bufs += int64_t(llvm::range_size(g.getRegion().front().without_terminator()));
+      }
+    }
+    return bufs * ((R * C + d - 1) / d);
   }
 
   // An element-wise dispatch (static contiguous loads / stores, generics with
@@ -415,6 +513,10 @@ private:
   // (first element, length) being lowered
   int64_t pieceN = -1;
   std::optional<std::pair<int64_t, int64_t>> piece;
+  // row-piece mode (a row-by-row dispatch too large for ACC): [R, C], the rows
+  // (first, count) being lowered
+  int64_t prR = -1, prC = -1;
+  std::optional<std::pair<int64_t, int64_t>> rowPiece;
   int preferBank = -1;                           // ACC temps of a linear chunk: its bank
   std::optional<uint32_t> allocAcc(uint32_t words) {
     if (preferBank >= 0 && accTop[preferBank] + words <= uint32_t(preferBank + 1) * lay.cbank) {
@@ -476,6 +578,8 @@ private:
       return l;
     }
     if (piece && mt.getNumElements() == pieceN) n = piece->second;
+    if (rowPiece && mt.getRank() == 2 && mt.getDimSize(0) == prR) n = rowPiece->second * prC;
+    if (rowPiece && mt.getRank() == 1 && mt.getDimSize(0) == prR) n = rowPiece->second;
     LocalBuf l = newLocal(*vt, n, bcast);
     locals[v] = l;
     return l;
@@ -489,8 +593,9 @@ private:
     Type et;
     std::optional<Lin> dyn;    // a dynamic innermost length (rows of it, contiguous)
     int64_t rows = 1;
+    int64_t pitch = 0;         // static rows `pitch` bytes apart (a column slice), 0: contiguous
   };
-  std::optional<Ddr> ddrOf(Value v) {
+  std::optional<Ddr> ddrOf(Value v, bool allowPitch = false) {
     auto mt = cast<MemRefType>(v.getType());
     if (!mt.hasStaticShape()) {
       // a binding of [?] or [H, ?] (the rows contiguous)
@@ -521,9 +626,14 @@ private:
     SmallVector<int64_t> strides;
     int64_t offset;
     if (failed(mt.getStridesAndOffset(strides, offset))) return fail("DDR view strides"), std::nullopt;
-    int64_t expect = 1;
+    // contiguous, or rows (the leading dimension) of contiguous elements a
+    // larger pitch apart (a column slice: DMA rows with a pitch)
+    int64_t expect = 1, pitchElems = 0;
     for (int i = int(mt.getRank()) - 1; i >= 0; --i) {
-      if (mt.getDimSize(i) != 1 && strides[i] != expect) return fail("non-contiguous DDR view"), std::nullopt;
+      if (mt.getDimSize(i) != 1 && strides[i] != expect) {
+        if (i != 0 || strides[0] < expect) return fail("non-contiguous DDR view"), std::nullopt;
+        pitchElems = strides[0];
+      }
       expect *= mt.getDimSize(i);
     }
     int64_t elem = 0;
@@ -562,6 +672,17 @@ private:
       if (!es) return fail("DDR element type"), std::nullopt;
       r.off = (off.isConst() ? off.add : 0) + elem * es;
       r.n = mt.getNumElements();
+      if (pitchElems) {
+        if (!allowPitch) return fail("non-contiguous DDR view"), std::nullopt;
+        r.rows = mt.getDimSize(0);
+        r.pitch = pitchElems * es;
+      }
+      if (rowPiece && mt.getRank() >= 1 && mt.getDimSize(0) == prR && (mt.getRank() == 1 || mt.getDimSize(1) == prC)) {
+        int64_t rowBytes = mt.getRank() == 1 ? es : (r.pitch ? r.pitch : prC * es);
+        r.off += rowPiece->first * rowBytes;
+        r.n = r.n / prR * rowPiece->second;
+        if (r.pitch) r.rows = rowPiece->second;
+      }
       if (piece && r.n == pieceN) {
         r.off += piece->first * es;
         r.n = piece->second;
@@ -635,13 +756,39 @@ private:
     if (rest) one(off + int64_t(rows) * rb, la + rows * (rb / wb), 1, rest);
   }
 
+  // rows of a column slice: one DMA of `rows` rows, `pitch` bytes apart in DDR,
+  // contiguous (whole words) in local memory
+  bool rowsDma(bool isLoad, const Ddr &r, uint32_t la) {
+    int64_t rb = r.n / r.rows * esize(r.et);
+    uint32_t wb = (la >> 28) == uint32_t(::sa::MEM_ACC) ? 4 * uint32_t(d) : uint32_t(d);
+    if (r.off % 8 || rb % 8 || r.pitch % 8 || rb % wb || rb > 65535 || r.rows > 65535)
+      return fail("column slice: rows not whole words / 8-byte aligned");
+    if (isLoad) sahw::LdOp::create(bb, loc, r.base, r.off, int64_t(la), r.rows, rb, r.pitch, 0, ValueRange{});
+    else sahw::StOp::create(bb, loc, r.base, r.off, int64_t(la), r.rows, rb, r.pitch, ValueRange{});
+    return true;
+  }
+
+  // an fp32 scalar at a 4-byte (not 8-byte) aligned address: through a PARAM
+  // (LDPARAM reads 32-bit words), a word of ones scaled by it (1.0 * v = v)
+  bool scalarByParam(const Ddr &r, const LocalBuf &dst) {
+    Value pv = privateParam();
+    sahw::LdParamOp::create(bb, loc, r.base, pv, r.off, 1, 0, ValueRange{});
+    LocalBuf ones = newLocal(::sa::VT_F32, 1, true);
+    ve({ones.la, ::sa::VT_I32}, std::nullopt, ones.la, ::sa::VT_F32, d, ::sa::VOP_COPY, 0.0f, 1.0f);
+    ve({ones.la}, std::nullopt, dst.la, ::sa::VT_F32, d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
+       ::sa::RED_NONE, 0, 0, {{::sa::DYN_VE_A, pv, false}});
+    return true;
+  }
+
   bool load(sahl::LoadOp l) {
-    auto r = ddrOf(l.getSrc());
+    auto r = ddrOf(l.getSrc(), /*allowPitch=*/true);
     if (!r) return false;
     if (r->et.isInteger(64)) return fail("i64 load");
     auto dst = bufOf(l.getDst());
     if (!dst) return false;
     if (r->dyn) return dynamicDma(*r, *dst, true);
+    if (r->pitch) return rowsDma(true, *r, dst->la);
+    if (r->off % 8 && r->n == 1 && r->et.isF32()) return scalarByParam(*r, *dst);
     uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
     if (r->off % 8) return fail("load not 8-byte aligned");
     contiguousDma(true, r->base, r->off, dst->la, bytes);
@@ -649,13 +796,14 @@ private:
   }
 
   bool store(sahl::StoreOp s) {
-    auto r = ddrOf(s.getDst());
+    auto r = ddrOf(s.getDst(), /*allowPitch=*/true);
     if (!r) return false;
     auto it = locals.find(s.getSrc());
     if (it == locals.end()) return fail("stored buffer not computed");
     LocalBuf l = it->second;
     if (r->dyn) return dynamicDma(*r, l, false);
     if (l.bcast && l.n > 1) l = packBcast(l);
+    if (r->pitch) return rowsDma(false, *r, l.la);
     uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
     if (r->off % 8) return fail("store not 8-byte aligned");
     contiguousDma(false, r->base, r->off, l.la, bytes);
@@ -730,6 +878,7 @@ private:
     Val e;
     e.kind = Val::Mem;
     e.o = {row.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
+    e.exactInt = true;
     return e;
   }
 
@@ -1737,11 +1886,22 @@ private:
       if (u == con.getOperation()) continue;
       if (auto f = dyn_cast<linalg::FillOp>(u)) fill = f;
       else if (auto e = dyn_cast<linalg::GenericOp>(u); e && !p.epi) p.epi = e;
+      else if (auto st = dyn_cast<sahl::StoreOp>(u); st && rows4 && st.getSrc() == p.acc && !p.store) p.store = st;
       else if (!isa<memref::DeallocOp>(u)) return false;
     }
-    if (!fill || !p.epi || !getConstantIntValue(fill.getDpsInputs()[0]) ||
-        *getConstantIntValue(fill.getDpsInputs()[0]) != 0)
+    if (!fill || !getConstantIntValue(fill.getDpsInputs()[0]) || *getConstantIntValue(fill.getDpsInputs()[0]) != 0)
       return false;
+    if (p.store) {                                   // rows: the accumulator stored as it is (no epilogue)
+      if (p.epi) return false;
+      const int64_t kk = cast<MemRefType>(p.w.getType()).getDimSize(1);
+      if (kk * d > 65535 || (p.rows / d) * kk > 2 * int64_t(lay.sbank)) return false;
+      for (Operation *o : {con.getOperation(), fill.getOperation(), p.store.getOperation(), lx.getOperation(),
+                           lw.getOperation()})
+        owned.insert(o);
+      linears[con.getOperation()] = p;
+      return true;
+    }
+    if (!p.epi) return false;
     linalg::GenericOp e = p.epi;
     if (e.getNumDpsInits() != 1 || e.getNumReductionLoops() || e.getNumLoops() != (rows4 ? 3 : 2) ||
         !e.getIndexingMapsArray().back().isIdentity())
@@ -1864,6 +2024,13 @@ private:
         LocalBuf acc = newLocal(::sa::VT_I32, n);
         sahw::ExOp::create(bb, loc, int64_t(strips[rb] & 0xFFFFFFF), int64_t(bw), int64_t(acc.la & 0xFFFFFFF),
                            k / d, false, nc, k, 1, nc, ValueRange{});
+        if (!p.epi) {                                 // the accumulator itself
+          sahw::StOp::create(bb, loc, yd->base, yd->off + (rb * d * N + c0 * d) * 4, int64_t(acc.la), d, nc * d * 4,
+                             N * 4, ValueRange{});
+          accTop[0] = savedRb[0];
+          accTop[1] = savedRb[1];
+          continue;
+        }
         Chunk ch;
         ch.n = n;
         LocalBuf out = newLocal(::sa::VT_F32, n);
@@ -2101,7 +2268,7 @@ private:
         cast<MemRefType>(g.getDpsInits()[0].getType()).getElementType().isInteger(64))
       return intScalar(g);
     bool collapse = false, merge = false;
-    int indexShift = 0;
+    int indexShift = 0, split = 0;
     SmallVector<AffineMap> maps2;
     if (nloops > 2 && !chunk) {
       bool noIndex = g.getRegion().front().getOps<linalg::IndexOp>().empty();
@@ -2109,32 +2276,42 @@ private:
       if (llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }) && !red && noIndex) {
         collapse = true;                     // an element-wise nest with identity maps only: one flat loop
       } else {
-        // the leading loops as one "row" loop: every map is the identity, the
-        // leading loops, the last loop or nothing
+        // loops [0, split) as one "row" loop and [split, n) as one inner loop:
+        // every map is the identity, the leading loops, the trailing loops or
+        // nothing (split = n - 1 first; an earlier split only for an
+        // element-wise nest without indices, its trailing loops static)
         MLIRContext *ctx = g.getContext();
         AffineExpr r0 = getAffineDimExpr(0, ctx), r1 = getAffineDimExpr(1, ctx);
-        // indices: only of the last loop (it stays the last), and no gathers
-        bool ok = true;
-        for (linalg::IndexOp ix : g.getRegion().front().getOps<linalg::IndexOp>())
-          ok &= int(ix.getDim()) == nloops - 1;
-        ok &= g.getRegion().front().getOps<memref::LoadOp>().empty();
-        for (int L = 0; L + 1 < nloops; ++L) ok &= iters[L] == utils::IteratorType::parallel;
-        for (AffineMap m : maps) {
-          SmallVector<int64_t> dims;
-          for (AffineExpr e : m.getResults()) {
-            auto de = dyn_cast<AffineDimExpr>(e);
-            if (!de) ok = false;
-            else dims.push_back(de.getPosition());
+        bool ok = false;
+        for (split = nloops - 1; split >= 1 && !ok; --split) {
+          ok = g.getRegion().front().getOps<memref::LoadOp>().empty();
+          // indices: only of the last loop (it stays the last)
+          for (linalg::IndexOp ix : g.getRegion().front().getOps<linalg::IndexOp>())
+            ok &= int(ix.getDim()) == nloops - 1 && split == nloops - 1;
+          for (int L = 0; L < nloops; ++L)
+            ok &= iters[L] == utils::IteratorType::parallel || (L == nloops - 1 && split == nloops - 1);
+          maps2.clear();
+          for (AffineMap m : maps) {
+            SmallVector<int64_t> dims;
+            for (AffineExpr e : m.getResults()) {
+              auto de = dyn_cast<AffineDimExpr>(e);
+              if (!de) ok = false;
+              else dims.push_back(de.getPosition());
+            }
+            auto seq = [&](int64_t from, int64_t to) {
+              if (int64_t(dims.size()) != to - from) return false;
+              for (int64_t i = 0; i < to - from; ++i)
+                if (dims[i] != from + i) return false;
+              return true;
+            };
+            if (seq(0, nloops)) maps2.push_back(AffineMap::get(2, 0, {r0, r1}, ctx));
+            else if (seq(0, split)) maps2.push_back(AffineMap::get(2, 0, {r0}, ctx));
+            else if (seq(split, nloops)) maps2.push_back(AffineMap::get(2, 0, {r1}, ctx));
+            else if (dims.empty()) maps2.push_back(AffineMap::get(2, 0, {}, ctx));
+            else ok = false;
           }
-          bool lead = int(dims.size()) == nloops - 1, all = int(dims.size()) == nloops;
-          for (size_t i = 0; i < dims.size() && (lead || all); ++i)
-            if (dims[i] != int64_t(i)) lead = all = false;
-          if (all) maps2.push_back(AffineMap::get(2, 0, {r0, r1}, ctx));
-          else if (lead) maps2.push_back(AffineMap::get(2, 0, {r0}, ctx));
-          else if (dims.size() == 1 && dims[0] == nloops - 1) maps2.push_back(AffineMap::get(2, 0, {r1}, ctx));
-          else if (dims.empty()) maps2.push_back(AffineMap::get(2, 0, {}, ctx));
-          else ok = false;
         }
+        ++split;
         if (!ok) return fail("more than two loops");
         merge = true;
       }
@@ -2165,9 +2342,11 @@ private:
     for (int64_t r : ranges)
       if (r < 0 && !chunk) return fail("loop range not given by an operand");
     if (merge) {
-      int64_t rows = 1;
-      for (int L = 0; L + 1 < nloops; ++L) rows *= ranges[L];
-      ranges = {rows, ranges.back()};
+      int64_t rows = 1, inner = 1;
+      for (int L = 0; L < split; ++L) rows *= ranges[L];
+      for (int L = split; L < nloops; ++L) inner *= ranges[L];
+      if (split < nloops - 1 && dynInner) return fail("more than two loops with a dynamic length");
+      ranges = {rows, inner};
       iters = {iters.front(), iters.back()};
       maps = maps2;
       indexShift = nloops - 2;                            // linalg.index n-1 -> 1
@@ -2185,6 +2364,7 @@ private:
       nloops = 1;
       dynInner.reset();
     }
+    if (rowPiece && nloops >= 1 && ranges[0] == prR) ranges[0] = rowPiece->second;   // row pieces
     if (piece) {                                          // piece mode: identity maps, this piece flat
       ranges = {piece->second};
       nloops = 1;
@@ -2352,6 +2532,18 @@ private:
           else if (!C) C = *f1 - *f0;
           else if (*C != *f1 - *f0) rowGather = false;
         }
+        // one element for the whole iteration space (the index depends on the
+        // scalar only): the scalar gather, its value in every element
+        bool uniform = !dom.empty();
+        auto u0 = flatIndex(dom.front(), 0), u1 = flatIndex(dom.front(), 1);
+        for (size_t pi = 0; pi < dom.size() && uniform; ++pi)
+          uniform = u0 && u1 && flatIndex(dom[pi], 0) == u0 && flatIndex(dom[pi], 1) == u1;
+        if (uniform && *u0 == 0 && *u1 > 0) {
+          rowGather = true;
+          C = *u1;
+        } else {
+          uniform = false;
+        }
         if (!rowGather || !C) {
           auto pe = packedRowGather(g, ld, mt, dom, scalarArgNo, flatIndex);
           if (!pe) return false;
@@ -2365,7 +2557,7 @@ private:
         Value p = privateParam();
         if (*C * es > 0xFFFF) return fail("gather row larger than 64 KB");
         sahw::LdParamOp::create(bb, loc, sym->base, p, sym->off, *C * es, 0, ValueRange{});
-        if (nloops == 0) {
+        if (nloops == 0 || uniform) {
           // one element: its bits into a PARAM, then a word of it (1.0 * v + -0 = v exactly)
           if (*vt != ::sa::VT_F32) return fail("scalar gather of a non-fp32 value");
           Value p2 = privateParam();
@@ -2588,7 +2780,7 @@ private:
       }
       if (auto sf = dyn_cast<arith::SIToFPOp>(op)) {
         Val x = valOf(sf.getIn());
-        if (x.kind != Val::Mem || x.o.vt == ::sa::VT_F32) return fail("sitofp of a computed value");
+        if (x.kind != Val::Mem || (x.o.vt == ::sa::VT_F32 && !x.exactInt)) return fail("sitofp of a computed value");
         vals[res] = x;                                   // the VE reads integer sources as fp32
         continue;
       }
@@ -2756,7 +2948,16 @@ private:
       }
       auto out0 = bufOf(init);
       if (!out0) return false;
-      if (out0->bcast) return fail("element-wise result into a broadcast buffer");
+      if (out0->bcast) {
+        // a buffer in the broadcast layout (a reduction's result) reused for an
+        // element-wise result: a packed buffer of its own from here on (the
+        // readers so far have read the broadcast words)
+        if (sel) return fail("element-wise result into a broadcast buffer");
+        LocalBuf nb = newLocal(out0->vt, out0->n);
+        locals[init] = nb;
+        bcastOf.erase(init);
+        out0 = nb;
+      }
       LocalBuf outRow = *out0;
       if (sel && nloops == 2) {                          // this row of the row layout
         if (!outRow.rowStride) return fail("row-by-row result not in the row layout");

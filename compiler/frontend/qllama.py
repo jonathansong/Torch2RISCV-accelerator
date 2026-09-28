@@ -212,26 +212,6 @@ class QLlama(torch.nn.Module):
         return qlinear(xq, s_x, self.cls_q, self.cls_s)
 
     # ------------------------------------------------------------ prefill (plan §8.13)
-    def attention_rows(self, l, q, T, posv):
-        """attention of M rows q (M, dim) at positions posv (M,): row m sees the
-        positions <= posv[m]; each row as attention() computes it."""
-        c = self.cfg
-        H, hs = c.heads, c.head_size
-        M = q.shape[0]
-        r0 = l * c.seq_len
-        kh = self.kc[r0:r0 + T].to(torch.int32).reshape(T, H, hs).permute(1, 2, 0)    # (H, hs, T)
-        vh = self.vc[r0:r0 + T].to(torch.int32).reshape(T, H, hs).permute(1, 0, 2)    # (H, T, hs)
-        qq, s_q = quant_act(q.reshape(M, H, hs))                                      # (M, H, hs), (M, H, 1)
-        sc = torch.matmul(qq.permute(1, 0, 2).to(torch.int32), kh)                    # (H, M, T) int32
-        sc = (sc.to(F32) * s_q.permute(1, 0, 2)) * self.a_k[l]
-        mask = torch.arange(T)[None, :] <= posv[:, None]                             # (M, T)
-        m = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
-        e = torch.where(mask, torch.exp(sc - m), torch.tensor(0.0))
-        r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
-        pq = to_i8((e * r) * 127.0).to(torch.int32)                                 # (H, M, T)
-        att = torch.matmul(pq, vh)                                                   # (H, M, hs) int32
-        return (att.to(F32) * self.a_v[l]).permute(1, 0, 2).reshape(M, c.dim)
-
     def prefill(self, tokens, positions, valid):
         """A chunk of M prompt tokens at positions[M] (start .. start + M - 1, given
         by the caller: no i64 vector arithmetic on the device):
@@ -241,19 +221,26 @@ class QLlama(torch.nn.Module):
         c = self.cfg
         M, T = tokens.shape[0], valid.shape[0]
         posv = positions
-        x = self.emb_q.index_select(0, tokens).to(F32) * self.emb_s.index_select(0, tokens).unsqueeze(-1)
-        cos = self.rope_cos.index_select(0, posv)                                    # (M, dim)
-        sin = self.rope_sin.index_select(0, posv)
+        # gathers and scatters with a vector index row by row, each a decode step's
+        # (a scalar index): only the linear layers gain from the rows
+        x = torch.cat([self.emb_q.index_select(0, tokens[m:m + 1]).to(F32) *
+                       self.emb_s.index_select(0, tokens[m:m + 1]).unsqueeze(-1) for m in range(M)])
+        cos = torch.cat([self.rope_cos.index_select(0, posv[m:m + 1]) for m in range(M)])
+        sin = torch.cat([self.rope_sin.index_select(0, posv[m:m + 1]) for m in range(M)])
         for l in range(c.layers):
             xq, s_x = quant_act(self.rmsnorm(x, self.rms_att[l]))
             qkv = qlinear(xq, s_x, self.wqkv[l], self.s_wqkv[l])
             q = self.rope(qkv[:, :c.dim], cos, sin)
             k = self.rope(qkv[:, c.dim:c.dim + c.kv_dim], cos, sin)
             v = qkv[:, c.dim + c.kv_dim:]
-            rows = posv + l * c.seq_len
-            self.kc.index_copy_(0, rows, to_i8(k * self.inv_sk[l]))
-            self.vc.index_copy_(0, rows, to_i8(v * self.inv_sv[l]))
-            att = self.attention_rows(l, q, T, posv)
+            kq, vq = to_i8(k * self.inv_sk[l]), to_i8(v * self.inv_sv[l])
+            for m in range(M):
+                row = posv[m:m + 1] + l * c.seq_len
+                self.kc.index_copy_(0, row, kq[m:m + 1])
+                self.vc.index_copy_(0, row, vq[m:m + 1])
+            # attention row by row, each as a decode step's (the scalar position
+            # positions[m]); the linear layers are what gain from the rows
+            att = torch.stack([self.attention(l, q[m], T, posv[m:m + 1]) for m in range(M)])
             aq, s_a = quant_act(att)
             x = x + qlinear(aq, s_a, self.wo[l], self.s_wo[l])
             xq, s_x = quant_act(self.rmsnorm(x, self.rms_ffn[l]))

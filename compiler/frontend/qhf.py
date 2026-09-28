@@ -353,29 +353,6 @@ class QModel(torch.nn.Module):
         return qlinear(xq, s_x, self.cls_q, self.cls_s)
 
     # ------------------------------------------------------------ prefill (plan §8.13)
-    def attention_rows(self, l, q, T, posv):
-        """attention of M rows q (M, q_dim) at positions posv (M,): row m sees the
-        positions <= posv[m] (the per-row causal mask); each row as in attention()."""
-        c = self.cfg
-        Hk, hs, G = c.kv_heads, c.head_size, c.heads // c.kv_heads
-        M = q.shape[0]
-        r0 = l * c.seq_len
-        kh = self.kc[r0:r0 + T].to(torch.int32).reshape(T, Hk, hs).permute(1, 2, 0)   # (Hk, hs, T)
-        vh = self.vc[r0:r0 + T].to(torch.int32).reshape(T, Hk, hs).permute(1, 0, 2)   # (Hk, T, hs)
-        qq, s_q = quant_act(q.reshape(M, Hk, G, hs))                                  # (M, Hk, G, hs), (M, Hk, G, 1)
-        qq = qq.permute(1, 0, 2, 3).reshape(Hk, M * G, hs)
-        s_q = s_q.permute(1, 0, 2, 3).reshape(Hk, M * G, 1)
-        sc = torch.matmul(qq.to(torch.int32), kh)                                    # (Hk, M*G, T) int32
-        sc = (sc.to(F32) * s_q) * self.a_k[l]
-        mask = torch.arange(T)[None, :] <= posv.repeat_interleave(G)[:, None]        # (M*G, T)
-        m = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
-        e = torch.where(mask, sfu_exp(sc - m), torch.tensor(0.0))
-        r = sfu_recip(torch.sum(e, dim=-1, keepdim=True))
-        pq = to_i8((e * r) * 127.0).to(torch.int32)                                 # (Hk, M*G, T)
-        att = torch.matmul(pq, vh)                                                   # (Hk, M*G, hs) int32
-        att = (att.to(F32) * self.a_v[l]).reshape(Hk, M, G, hs).permute(1, 0, 2, 3)
-        return att.reshape(M, c.q_dim)
-
     def prefill(self, tokens, positions, valid):
         """A chunk of M prompt tokens at positions[M] (start .. start + M - 1, given
         by the caller: no i64 vector arithmetic on the device):
@@ -388,9 +365,12 @@ class QModel(torch.nn.Module):
         c = self.cfg
         M, T, hs = tokens.shape[0], valid.shape[0], c.head_size
         posv = positions
-        x = self.emb_q.index_select(0, tokens).to(F32) * self.emb_s.index_select(0, tokens).unsqueeze(-1)
-        cos = self.rope_cos.index_select(0, posv).unsqueeze(1)                       # (M, 1, hs)
-        sin = self.rope_sin.index_select(0, posv).unsqueeze(1)
+        # gathers and scatters with a vector index row by row, each a decode step's
+        # (a scalar index): only the linear layers gain from the rows
+        x = torch.cat([self.emb_q.index_select(0, tokens[m:m + 1]).to(F32) *
+                       self.emb_s.index_select(0, tokens[m:m + 1]).unsqueeze(-1) for m in range(M)])
+        cos = torch.cat([self.rope_cos.index_select(0, posv[m:m + 1]) for m in range(M)]).unsqueeze(1)
+        sin = torch.cat([self.rope_sin.index_select(0, posv[m:m + 1]) for m in range(M)]).unsqueeze(1)
         rope = lambda v: v * cos + swapneg(v) * sin
         for l in range(c.layers):
             xq, s_x = quant_act(self.rmsnorm(x, self.rms_att[l]))
@@ -403,10 +383,14 @@ class QModel(torch.nn.Module):
                 k = self.rmsnorm(k, self.k_norm[l])
             q = rope(q).reshape(M, -1)
             k = rope(k).reshape(M, -1)
-            rows = posv + l * c.seq_len
-            self.kc.index_copy_(0, rows, to_i8(k * self.inv_sk[l]))
-            self.vc.index_copy_(0, rows, to_i8(v * self.inv_sv[l]))
-            att = self.attention_rows(l, q, T, posv)
+            kq, vq = to_i8(k * self.inv_sk[l]), to_i8(v * self.inv_sv[l])
+            for m in range(M):
+                row = posv[m:m + 1] + l * c.seq_len
+                self.kc.index_copy_(0, row, kq[m:m + 1])
+                self.vc.index_copy_(0, row, vq[m:m + 1])
+            # attention row by row, each as a decode step's (the scalar position
+            # positions[m]); the linear layers are what gain from the rows
+            att = torch.stack([self.attention(l, q[m], T, posv[m:m + 1]) for m in range(M)])
             aq, s_a = quant_act(att)
             x = x + qlinear(aq, s_a, self.wo[l], self.s_wo[l])
             xq, s_x = quant_act(self.rmsnorm(x, self.rms_ffn[l]))
