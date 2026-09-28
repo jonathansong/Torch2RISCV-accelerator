@@ -1124,11 +1124,12 @@ private:
         if (auto de = dyn_cast<AffineDimExpr>(outMap.getResult(i)); de && int(de.getPosition()) == L) return int(i);
       return -1;
     };
-    int eb = outPos(p.bLoop), eg = outPos(p.gLoop), en = outPos(p.nLoop);
+    int eb = outPos(p.bLoop), eg = outPos(p.gLoop), en = outPos(p.nLoop), el = outPos(p.laneLoop);
     if ((eb >= 0 && eg >= 0 && eb > eg) || (eg >= 0 && eg > en) || (eb >= 0 && eb > en))
       return fail("contraction: output not in the order (batch, row, n)");
-    // epilogue inputs: per output element (loaded per chunk), per (batch, row) value, or a scalar
-    enum class EpiKind { PerElement, PerRow, Scalar };
+    // epilogue inputs: per output element (loaded per chunk), per output column
+    // (the same for every (batch, row): loaded per chunk), per (batch, row) value, or a scalar
+    enum class EpiKind { PerElement, PerColumn, PerRow, Scalar };
     struct EpiIn {
       EpiKind kind;
       Value src;
@@ -1136,7 +1137,7 @@ private:
       int64_t sb = 0, sg = 0;                              // PerRow: element stride of the batch / row index
     };
     llvm::DenseMap<int, EpiIn> epiIn;
-    auto emaps = p.epi.getIndexingMapsArray();
+    auto emaps = p.epi ? p.epi.getIndexingMapsArray() : SmallVector<AffineMap>{};
     for (auto &[i, src] : p.epiLoads) {
       Value in = p.epi.getDpsInputs()[i];
       auto mt = cast<MemRefType>(in.getType());
@@ -1152,16 +1153,26 @@ private:
       SmallVector<int64_t> st;
       int64_t off;
       if (!mt.hasStaticShape() || failed(mt.getStridesAndOffset(st, off))) return fail("contraction epilogue input layout");
-      bool onlyRow = true;
+      bool onlyRow = true, onlyCol = true;
+      int64_t sn = 0, sl = 0;
       for (unsigned r = 0; r < em.getNumResults(); ++r) {
         if (auto de = dyn_cast<AffineDimExpr>(em.getResult(r))) {
           int pos = int(de.getPosition());
-          if (pos == eb) e.sb = st[r];
-          else if (pos == eg) e.sg = st[r];
-          else onlyRow = false;
+          if (pos == eb) e.sb = st[r], onlyCol = false;
+          else if (pos == eg) e.sg = st[r], onlyCol = false;
+          else if (pos == en) sn = st[r], onlyRow = false;
+          else if (pos == el && el >= 0) sl = st[r], onlyRow = false;
+          else onlyRow = onlyCol = false;
         } else if (auto c = dyn_cast<AffineConstantExpr>(em.getResult(r)); !c || c.getValue() != 0) {
-          onlyRow = false;
+          onlyRow = onlyCol = false;
         }
+      }
+      // per column: element n of the output row at n (tiles x lanes: tile * D + lane)
+      if (!onlyRow && onlyCol && sn == (el >= 0 ? d : 1) && (el < 0 || sl == 1) && !Nr.dyn &&
+          mt.getElementType().isF32()) {
+        e.kind = EpiKind::PerColumn;
+        epiIn[i] = e;
+        continue;
       }
       if (!onlyRow) return fail("contraction epilogue input layout");
       e.kind = (e.sb || e.sg) ? EpiKind::PerRow : EpiKind::Scalar;
@@ -1177,7 +1188,16 @@ private:
     }
     uint32_t xes = esize(p.x.et);
     bool xI32 = p.x.et.isInteger(32);
-    LocalBuf xl = newLocal(xI32 ? ::sa::VT_I32 : ::sa::VT_I8, K);
+    LocalBuf xl;
+    if (!xI32 && p.layout != MatLayout::RowsK) {
+      // int8 x: in SPAD_A bank 1 (only the RowsK layout uses it, for the raw rows)
+      if (uint32_t(K / d) > sb) return fail("contraction: int8 x larger than a SPAD bank");
+      xl.la = ::sa::laddr(::sa::MEM_SPAD_A, raw);
+      xl.vt = ::sa::VT_I8;
+      xl.n = K;
+    } else {
+      xl = newLocal(xI32 ? ::sa::VT_I32 : ::sa::VT_I8, K);
+    }
     // K blocks: the A strip of a block (kc words) in one SPAD_A bank, one B tile of it
     // in one SPAD_B bank and in one DMA row (16-bit length: kc * D bytes), and the
     // strip's DIV-mode source range (the VE checks kc words from the source start,
@@ -1302,8 +1322,18 @@ private:
               exOp(bwk, cw, kl, kb > 0);
             }
           }
-          // the epilogue on this chunk: n elements at (b, g, c0)
           int64_t row = b * G + g;
+          if (!p.epi) {                                    // the accumulator stored as it is (int32)
+            if (Nr.dyn) return fail("contraction without an epilogue: dynamic N");
+            int64_t yoff = ys->second + (row * N + int64_t(c0) * d) * 4;
+            if (yoff % 8) return fail("contraction: unaligned result");
+            sahw::StOp::create(bb, loc, ys->first, yoff, int64_t(::sa::acc(cw)), 1, int64_t(nc) * d * 4,
+                               int64_t(nc) * d * 4, ValueRange{});
+            accTop[0] = savedTop[0];
+            accTop[1] = savedTop[1];
+            continue;
+          }
+          // the epilogue on this chunk: n elements at (b, g, c0)
           Chunk ch;
           ch.n = int64_t(nc) * d;
           LocalBuf out = newLocal(::sa::VT_F32, ch.n);
@@ -1317,11 +1347,11 @@ private:
               continue;
             }
             const EpiIn &e = epiIn.at(i);
-            if (e.kind == EpiKind::PerElement) {
+            if (e.kind == EpiKind::PerElement || e.kind == EpiKind::PerColumn) {
               auto r = ddrStart(e.src, 4);
               if (!r) return fail("contraction epilogue input not in DDR");
               LocalBuf l = newLocal(::sa::VT_F32, ch.n);
-              int64_t off = r->second + (row * N + int64_t(c0) * d) * 4;
+              int64_t off = r->second + ((e.kind == EpiKind::PerElement ? row * N : 0) + int64_t(c0) * d) * 4;
               if (off % 8) return fail("contraction epilogue input not 8-byte aligned");
               sahw::LdOp::create(bb, loc, r->first, off, int64_t(l.la), 1, ch.n * 4, ch.n * 4, 0, ValueRange{});
               v.o = {l.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};

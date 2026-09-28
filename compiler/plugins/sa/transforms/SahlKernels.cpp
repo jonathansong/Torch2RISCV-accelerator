@@ -433,7 +433,18 @@ bool KernelMatcher::matchContraction(linalg::LinalgOp op) {
     if (u == op.getOperation()) continue;
     if (auto f = dyn_cast<linalg::FillOp>(u)) fill = f;
     else if (auto g = dyn_cast<linalg::GenericOp>(u); g && !p.epi) p.epi = g;
+    else if (auto st = dyn_cast<sahl::StoreOp>(u); st && st.getSrc() == acc && !p.store) p.store = st;
     else if (!isa<memref::DeallocOp>(u)) return false;
+  }
+  if (p.store) {                                  // no epilogue: the int32 accumulator stored as it is
+    // (the output order (batch, row, n) is checked by the lowering)
+    if (!fill || p.epi || !cast<MemRefType>(acc.getType()).getElementType().isInteger(32)) return false;
+    SmallVector<Operation *> cover = {op, fill, p.store};
+    cover.append(p.x.cover.begin(), p.x.cover.end());
+    cover.append(p.m.cover.begin(), p.m.cover.end());
+    record(op, cover);
+    contracts[op.getOperation()] = p;
+    return true;
   }
   if (!fill || !p.epi || p.epi.getNumDpsInits() != 1 || p.epi.getNumReductionLoops() ||
       !p.epi.getIndexingMapsArray().back().isIdentity())

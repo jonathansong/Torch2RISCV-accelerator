@@ -36,7 +36,9 @@ CASES = [
     ("stories_m8", "build/c6p/stories_m8/sa_sources", []),                  # decode + prefill (M = 8)
     ("stories_m8_none", "build/c6p/stories_m8/sa_sources", ["--iree-sa-ukernels=none"]),
     ("stories_m16", "build/c6p/stories_m16/sa_sources", []),
+    ("stories_m16_none", "build/c6p/stories_m16/sa_sources", ["--iree-sa-ukernels=none"]),
     ("smollm2_m8", "build/c6p/smollm2_m8/sa_sources", []),                  # GQA, tied embedding
+    ("smollm2_m8_none", "build/c6p/smollm2_m8/sa_sources", ["--iree-sa-ukernels=none"]),
     ("smollm2_m16", "build/c6p/smollm2_m16/sa_sources", []),
     ("qwen3", "build/c6/qwen3/sa_sources", []),                             # QK-norm, 28 layers
     ("k16k", "build/c6/k16k/sa_sources", []),                               # K blocks
