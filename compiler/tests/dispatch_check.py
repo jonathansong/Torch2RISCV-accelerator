@@ -149,11 +149,12 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
     O.run_dispatch(func, want, consts, d)
     # the template in the simulator
     base = 0x10000000
-    size = max(0x800000, -(-(0x10000 + sum(-(-len(b) // 4096) * 4096 for b in bufs.values())) // 0x100000) * 0x100000
+    tsize = -(-max(rows.nbytes, 0x10000) // 0x10000) * 0x10000          # the template, whole 64 KB pages
+    size = max(0x800000, -(-(tsize + sum(-(-len(b) // 4096) * 4096 for b in bufs.values())) // 0x100000) * 0x100000
                + 0x800000)
     sim = SaFuncSim(d, base, size)
     sim.ddr_write(base, rows.tobytes())
-    phys, a = [0] * max(nb, max(bufs, default=0) + 1), base + 0x10000
+    phys, a = [0] * max(nb, max(bufs, default=0) + 1), base + tsize
     for b in sorted(bufs):
         phys[b] = a
         sim.ddr_write(a, bytes(bufs[b]))

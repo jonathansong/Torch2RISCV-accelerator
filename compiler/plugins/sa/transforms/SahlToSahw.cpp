@@ -364,12 +364,12 @@ private:
     if (!mt.hasStaticShape()) {
       // [?] or [H, ?]: rows of max_dynamic elements
       auto alloc = v.getDefiningOp<memref::AllocOp>();
-      if (mt.getRank() > 2 || !mt.isDynamicDim(mt.getRank() - 1) || (mt.getRank() == 2 && mt.isDynamicDim(0)) ||
-          alloc.getDynamicSizes().size() != 1)
-        return fail("dynamic local buffer other than [?] or [H, ?]"), std::nullopt;
+      if (!mt.isDynamicDim(mt.getRank() - 1) || alloc.getDynamicSizes().size() != 1)
+        return fail("dynamic local buffer other than [..., ?]"), std::nullopt;
       auto dl = dynLin(alloc.getDynamicSizes()[0]);
       if (!dl) return fail("dynamic size not from a push constant"), std::nullopt;
-      int64_t rows = mt.getRank() == 2 ? mt.getDimSize(0) : 1;
+      int64_t rows = 1;
+      for (int64_t i = 0; i + 1 < mt.getRank(); ++i) rows *= mt.getDimSize(i);
       uint32_t stride = uint32_t((cfg.maxDynamic + d - 1) / d);
       LocalBuf l = newLocal(*vt, int64_t(stride) * rows * d, bcast);
       l.dyn = dl;
@@ -398,8 +398,9 @@ private:
     if (!mt.hasStaticShape()) {
       // a binding of [?] or [H, ?] (the rows contiguous)
       auto sub = v.getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
-      if (!sub || mt.getRank() > 2 || !mt.isDynamicDim(mt.getRank() - 1) || (mt.getRank() == 2 && mt.isDynamicDim(0)))
-        return fail("dynamic DDR view other than a [?] or [H, ?] binding"), std::nullopt;
+      bool lastOnly = mt.isDynamicDim(mt.getRank() - 1);
+      for (int64_t i = 0; i + 1 < mt.getRank(); ++i) lastOnly &= !mt.isDynamicDim(i);
+      if (!sub || !lastOnly) return fail("dynamic DDR view other than a [..., ?] binding"), std::nullopt;
       Lin off{-1, 1, 0, 0};
       if (Value o = sub.getByteOffset()) {
         auto l = linOf(o);
@@ -414,7 +415,8 @@ private:
       if (!esize(r.et)) return fail("DDR element type"), std::nullopt;
       r.off = off.isConst() ? off.add : 0;
       r.dyn = dl;
-      r.rows = mt.getRank() == 2 ? mt.getDimSize(0) : 1;
+      r.rows = 1;
+      for (int64_t i = 0; i + 1 < mt.getRank(); ++i) r.rows *= mt.getDimSize(i);
       r.n = cfg.maxDynamic * r.rows;
       return r;
     }
@@ -640,11 +642,17 @@ private:
     bcastOf[v] = b;
     return b;
   }
+  // broadcast words (one per element) -> packed: a D x D TRANSPOSE of each
+  // block of D words gives D equal words; block k goes to word k (in order,
+  // each overwriting the previous block's extra words), so the buffer has D - 1
+  // words of room at the end
   LocalBuf packBcast(const LocalBuf &b) {
     uint32_t w = uint32_t((b.n + d - 1) / d);
-    LocalBuf p = newLocal(::sa::VT_F32, b.n);
-    sahw::TransposeOp::create(bb, loc, int64_t(b.la), int64_t(p.la), int64_t(w * d * d),
-                              int64_t(::sa::vtypes(::sa::VT_F32, ::sa::VT_F32)), 1, ValueRange{});
+    LocalBuf p = newLocal(::sa::VT_F32, int64_t(w + d - 1) * d);
+    p.n = b.n;
+    for (uint32_t k = 0; k < w; ++k)
+      sahw::TransposeOp::create(bb, loc, int64_t(b.la + k * d), int64_t(p.la + k), int64_t(d * d),
+                                int64_t(::sa::vtypes(::sa::VT_F32, ::sa::VT_F32)), 1, ValueRange{});
     return p;
   }
 
@@ -752,6 +760,11 @@ private:
     p.H = ct.getDimSize(1);
     p.hs = ct.getDimSize(2);
     if (!ddrRoot(p.small)) return false;
+    {
+      auto st = cast<MemRefType>(p.small.getType());
+      if (st.getRank() != 3 || st.getDimSize(0) != p.H) return false;
+      if (p.scores ? (st.getDimSize(1) != p.hs || st.getDimSize(2) != 1) : st.getDimSize(1) != 1) return false;
+    }
     Value acc = bmm.getDpsInits()[0];
     linalg::FillOp fill;
     linalg::GenericOp epi;
@@ -947,6 +960,7 @@ private:
     sahl::StoreOp store;
     Operand x, m;
     int bLoop = -1, kLoop = -1, nLoop = -1, laneLoop = -1;   // laneLoop: the packed layout's lane
+    int gLoop = -1;                                          // in x and the output only: rows of x (GQA's query heads)
     MatLayout layout = MatLayout::Packed;
     SmallVector<std::pair<int, Value>> epiLoads;             // epilogue inputs loaded whole: (input, DDR)
   };
@@ -1065,17 +1079,18 @@ private:
     p.op = op;
     auto a = operandOf(op, 0), b = operandOf(op, 1);
     if (!a || !b) return false;
-    // x: the operand without output dims beyond the batch
+    // the matrix: the operand with the larger output extent of its own (the
+    // output loops the other operand does not have); x: the other one
     AffineMap outMap = op.getIndexingMapsArray()[2];
     auto inOut = [&](int L) { return outMap.isFunctionOfDim(L); };
-    auto only = [&](const Operand &x, const Operand &y) {
+    auto extent = [&](const Operand &x, const Operand &y) {
+      int64_t e = 1;
       for (int L = 0; L < int(iters.size()); ++L)
-        if ((*ranges)[L].size != 1 && inOut(L) && x.coef[L] && !y.coef[L]) return false;
-      return true;
+        if (inOut(L) && x.coef[L] && !y.coef[L]) e *= (*ranges)[L].size;
+      return e;
     };
-    if (only(*a, *b)) p.x = *a, p.m = *b;
-    else if (only(*b, *a)) p.x = *b, p.m = *a;
-    else return false;
+    if (extent(*b, *a) >= extent(*a, *b)) p.x = *a, p.m = *b;
+    else p.x = *b, p.m = *a;
     for (int L = 0; L < int(iters.size()); ++L) {
       if ((*ranges)[L].size == 1 && !(*ranges)[L].dyn) continue;
       bool red = iters[L] == utils::IteratorType::reduction;
@@ -1085,6 +1100,9 @@ private:
       } else if (p.x.coef[L] && p.m.coef[L]) {
         if (p.bLoop >= 0) return false;
         p.bLoop = L;
+      } else if (p.x.coef[L] && !p.m.coef[L]) {
+        if (p.gLoop >= 0 || !inOut(L)) return false;
+        p.gLoop = L;
       } else if (p.m.coef[L]) {
         if (p.m.coef[L] == 1 && p.nLoop >= 0 && p.m.coef[p.nLoop] != 1) p.laneLoop = L;
         else if (p.nLoop >= 0 && p.m.coef[p.nLoop] == 1) p.laneLoop = p.nLoop, p.nLoop = L;
@@ -1096,11 +1114,13 @@ private:
     }
     if (p.kLoop < 0 || p.nLoop < 0 || p.x.coef[p.kLoop] != 1) return false;
     for (int L = 0; L < int(iters.size()); ++L)
-      if ((p.m.coef[L] < 0 || p.x.coef[L] < 0) && L != p.bLoop && ((*ranges)[L].size != 1 || (*ranges)[L].dyn))
+      if ((p.m.coef[L] < 0 || p.x.coef[L] < 0) && L != p.bLoop && L != p.gLoop &&
+          ((*ranges)[L].size != 1 || (*ranges)[L].dyn))
         return false;
     if (p.bLoop >= 0 && p.m.coef[p.bLoop] < 0) return false;
-    // x rows of a dynamic length K, one per batch
-    if (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0 && !(*ranges)[p.kLoop].dyn) return false;
+    // x rows of a dynamic length K, one per (batch, row)
+    bool xRows = (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0) || (p.gLoop >= 0 && p.x.coef[p.gLoop] < 0);
+    if (xRows && !(*ranges)[p.kLoop].dyn) return false;
     int64_t K = (*ranges)[p.kLoop].size;
     if (p.laneLoop >= 0) {
       if ((*ranges)[p.laneLoop].size != d || p.m.coef[p.kLoop] != d || p.m.coef[p.nLoop] != K * d) return false;
@@ -1148,12 +1168,13 @@ private:
   bool contraction(ContractPlan &p) {
     auto ranges = *loopRanges(p.op);
     const Range B = p.bLoop >= 0 ? ranges[p.bLoop] : Range{};
+    const Range Gr = p.gLoop >= 0 ? ranges[p.gLoop] : Range{};
     Range Kr = ranges[p.kLoop];
     Range Nr = ranges[p.nLoop];
     if (p.laneLoop >= 0) Nr.size *= d;                    // packed: tiles x lanes
-    if (B.dyn) return fail("contraction: dynamic batch");
+    if (B.dyn || Gr.dyn) return fail("contraction: dynamic batch or rows");
     if (Kr.dyn && Nr.dyn) return fail("contraction: dynamic K and N");
-    const int64_t K = Kr.size, N = Nr.size, H = B.size;
+    const int64_t K = Kr.size, N = Nr.size, H = B.size, G = Gr.size;
     if (K % d || N % d) return fail("contraction: K and N must be multiples of D");
     const uint32_t sb = lay.sbank, nt = uint32_t(N / d);
     int logd = int(std::log2(double(d)));
@@ -1168,11 +1189,12 @@ private:
     uint32_t nc = nt;
     if (!Nr.dyn) {
       uint32_t cap = std::max<uint32_t>(sb / uint32_t(K), 1);
-      if (p.layout == MatLayout::RowsK) cap = std::min(cap, uint32_t(sb / K));   // raw rows in a SPAD_A bank too
       for (nc = std::min(cap, nt); nc > 1 && nt % nc; --nc) {
       }
     }
     if (uint32_t(K) * nc > sb) return fail("contraction: one chunk of B tiles does not fit a SPAD bank");
+    bool xRows = (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0) || (p.gLoop >= 0 && p.x.coef[p.gLoop] < 0);
+    if (xRows && nc != nt) return fail("contraction: x rows of a dynamic length and several chunks");
     if (spadTop != 0) return fail("contraction after other SPAD_A buffers");
     spadTop = 2 * sb;                                      // the A strip at 0, raw rows in bank 1
     const uint32_t strip = 0, raw = sb;
@@ -1187,62 +1209,108 @@ private:
       op.setDynFields(fs);
       op.setDynAdd(as);
     };
-    // epilogue inputs loaded whole (a scalar: its broadcast word)
-    llvm::DenseMap<int, LocalBuf> epiLocal;
-    llvm::DenseMap<int, Value> epiChunked;                // identity-mapped inputs: loaded per chunk
+    // the output (and the epilogue's loops) in the order (batch, row, n)
+    AffineMap outMap = p.op.getIndexingMapsArray()[2];
+    auto outPos = [&](int L) -> int {
+      if (L < 0) return -1;
+      for (unsigned i = 0; i < outMap.getNumResults(); ++i)
+        if (auto de = dyn_cast<AffineDimExpr>(outMap.getResult(i)); de && int(de.getPosition()) == L) return int(i);
+      return -1;
+    };
+    int eb = outPos(p.bLoop), eg = outPos(p.gLoop), en = outPos(p.nLoop);
+    if ((eb >= 0 && eg >= 0 && eb > eg) || (eg >= 0 && eg > en) || (eb >= 0 && eb > en))
+      return fail("contraction: output not in the order (batch, row, n)");
+    // epilogue inputs: per output element (loaded per chunk), per (batch, row) value, or a scalar
+    enum class EpiKind { PerElement, PerRow, Scalar };
+    struct EpiIn {
+      EpiKind kind;
+      Value src;
+      LocalBuf l;
+      int64_t sb = 0, sg = 0;                              // PerRow: element stride of the batch / row index
+    };
+    llvm::DenseMap<int, EpiIn> epiIn;
+    auto emaps = p.epi.getIndexingMapsArray();
     for (auto &[i, src] : p.epiLoads) {
       Value in = p.epi.getDpsInputs()[i];
       auto mt = cast<MemRefType>(in.getType());
-      if (p.epi.getIndexingMapsArray()[i].isIdentity() && !Nr.dyn) {
-        if (!mt.getElementType().isF32()) return fail("contraction epilogue input type");
-        epiChunked[i] = src;
+      AffineMap em = emaps[i];
+      EpiIn e;
+      e.src = src;
+      if (em.isIdentity()) {
+        if (Nr.dyn || !mt.getElementType().isF32()) return fail("contraction epilogue input per element");
+        e.kind = EpiKind::PerElement;
+        epiIn[i] = e;
         continue;
       }
+      SmallVector<int64_t> st;
+      int64_t off;
+      if (!mt.hasStaticShape() || failed(mt.getStridesAndOffset(st, off))) return fail("contraction epilogue input layout");
+      bool onlyRow = true;
+      for (unsigned r = 0; r < em.getNumResults(); ++r) {
+        if (auto de = dyn_cast<AffineDimExpr>(em.getResult(r))) {
+          int pos = int(de.getPosition());
+          if (pos == eb) e.sb = st[r];
+          else if (pos == eg) e.sg = st[r];
+          else onlyRow = false;
+        } else if (auto c = dyn_cast<AffineConstantExpr>(em.getResult(r)); !c || c.getValue() != 0) {
+          onlyRow = false;
+        }
+      }
+      if (!onlyRow) return fail("contraction epilogue input layout");
+      e.kind = (e.sb || e.sg) ? EpiKind::PerRow : EpiKind::Scalar;
       auto l = materialize(src);
       if (!l) return false;
       locals[in] = *l;
-      epiLocal[i] = *l;
+      e.l = *l;
       // broadcasts now: the chunk buffers below are released after each chunk,
       // so nothing cached may be allocated there
-      AffineMap em = p.epi.getIndexingMapsArray()[i];
-      if (mt.getRank() == 0 && !scalarBcast(in, *l)) return false;
-      if (em.getNumResults() == 1 && p.bLoop >= 0 && !em.isIdentity() && !perElementBcast(in, *l, H)) return false;
+      if (e.kind == EpiKind::Scalar && !scalarBcast(in, *l)) return false;
+      if (e.kind == EpiKind::PerRow && !perElementBcast(in, *l, mt.getNumElements())) return false;
+      epiIn[i] = e;
     }
     uint32_t xes = esize(p.x.et);
     bool xI32 = p.x.et.isInteger(32);
     LocalBuf xl = newLocal(xI32 ? ::sa::VT_I32 : ::sa::VT_I8, K);
     Value pK = Kr.dyn ? parOf(*Kr.dyn, 1, 0) : Value();
     Value pN = Nr.dyn ? parOf(*Nr.dyn, 1, 0) : Value();
-    AffineMap epiOut = p.epi.getIndexingMapsArray().back();
-    (void)epiOut;
-    bool xRows = p.bLoop >= 0 && p.x.coef[p.bLoop] < 0;           // x rows at a dynamic stride
-    if (xRows && Nr.dyn) return fail("contraction: dynamic x rows and a dynamic N");
-    if (xRows) {
+    if (xRows || Nr.dyn) {
       if (!rowAcc) rowAcc = privateParam();
       sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 0, ValueRange{});
     }
-    for (int64_t b = 0; b < H; ++b) {
-      int64_t xoff = xs->second + (p.bLoop >= 0 && !xRows ? b * p.x.coef[p.bLoop] * int64_t(xes) : 0);
-      int64_t moff = ms->second + (p.bLoop >= 0 ? b * p.m.coef[p.bLoop] : 0);
-      if (xoff % 8 || moff % 8) return fail("contraction: unaligned operand");
-      // x_b -> the A strip
+    auto addRow = [&](Value bytes) {
+      auto s2 = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{bytes});
+      s2.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});
+      s2.setDynAdd(ArrayRef<bool>{false});
+    };
+    // x_(b, g) -> the A strip (each element over the D rows); with one row
+    // per batch (G = 1) once per batch, else per chunk and row
+    auto loadStrip = [&](int64_t b, int64_t g) -> bool {
+      // x_(b, g) -> the A strip (each element over the D rows)
+      int64_t xoff = xs->second;
+      if (!xRows) xoff += ((p.bLoop >= 0 ? b * p.x.coef[p.bLoop] : 0) + (p.gLoop >= 0 ? g * p.x.coef[p.gLoop] : 0)) *
+                          int64_t(xes);
+      if (xoff % 8) return fail("contraction: unaligned x");
       auto lx = sahw::LdOp::create(bb, loc, xs->first, xoff, int64_t(xl.la), 1, K * xes, K * xes, 0, ValueRange{});
       if (xRows) {
         Value xb = parOf(*Kr.dyn, xes, 0);
         dyn(lx, {{::sa::DYN_DMA_DDR, rowAcc, true}, {::sa::DYN_DMA_ROW_BYTES, xb, false}});
-        auto s2 = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{xb});
-        s2.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});
-        s2.setDynAdd(ArrayRef<bool>{false});
+        addRow(xb);
       } else if (Kr.dyn) {
         dyn(lx, {{::sa::DYN_DMA_ROW_BYTES, parOf(*Kr.dyn, xes, 0), false}});
       }
-      ve({xl.la, xl.vt, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt, ::sa::laddr(::sa::MEM_SPAD_A, strip), ::sa::VT_I8,
-         K * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_NONE, 0, 0,
+      ve({xl.la, xl.vt, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt, ::sa::laddr(::sa::MEM_SPAD_A, strip),
+         ::sa::VT_I8, K * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_NONE, 0, 0,
          Kr.dyn ? SmallVector<DynF>{{::sa::DYN_VE_LEN, parOf(*Kr.dyn, d, 0), false}} : SmallVector<DynF>{});
+      return true;
+    };
+    for (int64_t b = 0; b < H; ++b) {
+      int64_t moff = ms->second + (p.bLoop >= 0 ? b * p.m.coef[p.bLoop] : 0);
+      if (moff % 8) return fail("contraction: unaligned matrix");
+      if (G == 1 && !loadStrip(b, 0)) return false;
       for (uint32_t c0 = 0; c0 < nt; c0 += nc) {
         uint32_t bank = (c0 / nc) & 1, bw = bank * sb;
         uint32_t la = ::sa::laddr(::sa::MEM_SPAD_B, bw);
-        // the B tiles of this chunk
+        // the B tiles of this chunk (shared by the rows of x)
         if (p.layout == MatLayout::Packed) {
           sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * K * d, int64_t(la), nc, K * d, K * d, 0,
                              ValueRange{});
@@ -1264,83 +1332,75 @@ private:
                                       int64_t(nc) * d, sK, /*INTERLEAVE=*/1, ValueRange{});
           if (Kr.dyn) dyn(l, {{::sa::DYN_DMA_ROWS, pK, false}});
         }
-        // the chunk's accumulator and epilogue buffers: released after its store
-        uint32_t savedTop[2] = {accTop[0], accTop[1]};
-        LocalBuf acc = newLocal(::sa::VT_I32, int64_t(nc) * d);
-        uint32_t cw = acc.la & 0xFFFFFFF;
-        auto ex = sahw::ExOp::create(bb, loc, int64_t(strip), int64_t(bw), int64_t(cw), K / d, false, int64_t(nc), K,
-                                     1, int64_t(nc), ValueRange{});
-        if (Kr.dyn) dyn(ex, {{::sa::DYN_EX_KT, parOf(*Kr.dyn, 1, logd), false}, {::sa::DYN_EX_BSTEP, pK, false}});
-        if (Nr.dyn) dyn(ex, {{::sa::DYN_EX_REPEAT, parOf(*Nr.dyn, 1, logd), false}});
-        // the epilogue on this chunk: n elements at (b, c0)
-        Chunk ch;
-        ch.n = int64_t(nc) * d;
-        LocalBuf out = newLocal(::sa::VT_F32, ch.n);
-        ch.outLa = out.la;
-        auto emaps = p.epi.getIndexingMapsArray();
-        for (int i = 0; i < p.epi.getNumDpsInputs(); ++i) {
-          Val v;
-          v.kind = Val::Mem;
-          if (p.epi.getDpsInputs()[i] == p.op.getDpsInits()[0]) {
-            v.o = {::sa::acc(cw), ::sa::VT_I32, ::sa::IDX_LIN, 0};
-          } else if (auto ci = epiChunked.find(i); ci != epiChunked.end()) {
-            // this chunk of the input, from DDR
-            auto r = ddrStart(ci->second, 4);
-            if (!r) return fail("contraction epilogue input not in DDR");
-            LocalBuf l = newLocal(::sa::VT_F32, ch.n);
-            int64_t off = r->second + (b * N + int64_t(c0) * d) * 4;
-            if (off % 8) return fail("contraction epilogue input not 8-byte aligned");
-            sahw::LdOp::create(bb, loc, r->first, off, int64_t(l.la), 1, ch.n * 4, ch.n * 4, 0, ValueRange{});
-            v.o = {l.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
-          } else {
-            AffineMap em = emaps[i];
-            LocalBuf l = epiLocal.at(i);
-            if (em.getNumResults() == 0) {
-              auto bc = scalarBcast(p.epi.getDpsInputs()[i], l);
+        for (int64_t g = 0; g < G; ++g) {
+          if (G > 1 && !loadStrip(b, g)) return false;
+          // the chunk's accumulator and epilogue buffers: released after its store
+          uint32_t savedTop[2] = {accTop[0], accTop[1]};
+          LocalBuf acc = newLocal(::sa::VT_I32, int64_t(nc) * d);
+          uint32_t cw = acc.la & 0xFFFFFFF;
+          auto ex = sahw::ExOp::create(bb, loc, int64_t(strip), int64_t(bw), int64_t(cw), K / d, false, int64_t(nc),
+                                       K, 1, int64_t(nc), ValueRange{});
+          if (Kr.dyn) dyn(ex, {{::sa::DYN_EX_KT, parOf(*Kr.dyn, 1, logd), false}, {::sa::DYN_EX_BSTEP, pK, false}});
+          if (Nr.dyn) dyn(ex, {{::sa::DYN_EX_REPEAT, parOf(*Nr.dyn, 1, logd), false}});
+          // the epilogue on this chunk: n elements at (b, g, c0)
+          int64_t row = b * G + g;
+          Chunk ch;
+          ch.n = int64_t(nc) * d;
+          LocalBuf out = newLocal(::sa::VT_F32, ch.n);
+          ch.outLa = out.la;
+          for (int i = 0; i < p.epi.getNumDpsInputs(); ++i) {
+            Val v;
+            v.kind = Val::Mem;
+            if (p.epi.getDpsInputs()[i] == p.op.getDpsInits()[0]) {
+              v.o = {::sa::acc(cw), ::sa::VT_I32, ::sa::IDX_LIN, 0};
+              ch.inputs[i] = v;
+              continue;
+            }
+            const EpiIn &e = epiIn.at(i);
+            if (e.kind == EpiKind::PerElement) {
+              auto r = ddrStart(e.src, 4);
+              if (!r) return fail("contraction epilogue input not in DDR");
+              LocalBuf l = newLocal(::sa::VT_F32, ch.n);
+              int64_t off = r->second + (row * N + int64_t(c0) * d) * 4;
+              if (off % 8) return fail("contraction epilogue input not 8-byte aligned");
+              sahw::LdOp::create(bb, loc, r->first, off, int64_t(l.la), 1, ch.n * 4, ch.n * 4, 0, ValueRange{});
+              v.o = {l.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
+            } else if (e.kind == EpiKind::Scalar) {
+              auto bc = scalarBcast(p.epi.getDpsInputs()[i], e.l);
               if (!bc) return false;
               v.o = {bc->la, ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
               v.uni = 1;
-            } else if (em.getNumResults() == 1 && p.bLoop >= 0) {
-              // one value per batch
-              auto bc = perElementBcast(p.epi.getDpsInputs()[i], l, H);
-              if (!bc) return false;
-              v.o = {bc->la + uint32_t(b), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
-              v.uni = 1;
             } else {
-              return fail("contraction epilogue input layout");
+              auto bc = perElementBcast(p.epi.getDpsInputs()[i], e.l, e.l.n);
+              if (!bc) return false;
+              v.o = {bc->la + uint32_t(b * e.sb + g * e.sg), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+              v.uni = 1;
             }
+            ch.inputs[i] = v;
           }
-          ch.inputs[i] = v;
-        }
-        if (Nr.dyn) {
-          curLen = pN;
-          curLenStatic = (N + d - 1) / d * d;
-        }
-        bool ok = generic(p.epi, nullptr, &ch);
-        curLen = Value();
-        curLenStatic = -1;
-        if (!ok) return false;
-        // the store: row b, chunk c0 (a dynamic N: the row's T elements)
-        int64_t yoff = ys->second + (b * N + int64_t(c0) * d) * 4;
-        if (Nr.dyn) {
-          if (b == 0) {
-            if (!rowAcc) rowAcc = privateParam();
-            sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 0, ValueRange{});
+          if (Nr.dyn) {
+            curLen = pN;
+            curLenStatic = (N + d - 1) / d * d;
           }
-          Value bytes = parOf(*Nr.dyn, 4, 0);
-          auto st = sahw::StOp::create(bb, loc, ys->first, ys->second, int64_t(out.la), 1, N * 4, N * 4, ValueRange{});
-          dyn(st, {{::sa::DYN_DMA_DDR, rowAcc, true}, {::sa::DYN_DMA_ROW_BYTES, bytes, false}});
-          if (b + 1 < H) {
-            auto s = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{bytes});
-            s.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});
-            s.setDynAdd(ArrayRef<bool>{false});
+          bool ok = generic(p.epi, nullptr, &ch);
+          curLen = Value();
+          curLenStatic = -1;
+          if (!ok) return false;
+          // the store: row (b, g), chunk c0 (a dynamic N: the row's N elements, rows contiguous)
+          if (Nr.dyn) {
+            Value bytes = parOf(*Nr.dyn, 4, 0);
+            auto st = sahw::StOp::create(bb, loc, ys->first, ys->second, int64_t(out.la), 1, N * 4, N * 4,
+                                         ValueRange{});
+            dyn(st, {{::sa::DYN_DMA_DDR, rowAcc, true}, {::sa::DYN_DMA_ROW_BYTES, bytes, false}});
+            if (row + 1 < H * G) addRow(bytes);
+          } else {
+            int64_t yoff = ys->second + (row * N + int64_t(c0) * d) * 4;
+            if (yoff % 8) return fail("contraction: unaligned result");
+            sahw::StOp::create(bb, loc, ys->first, yoff, int64_t(out.la), 1, ch.n * 4, ch.n * 4, ValueRange{});
           }
-        } else {
-          if (yoff % 8) return fail("contraction: unaligned result");
-          sahw::StOp::create(bb, loc, ys->first, yoff, int64_t(out.la), 1, ch.n * 4, ch.n * 4, ValueRange{});
+          accTop[0] = savedTop[0];
+          accTop[1] = savedTop[1];
         }
-        accTop[0] = savedTop[0];
-        accTop[1] = savedTop[1];
       }
     }
     return err.empty();
@@ -1655,14 +1715,44 @@ private:
     if (nloops == 0 && g.getNumDpsInits() == 1 &&
         cast<MemRefType>(g.getDpsInits()[0].getType()).getElementType().isInteger(64))
       return intScalar(g);
-    bool collapse = false;
+    bool collapse = false, merge = false;
+    int indexShift = 0;
+    SmallVector<AffineMap> maps2;
     if (nloops > 2 && !chunk) {
-      // an element-wise nest with identity maps only: one flat loop
-      if (!llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }) ||
-          llvm::any_of(iters, [](utils::IteratorType t) { return t == utils::IteratorType::reduction; }))
-        return fail("more than two loops");
-      if (!g.getRegion().front().getOps<linalg::IndexOp>().empty()) return fail("indices in a nest of more than two loops");
-      collapse = true;
+      bool noIndex = g.getRegion().front().getOps<linalg::IndexOp>().empty();
+      bool red = llvm::any_of(iters, [](utils::IteratorType t) { return t == utils::IteratorType::reduction; });
+      if (llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }) && !red && noIndex) {
+        collapse = true;                     // an element-wise nest with identity maps only: one flat loop
+      } else {
+        // the leading loops as one "row" loop: every map is the identity, the
+        // leading loops, the last loop or nothing
+        MLIRContext *ctx = g.getContext();
+        AffineExpr r0 = getAffineDimExpr(0, ctx), r1 = getAffineDimExpr(1, ctx);
+        // indices: only of the last loop (it stays the last), and no gathers
+        bool ok = true;
+        for (linalg::IndexOp ix : g.getRegion().front().getOps<linalg::IndexOp>())
+          ok &= int(ix.getDim()) == nloops - 1;
+        ok &= g.getRegion().front().getOps<memref::LoadOp>().empty();
+        for (int L = 0; L + 1 < nloops; ++L) ok &= iters[L] == utils::IteratorType::parallel;
+        for (AffineMap m : maps) {
+          SmallVector<int64_t> dims;
+          for (AffineExpr e : m.getResults()) {
+            auto de = dyn_cast<AffineDimExpr>(e);
+            if (!de) ok = false;
+            else dims.push_back(de.getPosition());
+          }
+          bool lead = int(dims.size()) == nloops - 1, all = int(dims.size()) == nloops;
+          for (size_t i = 0; i < dims.size() && (lead || all); ++i)
+            if (dims[i] != int64_t(i)) lead = all = false;
+          if (all) maps2.push_back(AffineMap::get(2, 0, {r0, r1}, ctx));
+          else if (lead) maps2.push_back(AffineMap::get(2, 0, {r0}, ctx));
+          else if (dims.size() == 1 && dims[0] == nloops - 1) maps2.push_back(AffineMap::get(2, 0, {r1}, ctx));
+          else if (dims.empty()) maps2.push_back(AffineMap::get(2, 0, {}, ctx));
+          else ok = false;
+        }
+        if (!ok) return fail("more than two loops");
+        merge = true;
+      }
     }
     SmallVector<int64_t> ranges(nloops, -1);
     std::optional<Lin> dynInner;
@@ -1689,6 +1779,15 @@ private:
     }
     for (int64_t r : ranges)
       if (r < 0 && !chunk) return fail("loop range not given by an operand");
+    if (merge) {
+      int64_t rows = 1;
+      for (int L = 0; L + 1 < nloops; ++L) rows *= ranges[L];
+      ranges = {rows, ranges.back()};
+      iters = {iters.front(), iters.back()};
+      maps = maps2;
+      indexShift = nloops - 2;                            // linalg.index n-1 -> 1
+      nloops = 2;
+    }
     if (collapse) {
       if (dynInner) return fail("dynamic nest of more than two loops");
       int64_t prod = 1;
@@ -1726,8 +1825,18 @@ private:
     for (int64_t r : ranges) n *= r;
     int64_t inner = nloops ? ranges.back() : 1;
     if (sel) n = inner;                                  // one row
+    // an element-wise nest with identity maps only: one flat loop; its length
+    // is rounded up to D (local buffers are whole words; the store of the
+    // result rounds its bytes to 8, inside IREE's 64-byte aligned allocations)
+    bool allIdentity = !reduction && llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }) &&
+                       g.getRegion().front().getOps<linalg::IndexOp>().empty() && !dynInner && !chunk;
+    if (nloops == 2 && inner % d && allIdentity) {
+      ranges = {n};
+      nloops = 1;
+      inner = n;
+    }
     if (nloops > 1 && inner % d) return fail("innermost size not a multiple of D");
-    if (nloops == 1 && n > d && n % d && !reduction) return fail("1-D size not a multiple of D");
+    if (nloops == 1 && n > d && n % d && !reduction && !allIdentity) return fail("1-D size not a multiple of D");
     uint32_t wordsPerRow = uint32_t(inner / d);
 
     Block &body = g.getRegion().front();
@@ -1960,7 +2069,7 @@ private:
       if (auto ix = dyn_cast<linalg::IndexOp>(op)) {
         Val v;
         v.kind = Val::Index;
-        v.dim = int(ix.getDim());
+        v.dim = int(ix.getDim()) - indexShift;
         vals[res] = v;
         continue;
       }
@@ -2004,7 +2113,8 @@ private:
       if (auto s = dyn_cast<arith::SelectOp>(op); s && valOf(s.getCondition()).kind == Val::IdxCond) {
         // select(cond(i), -swap(x), swap(x)) with cond(i) = (i even): the VE's SWAPNEG
         Val tv = valOf(s.getTrueValue()), fv = valOf(s.getFalseValue());
-        if (tv.kind != Val::NegSwap || fv.kind != Val::SwapSrc || tv.o.la != fv.o.la || nloops != 1)
+        if (tv.kind != Val::NegSwap || fv.kind != Val::SwapSrc || tv.o.la != fv.o.la || nloops > 2 ||
+            (nloops == 2 && ranges.back() % 2))
           return fail("select on an index condition other than the pair swap with negation");
         for (size_t pi = 0; pi < domain.size(); ++pi) {
           auto c = evalInt(s.getCondition(), domain[pi], 0);
