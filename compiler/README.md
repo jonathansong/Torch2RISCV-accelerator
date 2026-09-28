@@ -167,7 +167,8 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   (30 layers, GQA 9/3) compiles to 230 dispatches, all bit-exact against the
   oracle, and runs end to end on sim (argmax equal to the eager quantized
   model with the device's EXP / RECIP / RSQRT); Qwen3-0.6B truncated to 2
-  layers (QK-norm, head_dim 128, GQA 16/8) likewise on sim. The device window
+  layers (QK-norm, head_dim 128, GQA 16/8) likewise on sim. SmolLM2 on the
+  board: bit-exact with the sim, 1.90 tok/s. The device window
   is configurable (`--mb`; SmolLM2 needs 160.5 MB: parameter loads read
   straight into device memory, `sa-llm-run` prints the peak).
 
@@ -175,7 +176,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   python3 compiler/tests/test_c5.py                  # lit, both configurations, dispatch_check at T = 16, 80, 256
   python3 compiler/frontend/export_hf.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2
   python3 compiler/tests/test_c55.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2 --check
-  compiler/scripts/deploy_c55.sh                     # board: python3 board_llm.py (window 176 MB)
+  compiler/scripts/deploy_c55.sh                     # board: python3 board_llm.py (window 168 MB; the board needs cma=320M in uEnv.txt, see the plan §8.7)
   python3 compiler/frontend/export_hf.py --model build/llm_cache/Qwen3-0.6B --out build/c55/qwen3_l2 --layers 2
   python3 compiler/tests/test_c55.py --model build/llm_cache/Qwen3-0.6B --out build/c55/qwen3_l2 --check --mb 384
   python3 compiler/runtime/tools/sadis.py <file.sadesc>   # disassembler

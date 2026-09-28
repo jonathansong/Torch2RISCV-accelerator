@@ -34,10 +34,27 @@ from pynq_matmul import (BRAM_ARM_BASE, MBOX, MBOX_CPL_BASE, MBOX_FW_STATE, MBOX
 CPL_OFFSET = 0x2000                      # sa_transport_board.c
 
 
+def alloc_window(mb):
+    """The device window (CMA). A large window can fail on free but fragmented
+    CMA (loading the overlay leaves page cache in it): then drop the page cache,
+    compact memory (root) and retry. SmolLM2 (168 MB) needs cma=320M on the
+    PYNQ-Z1 (uEnv.txt bootargs): with 256M the overlay load leaves no 168 MB block."""
+    try:
+        return allocate(shape=(mb << 20,), dtype=np.uint8)
+    except RuntimeError as e:
+        print(f"launcher: {mb} MB window: {e}; dropping caches, compacting memory, retrying", flush=True)
+        os.sync()
+        for f, v in (("/proc/sys/vm/drop_caches", "3"), ("/proc/sys/vm/compact_memory", "1")):
+            if os.path.exists(f):            # compact_memory: only with CONFIG_COMPACTION
+                with open(f, "w") as fh:
+                    fh.write(v)
+        return allocate(shape=(mb << 20,), dtype=np.uint8)
+
+
 def start(bit, fw, mb=16, ring=16):
     """Overlay + window + ring + rt_fw; returns (mm, buf, env for the program)."""
     mm = MatmulOverlay(bit, fw)
-    buf = allocate(shape=(mb << 20,), dtype=np.uint8)
+    buf = alloc_window(mb)
     buf[:] = 0
     buf.flush()                          # no dirty lines left: the program maps the window non-cacheable
     phys = buf.physical_address

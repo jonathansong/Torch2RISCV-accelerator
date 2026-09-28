@@ -17,7 +17,7 @@ hand-written device model for it, so:
      sim, staged as the board test's reference (board_llm.py: bit-exact).
 
     python3 compiler/tests/test_c55.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2 \\
-        [--check] [--steps 8] [--generate 8] [--mb 176] [--board-bundle build/deploy_c55]
+        [--check] [--steps 8] [--generate 8] [--mb 168] [--board-bundle build/deploy_c55]
 """
 import argparse
 import os
@@ -74,7 +74,7 @@ def main():
     ap.add_argument("--check", action="store_true", help="dispatch_check.py at T = 16, 80, 256")
     ap.add_argument("--steps", type=int, default=8, help="prompt tokens on the sim")
     ap.add_argument("--generate", type=int, default=8, help="then greedy tokens on the sim")
-    ap.add_argument("--mb", type=int, default=176, help="device memory window (MB): SmolLM2-135M peaks at 160.5")
+    ap.add_argument("--mb", type=int, default=168, help="device memory window (MB): SmolLM2-135M peaks at 160.6")
     ap.add_argument("--board-bundle", help="stage the board test here")
     ap.add_argument("--board-generate", type=int, default=24)
     args = ap.parse_args()
