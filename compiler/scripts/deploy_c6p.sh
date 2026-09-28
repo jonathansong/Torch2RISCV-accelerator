@@ -15,11 +15,11 @@ rm -rf "$D" && mkdir -p "$D"
 case $model in
   stories)
     "$SA_PY" "$SA_COMPILER/frontend/export.py" --out "$O" --prefill "$M" | tail -2
-    "$SA_PY" "$SA_COMPILER/tests/test_c6p.py" --out "$O" --prefill "$M" --board-bundle "$D" --board-generate 60 ;;
+    "$SA_PY" "$SA_COMPILER/tests/test_c6p.py" --out "$O" --prefill "$M" --check --board-bundle "$D" --board-generate 60 ;;
   smollm2)
     "$SA_PY" "$SA_COMPILER/frontend/export_hf.py" --model "$SA_REPO/build/llm_cache/SmolLM2-135M" --out "$O" \
       --prefill "$M" | tail -2
-    "$SA_PY" "$SA_COMPILER/tests/test_c6p.py" --out "$O" --prefill "$M" --mb 144 \
+    "$SA_PY" "$SA_COMPILER/tests/test_c6p.py" --out "$O" --prefill "$M" --check --mb 144 \
       --model "$SA_REPO/build/llm_cache/SmolLM2-135M" --board-bundle "$D" --board-generate 24 ;;
   *) echo "stories or smollm2"; exit 2 ;;
 esac

@@ -166,10 +166,9 @@ def check_prefill(vmfb, irpa, eager, prompt, M, d, step, gen=4):
     module: the last position's logits against the decode-only run and against
     eager prefill (eager: a fresh model), correlation > 0.98 as decode (argmax
     and the greedy tokens after it reported). step(token, pos, d): decode inputs."""
+    if len(prompt) < 2 * M:                       # at least two chunks and an overlapping last one
+        prompt = [int(t) for t in np.resize(np.array(prompt), 2 * M + M // 2)]
     P = len(prompt)
-    if P < M:
-        print(f"prefill: a prompt of {P} tokens is shorter than a chunk ({M})")
-        return False
     t0 = time.time()
     dec, pre, e = IreeModel(vmfb, irpa), IreeModel(vmfb, irpa), eager
     with torch.no_grad():

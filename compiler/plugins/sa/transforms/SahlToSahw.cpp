@@ -121,7 +121,7 @@ SmallVector<SmallVector<int64_t>> points(ArrayRef<int64_t> ranges) {
   SmallVector<SmallVector<int64_t>> out;
   int64_t n = 1;
   for (int64_t r : ranges) n *= r;
-  if (n > 4096) return out;
+  if (n > 65536) return out;
   for (int64_t e = 0; e < n; ++e) {
     SmallVector<int64_t> p(ranges.size());
     int64_t x = e;
@@ -351,6 +351,15 @@ public:
     auto size = [&](Value v, bool scalarOk) {
       auto mt = dyn_cast<MemRefType>(v.getType());
       if (!mt || !mt.hasStaticShape()) return false;
+      // flat pieces of a contiguous view only (a column slice goes by rows: rowPieceable)
+      SmallVector<int64_t> st;
+      int64_t off;
+      if (failed(mt.getStridesAndOffset(st, off))) return false;
+      int64_t expect = 1;
+      for (int i = int(mt.getRank()) - 1; i >= 0; --i) {
+        if (mt.getDimSize(i) != 1 && st[i] != expect) return false;
+        expect *= mt.getDimSize(i);
+      }
       if (mt.getRank() == 0 || (scalarOk && mt.getNumElements() == 1)) return scalarOk;
       if (n < 0) n = mt.getNumElements();
       return mt.getNumElements() == n;
@@ -2503,7 +2512,7 @@ private:
     // gathers: memref.load of a buffer captured from outside the body, the
     // index evaluated at every point of the (small) iteration space
     auto domain = points(ranges);
-    if (domain.size() > 4096) domain.clear();
+    if (domain.size() > 65536) domain.clear();          // (prefill: M rows of a table)
     for (memref::LoadOp ld : body.getOps<memref::LoadOp>()) {
       Value t = ld.getMemRef();
       auto mt = cast<MemRefType>(t.getType());

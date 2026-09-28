@@ -94,6 +94,8 @@ def main():
                 ok = False
     pn = os.path.join(out, "prompt.npy")
     prompt = [int(t) for t in np.load(pn)] if os.path.exists(pn) else STORIES_PROMPT
+    if len(prompt) < 2 * args.prefill:            # at least two chunks and an overlapping last one
+        prompt = [int(t) for t in np.resize(np.array(prompt), 2 * args.prefill + args.prefill // 2)]
     t0 = time.time()
     dt, dl, dstat = run_sim(out, prompt, args.generate, args.mb)
     t1 = time.time()
