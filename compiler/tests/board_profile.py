@@ -7,7 +7,10 @@ lists of whole command buffers (as board_llm.py runs) and times those;
 NAME=VALUE arguments set environment variables of the runner (A/B switches).
 
     sudo bash -c 'source /etc/profile.d/pynq_venv.sh && source /etc/profile.d/xrt_setup.sh && \\
-        cd /home/xilinx/c3 && python3 board_profile.py [tokens] [--batch] [NAME=VALUE...]'
+        cd /home/xilinx/c3 && python3 board_profile.py [tokens] [--prompt N] [--batch] [NAME=VALUE...]'
+
+With a prefill bundle (sa_args.txt --prefill=M) and --prompt N (N / M chunks) the prefill
+chunks after the first are profiled too.
 """
 import os
 import subprocess
@@ -22,11 +25,18 @@ import board_launcher as BL  # noqa: E402
 
 def main():
     prompt = np.load(os.path.join(HERE, "prompt.npy"))
-    argv = [a for a in sys.argv[1:] if a != "--batch" and "=" not in a]
+    args = sys.argv[1:]
+    if "--prompt" in args:                          # a longer prompt (prefill): prompt.npy repeated
+        i = args.index("--prompt")
+        p = int(args[i + 1])
+        prompt = np.resize(prompt, p)
+        del args[i:i + 2]
+    argv = [a for a in args if a != "--batch" and "=" not in a]
     n = int(argv[0]) if argv else 40
     args_file = os.path.join(HERE, "sa_args.txt")
     extra = open(args_file).read().split() if os.path.exists(args_file) else []
-    mm, buf, env = BL.start(os.path.join(HERE, "picorv32.bit"), os.path.join(HERE, "rt_fw.bin"), mb=64, ring=16)
+    mb = int(open(os.path.join(HERE, "board.txt")).read().split()[-1]) if os.path.exists(os.path.join(HERE, "board.txt")) else 64
+    mm, buf, env = BL.start(os.path.join(HERE, "picorv32.bit"), os.path.join(HERE, "rt_fw.bin"), mb=mb, ring=16)
     env["SA_PROFILE"] = "batch" if "--batch" in sys.argv else "1"
     for a in sys.argv[1:]:
         if "=" in a:

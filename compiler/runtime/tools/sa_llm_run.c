@@ -156,10 +156,20 @@ static iree_status_t run(iree_allocator_t host) {
       status = call3(context, pf, device, allocator, host, toks + s, M, pos_buf, M, valid, vlen, &logits, &vocab);
       prefill_time += now() - t0;
       ++chunks;
+      if (chunks == 1) sa_context_profile_reset();   // the first chunk includes loading
       if (s + M >= ntok) break;
       s0 += M;
     }
     free(pos_buf);
+    if (iree_status_is_ok(status) && chunks > 1 && getenv("SA_PROFILE")) {
+      uint64_t nd, cyc, ns;
+      sa_context_profile_totals(&nd, &cyc, &ns);
+      printf("prefill per chunk (after the first, %d chunks of %d): %.1f %s, device %.2f ms (%.0f cycles at 50 MHz), "
+             "submissions %.2f ms\n",
+             chunks - 1, M, nd / (double)(chunks - 1), strcmp(getenv("SA_PROFILE"), "batch") ? "dispatches" : "lists",
+             cyc / (chunks - 1) / 50e3, cyc / (double)(chunks - 1), ns / 1e6 / (chunks - 1));
+      sa_context_profile_report(stdout, chunks - 1);
+    }
     if (iree_status_is_ok(status)) {
       if (lf) fwrite(logits, sizeof(float), vocab, lf);
       iree_host_size_t best = 0;
