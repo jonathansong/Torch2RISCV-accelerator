@@ -1,6 +1,6 @@
 # LLM 编译器：基于 MLIR / IREE 的端到端方案（PyTorch → 描述符列表）
 
-状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 进行中**（§8；C5.0 完成）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
+状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 进行中**（§8；C5.0–C5.4 完成，下一步 C5.5）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
 取代那里 §10.4、§10.5 的概要。
 
 **目标**：从一个 PyTorch 写的 llama 类模型出发，用 MLIR / IREE 自动编译，得到在 PYNQ-Z1 上运行的完整程序：
@@ -724,16 +724,25 @@ C5.5 的模型（§8.9 的第一步）：
 - 结果（`tests/test_c51.py`）：stories15M 的 58 个可执行体中 34 个走新流水线（逐元素与归约类全部），58 个全部通过 `dispatch_check`，端到端 sim 逐位一致；描述符 / VE 数与 C3/C4 相同，dispatch 5、30 各少一条 VE（REDUCE 合并进了折半的最后一步）。C5.1a 的 23 个在板上逐 dispatch 周期不高于 C4，整体 2,590,630 周期 / token。
 - 其余 24 个：线性层 5 个（C5.2）、注意力的 batch_matmul 12 个与 KV 写入的 scatter 7 个（C5.3）。
 
-**C5.2（2026-09-28，待板上验收）**：线性层走新流水线。
+**C5.2（2026-09-28）**：线性层走新流水线。
 - 在 `sahl` 层识别“int8 收缩 + 逐元素尾部”：x（i8 或 i32 中的 int8 值）× 打包的 W（i8 [N/D, K, D]）→ int32 累加器 → 一个 [N/D, D] 的逐元素尾部 → 写回。收缩与尾部的全部缓冲只能由这个结构使用。
 - 降级：分块（块大小按 SPAD_B bank 与 ACC 暂存区，容量来自目标配置）；A 条带由 x 做 DIV-D 复制；第 i 块 EX 之后预取第 i+1 块的权重和尾部的逐块输入（另一个 bank）；尾部按块走 C5.1 的逐元素降级（任意逐元素运算，不再限于模板的几种形式），临时缓冲放在本块的 bank；块数多时用 LOOP_END 循环一对块；第 0 块权重放进前缀。
 - 结果：5 种线性层全部通过 `dispatch_check`；命令的种类、顺序与数量与模板相同（分类层的循环结构一致），差别只在尾部中间结果的位置、残差随下一块预取、寄存器编号。
 - 调试工具：`compiler/runtime/tools/sadis.py`（sa-desc 反汇编）。
 - 板上：逐 dispatch 周期与模板相同或略少（33：−1,071；22：−582，残差预取），整体 2,588,992 周期 / token。**C5.2 验收通过。**
 
-**C5.3（2026-09-28，待板上验收）**：注意力与 KV 写入走新流水线，stories15M 的 58 个可执行体全部由 C5 流水线生成（`--iree-sa-new-codegen=only` 可以编译）。
+**C5.3（2026-09-28）**：注意力与 KV 写入走新流水线，stories15M 的 58 个可执行体全部由 C5 流水线生成（`--iree-sa-new-codegen=only` 可以编译）。
 - scatter（KV 写入）：LDPARAM（位置 × 行字节数）+ 带动态 DDR 地址的 ST；“把 cache 拷给自己”的写回在 `sa-to-sahl` 中删去；只有恒等映射的多层逐元素循环压平成一维。
 - 注意力：`sa-to-sahl` 保留 batch_matmul 与缓存切片的扩展 generic；`sahl-to-sahw` 把“扩展 + batch_matmul + 尾部 + 写回”作为一个结构，按 C3 的方式逐头降级（分数：K 行 → TRANSPOSE → Kᵀ 块、q 复制成 A 条带、EX、`×s_q[h]×a_k`；P·V：p 复制成 A 条带、V 按 INTERLEAVE 加载、EX、`×a_v`；T 动态）。这实际上是把注意力模板移植到了新流水线，C5.4 中成为 `attention` 微内核；batch_matmul 的通用降级（Kᵀ 布局由布局传播插入）暂缓。
+- 板上：58 个可执行体全部来自 C5 流水线，2,588,991 周期 / token，逐位一致。**C5.3 验收通过。**
+
+**C5.4 结果（2026-09-28）**：C3/C4 生成器退役，模板改成微内核，没有微内核也能编译 stories15M。
+- 退役：`Codegen.cpp`（C3/C4 的直接生成描述符的生成器）、`Templates`（参考实现的 DescList 移植）、C5.0 的提升层、`--iree-sa-codegen` / `--iree-sa-new-codegen`。代码生成只有 `iree-sa-codegen` 一条路径；编译不了的 dispatch 报错（`--iree-sa-allow-unsupported`：生成运行即报错的导出）。
+- 微内核（`--iree-sa-ukernels=all|none|<列表>`）：`linear`（C5.2 的调过的线性层降级）、`attention`（C5.3 的注意力降级）。
+- 通用收缩降级（没有微内核时）：每个操作数沿 `sahl.load` 与扩展 generic（含置换）追到 DDR，得到“元素偏移 = 各循环维 × 系数”，循环分成 batch / N / K；矩阵按布局变成 B 块（已打包：直接 LD；K 连续：逐行 LD + TRANSPOSE；N 连续：INTERLEAVE LD），x 复制成 A 条带；按 batch、按输出块：B 块、EX、尾部（逐元素降级，恒等映射的输入逐块加载）、写回；动态 N / K 用 PARAM；串行调度（不预取、不用 LOOP_END）。块用过的片上缓冲在块结束后收回，因此尾部的广播字须在分块循环之前生成（板上第一次运行在 T ≥ 80 时发现的错误）。
+- 验收：`--iree-sa-ukernels=all` 与 `none` 都编译出 58 个可执行体，`tests/test_c5.py` 在 T = 16、80、256 下全部通过 `dispatch_check`，sim 76 步逐位一致；板上两种都与 L5 文本相同、逐位一致。
+- 微内核的价值（板上，周期 / token）：带微内核 2,588,975；只用通用降级 4,395,723（10.3 tok/s）。差别几乎都在线性层（没有预取、没有循环）：分类层 1.26M → 2.43M，W13 0.41M → 0.70M，Wqkv 0.26M → 0.40M，W2 0.23M → 0.35M；注意力相差很小。
+- 测试：`tests/test_c5.py`（lit、两种配置、T 扫描、微内核改变了哪些 dispatch）；`test_c2.py` 改为检查命令的种类与数量与参考调度相同（不再逐字节）；`test_c50.py`、`test_c51.py` 删除。
 
 ### 8.8 扩展点与微内核
 

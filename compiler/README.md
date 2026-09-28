@@ -150,15 +150,21 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   Environment: `SA_PROFILE=1` (one list per dispatch, per-export cycles),
   `SA_PROFILE=batch` (per list), `SA_NO_BATCH=1` (one list per dispatch, to
   find a failing dispatch).
-- **C5 in progress** (docs/iree_compiler_plan.md §8): full code generation
-  through two dialects, `sahl` (tile level) and `sahw` (command level).
-  **C5.0 done**: the `sahw` dialect (`plugins/sa/dialect/`), the output of the
-  C3/C4 generator raised into it, `sahw-split-head`, `sahw-assign-registers`
-  and the sahw serializer (`plugins/sa/transforms/`); the hardware parameters
-  come from the executable target configuration. `--iree-sa-codegen=dialect`
-  (default) and `=templates` give byte-identical executables.
+- **C5 in progress** (docs/iree_compiler_plan.md §8): the code generator is an
+  MLIR pipeline (`plugins/sa/transforms/`): IREE bufferization, `iree-sa-to-sahl`
+  (explicit DDR traffic, the `sahl` dialect), `iree-sahl-to-sahw` (local
+  memory, one single-stage VE per operation, reductions, gathers, masks,
+  dynamic lengths, contractions), `iree-sahw-fuse-ve`, `iree-sahw-split-head`,
+  `iree-sahw-assign-registers`, the `sahw` serializer. The linear layer and
+  attention are micro-kernels (`--iree-sa-ukernels=all|none|linear,attention`);
+  without them a generic contraction lowering compiles everything.
+  **C5.0–C5.4 done**: stories15M compiles with and without micro-kernels,
+  bit-exact on sim and on the board (2.589M cycles / token with, 4.396M
+  without); the hardware parameters come from the executable target
+  configuration. Next: C5.5 (SmolLM2-135M, a Qwen3-structure configuration).
 
   ```sh
-  python3 compiler/tests/test_c50.py                       # lit tests + byte comparison of the two paths
+  python3 compiler/tests/test_c5.py                  # lit, both configurations, dispatch_check at T = 16, 80, 256
+  python3 compiler/runtime/tools/sadis.py <file.sadesc>   # disassembler
   $IREE_BUILD/llvm-project/bin/llvm-lit -v compiler/plugins/sa/test
   ```
