@@ -52,8 +52,10 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
     llvm::DenseMap<Value, Value> loaded;          // DDR view -> its local copy
     auto localFor = [&](OpBuilder &b, Location loc, Value ddr) -> Value {
       auto mt = cast<MemRefType>(ddr.getType());
-      if (!mt.hasStaticShape()) return {};
-      return memref::AllocOp::create(b, loc, MemRefType::get(mt.getShape(), mt.getElementType()));
+      SmallVector<Value> dyn;                    // dynamic sizes: those of the DDR view
+      for (int64_t i = 0; i < mt.getRank(); ++i)
+        if (mt.isDynamicDim(i)) dyn.push_back(memref::DimOp::create(b, loc, ddr, i));
+      return memref::AllocOp::create(b, loc, MemRefType::get(mt.getShape(), mt.getElementType()), dyn);
     };
     SmallVector<Operation *> ops;
     for (Operation &op : f.getBody().front()) ops.push_back(&op);

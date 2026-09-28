@@ -25,6 +25,7 @@
 #include "SahlPasses.h"
 #include "SahwPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -150,6 +151,11 @@ struct LocalBuf {
   VType vt = ::sa::VT_F32;
   int64_t n = 0;
   bool bcast = false;          // one word per element, the value in every lane
+  // a dynamic innermost length (upper bound max_dynamic): rows of it `rowStride`
+  // words apart (rows = 1: a vector)
+  std::optional<Lin> dyn;
+  uint32_t rowStride = 0;
+  int64_t rows = 1;
 };
 
 // a VE source operand
@@ -164,10 +170,12 @@ struct Opd {
 
 // a value inside a generic body
 struct Val {
-  // Index: linalg.index `dim`; IntExpr / IdxCond: index arithmetic / conditions
+  // Mask: innermost index <= / < an i64 scalar (`arg`, pred); Index: linalg.index `dim`; IntExpr / IdxCond: index arithmetic / conditions
   // (evaluated where used); ScalarArg: an i64 scalar input (`arg`); SwapSrc /
   // NegSwap: the pair swap of a buffer (negated)
-  enum Kind { None, Const, Mem, ToI8, I32OfI8, Index, IntExpr, IdxCond, ScalarArg, SwapSrc, NegSwap } kind = None;
+  enum Kind { None, Const, Mem, ToI8, I32OfI8, Index, IntExpr, IdxCond, ScalarArg, SwapSrc, NegSwap, Mask } kind = None;
+  arith::CmpIPredicate pred{};
+  bool negInf = false;         // masked with -inf (only for a max reduction)
   float c = 0;
   int dim = -1, arg = -1;
   Opd o;
@@ -192,7 +200,8 @@ public:
       Operation *op = &opRef;
       loc = op->getLoc();
       if (isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CastOp,
-              IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp, func::ReturnOp>(op))
+              memref::DimOp, IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp,
+              IREE::TensorExt::DispatchWorkloadOrdinalOp, func::ReturnOp>(op))
         continue;
       if (op->getDialect() && op->getDialect()->getNamespace() == "util") continue;
       if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp, arith::OrIOp>(op)) continue;
@@ -235,6 +244,11 @@ private:
   uint32_t accTop[2];
   uint32_t spadTop = 0;
   Operation *lastVe = nullptr;
+  std::map<Lin, Value> params;
+  Value rowAcc;                                  // the row loops' DDR offset
+  Value curLen;                                  // row mode: the dynamic LEN of full-length VEs
+  int64_t curLenStatic = -1;
+  std::map<std::pair<void *, int>, Value> validParams;   // (i64 scalar, predicate) -> VALID count
 
   bool fail(const std::string &m) {
     if (err.empty()) err = m;
@@ -250,6 +264,28 @@ private:
                                    key.mul, int64_t(key.shift), key.add, IntegerAttr());
     bases[{binding, key}] = v;
     return v;
+  }
+
+  Value paramFor(const Lin &v) {
+    if (auto it = params.find(v); it != params.end()) return it->second;
+    Value p = sahw::ParamOp::create(regB, loc, regB.getType<sahw::ParamType>(), int64_t(v.ord), v.mul,
+                                    int64_t(v.shift), v.add, IntegerAttr());
+    params[v] = p;
+    return p;
+  }
+  // the Lin of a dynamic size (a push constant, possibly through memref.dim of a binding)
+  std::optional<Lin> dynLin(Value size) {
+    if (auto dim = size.getDefiningOp<memref::DimOp>()) {
+      Value root = ddrRoot(dim.getSource());
+      auto idx = dim.getConstantIndex();
+      if (!root || !idx || root != dim.getSource()) return std::nullopt;
+      auto sub = root.getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+      auto mt = cast<MemRefType>(root.getType());
+      int k = 0;
+      for (int64_t i = 0; i < *idx; ++i) k += mt.isDynamicDim(i);
+      return linOf(sub.getDynamicDims()[k]);
+    }
+    return linOf(size);
   }
 
   // ------------------------------------------------------------ local memory
@@ -288,7 +324,25 @@ private:
     auto vt = vtOf(mt.getElementType());
     int64_t n = mt.hasStaticShape() ? mt.getNumElements() : 0;
     if (mt.getElementType().isInteger(64)) vt = ::sa::VT_I32, n *= 2;       // (low, high) in two lanes
-    if (!vt || !mt.hasStaticShape()) return fail("local buffer type"), std::nullopt;
+    if (!vt) return fail("local buffer type"), std::nullopt;
+    if (!mt.hasStaticShape()) {
+      // [?] or [H, ?]: rows of max_dynamic elements
+      auto alloc = v.getDefiningOp<memref::AllocOp>();
+      if (mt.getRank() > 2 || !mt.isDynamicDim(mt.getRank() - 1) || (mt.getRank() == 2 && mt.isDynamicDim(0)) ||
+          alloc.getDynamicSizes().size() != 1)
+        return fail("dynamic local buffer other than [?] or [H, ?]"), std::nullopt;
+      auto dl = dynLin(alloc.getDynamicSizes()[0]);
+      if (!dl) return fail("dynamic size not from a push constant"), std::nullopt;
+      int64_t rows = mt.getRank() == 2 ? mt.getDimSize(0) : 1;
+      uint32_t stride = uint32_t((cfg.maxDynamic + d - 1) / d);
+      LocalBuf l = newLocal(*vt, int64_t(stride) * rows * d, bcast);
+      l.dyn = dl;
+      l.rowStride = stride;
+      l.rows = rows;
+      l.n = cfg.maxDynamic * rows;
+      locals[v] = l;
+      return l;
+    }
     LocalBuf l = newLocal(*vt, n, bcast);
     locals[v] = l;
     return l;
@@ -300,10 +354,34 @@ private:
     int64_t off = 0;           // bytes
     int64_t n = 0;
     Type et;
+    std::optional<Lin> dyn;    // a dynamic innermost length (rows of it, contiguous)
+    int64_t rows = 1;
   };
   std::optional<Ddr> ddrOf(Value v) {
     auto mt = cast<MemRefType>(v.getType());
-    if (!mt.hasStaticShape()) return fail("DDR view with a dynamic shape"), std::nullopt;
+    if (!mt.hasStaticShape()) {
+      // a binding of [?] or [H, ?] (the rows contiguous)
+      auto sub = v.getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+      if (!sub || mt.getRank() > 2 || !mt.isDynamicDim(mt.getRank() - 1) || (mt.getRank() == 2 && mt.isDynamicDim(0)))
+        return fail("dynamic DDR view other than a [?] or [H, ?] binding"), std::nullopt;
+      Lin off{-1, 1, 0, 0};
+      if (Value o = sub.getByteOffset()) {
+        auto l = linOf(o);
+        if (!l) return fail("binding offset is not a constant or a push constant"), std::nullopt;
+        off = *l;
+      }
+      auto dl = linOf(sub.getDynamicDims()[0]);
+      if (!dl) return fail("dynamic dimension is not a push constant"), std::nullopt;
+      Ddr r;
+      r.base = baseFor(int(sub.getBinding().getZExtValue()), off);
+      r.et = mt.getElementType();
+      if (!esize(r.et)) return fail("DDR element type"), std::nullopt;
+      r.off = off.isConst() ? off.add : 0;
+      r.dyn = dl;
+      r.rows = mt.getRank() == 2 ? mt.getDimSize(0) : 1;
+      r.n = cfg.maxDynamic * r.rows;
+      return r;
+    }
     // contiguous row-major view
     SmallVector<int64_t> strides;
     int64_t offset;
@@ -353,12 +431,63 @@ private:
     }
   }
 
+  // rows of a dynamic length T (bytes per row = f(T)): row r at DDR offset
+  // r * bytes; a PARAM accumulates the offset on the device (SETREG PARAM +=
+  // PARAM), so each DMA has two dynamic fields (address, bytes)
+  template <typename F>
+  void rowLoop(int64_t H, Value bytesParam, F dma) {
+    if (!rowAcc) rowAcc = privateParam();
+    sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 0, ValueRange{});
+    for (int64_t r = 0; r < H; ++r) {
+      dma(r);
+      if (r + 1 < H) {
+        auto s = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{bytesParam});
+        s.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});
+        s.setDynAdd(ArrayRef<bool>{false});
+      }
+    }
+  }
+  template <typename OpT>
+  static void dynDma(OpT op, Value acc, Value bytes) {
+    SmallVector<int32_t> f;
+    SmallVector<bool> a;
+    if (acc) f.push_back(::sa::DYN_DMA_DDR), a.push_back(true);
+    f.push_back(::sa::DYN_DMA_ROW_BYTES), a.push_back(false);
+    op.setDynFields(f);
+    op.setDynAdd(a);
+  }
+  bool dynamicDma(const Ddr &r, const LocalBuf &l, bool isLoad) {
+    if (!l.dyn || l.rows != r.rows) return fail("dynamic DMA between different shapes");
+    uint32_t es = esize(r.et);
+    Lin b = *r.dyn;
+    b.mul *= es;
+    b.add *= es;
+    Value bp = paramFor(b);
+    int64_t maxBytes = cfg.maxDynamic * es;
+    if (r.off % 8) return fail("dynamic DMA not 8-byte aligned");
+    auto one = [&](int64_t row, Value acc) {
+      int64_t la = int64_t(l.la) + row * l.rowStride;
+      SmallVector<Value> dv;
+      if (acc) dv.push_back(acc);
+      dv.push_back(bp);
+      if (isLoad) dynDma(sahw::LdOp::create(bb, loc, r.base, r.off, la, 1, maxBytes, maxBytes, 0, dv), acc, bp);
+      else dynDma(sahw::StOp::create(bb, loc, r.base, r.off, la, 1, maxBytes, maxBytes, dv), acc, bp);
+    };
+    if (r.rows == 1) {
+      one(0, Value());
+      return true;
+    }
+    rowLoop(r.rows, bp, [&](int64_t row) { one(row, rowAcc); });
+    return true;
+  }
+
   bool load(sahl::LoadOp l) {
     auto r = ddrOf(l.getSrc());
     if (!r) return false;
     if (r->et.isInteger(64)) return fail("i64 load");
     auto dst = bufOf(l.getDst());
     if (!dst) return false;
+    if (r->dyn) return dynamicDma(*r, *dst, true);
     uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
     if (r->off % 8) return fail("load not 8-byte aligned");
     if (bytes > 65535) return fail("load larger than 64 KB");
@@ -372,6 +501,7 @@ private:
     auto it = locals.find(s.getSrc());
     if (it == locals.end()) return fail("stored buffer not computed");
     LocalBuf l = it->second;
+    if (r->dyn) return dynamicDma(*r, l, false);
     if (l.bcast && l.n > 1) l = packBcast(l);
     uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
     if (r->off % 8) return fail("store not 8-byte aligned");
@@ -411,6 +541,11 @@ private:
     SmallVector<Value> dv;
     SmallVector<int32_t> df;
     SmallVector<bool> da;
+    if (curLen && int64_t(len) == curLenStatic) {
+      dv.push_back(curLen);
+      df.push_back(::sa::DYN_VE_LEN);
+      da.push_back(false);
+    }
     for (const DynF &x : dyn) {
       dv.push_back(x.param);
       df.push_back(x.field);
@@ -516,7 +651,13 @@ private:
   // a PARAM of the template's own (from 7 down, by sahw-assign-registers)
   Value privateParam() { return sahw::PrivateOp::create(regB, loc, regB.getType<sahw::ParamType>(), IntegerAttr()); }
 
-  bool generic(linalg::GenericOp g) {
+  // a row of an [H, T] generic with a dynamic T (or the one row of a [T] one)
+  struct RowSel {
+    int64_t row = 0;
+    Lin len;
+  };
+
+  bool generic(linalg::GenericOp g, const RowSel *sel = nullptr) {
     auto iters = g.getIteratorTypesArray();
     int nloops = int(iters.size());
     SmallVector<AffineMap> maps = g.getIndexingMapsArray();
@@ -526,14 +667,45 @@ private:
       return intScalar(g);
     if (nloops > 2) return fail("more than two loops");
     SmallVector<int64_t> ranges(nloops, -1);
+    std::optional<Lin> dynInner;
     for (int i = 0; i < int(g->getNumOperands()); ++i) {
-      auto mt = dyn_cast<MemRefType>(g->getOperand(i).getType());
+      Value opnd = g->getOperand(i);
+      auto mt = dyn_cast<MemRefType>(opnd.getType());
       if (!mt) continue;
-      for (unsigned r = 0; r < maps[i].getNumResults(); ++r)
-        if (auto de = dyn_cast<AffineDimExpr>(maps[i].getResult(r))) ranges[de.getPosition()] = mt.getDimSize(r);
+      for (unsigned r = 0; r < maps[i].getNumResults(); ++r) {
+        auto de = dyn_cast<AffineDimExpr>(maps[i].getResult(r));
+        if (!de) continue;
+        int L = int(de.getPosition());
+        if (!mt.isDynamicDim(r)) {
+          ranges[L] = mt.getDimSize(r);
+        } else if (ranges[L] < 0) {
+          ranges[L] = cfg.maxDynamic;
+          if (L != nloops - 1) return fail("dynamic loop other than the innermost");
+          if (!dynInner) {
+            auto lb = bufOf(opnd);
+            if (!lb || !lb->dyn) return fail("dynamic operand without its length");
+            dynInner = lb->dyn;
+          }
+        }
+      }
     }
     for (int64_t r : ranges)
       if (r < 0) return fail("loop range not given by an operand");
+    // a dynamic innermost length: one row at a time (each VE then needs only a
+    // dynamic LEN, and VALID for a mask)
+    if (dynInner && !sel) {
+      int64_t H = nloops == 2 ? ranges[0] : 1;
+      if (H > 16) return fail("more than 16 rows of a dynamic length");
+      curLen = paramFor(*dynInner);
+      curLenStatic = (cfg.maxDynamic + d - 1) / d * d;
+      for (int64_t r = 0; r < H; ++r) {
+        RowSel rs{r, *dynInner};
+        if (!generic(g, &rs)) return false;
+      }
+      curLen = Value();
+      curLenStatic = -1;
+      return err.empty();
+    }
     bool reduction = false;
     for (int L = 0; L < nloops; ++L)
       if (iters[L] == utils::IteratorType::reduction) {
@@ -543,6 +715,7 @@ private:
     int64_t n = 1;
     for (int64_t r : ranges) n *= r;
     int64_t inner = nloops ? ranges.back() : 1;
+    if (sel) n = inner;                                  // one row
     if (nloops > 1 && inner % d) return fail("innermost size not a multiple of D");
     if (nloops == 1 && n > d && n % d && !reduction) return fail("1-D size not a multiple of D");
     uint32_t wordsPerRow = uint32_t(inner / d);
@@ -577,17 +750,26 @@ private:
       } else if (m.isIdentity() || (int(m.getNumResults()) == nloops && m.isMinorIdentity())) {
         LocalBuf l = *lb;
         if (l.bcast && l.n > 1) {
+          if (sel) return fail("broadcast-layout operand in a row-by-row generic");
           l = packBcast(l);
           locals[in] = l;
         }
         v.o = {l.la, l.vt, ::sa::IDX_LIN, 0};
+        if (sel && nloops == 2) {
+          if (!l.rowStride) return fail("row-by-row operand not in the row layout");
+          v.o.la += uint32_t(sel->row) * l.rowStride;
+        }
       } else if (nloops == 2 && m.getNumResults() == 1 && m.getResult(0) == getAffineDimExpr(0, g.getContext())) {
         auto b = perElementBcast(in, *lb, ranges[0]);
         if (!b) return false;
         v.o = {b->la, ::sa::VT_F32, ::sa::IDX_DIV, wordsPerRow};
         v.uni = 2;
+        if (sel) {                                          // this row's value, in every element
+          v.o = {b->la + uint32_t(sel->row), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+          v.uni = 1;
+        }
       } else if (nloops == 2 && m.getNumResults() == 1 && m.getResult(0) == getAffineDimExpr(1, g.getContext())) {
-        v.o = {lb->la, lb->vt, ::sa::IDX_MOD, wordsPerRow};
+        v.o = {lb->la, lb->vt, sel ? ::sa::IDX_LIN : ::sa::IDX_MOD, sel ? 0u : wordsPerRow};
       } else {
         return fail("unsupported indexing map of a generic input");
       }
@@ -794,7 +976,16 @@ private:
           vals[res] = v;
           continue;
         }
-        return fail("comparison other than on indices");
+        if (a.kind != Val::Index || b.kind != Val::ScalarArg || a.dim != nloops - 1 ||
+            (ci.getPredicate() != arith::CmpIPredicate::sle && ci.getPredicate() != arith::CmpIPredicate::slt))
+          return fail("comparison other than a prefix mask (innermost index <= scalar)");
+        Val v;
+        v.kind = Val::Mask;
+        v.dim = a.dim;
+        v.arg = b.arg;
+        v.pred = ci.getPredicate();
+        vals[res] = v;
+        continue;
       }
       if (auto s = dyn_cast<arith::SelectOp>(op); s && valOf(s.getCondition()).kind == Val::IdxCond) {
         // select(cond(i), -swap(x), swap(x)) with cond(i) = (i even): the VE's SWAPNEG
@@ -808,6 +999,39 @@ private:
         Val x = fv;
         x.kind = Val::Mem;
         vals[res] = temp(x, std::nullopt, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, /*swapneg=*/true);
+        continue;
+      }
+      if (auto sl = dyn_cast<arith::SelectOp>(op)) {
+        // a prefix mask: VALID = pos + 1 (sle) or pos (slt), pos = the i64 scalar
+        // (its low word, through LDPARAM, once per scalar and predicate)
+        Val c = valOf(sl.getCondition());
+        if (c.kind != Val::Mask) return fail("select other than a prefix mask");
+        bool negInf = isF32Const(sl.getFalseValue(), -INFINITY);
+        if (!isF32Const(sl.getFalseValue(), 0.0f) && !negInf) return fail("masked value other than 0 / -inf");
+        Value scalar = g.getDpsInputs()[c.arg];
+        auto key = std::make_pair(scalar.getAsOpaquePointer(), int(c.pred));
+        Value p;
+        if (auto vi = validParams.find(key); vi != validParams.end()) {
+          p = vi->second;
+        } else {
+          auto r = ddrOf(scalar);
+          if (!r) return false;
+          p = privateParam();
+          sahw::LdParamOp::create(bb, loc, r->base, p, r->off, 1, c.pred == arith::CmpIPredicate::sle ? 1 : 0,
+                                  ValueRange{});
+          validParams[key] = p;
+        }
+        Val x = valOf(sl.getTrueValue());
+        if (x.kind != Val::Mem) return fail("masked value is not a vector value");
+        LocalBuf t = newLocal(::sa::VT_F32, n);
+        ve(x.o, std::nullopt, t.la, ::sa::VT_F32, n, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_NONE, 0,
+           0, {{::sa::DYN_VE_VALID, p, false}});
+        Val v;
+        v.kind = Val::Mem;
+        v.o = {t.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
+        v.producer = lastVe;
+        v.negInf = negInf;
+        vals[res] = v;
         continue;
       }
       if (auto fp = dyn_cast<arith::FPToSIOp>(op)) {
@@ -901,6 +1125,7 @@ private:
           continue;
         }
         if (a.kind != Val::Mem || b.kind != Val::Mem) return fail("operand is not a vector value");
+        if (a.negInf || b.negInf) return fail("-inf mask outside a max reduction");
         Val s1 = a, s2 = b;
         if (s1.o.mode != ::sa::IDX_LIN && s2.o.mode == ::sa::IDX_LIN && comm) std::swap(s1, s2);
         ::sa::VOp vop = isa<arith::AddFOp>(op)       ? ::sa::VOP_ADD
@@ -934,12 +1159,13 @@ private:
       if (a != b) return fail("reduction init is not the identity");
       Val e = valOf(elem);
       if (e.kind != Val::Mem) return fail("reduced value is not a vector value");
+      if (e.negInf && rk != ::sa::RED_MAX) return fail("-inf mask outside a max reduction");
       auto out = bufOf(init, /*bcast=*/true);
       if (!out) return false;
       if (!out->bcast) return fail("reduction result used before");
       int64_t groups = n / d;
       auto absOp = elem.getDefiningOp<math::AbsFOp>();
-      if (rk == ::sa::RED_MAX && absOp && elem.hasOneUse() && e.producer && e.uni == 0 && nloops == 1 &&
+      if (!sel && rk == ::sa::RED_MAX && absOp && elem.hasOneUse() && e.producer && e.uni == 0 && nloops == 1 &&
           n % d == 0 && groups >= 8) {
         // an abs-max (values >= +0: any order gives the same bits): |x| in the
         // pipelined VE mode, halved in place by element-wise maxima, then a
@@ -954,6 +1180,11 @@ private:
            uint32_t(groups));
         return err.empty();
       }
+      if (sel) {                                         // this row's word
+        ve(e.o, std::nullopt, out->la + uint32_t(sel->row), ::sa::VT_F32, n, ::sa::VOP_COPY, 1.0f, NEG0,
+           ::sa::FUNC_NONE, rk, 0);
+        return err.empty();
+      }
       ve(e.o, std::nullopt, out->la, ::sa::VT_F32, n, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, rk,
          uint32_t(inner / d));
       return err.empty();
@@ -961,7 +1192,8 @@ private:
     for (unsigned r = 0; r < unsigned(g.getNumDpsInits()); ++r) {
       Value init = g.getDpsInits()[r];
       Val y = valOf(yield.getOperand(r));
-      if (y.kind == Val::Mem && y.fresh && !locals.count(init) && init.getDefiningOp<memref::AllocOp>() &&
+      if (y.negInf) return fail("-inf mask outside a max reduction");
+      if (!sel && y.kind == Val::Mem && y.fresh && !locals.count(init) && init.getDefiningOp<memref::AllocOp>() &&
           vtOf(cast<MemRefType>(init.getType()).getElementType()) == y.o.vt) {
         LocalBuf row;                                    // the result is the gathered row itself
         row.la = y.o.la;
@@ -970,9 +1202,15 @@ private:
         locals[init] = row;
         continue;
       }
-      auto out = bufOf(init);
-      if (!out) return false;
-      if (out->bcast) return fail("element-wise result into a broadcast buffer");
+      auto out0 = bufOf(init);
+      if (!out0) return false;
+      if (out0->bcast) return fail("element-wise result into a broadcast buffer");
+      LocalBuf outRow = *out0;
+      if (sel && nloops == 2) {                          // this row of the row layout
+        if (!outRow.rowStride) return fail("row-by-row result not in the row layout");
+        outRow.la += uint32_t(sel->row) * outRow.rowStride;
+      }
+      const LocalBuf *out = &outRow;
       if (y.kind == Val::Mem) {
         if (y.o.mode != ::sa::IDX_LIN && out->vt != ::sa::VT_F32) return fail("broadcast into a non-fp32 result");
         Opd o = y.o;

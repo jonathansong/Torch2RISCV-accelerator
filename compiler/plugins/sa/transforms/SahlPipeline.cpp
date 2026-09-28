@@ -63,10 +63,24 @@ struct SahwFuseVePass : public PassWrapper<SahwFuseVePass, OperationPass<>> {
     return 0;
   }
 
-  // v2 only applies stages to src1 (a COPY without index modes, VALID, SWAPNEG)
+  // dynamic fields allowed on merged VEs: LEN (4) and VALID (5), not added
+  static bool dynOf(sahw::VeOp v, Value &len, Value &valid) {
+    auto f = v.getDynFields();
+    auto a = v.getDynAdd();
+    for (size_t i = 0; i < f.size(); ++i) {
+      if (a[i]) return false;
+      if (f[i] == 4) len = v.getDyn()[i];
+      else if (f[i] == 5) valid = v.getDyn()[i];
+      else return false;
+    }
+    return true;
+  }
+
+  // v2 only applies stages to src1 (a COPY without index modes or SWAPNEG)
   static bool stageOnly(sahw::VeOp v) {
+    Value len, valid;
     return v.getFp() && v.getOp() == 5 && v.getM1() == 0 && v.getP1() == 0 && v.getM2() == 0 && v.getSrc2() == 0 &&
-           v.getValid() == 0 && !v.getSwapneg() && v.getPeriod() == 0 && v.getDyn().empty() &&
+           v.getValid() == 0 && !v.getSwapneg() && v.getPeriod() == 0 && dynOf(v, len, valid) &&
            (v.getTypes() & 3) == 3 && (v.getTypes() >> 4) == 0 && !v.getFenceBefore();
   }
 
@@ -87,13 +101,19 @@ struct SahwFuseVePass : public PassWrapper<SahwFuseVePass, OperationPass<>> {
         }
         if (!isa<sahw::VeOp, sahw::LdOp, sahw::StOp, sahw::TransposeOp>(ops[i])) break;   // no merging across control
       }
+      Value len1, valid1, len2, valid2;
       if (!v1 || !v1.getFp() || v1.getLength() != v2.getLength() || v1.getReduce() != 0 || v1.getValid() != 0 ||
-          ((v1.getTypes() >> 2) & 3) != 3 || !v1.getDyn().empty())
+          ((v1.getTypes() >> 2) & 3) != 3 || !dynOf(v1, len1, valid1))
         continue;
+      dynOf(v2, len2, valid2);
+      if (len1 != len2) continue;
       bool usesA = bitsOf(v2.getA()) != ONE, usesB = bitsOf(v2.getB()) != NEG0, usesF = v2.getFunc() != 0,
-           usesR = v2.getReduce() != 0;
-      int need = usesA ? 1 : usesB ? 2 : usesF ? 3 : 4;
-      if (stageOf(v1) >= need) continue;
+           usesR = v2.getReduce() != 0, usesV = bool(valid2);
+      // stages: 1 A, 2 B, 3 FUNC, 4 VALID, 5 REDUCE, then the output conversion
+      int need = usesA ? 1 : usesB ? 2 : usesF ? 3 : usesV ? 4 : usesR ? 5 : 6;
+      int have = valid1 ? 4 : stageOf(v1);
+      if (have >= need) continue;
+      if (usesV && v1.getDynFields().size() >= 2) continue;       // at most two dynamic fields
       // the intermediate has no other reader; nothing between touches v2's destination
       bool ok = true;
       Range dst2 = rangeOf(v2.getDst(), (v2.getLength() + d - 1) / d);
@@ -120,6 +140,15 @@ struct SahwFuseVePass : public PassWrapper<SahwFuseVePass, OperationPass<>> {
       if (usesR) {
         v1.setReduce(v2.getReduce());
         v1.setRowlen(v2.getRowlen());
+      }
+      if (usesV) {
+        SmallVector<int32_t> f(v1.getDynFields());
+        SmallVector<bool> a(v1.getDynAdd());
+        v1.getDynMutable().append(valid2);
+        f.push_back(5);
+        a.push_back(false);
+        v1.setDynFields(f);
+        v1.setDynAdd(a);
       }
       v1.setTypes((v1.getTypes() & ~uint64_t(0xC)) | (v2.getTypes() & 0xC));
       v1.setDst(v2.getDst());
