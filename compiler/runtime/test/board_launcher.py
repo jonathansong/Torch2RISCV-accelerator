@@ -39,16 +39,27 @@ def alloc_window(mb):
     CMA (loading the overlay leaves page cache in it): then drop the page cache,
     compact memory (root) and retry. SmolLM2 (168 MB) needs cma=320M on the
     PYNQ-Z1 (uEnv.txt bootargs): with 256M the overlay load leaves no 168 MB block."""
+    for attempt in range(4):
+        try:
+            return allocate(shape=(mb << 20,), dtype=np.uint8)
+        except RuntimeError as e:
+            if attempt == 3:
+                raise RuntimeError(f"{mb} MB window: {e} (CMA: {cma_info()}; is cma= large enough, "
+                                   "Jupyter stopped?)") from None
+            print(f"launcher: {mb} MB window: {e}; dropping caches, compacting memory, retrying", flush=True)
+            os.sync()
+            for f, v in (("/proc/sys/vm/drop_caches", "3"), ("/proc/sys/vm/compact_memory", "1")):
+                if os.path.exists(f):            # compact_memory: only with CONFIG_COMPACTION
+                    with open(f, "w") as fh:
+                        fh.write(v)
+            time.sleep(1)
+
+
+def cma_info():
     try:
-        return allocate(shape=(mb << 20,), dtype=np.uint8)
-    except RuntimeError as e:
-        print(f"launcher: {mb} MB window: {e}; dropping caches, compacting memory, retrying", flush=True)
-        os.sync()
-        for f, v in (("/proc/sys/vm/drop_caches", "3"), ("/proc/sys/vm/compact_memory", "1")):
-            if os.path.exists(f):            # compact_memory: only with CONFIG_COMPACTION
-                with open(f, "w") as fh:
-                    fh.write(v)
-        return allocate(shape=(mb << 20,), dtype=np.uint8)
+        return ", ".join(l.split(":")[0] + " " + l.split()[1] + " kB" for l in open("/proc/meminfo") if l.startswith("Cma"))
+    except OSError:
+        return "unknown"
 
 
 def start(bit, fw, mb=16, ring=16):

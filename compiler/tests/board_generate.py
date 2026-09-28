@@ -101,15 +101,18 @@ def main():
     ap.add_argument("--max-new", type=int, default=64, help="tokens to generate at most")
     args = ap.parse_args()
     cfg = json.load(open(os.path.join(HERE, "model.json")))
-    encode, decode = load_tokenizer(cfg)
     mb = 64
     if os.path.exists(os.path.join(HERE, "board.txt")):
         mb = int(open(os.path.join(HERE, "board.txt")).read().split()[-1])
     args_file = os.path.join(HERE, "sa_args.txt")
     extra = open(args_file).read().split() if os.path.exists(args_file) else []
     ctx = cfg.get("context", 256)
+    # the window first: a large contiguous CMA block needs the free memory the
+    # tokenizer's Python objects would otherwise take (CMA pages lent to the
+    # kernel must migrate out)
     mm, buf, env = BL.start(os.path.join(HERE, "picorv32.bit"), os.path.join(HERE, "rt_fw.bin"), mb=mb, ring=16)
     try:
+        encode, decode = load_tokenizer(cfg)
         while True:
             if args.prompt is not None:
                 text = args.prompt
@@ -118,7 +121,7 @@ def main():
                     text = input("\nprompt> ")
                 except EOFError:
                     break
-                if text.strip() in ("", "quit", "exit"):
+                if text.strip() in ("", "q", "quit", "exit"):
                     if text.strip():
                         break
                     continue
@@ -134,6 +137,8 @@ def main():
                 print(f"[{len(ids)} prompt tokens; {stats}]")
             if args.prompt is not None:
                 break
+    except KeyboardInterrupt:
+        print()
     finally:
         BL.stop(mm, buf)
     return 0
