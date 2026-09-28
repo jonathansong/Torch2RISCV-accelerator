@@ -203,6 +203,12 @@ public:
         if (g->getParentOp() == f.getOperation()) matchLinear(g);
       });
     if (cfg.ukernel("attention")) f.walk([&](linalg::BatchMatmulOp m) { matchAttention(m); });
+    // the other contractions: the generic lowering
+    f.walk([&](linalg::LinalgOp op) {
+      if (op->getParentOp() == f.getOperation() && !owned.contains(op.getOperation()) &&
+          (isa<linalg::BatchMatmulOp>(op) || op.getNumReductionLoops() == 1) && op.getNumDpsInputs() == 2)
+        matchContraction(op);
+    });
     for (Operation &opRef : f.getBody().front()) {
       Operation *op = &opRef;
       loc = op->getLoc();
@@ -212,6 +218,10 @@ public:
       }
       if (auto it = attns.find(op); it != attns.end()) {
         if (!attention(it->second)) return false;
+        continue;
+      }
+      if (auto it = contracts.find(op); it != contracts.end()) {
+        if (!contraction(it->second)) return false;
         continue;
       }
       if (owned.contains(op)) continue;
@@ -909,6 +919,429 @@ private:
     return err.empty();
   }
 
+  // ------------------------------------------------------------ contractions (C5.4, generic)
+  // y[b, n] = sum_k x[b, k] * M[b, n, k] over int8 values (int32 accumulator),
+  // the result consumed by one element-wise epilogue that is stored. Each
+  // operand is followed back to DDR (through its sahl.load and an extsi
+  // generic, possibly transposing), giving its element offset as a linear
+  // function of the contraction's loops; the loops then split into batch (in
+  // x and M), output n (in M only) and reduction k. The matrix becomes B tiles
+  // by its layout:
+  //   packed [N/D, K, D] (the packed weights): loaded as is;
+  //   rows of K (n stride sN, k contiguous): rows loaded, TRANSPOSE;
+  //   rows of N (k stride sK, n contiguous): loaded INTERLEAVE;
+  // x becomes the A strip (each element over the D rows). Per batch, per chunk
+  // of output tiles: the B tiles, EX, the epilogue on the chunk (element-wise
+  // lowering), the store. A plain serial schedule (the micro-kernels are the
+  // tuned ones); dynamic N or K (one chunk of all tiles) from PARAMs.
+  struct Operand {
+    Value view;                                   // the DDR view
+    Type et;                                      // its element type
+    SmallVector<int64_t> coef;                    // element offset per contraction loop
+    SmallVector<Operation *> cover;               // its load / extension
+  };
+  enum class MatLayout { Packed, RowsK, RowsN };
+  struct ContractPlan {
+    linalg::LinalgOp op;
+    linalg::GenericOp epi;
+    sahl::StoreOp store;
+    Operand x, m;
+    int bLoop = -1, kLoop = -1, nLoop = -1, laneLoop = -1;   // laneLoop: the packed layout's lane
+    MatLayout layout = MatLayout::Packed;
+    SmallVector<std::pair<int, Value>> epiLoads;             // epilogue inputs loaded whole: (input, DDR)
+  };
+  llvm::DenseMap<Operation *, ContractPlan> contracts;
+
+  // the loop ranges of a linalg op: static, or a Lin (dynamic)
+  struct Range {
+    int64_t size = 1;
+    std::optional<Lin> dyn;
+  };
+  std::optional<SmallVector<Range>> loopRanges(linalg::LinalgOp op) {
+    SmallVector<Range> r(op.getNumLoops());
+    SmallVector<bool> seen(op.getNumLoops(), false);
+    auto maps = op.getIndexingMapsArray();
+    for (OpOperand &o : op->getOpOperands()) {
+      auto mt = dyn_cast<MemRefType>(o.get().getType());
+      if (!mt) continue;
+      AffineMap m = maps[o.getOperandNumber()];
+      for (unsigned i = 0; i < m.getNumResults(); ++i) {
+        auto de = dyn_cast<AffineDimExpr>(m.getResult(i));
+        if (!de || seen[de.getPosition()]) continue;
+        if (!mt.isDynamicDim(i)) {
+          r[de.getPosition()].size = mt.getDimSize(i);
+        } else {
+          // the size of a subview / alloc: a push constant
+          Value sz;
+          if (auto sv = o.get().getDefiningOp<memref::SubViewOp>()) {
+            int k = 0;
+            for (unsigned j = 0; j < i; ++j) k += mt.isDynamicDim(j);
+            sz = sv.getSizes()[k];
+          } else if (auto al = o.get().getDefiningOp<memref::AllocOp>()) {
+            int k = 0;
+            for (unsigned j = 0; j < i; ++j) k += mt.isDynamicDim(j);
+            sz = al.getDynamicSizes()[k];
+          } else if (auto sub = o.get().getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>()) {
+            int k = 0;
+            for (unsigned j = 0; j < i; ++j) k += mt.isDynamicDim(j);
+            sz = sub.getDynamicDims()[k];
+          } else {
+            continue;
+          }
+          auto l = dynLin(sz);
+          if (!l) continue;
+          r[de.getPosition()].size = cfg.maxDynamic;
+          r[de.getPosition()].dyn = l;
+        }
+        seen[de.getPosition()] = true;
+      }
+    }
+    for (bool s : seen)
+      if (!s) return std::nullopt;
+    return r;
+  }
+
+  // an operand of the contraction back to DDR: its element offset per loop
+  std::optional<Operand> operandOf(linalg::LinalgOp op, int input) {
+    Operand o;
+    Value v = op.getDpsInputOperand(input)->get();
+    AffineMap m = op.getIndexingMapsArray()[input];     // loops -> v indices
+    // through an extension generic (extsi, a permutation) into a local
+    if (auto al = v.getDefiningOp<memref::AllocOp>()) {
+      linalg::GenericOp ext;
+      for (Operation *u : v.getUsers())
+        if (auto g = dyn_cast<linalg::GenericOp>(u); g && g.getNumDpsInits() == 1 && g.getDpsInits()[0] == v &&
+                                                     g.getOperation() != op.getOperation())
+          ext = g;
+      if (ext) {
+        if (ext.getNumDpsInputs() != 1 || ext.getNumReductionLoops()) return std::nullopt;
+        Block &eb = ext.getRegion().front();
+        auto es = cast<linalg::YieldOp>(eb.getTerminator()).getOperand(0).getDefiningOp<arith::ExtSIOp>();
+        if (!es || es.getIn() != eb.getArgument(0) || eb.getOperations().size() != 2) return std::nullopt;
+        auto em = ext.getIndexingMapsArray();
+        if (!em[0].isPermutation() || !em[1].isPermutation()) return std::nullopt;
+        // v indices -> ext loops -> ext input indices
+        m = em[0].compose(inversePermutation(em[1])).compose(m);
+        o.cover.push_back(ext);
+        v = ext.getDpsInputs()[0];
+      }
+    }
+    // a local loaded whole from DDR: its source
+    if (!ddrRoot(v)) {
+      auto l = loadInto(v);
+      if (!l) return std::nullopt;
+      o.cover.push_back(l);
+      v = l.getSrc();
+    }
+    o.view = v;
+    auto mt = cast<MemRefType>(v.getType());
+    o.et = mt.getElementType();
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (failed(mt.getStridesAndOffset(strides, offset))) return std::nullopt;
+    o.coef.assign(op.getNumLoops(), 0);
+    for (unsigned i = 0; i < m.getNumResults(); ++i) {
+      if (auto de = dyn_cast<AffineDimExpr>(m.getResult(i))) {
+        // a dynamic stride (rows of a dynamic length): -1, only for a batch loop (checked by the caller)
+        if (ShapedType::isDynamic(strides[i])) {
+          o.coef[de.getPosition()] = -1;
+          continue;
+        }
+        o.coef[de.getPosition()] += strides[i];
+      } else if (auto c = dyn_cast<AffineConstantExpr>(m.getResult(i)); !c || c.getValue() != 0) {
+        return std::nullopt;
+      }
+    }
+    return o;
+  }
+
+  bool matchContraction(linalg::LinalgOp op) {
+    if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1 || !linalg::isaContractionOpInterface(op))
+      return false;
+    auto ranges = loopRanges(op);
+    if (!ranges) return false;
+    auto iters = op.getIteratorTypesArray();
+    ContractPlan p;
+    p.op = op;
+    auto a = operandOf(op, 0), b = operandOf(op, 1);
+    if (!a || !b) return false;
+    // x: the operand without output dims beyond the batch
+    AffineMap outMap = op.getIndexingMapsArray()[2];
+    auto inOut = [&](int L) { return outMap.isFunctionOfDim(L); };
+    auto only = [&](const Operand &x, const Operand &y) {
+      for (int L = 0; L < int(iters.size()); ++L)
+        if ((*ranges)[L].size != 1 && inOut(L) && x.coef[L] && !y.coef[L]) return false;
+      return true;
+    };
+    if (only(*a, *b)) p.x = *a, p.m = *b;
+    else if (only(*b, *a)) p.x = *b, p.m = *a;
+    else return false;
+    for (int L = 0; L < int(iters.size()); ++L) {
+      if ((*ranges)[L].size == 1 && !(*ranges)[L].dyn) continue;
+      bool red = iters[L] == utils::IteratorType::reduction;
+      if (red) {
+        if (p.kLoop >= 0 || !p.x.coef[L] || !p.m.coef[L]) return false;
+        p.kLoop = L;
+      } else if (p.x.coef[L] && p.m.coef[L]) {
+        if (p.bLoop >= 0) return false;
+        p.bLoop = L;
+      } else if (p.m.coef[L]) {
+        if (p.m.coef[L] == 1 && p.nLoop >= 0 && p.m.coef[p.nLoop] != 1) p.laneLoop = L;
+        else if (p.nLoop >= 0 && p.m.coef[p.nLoop] == 1) p.laneLoop = p.nLoop, p.nLoop = L;
+        else if (p.nLoop < 0) p.nLoop = L;
+        else return false;
+      } else {
+        return false;
+      }
+    }
+    if (p.kLoop < 0 || p.nLoop < 0 || p.x.coef[p.kLoop] != 1) return false;
+    for (int L = 0; L < int(iters.size()); ++L)
+      if ((p.m.coef[L] < 0 || p.x.coef[L] < 0) && L != p.bLoop && ((*ranges)[L].size != 1 || (*ranges)[L].dyn))
+        return false;
+    if (p.bLoop >= 0 && p.m.coef[p.bLoop] < 0) return false;
+    // x rows of a dynamic length K, one per batch
+    if (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0 && !(*ranges)[p.kLoop].dyn) return false;
+    int64_t K = (*ranges)[p.kLoop].size;
+    if (p.laneLoop >= 0) {
+      if ((*ranges)[p.laneLoop].size != d || p.m.coef[p.kLoop] != d || p.m.coef[p.nLoop] != K * d) return false;
+      p.layout = MatLayout::Packed;
+    } else if (p.m.coef[p.kLoop] == 1) {
+      p.layout = MatLayout::RowsK;
+    } else if (p.m.coef[p.nLoop] == 1) {
+      p.layout = MatLayout::RowsN;
+    } else {
+      return false;
+    }
+    if (!p.m.et.isInteger(8) || !(p.x.et.isInteger(8) || p.x.et.isInteger(32))) return false;
+    // the accumulator: filled with 0, consumed by one element-wise epilogue that is stored
+    Value acc = op.getDpsInits()[0];
+    linalg::FillOp fill;
+    for (Operation *u : acc.getUsers()) {
+      if (u == op.getOperation()) continue;
+      if (auto f = dyn_cast<linalg::FillOp>(u)) fill = f;
+      else if (auto g = dyn_cast<linalg::GenericOp>(u); g && !p.epi) p.epi = g;
+      else if (!isa<memref::DeallocOp>(u)) return false;
+    }
+    if (!fill || !p.epi || p.epi.getNumDpsInits() != 1 || p.epi.getNumReductionLoops() ||
+        !p.epi.getIndexingMapsArray().back().isIdentity())
+      return false;
+    Value out = p.epi.getDpsInits()[0];
+    for (Operation *u : out.getUsers())
+      if (auto s = dyn_cast<sahl::StoreOp>(u); s && s.getSrc() == out) p.store = s;
+    if (!p.store) return false;
+    SmallVector<Operation *> cover = {op, fill, p.epi, p.store};
+    cover.append(p.x.cover.begin(), p.x.cover.end());
+    cover.append(p.m.cover.begin(), p.m.cover.end());
+    for (int i = 0; i < p.epi.getNumDpsInputs(); ++i) {
+      Value in = p.epi.getDpsInputs()[i];
+      if (in == acc) continue;
+      auto l = loadInto(in);
+      if (!l) return false;
+      p.epiLoads.push_back({i, l.getSrc()});
+      cover.push_back(l);
+    }
+    for (Operation *o : cover) owned.insert(o);
+    contracts[op.getOperation()] = p;
+    return true;
+  }
+
+  bool contraction(ContractPlan &p) {
+    auto ranges = *loopRanges(p.op);
+    const Range B = p.bLoop >= 0 ? ranges[p.bLoop] : Range{};
+    Range Kr = ranges[p.kLoop];
+    Range Nr = ranges[p.nLoop];
+    if (p.laneLoop >= 0) Nr.size *= d;                    // packed: tiles x lanes
+    if (B.dyn) return fail("contraction: dynamic batch");
+    if (Kr.dyn && Nr.dyn) return fail("contraction: dynamic K and N");
+    const int64_t K = Kr.size, N = Nr.size, H = B.size;
+    if (K % d || N % d) return fail("contraction: K and N must be multiples of D");
+    const uint32_t sb = lay.sbank, nt = uint32_t(N / d);
+    int logd = int(std::log2(double(d)));
+    auto parOf = [&](const Lin &l, int64_t mul, int shift) {
+      Lin x = l;
+      x.mul *= mul;
+      x.add *= mul;
+      x.shift += shift;
+      return paramFor(x);
+    };
+    // chunks of output tiles: the B tiles of a chunk in one SPAD_B bank (a dynamic N: all tiles, one chunk)
+    uint32_t nc = nt;
+    if (!Nr.dyn) {
+      uint32_t cap = std::max<uint32_t>(sb / uint32_t(K), 1);
+      if (p.layout == MatLayout::RowsK) cap = std::min(cap, uint32_t(sb / K));   // raw rows in a SPAD_A bank too
+      for (nc = std::min(cap, nt); nc > 1 && nt % nc; --nc) {
+      }
+    }
+    if (uint32_t(K) * nc > sb) return fail("contraction: one chunk of B tiles does not fit a SPAD bank");
+    if (spadTop != 0) return fail("contraction after other SPAD_A buffers");
+    spadTop = 2 * sb;                                      // the A strip at 0, raw rows in bank 1
+    const uint32_t strip = 0, raw = sb;
+    auto xs = ddrStart(p.x.view, esize(p.x.et)), ms = ddrStart(p.m.view, 1), ys = ddrStart(p.store.getDst(), 4);
+    if (!xs || !ms || !ys) return fail("contraction: operands not in DDR");
+    auto dyn = [](auto op, SmallVector<std::tuple<int32_t, Value, bool>> f) {
+      SmallVector<Value> vs;
+      SmallVector<int32_t> fs;
+      SmallVector<bool> as;
+      for (auto &[field, v, add] : f) vs.push_back(v), fs.push_back(field), as.push_back(add);
+      op.getDynMutable().assign(vs);
+      op.setDynFields(fs);
+      op.setDynAdd(as);
+    };
+    // epilogue inputs loaded whole (a scalar: its broadcast word)
+    llvm::DenseMap<int, LocalBuf> epiLocal;
+    llvm::DenseMap<int, Value> epiChunked;                // identity-mapped inputs: loaded per chunk
+    for (auto &[i, src] : p.epiLoads) {
+      Value in = p.epi.getDpsInputs()[i];
+      auto mt = cast<MemRefType>(in.getType());
+      if (p.epi.getIndexingMapsArray()[i].isIdentity() && !Nr.dyn) {
+        if (!mt.getElementType().isF32()) return fail("contraction epilogue input type");
+        epiChunked[i] = src;
+        continue;
+      }
+      auto l = materialize(src);
+      if (!l) return false;
+      locals[in] = *l;
+      epiLocal[i] = *l;
+      if (mt.getRank() == 0 && !scalarBcast(in, *l)) return false;
+    }
+    uint32_t xes = esize(p.x.et);
+    bool xI32 = p.x.et.isInteger(32);
+    LocalBuf xl = newLocal(xI32 ? ::sa::VT_I32 : ::sa::VT_I8, K);
+    Value pK = Kr.dyn ? parOf(*Kr.dyn, 1, 0) : Value();
+    Value pN = Nr.dyn ? parOf(*Nr.dyn, 1, 0) : Value();
+    AffineMap epiOut = p.epi.getIndexingMapsArray().back();
+    (void)epiOut;
+    bool xRows = p.bLoop >= 0 && p.x.coef[p.bLoop] < 0;           // x rows at a dynamic stride
+    if (xRows && Nr.dyn) return fail("contraction: dynamic x rows and a dynamic N");
+    if (xRows) {
+      if (!rowAcc) rowAcc = privateParam();
+      sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 0, ValueRange{});
+    }
+    for (int64_t b = 0; b < H; ++b) {
+      int64_t xoff = xs->second + (p.bLoop >= 0 && !xRows ? b * p.x.coef[p.bLoop] * int64_t(xes) : 0);
+      int64_t moff = ms->second + (p.bLoop >= 0 ? b * p.m.coef[p.bLoop] : 0);
+      if (xoff % 8 || moff % 8) return fail("contraction: unaligned operand");
+      // x_b -> the A strip
+      auto lx = sahw::LdOp::create(bb, loc, xs->first, xoff, int64_t(xl.la), 1, K * xes, K * xes, 0, ValueRange{});
+      if (xRows) {
+        Value xb = parOf(*Kr.dyn, xes, 0);
+        dyn(lx, {{::sa::DYN_DMA_DDR, rowAcc, true}, {::sa::DYN_DMA_ROW_BYTES, xb, false}});
+        auto s2 = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{xb});
+        s2.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});
+        s2.setDynAdd(ArrayRef<bool>{false});
+      } else if (Kr.dyn) {
+        dyn(lx, {{::sa::DYN_DMA_ROW_BYTES, parOf(*Kr.dyn, xes, 0), false}});
+      }
+      ve({xl.la, xl.vt, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt, ::sa::laddr(::sa::MEM_SPAD_A, strip), ::sa::VT_I8,
+         K * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_NONE, 0, 0,
+         Kr.dyn ? SmallVector<DynF>{{::sa::DYN_VE_LEN, parOf(*Kr.dyn, d, 0), false}} : SmallVector<DynF>{});
+      for (uint32_t c0 = 0; c0 < nt; c0 += nc) {
+        uint32_t bank = (c0 / nc) & 1, bw = bank * sb;
+        uint32_t la = ::sa::laddr(::sa::MEM_SPAD_B, bw);
+        // the B tiles of this chunk
+        if (p.layout == MatLayout::Packed) {
+          sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * K * d, int64_t(la), nc, K * d, K * d, 0,
+                             ValueRange{});
+        } else if (p.layout == MatLayout::RowsK) {
+          int64_t sN = p.m.coef[p.nLoop];
+          auto l = sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * d * sN,
+                                      int64_t(::sa::laddr(::sa::MEM_SPAD_A, raw)), int64_t(nc) * d, K, sN, 0,
+                                      ValueRange{});
+          auto t = sahw::TransposeOp::create(bb, loc, int64_t(::sa::laddr(::sa::MEM_SPAD_A, raw)), int64_t(la),
+                                             int64_t(nc) * d * K, int64_t(::sa::vtypes(::sa::VT_I8, ::sa::VT_I8)),
+                                             K / d, ValueRange{});
+          if (Nr.dyn) {
+            dyn(l, {{::sa::DYN_DMA_ROWS, pN, false}});
+            dyn(t, {{::sa::DYN_VE_LEN, parOf(*Nr.dyn, K, 0), false}});
+          }
+        } else {
+          int64_t sK = p.m.coef[p.kLoop];
+          auto l = sahw::LdOp::create(bb, loc, ms->first, moff + int64_t(c0) * d, int64_t(la), K,
+                                      int64_t(nc) * d, sK, /*INTERLEAVE=*/1, ValueRange{});
+          if (Kr.dyn) dyn(l, {{::sa::DYN_DMA_ROWS, pK, false}});
+        }
+        // the chunk's accumulator and epilogue buffers: released after its store
+        uint32_t savedTop[2] = {accTop[0], accTop[1]};
+        LocalBuf acc = newLocal(::sa::VT_I32, int64_t(nc) * d);
+        uint32_t cw = acc.la & 0xFFFFFFF;
+        auto ex = sahw::ExOp::create(bb, loc, int64_t(strip), int64_t(bw), int64_t(cw), K / d, false, int64_t(nc), K,
+                                     1, int64_t(nc), ValueRange{});
+        if (Kr.dyn) dyn(ex, {{::sa::DYN_EX_KT, parOf(*Kr.dyn, 1, logd), false}, {::sa::DYN_EX_BSTEP, pK, false}});
+        if (Nr.dyn) dyn(ex, {{::sa::DYN_EX_REPEAT, parOf(*Nr.dyn, 1, logd), false}});
+        // the epilogue on this chunk: n elements at (b, c0)
+        Chunk ch;
+        ch.n = int64_t(nc) * d;
+        LocalBuf out = newLocal(::sa::VT_F32, ch.n);
+        ch.outLa = out.la;
+        auto emaps = p.epi.getIndexingMapsArray();
+        for (int i = 0; i < p.epi.getNumDpsInputs(); ++i) {
+          Val v;
+          v.kind = Val::Mem;
+          if (p.epi.getDpsInputs()[i] == p.op.getDpsInits()[0]) {
+            v.o = {::sa::acc(cw), ::sa::VT_I32, ::sa::IDX_LIN, 0};
+          } else if (auto ci = epiChunked.find(i); ci != epiChunked.end()) {
+            // this chunk of the input, from DDR
+            auto r = ddrStart(ci->second, 4);
+            if (!r) return fail("contraction epilogue input not in DDR");
+            LocalBuf l = newLocal(::sa::VT_F32, ch.n);
+            int64_t off = r->second + (b * N + int64_t(c0) * d) * 4;
+            if (off % 8) return fail("contraction epilogue input not 8-byte aligned");
+            sahw::LdOp::create(bb, loc, r->first, off, int64_t(l.la), 1, ch.n * 4, ch.n * 4, 0, ValueRange{});
+            v.o = {l.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
+          } else {
+            AffineMap em = emaps[i];
+            LocalBuf l = epiLocal.at(i);
+            if (em.getNumResults() == 0) {
+              auto bc = scalarBcast(p.epi.getDpsInputs()[i], l);
+              if (!bc) return false;
+              v.o = {bc->la, ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+              v.uni = 1;
+            } else if (em.getNumResults() == 1 && p.bLoop >= 0) {
+              // one value per batch
+              auto bc = perElementBcast(p.epi.getDpsInputs()[i], l, H);
+              if (!bc) return false;
+              v.o = {bc->la + uint32_t(b), ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+              v.uni = 1;
+            } else {
+              return fail("contraction epilogue input layout");
+            }
+          }
+          ch.inputs[i] = v;
+        }
+        if (Nr.dyn) {
+          curLen = pN;
+          curLenStatic = (N + d - 1) / d * d;
+        }
+        bool ok = generic(p.epi, nullptr, &ch);
+        curLen = Value();
+        curLenStatic = -1;
+        if (!ok) return false;
+        // the store: row b, chunk c0 (a dynamic N: the row's T elements)
+        int64_t yoff = ys->second + (b * N + int64_t(c0) * d) * 4;
+        if (Nr.dyn) {
+          if (b == 0) {
+            if (!rowAcc) rowAcc = privateParam();
+            sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 0, ValueRange{});
+          }
+          Value bytes = parOf(*Nr.dyn, 4, 0);
+          auto st = sahw::StOp::create(bb, loc, ys->first, ys->second, int64_t(out.la), 1, N * 4, N * 4, ValueRange{});
+          dyn(st, {{::sa::DYN_DMA_DDR, rowAcc, true}, {::sa::DYN_DMA_ROW_BYTES, bytes, false}});
+          if (b + 1 < H) {
+            auto s = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{bytes});
+            s.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});
+            s.setDynAdd(ArrayRef<bool>{false});
+          }
+        } else {
+          if (yoff % 8) return fail("contraction: unaligned result");
+          sahw::StOp::create(bb, loc, ys->first, yoff, int64_t(out.la), 1, ch.n * 4, ch.n * 4, ValueRange{});
+        }
+        accTop[0] = savedTop[0];
+        accTop[1] = savedTop[1];
+      }
+    }
+    return err.empty();
+  }
+
   // ------------------------------------------------------------ linear layers (C5.2)
   // y = epilogue(sum_k x[k] * W[n, k], ...): a contraction generic with the
   // packed weights (i8 [N / D, K, D], iree-sa-pack-linear-weights) and x (i8 or
@@ -1219,7 +1652,7 @@ private:
         cast<MemRefType>(g.getDpsInits()[0].getType()).getElementType().isInteger(64))
       return intScalar(g);
     bool collapse = false;
-    if (nloops > 2) {
+    if (nloops > 2 && !chunk) {
       // an element-wise nest with identity maps only: one flat loop
       if (!llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }) ||
           llvm::any_of(iters, [](utils::IteratorType t) { return t == utils::IteratorType::reduction; }))
@@ -1229,7 +1662,7 @@ private:
     }
     SmallVector<int64_t> ranges(nloops, -1);
     std::optional<Lin> dynInner;
-    for (int i = 0; i < int(g->getNumOperands()); ++i) {
+    for (int i = 0; i < int(g->getNumOperands()) && !chunk; ++i) {
       Value opnd = g->getOperand(i);
       auto mt = dyn_cast<MemRefType>(opnd.getType());
       if (!mt) continue;
@@ -1251,7 +1684,7 @@ private:
       }
     }
     for (int64_t r : ranges)
-      if (r < 0) return fail("loop range not given by an operand");
+      if (r < 0 && !chunk) return fail("loop range not given by an operand");
     if (collapse) {
       if (dynInner) return fail("dynamic nest of more than two loops");
       int64_t prod = 1;
@@ -1259,9 +1692,10 @@ private:
       ranges = {prod};
       nloops = 1;
     }
-    if (chunk) {
-      if (nloops != 2 || dynInner) return fail("linear epilogue other than [N / D, D]");
-      ranges = {chunk->n / d, d};
+    if (chunk) {                                          // a slice of n elements, all inputs given
+      ranges = {chunk->n};
+      nloops = 1;
+      dynInner.reset();
     }
     // a dynamic innermost length: one row at a time (each VE then needs only a
     // dynamic LEN, and VALID for a mask)
