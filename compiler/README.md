@@ -18,7 +18,7 @@ an `sa` HAL driver through the command ring.
 | `scripts/compile_sa.sh` | Compiles an exported model for the sa device (parameters imported, weights packed, packed parameters exported, dispatch sources dumped) | C3 |
 | `scripts/deploy_c3.sh` | Runs the C3 host test and stages the board test in `build/deploy_c3` | C3 |
 | `scripts/deploy_c55.sh` | Runs the C5.5 host test on SmolLM2-135M and stages the board test in `build/deploy_c55` | C5.5 |
-| `plugins/sa/` | The `sa` HAL target plugin (C++). `dialect/`: the `sahl` (tile) and `sahw` (command) dialects. `transforms/`: the C5 pipeline (sa-to-sahl, sahl-to-sahw with the micro-kernels, sahw-fuse-ve, head split, register assignment), the sahw serializer, the target configuration. `target/`: the `sa` device and backend, the preprocessing passes (weight packing, cheap-producer cloning), `DescList`, `Layout`. `test/`: lit tests (iree-opt + FileCheck). `templates/reference.py`: the Python reference of the linear-layer schedule (test_c2 compares the commands) | C2–C5 |
+| `plugins/sa/` | The `sa` HAL target plugin (C++). `dialect/`: the `sahl` (tile) and `sahw` (command) dialects. `transforms/`: the pipeline (sa-to-sahl with the kernel matching of `SahlKernels`, sahl-tile, sahl-plan-memory, sahl-schedule, sahl-to-sahw: `SahlLower.h` with `SahlLowerGeneric` and `SahlLowerKernels`, sahw-fuse-ve, head split, register assignment), the sahw serializer, the target configuration. `target/`: the `sa` device and backend, the preprocessing passes (weight packing, cheap-producer cloning), `DescList`, `Layout`. `test/`: lit tests (iree-opt + FileCheck). `templates/reference.py`: the Python reference of the linear-layer schedule (test_c2 compares the commands) | C2–C5 |
 | `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories); `qhf.py` (HuggingFace Llama / Qwen3 decoders: config, safetensors, BPE tokenizer, fp32 and quantized models), `export_hf.py` (their export), `synth_hf.py` (random-weight HF models of any shape), `hf_tokenizer.py` (the BPE tokenizer, standard library only: also on the board) | C0, C5.5 |
 | `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports; its own device and command buffer (C4) record a command buffer's dispatches and build one descriptor list per command buffer. `tools/`: sa-desc writer / reader (`sadesc.py`, format versions 1–3), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
 | `sim/` | `sa_sim_server.py` (the `sim` transport's device: `llm/sa_funcsim.py` on a shared-memory DDR), `sa_board_emu.py` (rt_fw's ring emulated on the host, for the `board` transport) | C1 |
@@ -172,6 +172,20 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   interactively on the board (`board_generate.py`). The device window
   is configurable (`--mb`; SmolLM2 needs 160.5 MB: parameter loads read
   straight into device memory, `sa-llm-run` prints the peak).
+- **C8 done** (docs/iree_compiler_plan.md §8.14): the code generator's
+  decisions are passes with lit tests, visible in the IR: `iree-sa-to-sahl`
+  groups each micro-kernel / generic contraction into a `sahl.kernel` and
+  marks each gather's form (`sahl.gather "row" | "scalar" | "packed" |
+  "swap"`), the to_i8 chain (`sahl.to_i8`) and the KV write
+  (`sahl.scatter`); `iree-sahl-tile` splits element-wise dispatches too large
+  for ACC into pieces (`sahl.scope`); `iree-sahl-plan-memory` places each local
+  buffer (`sa.mem`, `sa.layout`); `iree-sahl-schedule` chooses the linear
+  kernels' chunks; `iree-sahl-to-sahw` only translates (541 lines, plus
+  `SahlLowerGeneric.cpp` and `SahlLowerKernels.cpp`; it was 3052). Every step
+  kept all 3962 corpus dispatches byte-identical. `--iree-sa-ukernels=none`
+  now compiles every dispatch of all models (prefill's linear layers through
+  the generic contraction, bit-exact with the oracle and on sim).
+
 - **C6 in progress** (docs/iree_compiler_plan.md §8.12: models of the
   Qwen3-0.6B / Llama-3.2-1B class, for larger boards; sim here). Done: the
   target configuration cross-check (`--iree-sa-spad-kb`, `--iree-sa-acc-kb`;
@@ -210,7 +224,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   ```
 
   ```sh
-  compiler/scripts/run_tests.sh golden               # C8 guard: pass lit tests + the golden corpus (2959 dispatches) byte for byte, ~30 s
+  compiler/scripts/run_tests.sh golden               # C8 guard: pass lit tests + the golden corpus (3962 dispatches) byte for byte, ~30 s
   python3 compiler/tests/test_c5.py                  # lit, both configurations, dispatch_check at T = 16, 80, 256
   python3 compiler/tests/test_c5.py --configs        # + other hardware (D = 16, larger SPAD / ACC: --iree-sa-d / -spad-kb / -acc-kb)
   compiler/scripts/run_tests.sh -j 1 smollm2 qwen3l2 c5cfg   # long runs: a bounded number of jobs, a log each (build/c6/logs)

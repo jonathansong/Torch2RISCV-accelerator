@@ -665,7 +665,7 @@ linalg / scf（IREE 的 dispatch）
 | 15 | sahw | `sahw-assign-registers` | BASE / PARAM 分配与装载表（§4.4），BASE15 留给前缀 |
 | 16 | sahw → 字节 | 序列化 | `sahw.template` → sa-desc v3，经 `DescList`（RISC-V 后端改为 `sahw-to-llvm`，§8.10） |
 
-**实现状态（2026-09-29）**：第 1–3、5–9、12–14 项实际上都合在 `sahl-to-sahw` 一个转换里，差距与拆分计划见 §8.14（C8）。
+**实现状态（2026-09-29，C8 之后）**：分块（逐元素的分片：`sahl-tile`）、内存的位置与布局（`sahl-plan-memory`）、线性层调度（`sahl-schedule`）、内核与 gather 的识别（`sa-to-sahl`）已是独立的 pass；第 1 项的归一化、第 12 项、第 14 项的细粒度调度，以及 contraction 的分块与双缓冲仍在翻译里。见 §8.14。
 
 ### 8.5 代价模型
 
@@ -1070,7 +1070,32 @@ C5.5 的模型（§8.9 的第一步）：
   - 黄金语料逐字节相同；新 lit 测试 `sahl_gather.mlir`，`sa_to_sahl.mlir` 加了 to_i8。
   - **为保持字节不变留下的一处**：平坦分片的容量估计（`pieceWords`）原来按运算体的操作数计，`sahl.to_i8` 仍按它替换的 12 个操作计。按 1 个计会让 2 个 dispatch 不再分片（描述符变小，可能是改进），留给 R4 的内存规划一起处理。
   - **没有做成操作的**：形状的归一化（多层循环压平、按行合并、动态长度逐行）属于 R3 的分块；i64 标量的 `x + c` 仍是一个 generic（只有位置计算用到，价值小）。
-- **R1c**：scatter → `sahl.scatter`；relayout（转置、DIV-D 复制、打包成广播字）作为显式操作。
+- **R1c scatter（完成）**：一行的 `iree_linalg_ext.scatter`（KV 写入）在 `sa-to-sahl` 里变成 `sahl.scatter`；lit 测试 `sahl_scatter.mlir`。布局转换（转置、DIV-D 复制、打包成广播字）没有做成操作：它们由降级在用到时插入，属于内存布局，见 R4。
+
+**R2–R6 结果（2026-09-29，每步黄金语料逐字节相同，除 R2 的新增功能外）**：
+
+| 步骤 | 实际做的 | 与原计划的差别及原因 |
+|---|---|---|
+| **R2 微内核** | 通用 contraction 补齐 prefill 线性层的三种形式（按列的尾部输入、int8 的 x 放在 SPAD_A bank 1、没有尾部直接存 int32 累加器）：`--iree-sa-ukernels=none` 现在能编译所有模型的全部 dispatch（原来每个模型有 5 个 prefill dispatch 编不了）。新编译的 dispatch 在 T = 16 / 80 / 256 下与 oracle 逐位一致，stories15M 不用微内核的 prefill + decode 在 sim 上与只用 decode 逐位一致；语料加了 `stories_m16_none`、`smollm2_m8_none`（共 3962 个 dispatch） | 没有把微内核改写成 `sahl` 层的展开：线性层、注意力的调度本质上是命令级的（EX 条带、SPAD_B bank 交替、LOOP_END 成对循环、前缀预取），在 `sahl` 上表达就得把 `sahw` 的概念再造一遍。微内核留在降级里，按种类分文件（R6） |
+| **R3 `sahl-tile`** | 逐元素 dispatch 放不下 ACC 时的平坦分片与按行分片变成 IR：每片一个 `sahl.scope`（片内分配在片结束时释放），DDR 视图换成片的子视图（平坦分片经 `collapse_shape`），局部缓冲换成片的大小；跨片共用的归约结果用 `sahl.reserve` 预先分配、只 fill 一次，后面几片的归约标 `sahl.accumulate`。容量估计从降级挪到这个 pass。语料中 17 个 dispatch 被切片（55 片）；降级器不再有分片状态 | contraction 的 N / K 块仍在内核降级里（K 块取决于 x 在降级时落在哪个地址）；动态长度的逐行降级也留在降级里（它是按“每条描述符最多 2 个动态字段”做的，属于命令编码） |
+| **R4 内存** | `sahl-plan-memory`：每个局部缓冲的位置（`sa.mem`：`spad_a` / `acc`）与布局（`sa.layout`：`packed` / `bcast` / `rows`）写成属性，降级照此分配并核对；分配器抽成 `LocalMemory`（`SahlLocalMemory.h`：顺序分配，片、块、行结束时按标记释放） | 地址没有在 pass 里定：降级的临时值与缓冲在首次使用时交错分配，事先定地址必然改变输出；带生存期分析的分配会改变地址和记分板看到的 bank 冲突，要先上板测周期（放进 R7） |
+| **R5 `sahl-schedule`** | 线性层微内核的调度（`chunk_tiles`：每块多少输出 tile；`loop`：decode 形式超过 4 块时用 LOOP_END 成对循环）由这个 pass 写在 `sahl.kernel` 上，公式共用（`linearSchedule`），降级照此生成 | 双缓冲与预取的位置仍由微内核的降级决定（命令级，见 R2）；通用 contraction 的块由降级决定（见 R3） |
+| **R6 只做翻译** | 降级器的声明移到 `SahlLower.h`，定义按职责分文件：`SahlToSahw.cpp` 541 行（pass、逐块遍历、寄存器、局部内存、DDR / DMA、VE、scatter），`SahlLowerGeneric.cpp`（逐元素运算、归约、gather），`SahlLowerKernels.cpp`（线性层、注意力、通用 contraction）；补了 `sa-pack-linear-weights`、`sa-clone-cheap-producers` 的 lit 测试（lit 共 10 个） | 没有 `sahw-legalize-dynamic`：动态值（PARAM、行循环、动态 DMA）是在生成命令时按描述符的编码限制处理的，`sahw` 现在没有“符号化的动态字段”这种中间形式；等 C7（RISC-V 后端，没有 2 个动态字段的限制）需要时再分出来 |
+
+**C8 的结果**：
+- **pass 流水线**（每个都能用 `iree-opt` 单独运行，都有 lit 测试）：IREE bufferize → `iree-sa-to-sahl`（DDR 流量显式；内核分组、gather 种类、to_i8、scatter）→ `iree-sahl-tile`（分片）→ `iree-sahl-plan-memory`（位置与布局）→ `iree-sahl-schedule`（线性层调度）→ `iree-sahl-to-sahw`（翻译）→ `iree-sahw-fuse-ve` → `iree-sahw-split-head` → `iree-sahw-assign-registers` → 序列化。
+- **决定在 IR 上可见**：用哪个内核、gather 的种类、分片、缓冲的位置与布局、线性层的分块。
+- **代码**：原来 3052 行的 `SahlToSahw.cpp` 拆成：
+  - 共享的匹配与分类 `SahlKernels.cpp` 约 720 行；
+  - 各 pass：`SaToSahl.cpp` 约 290 行、`SahlTile.cpp` 约 350 行、`SahlPlanMemory.cpp`、`SahlSchedule.cpp`；
+  - 翻译：`SahlToSahw.cpp` 541 行、`SahlLowerGeneric.cpp` 754 行、`SahlLowerKernels.cpp` 710 行，加 `SahlLower.h`、`SahlLocalMemory.h`。
+- **护栏**：`run_tests.sh golden`（lit + 3962 个 dispatch 逐字节比较，约 30 秒）。重构过程中所有已有 dispatch 的输出都没有改变，不需要重新上板。
+- **没做到、留给以后的**：
+  - 微内核在 `sahl` 层的展开及其双缓冲 / 预取的 IR 表示；
+  - 带生存期的内存规划（会改变输出，需要板上周期验收）；
+  - `sahw-legalize-dynamic`；
+  - R7 代价模型。
+  - 为保持字节不变保留的一处估计（`sahl.to_i8` 在分片估计里按 12 个操作计），在做带生存期的内存规划时一起处理。
 
 **顺序与依赖**：R0 → R1 → R2 → R3 → R4 → R5 → R6，每步单独提交。R1 是最大的一步（识别逻辑全部搬家）；R3 与 R4 是 C6.5（T 分块注意力）与代价模型的前提。
 
@@ -1111,7 +1136,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
-| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**进行中**（R0、R1a、R1b 完成） | 大 |
+| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**完成**（2026-09-29，§8.14：R0–R6；微内核的 `sahl` 展开、带生存期的内存规划、`sahw-legalize-dynamic`、R7 代价模型留给以后） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。

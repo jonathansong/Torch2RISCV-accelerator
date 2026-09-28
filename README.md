@@ -187,6 +187,9 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
   per dispatch and generates correct text end to end). A model now compiles
   with both prefill and decode: on the board the prompt is processed 8 tokens
   per call on the full array, 4.3-4.7x faster per token than decode, bit-exact.
+  The code generator's decisions (kernels, gathers, pieces, memory places,
+  schedules) are separate passes visible in the IR, guarded by a
+  byte-for-byte golden corpus of 3962 dispatches (C8).
   See [compiler/README.md](compiler/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)
