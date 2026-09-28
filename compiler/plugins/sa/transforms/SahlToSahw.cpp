@@ -362,7 +362,7 @@ public:
         if (!generic(g)) return false;
         continue;
       }
-      if (auto sc = dyn_cast<IREE::LinalgExt::ScatterOp>(op)) {
+      if (auto sc = dyn_cast<sahl::ScatterOp>(op)) {
         if (!scatter(sc)) return false;
         continue;
       }
@@ -894,15 +894,10 @@ private:
   // ------------------------------------------------------------ scatter (C5.3)
   // one row written at a dynamic index (the KV cache update): LDPARAM of the
   // index * row bytes, a ST with that DDR offset
-  bool scatter(IREE::LinalgExt::ScatterOp sc) {
-    Value upd = sc.getUpdates(), idx = sc.getIndices(), orig = sc.getOriginal();
-    auto uT = cast<MemRefType>(upd.getType()), oT = cast<MemRefType>(orig.getType());
-    if (sc.getDimensionMap() != ArrayRef<int64_t>{0} || uT.getDimSize(0) != 1 || !uT.hasStaticShape() ||
-        !oT.hasStaticShape() || uT.getElementType() != oT.getElementType())
-      return fail("scatter other than one row at a dynamic index");
-    Block &b = sc.getRegion().front();
-    auto y = dyn_cast<IREE::LinalgExt::YieldOp>(b.getTerminator());
-    if (!y || y.getOperand(0) != b.getArgument(0)) return fail("scatter that does not overwrite");
+  // (the form is checked by sa-to-sahl: rowScatter)
+  bool scatter(sahl::ScatterOp sc) {
+    Value upd = sc.getUpdates(), idx = sc.getIndices(), orig = sc.getDest();
+    auto uT = cast<MemRefType>(upd.getType());
     uint32_t es = esize(uT.getElementType());
     uint32_t rowBytes = uint32_t(uT.getNumElements() * es);
     if (rowBytes % 8 || rowBytes > 0xFFFF) return fail("scatter row size");

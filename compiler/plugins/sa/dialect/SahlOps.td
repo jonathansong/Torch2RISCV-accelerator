@@ -56,6 +56,19 @@ def Sahl_GatherOp : Sahl_Op<"gather"> {
   let assemblyFormat = "$kind $source `[` $indices `]` attr-dict `:` type($source) `->` type($result)";
 }
 
+def Sahl_ScatterOp : Sahl_Op<"scatter"> {
+  let summary = "One row written into DDR at a dynamic index (the KV cache update)";
+  let description = [{
+    dest[index, ...] = updates[0, ...], index = the i64 in `indices` (DDR).
+    sa-to-sahl makes it from an iree_linalg_ext.scatter that overwrites one
+    row along dimension 0.
+  }];
+  let arguments = (ins Arg<AnyMemRef, "the row", [MemRead]>:$updates,
+                       Arg<AnyMemRef, "the index", [MemRead]>:$indices,
+                       Arg<AnyMemRef, "the table", [MemWrite]>:$dest);
+  let assemblyFormat = "$updates `,` $indices `,` $dest attr-dict `:` type($updates) `,` type($indices) `,` type($dest)";
+}
+
 def Sahl_KernelOp : Sahl_Op<"kernel", [SingleBlock, NoTerminator]> {
   let summary = "Operations lowered together: a micro-kernel or a generic contraction";
   let description = [{

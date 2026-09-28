@@ -5,7 +5,7 @@
 // sahl.load before (inputs, and outputs whose old value is read) and a
 // sahl.store after (outputs); an identity copy into DDR becomes a sahl.store.
 // Computation then only touches local buffers. Each to_i8 chain inside a
-// body becomes one sahl.to_i8, each gather (a memref.load in a body) a
+// body becomes one sahl.to_i8, a one-row scatter a sahl.scatter, each gather (a memref.load in a body) a
 // sahl.gather with the form the lowering will use. Then the kernel matcher
 // (SahlKernels.h) decides which operations are lowered together: each match
 // (a linear layer or attention micro-kernel, a generic contraction) moves into a
@@ -16,6 +16,7 @@
 #include "SahlKernels.h"
 #include "SahlPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -44,6 +45,26 @@ bool isIdentityCopy(linalg::GenericOp g) {
   Block &b = g.getRegion().front();
   auto y = cast<linalg::YieldOp>(b.getTerminator());
   return b.getOperations().size() == 1 && y.getOperand(0) == b.getArgument(0);
+}
+
+// An iree_linalg_ext.scatter that overwrites one row along dimension 0 (the
+// KV cache update) -> sahl.scatter; others stay (the lowering rejects them).
+void replaceScatters(func::FuncOp f) {
+  SmallVector<IREE::LinalgExt::ScatterOp> scs;
+  f.walk([&](IREE::LinalgExt::ScatterOp sc) { scs.push_back(sc); });
+  for (auto sc : scs) {
+    auto uT = dyn_cast<MemRefType>(sc.getUpdates().getType());
+    auto oT = dyn_cast<MemRefType>(sc.getOriginal().getType());
+    if (!uT || !oT || sc.getDimensionMap() != ArrayRef<int64_t>{0} || uT.getDimSize(0) != 1 || !uT.hasStaticShape() ||
+        !oT.hasStaticShape() || uT.getElementType() != oT.getElementType())
+      continue;
+    Block &b = sc.getRegion().front();
+    auto y = dyn_cast<IREE::LinalgExt::YieldOp>(b.getTerminator());
+    if (!y || y.getOperand(0) != b.getArgument(0)) continue;
+    OpBuilder bld(sc);
+    sahl::ScatterOp::create(bld, sc.getLoc(), sc.getUpdates(), sc.getIndices(), sc.getOriginal());
+    sc.erase();
+  }
 }
 
 // Each to_i8 chain inside a linalg body -> one sahl.to_i8.
@@ -249,6 +270,7 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
       cfg.accBytes = optAccKB * 1024;
       cfg.ukernels = optUkernels;
     }
+    replaceScatters(f);
     replaceToI8(f);
     replaceGathers(f, cfg);
     if (failed(groupKernels(f, cfg))) return signalPassFailure();
