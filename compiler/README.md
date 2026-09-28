@@ -17,11 +17,12 @@ an `sa` HAL driver through the command ring.
 | `scripts/deploy_c2.sh` | Runs the C2 host test and stages the board test in `build/deploy_c2` | C2 |
 | `scripts/compile_sa.sh` | Compiles an exported model for the sa device (parameters imported, weights packed, packed parameters exported, dispatch sources dumped) | C3 |
 | `scripts/deploy_c3.sh` | Runs the C3 host test and stages the board test in `build/deploy_c3` | C3 |
+| `scripts/deploy_c55.sh` | Runs the C5.5 host test on SmolLM2-135M and stages the board test in `build/deploy_c55` | C5.5 |
 | `plugins/sa/` | The `sa` HAL target plugin (C++). `dialect/`: the `sahl` (tile) and `sahw` (command) dialects. `transforms/`: the C5 pipeline (sa-to-sahl, sahl-to-sahw with the micro-kernels, sahw-fuse-ve, head split, register assignment), the sahw serializer, the target configuration. `target/`: the `sa` device and backend, the preprocessing passes (weight packing, cheap-producer cloning), `DescList`, `Layout`. `test/`: lit tests (iree-opt + FileCheck). `templates/reference.py`: the Python reference of the linear-layer schedule (test_c2 compares the commands) | C2–C5 |
-| `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories) | C0 |
+| `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories); `qhf.py` (HuggingFace Llama / Qwen3 decoders: config, safetensors, BPE tokenizer, fp32 and quantized models), `export_hf.py` (their export) | C0, C5.5 |
 | `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports; its own device and command buffer (C4) record a command buffer's dispatches and build one descriptor list per command buffer. `tools/`: sa-desc writer / reader (`sadesc.py`, format versions 1–3), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
 | `sim/` | `sa_sim_server.py` (the `sim` transport's device: `llm/sa_funcsim.py` on a shared-memory DDR), `sa_board_emu.py` (rt_fw's ring emulated on the host, for the `board` transport) | C1 |
-| `tests/` | `test_c2.py` / `test_c3.py` (host), `board_c2.py` / `board_c3.py` / `board_profile.py` (board); `oracle.py` (reference interpreter of dispatch IR with the device's numerics), `dispatch_check.py` (per-dispatch differential test), `summarize.py` | C2– |
+| `tests/` | `test_c2.py` / `test_c3.py` / `test_c5.py` / `test_c55.py` (host), `board_c2.py` / `board_llm.py` / `board_profile.py` (board); `oracle.py` (reference interpreter of dispatch IR with the device's numerics), `dispatch_check.py` (per-dispatch differential test), `summarize.py` | C2– |
 
 ## Environment
 
@@ -132,7 +133,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
 
   ```sh
   python3 compiler/tests/test_c3.py [--generate 8]    # export, compile, per-dispatch check, sim run
-  compiler/scripts/deploy_c3.sh                       # board: python3 board_c3.py
+  compiler/scripts/deploy_c3.sh                       # board: python3 board_llm.py
   ```
 - **C4 partly done, on hold** (docs/iree_compiler_plan.md §7.1): dynamic
   attention length, aggressive fusion (200 dispatches per token), uniform
@@ -145,7 +146,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   ```sh
   python3 compiler/tests/test_c3.py --skip-export --out build/c4/fuse
   compiler/scripts/deploy_c3.sh --skip-export --out build/c4/fuse
-  # board: python3 board_c3.py; python3 board_profile.py 40 [--batch] [NAME=VALUE...]
+  # board: python3 board_llm.py; python3 board_profile.py 40 [--batch] [NAME=VALUE...]
   ```
   Environment: `SA_PROFILE=1` (one list per dispatch, per-export cycles),
   `SA_PROFILE=batch` (per list), `SA_NO_BATCH=1` (one list per dispatch, to
@@ -161,10 +162,22 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   **C5.0–C5.4 done**: stories15M compiles with and without micro-kernels,
   bit-exact on sim and on the board (2.589M cycles / token with, 4.396M
   without); the hardware parameters come from the executable target
-  configuration. Next: C5.5 (SmolLM2-135M, a Qwen3-structure configuration).
+  configuration.
+  **C5.5**: HuggingFace decoders with no model-specific code. SmolLM2-135M
+  (30 layers, GQA 9/3) compiles to 230 dispatches, all bit-exact against the
+  oracle, and runs end to end on sim (argmax equal to the eager quantized
+  model with the device's EXP / RECIP / RSQRT); Qwen3-0.6B truncated to 2
+  layers (QK-norm, head_dim 128, GQA 16/8) likewise on sim. The device window
+  is configurable (`--mb`; SmolLM2 needs 160.5 MB: parameter loads read
+  straight into device memory, `sa-llm-run` prints the peak).
 
   ```sh
   python3 compiler/tests/test_c5.py                  # lit, both configurations, dispatch_check at T = 16, 80, 256
+  python3 compiler/frontend/export_hf.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2
+  python3 compiler/tests/test_c55.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2 --check
+  compiler/scripts/deploy_c55.sh                     # board: python3 board_llm.py (window 176 MB)
+  python3 compiler/frontend/export_hf.py --model build/llm_cache/Qwen3-0.6B --out build/c55/qwen3_l2 --layers 2
+  python3 compiler/tests/test_c55.py --model build/llm_cache/Qwen3-0.6B --out build/c55/qwen3_l2 --check --mb 384
   python3 compiler/runtime/tools/sadis.py <file.sadesc>   # disassembler
   $IREE_BUILD/llvm-project/bin/llvm-lit -v compiler/plugins/sa/test
   ```

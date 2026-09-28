@@ -25,11 +25,41 @@ end against the fp32 model within a tolerance.
 """
 import json
 import os
+import sys
 
 import numpy as np
 import torch
 
 F32 = torch.float32
+
+# EXP / RECIP / RSQRT of QModel: torch (the export) or, via device_sfu(), the
+# device's approximations (llm/ref_model.py SfuExact) for an eager reference
+# that matches the sa device up to reduction order
+_sfu = None
+
+
+def _op(name, torch_op):
+    def f(x):
+        if _sfu is None:
+            return torch_op(x)
+        return torch.from_numpy(np.ascontiguousarray(getattr(_sfu, name)(x.detach().numpy().astype(np.float32))))
+    return f
+
+
+sfu_exp, sfu_recip, sfu_rsqrt = _op("exp", torch.exp), _op("recip", torch.reciprocal), _op("rsqrt", torch.rsqrt)
+
+
+class device_sfu:
+    """with device_sfu(): QModel computes EXP / RECIP / RSQRT as the device does."""
+    def __enter__(self):
+        global _sfu
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "llm"))
+        from ref_model import SfuExact
+        _sfu = SfuExact
+
+    def __exit__(self, *a):
+        global _sfu
+        _sfu = None
 
 
 def f32c(v):
@@ -43,7 +73,7 @@ def to_i8(x):
 def quant_act(x):
     amax = torch.amax(torch.abs(x), dim=-1, keepdim=True)
     s_x = amax * f32c(1.0 / 127.0)
-    inv = torch.reciprocal(s_x)
+    inv = sfu_recip(s_x)
     return to_i8(x * inv), s_x
 
 
@@ -315,7 +345,7 @@ class QModel(torch.nn.Module):
 
     def rmsnorm(self, x, g):
         ss = torch.sum(x * x, dim=-1, keepdim=True)
-        return (x * torch.rsqrt(ss * f32c(1.0 / x.shape[-1]) + f32c(self.cfg.eps))) * g
+        return (x * sfu_rsqrt(ss * f32c(1.0 / x.shape[-1]) + f32c(self.cfg.eps))) * g
 
     def attention(self, l, q, T, pos):
         c = self.cfg
@@ -328,8 +358,8 @@ class QModel(torch.nn.Module):
         sc = (sc.to(F32) * s_q) * self.a_k[l]
         mask = torch.arange(T) <= pos
         m = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
-        e = torch.where(mask, torch.exp(sc - m), torch.tensor(0.0))
-        r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
+        e = torch.where(mask, sfu_exp(sc - m), torch.tensor(0.0))
+        r = sfu_recip(torch.sum(e, dim=-1, keepdim=True))
         pq = to_i8((e * r) * 127.0).to(torch.int32)                                 # (Hk, G, T)
         att = torch.matmul(pq, vh)                                                   # (Hk, G, hs) int32
         return (att.to(F32) * self.a_v[l]).reshape(c.q_dim)
@@ -362,7 +392,7 @@ class QModel(torch.nn.Module):
             xq, s_x = quant_act(self.rmsnorm(x, self.rms_ffn[l]))
             h13 = qlinear(xq, s_x, self.w13[l], self.s_w13[l])
             h1, h3 = h13[:c.hidden], h13[c.hidden:]
-            u = (h1 * torch.reciprocal(1.0 + torch.exp(h1 * -1.0))) * h3
+            u = (h1 * sfu_recip(1.0 + sfu_exp(h1 * -1.0))) * h3
             hq, s_h = quant_act(u)
             x = x + qlinear(hq, s_h, self.w2[l], self.s_w2[l])
         xq, s_x = quant_act(self.rmsnorm(x, self.rms_final))

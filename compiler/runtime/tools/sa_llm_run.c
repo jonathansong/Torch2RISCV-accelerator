@@ -155,6 +155,12 @@ static iree_status_t run(iree_allocator_t host) {
   if (iree_status_is_ok(status) && steps > 1)
     printf("%d steps, %.1f ms per step after the first (%.2f tokens/s)\n", steps, 1e3 * total / (steps - 1),
            (steps - 1) / total);
+  if (iree_status_is_ok(status)) {
+    sa_context_t* sc = NULL;
+    if (iree_status_is_ok(sa_context_get(&sc)))
+      printf("device memory: peak %.1f MB of the %.1f MB heap\n", sc->heap_peak / 1048576.0,
+             (double)(sc->heap_end - sc->heap_begin) / 1048576.0);
+  }
   if (iree_status_is_ok(status) && steps > 1 && getenv("SA_PROFILE")) {
     uint64_t nd, cyc, ns;
     sa_context_profile_totals(&nd, &cyc, &ns);

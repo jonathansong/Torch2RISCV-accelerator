@@ -361,6 +361,17 @@ static iree_status_t sa_device_queue_read(
     iree_hal_file_t* source_file, uint64_t source_offset,
     iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
     iree_device_size_t length, iree_hal_read_flags_t flags) {
+  // Device memory is host mapped and the queue is synchronous: read the file
+  // straight into the target. (The streaming path stages through a device
+  // buffer as large as the transfer, up to 64 MB: a parameter load would need
+  // the window to hold the largest parameter twice.)
+  if (iree_hal_file_supports_synchronous_io(source_file)) {
+    IREE_RETURN_IF_ERROR(iree_hal_semaphore_list_wait(
+        wait_semaphore_list, iree_infinite_timeout(), IREE_HAL_WAIT_FLAG_DEFAULT));
+    IREE_RETURN_IF_ERROR(iree_hal_file_read(source_file, source_offset, target_buffer,
+                                            target_offset, length));
+    return iree_hal_semaphore_list_signal(signal_semaphore_list);
+  }
   // TODO: expose streaming chunk count/size options.
   iree_status_t loop_status = iree_ok_status();
   iree_hal_file_transfer_options_t options = {

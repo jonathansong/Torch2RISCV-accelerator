@@ -1808,8 +1808,16 @@ private:
       curLen = paramFor(*dynInner);
       curLenStatic = (cfg.maxDynamic + d - 1) / d * d;
       for (int64_t r = 0; r < H; ++r) {
+        // a row's temps are released after it, unless it allocated something
+        // later rows use (a buffer's local, a broadcast: usually the first row)
+        uint32_t savedTop[2] = {accTop[0], accTop[1]};
+        size_t nLocals = locals.size(), nBcast = bcastOf.size();
         RowSel rs{r, *dynInner};
         if (!generic(g, &rs)) return false;
+        if (locals.size() == nLocals && bcastOf.size() == nBcast) {
+          accTop[0] = savedTop[0];
+          accTop[1] = savedTop[1];
+        }
       }
       curLen = Value();
       curLenStatic = -1;

@@ -1,6 +1,6 @@
 # LLM 编译器：基于 MLIR / IREE 的端到端方案（PyTorch → 描述符列表）
 
-状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 进行中**（§8；C5.0–C5.4 完成，下一步 C5.5）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
+状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 进行中**（§8；C5.0–C5.4 完成，C5.5 sim 完成、SmolLM2 板上待验）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
 取代那里 §10.4、§10.5 的概要。
 
 **目标**：从一个 PyTorch 写的 llama 类模型出发，用 MLIR / IREE 自动编译，得到在 PYNQ-Z1 上运行的完整程序：
@@ -505,7 +505,7 @@ qlinear 模板（参考 `templates/reference.py`）：
 | 编译 | `compile_sa.sh`：4.4 s；64 个 dispatch 全部由 sa 后端生成模板（没有 CPU 回退）；sa.vmfb 10.3 MB + sa_packed.irpa 16.1 MB |
 | 逐 dispatch 差分测试（`tests/dispatch_check.py`：oracle 执行 IR 语义 vs 模板在 funcsim 中运行，每个调用点） | 64/64 逐位一致 |
 | 端到端，sim（`tests/test_c3.py`，`sa-llm-run` + `sa_sim_server.py`） | 20 步（12 个提示 + 8 个贪心）逐位一致；约 1.4 s / token（Python funcsim） |
-| 端到端，板上（`tests/board_c3.py`，L2 bitstream、rt_fw） | 76/76 步逐位一致，生成的 token 与主机参考相同；**12.6 tok/s**（L5 手写：15.1 tok/s）；每 token 242 次 dispatch |
+| 端到端，板上（`tests/board_llm.py`，L2 bitstream、rt_fw） | 76/76 步逐位一致，生成的 token 与主机参考相同；**12.6 tok/s**（L5 手写：15.1 tok/s）；每 token 242 次 dispatch |
 
 实现（`plugins/sa/target/`）：
 
@@ -686,7 +686,7 @@ linalg / scf（IREE 的 dispatch）
 | 逐 dispatch | `dispatch_check.py` 不变（oracle 执行 IR 语义 vs funcsim 运行生成的列表，每个调用点）：这是主要的正确性保障 |
 | 新旧对照 | 开关 `--iree-sa-codegen=templates|dialect`，两条路径并存到 C5.4：同一个 dispatch 的结果都要逐位一致，估计周期可以互相对照 |
 | 微内核对照 | 同一个 dispatch 用微内核与 `--iree-sa-ukernels=none` 各编一次：结果逐位一致，周期对照（微内核的价值要有数据） |
-| 端到端 | `test_c3.py`（sim）、`board_c3.py`、`board_profile.py`；新增 `compare_profiles.py`：两份逐 dispatch 周期表逐项对比 |
+| 端到端 | `test_c3.py`（sim）、`board_llm.py`、`board_profile.py`；新增 `compare_profiles.py`：两份逐 dispatch 周期表逐项对比 |
 | 变异测试 | 故意改错 VE 折叠规则、下标模式、循环次数，确认测试能检出 |
 
 ### 8.7 分步计划（纵向切片，每步 sim → 板上 → 提交）
@@ -743,6 +743,15 @@ C5.5 的模型（§8.9 的第一步）：
 - 验收：`--iree-sa-ukernels=all` 与 `none` 都编译出 58 个可执行体，`tests/test_c5.py` 在 T = 16、80、256 下全部通过 `dispatch_check`，sim 76 步逐位一致；板上两种都与 L5 文本相同、逐位一致。
 - 微内核的价值（板上，周期 / token）：带微内核 2,588,975；只用通用降级 4,395,723（10.3 tok/s）。差别几乎都在线性层（没有预取、没有循环）：分类层 1.26M → 2.43M，W13 0.41M → 0.70M，Wqkv 0.26M → 0.40M，W2 0.23M → 0.35M；注意力相差很小。
 - 测试：`tests/test_c5.py`（lit、两种配置、T 扫描、微内核改变了哪些 dispatch）；`test_c2.py` 改为检查命令的种类与数量与参考调度相同（不再逐字节）；`test_c50.py`、`test_c51.py` 删除。
+
+**C5.5 结果（2026-09-28，sim；板上待验）**：两个没有写过专用代码的模型通过。
+- 前端：`frontend/qhf.py`（HuggingFace 配置、不依赖第三方包的 safetensors 读取（BF16 → f32）、字节级 BPE 分词、fp32 参考模型、KV 标定、量化模型 `QModel`；rotate-half RoPE 改成交错排列的行置换；GQA 写成 batch = KV 头、行 = 组内 Q 头；Qwen3 的 QK-norm），`frontend/export_hf.py`（导出，`--layers` 截断层数）。
+- 验收的参照：设备的 EXP / RECIP / RSQRT 是硬件近似，torch 精确函数作参照时第一步相关系数只有 0.9875。`qhf.device_sfu()` 让 eager `QModel` 用设备的近似（`llm/ref_model.py` 的 `SfuExact`）：第一步与 sim 只差求和顺序（相对误差 2e-5）；之后求和顺序偶尔翻转一个 int8 舍入并逐层放大，按 argmax 相同、相关系数 > 0.99 验收（`tests/test_c55.py`）。板上与 sim 逐位比较。
+- 运行时：设备窗口可配置（sim `--mb`、板上 `board.txt`）；`sa_device_queue_read` 直接把文件读进设备缓冲（原来的流式路径先分配一个和传输一样大的暂存缓冲，最大的参数要放两份：SmolLM2 峰值 184.5 → 160.5 MB）；`sa-llm-run` 打印设备内存峰值，arena 内存不足的错误带当前用量。
+- 编译器：动态 T 的逐行降级在每行之后收回该行的临时缓冲（Qwen3 的 softmax 有 16 行，原来 ACC 用满）。
+- SmolLM2-135M（30 层，GQA 9/3，dim 576，词表 49152）：230 个 dispatch，T = 16 / 80 / 256 全部与 oracle 逐位一致；sim 端到端 16 步 argmax 16/16、最小相关 0.9922，生成 “Once upon a time, there was a little girl named Lily. She lived in a big house with her family, and she loved to play with her toys. …”；窗口 176 MB（峰值 160.5 MB）；sim 9 s / token。板上包：`scripts/deploy_c55.sh`（`tests/board_llm.py`：C3 与 C5.5 共用，按 sim 的结果逐位比较）。
+- Qwen3-0.6B 截断到 2 层（QK-norm、head_dim 128、q_dim 2048 ≠ dim 1024、GQA 16/8、θ = 1e6、词表 151936）：42 个 dispatch 全部逐位一致；sim 8 步 argmax 8/8、相关 1.00000；峰值 330.5 MB。
+- 发现的问题（留给 C6）：共享的嵌入存了两份（分类层的打包权重在参数文件里，gather 用的原始表作为常量在 vmfb 里）：SmolLM2 多 28 MB，Qwen3 多 155 MB；可以让 gather 直接读打包布局，或把原始表也导出成参数。
 
 ### 8.8 扩展点与微内核
 
@@ -906,7 +915,7 @@ compiler/
   frontend/               C0：qllama.py（量化模型）、export.py（iree-turbine 导出）、对比脚本
   runtime/                C1：sa HAL 驱动（C，sa/），传输层 board / sim；tools/（sa-desc-v1）；test/
   sim/                    模拟器服务 sa_sim_server.py、命令环模拟 sa_board_emu.py（基于 llm/sa_funcsim.py）
-  tests/                  test_c2 / test_c3（主机）、board_c2 / board_c3（板上）；oracle.py（dispatch 参考解释器）、
+  tests/                  test_c2 / test_c3（主机）、board_c2 / board_llm（板上）；oracle.py（dispatch 参考解释器）、
                           dispatch_check.py（逐 dispatch 差分测试）、summarize.py
 iree-sa/l0/               已有：armv7 工具链验证（L0）
 build/iree/               不入库：IREE 源码、Python 环境、编译器构建目录

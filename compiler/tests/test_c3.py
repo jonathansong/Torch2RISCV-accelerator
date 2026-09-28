@@ -11,7 +11,7 @@ path).
      oracle vs its template in the functional simulator, every call site);
   4. end to end: sa-llm-run on the sim device (sa_sim_server.py), the logits of
      every step bit-exact with DeviceModel(SfuExact); --board-bundle also stages
-     the board test (board_c3.py) with the expected tokens and logits.
+     the board test (board_llm.py) with the expected tokens and logits.
 
     python3 compiler/tests/test_c3.py [--steps 12] [--generate 20] [--board-bundle DIR]
 """

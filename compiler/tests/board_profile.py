@@ -2,8 +2,8 @@
 """C4 measurement on the PYNQ-Z1: where the time of one token goes for the
 IREE-compiled model (device cycles per export from rt_fw's completion records,
 host time of the submissions, the rest of the IREE runtime). Same files as
-board_c3.py. One list per dispatch (so each export is timed); --batch keeps the
-lists of whole command buffers (as board_c3.py runs) and times those;
+board_llm.py. One list per dispatch (so each export is timed); --batch keeps the
+lists of whole command buffers (as board_llm.py runs) and times those;
 NAME=VALUE arguments set environment variables of the runner (A/B switches).
 
     sudo bash -c 'source /etc/profile.d/pynq_venv.sh && source /etc/profile.d/xrt_setup.sh && \\

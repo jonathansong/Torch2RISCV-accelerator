@@ -49,6 +49,8 @@ static void* sa_arena_alloc(sa_context_t* c, uint64_t bytes) {
       b->size = need;
     }
     b->used = 1;
+    c->heap_used += b->size;
+    if (c->heap_used > c->heap_peak) c->heap_peak = c->heap_used;
     return b + 1;
   }
   return NULL;
@@ -69,6 +71,7 @@ static void sa_arena_free(sa_context_t* c, void* p) {
   sa_block_t* b = sa_arena_block(c, p);
   if (!b) return;  // not ours (or already free): ignore
   b->used = 0;
+  c->heap_used -= b->size;
   for (sa_block_t* n = sa_next(c, b); n && !n->used; n = sa_next(c, b)) b->size += n->size;
 }
 
@@ -84,8 +87,9 @@ static iree_status_t sa_arena_ctl(void* self, iree_allocator_command_t command, 
       void* p = sa_arena_alloc(c, n);
       if (!p) {
         status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                                  "sa arena: out of device memory allocating %llu bytes",
-                                  (unsigned long long)n);
+                                  "sa arena: out of device memory allocating %llu bytes (%.1f of %.1f MB in use)",
+                                  (unsigned long long)n, c->heap_used / 1048576.0,
+                                  (double)(c->heap_end - c->heap_begin) / 1048576.0);
       } else if (command == IREE_ALLOCATOR_COMMAND_CALLOC) {
         memset(p, 0, n);
       }

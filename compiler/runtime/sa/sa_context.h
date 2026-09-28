@@ -65,6 +65,7 @@ typedef struct sa_context_t {
   iree_slim_mutex_t mutex;         // the arena and the list scratch
   uint8_t* heap_begin;
   uint8_t* heap_end;
+  uint64_t heap_used, heap_peak;   // arena bytes in use (with block headers), its maximum
   uint64_t* list;                  // scratch for dispatch lists (64-byte aligned)
   uint32_t list_phys;
   uint32_t list_capacity;          // descriptors
