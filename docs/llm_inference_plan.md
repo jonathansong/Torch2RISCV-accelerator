@@ -5,7 +5,9 @@
 - 8 条序列批处理 63.3 tok/s（设备 77 tok/s）；
 - teacher-forced top-1 与 fp32 一致率 96.2%。
 
-还没做的：L5.5（75 MHz）和 L6-IREE（编译器）。各级的实现记录与板上结果见
+L6-IREE（编译器）大部分完成：PyTorch / HuggingFace 模型经 IREE 与自己的 `sa` 后端（两层方言 sahl / sahw）编译，stories15M 与 SmolLM2-135M 在板上运行，logits 与参考逐位一致（stories15M 17.7 tok/s，SmolLM2 1.90 tok/s）；进度与剩下的工作（C4 性能、C6 更大的模型）见 [`iree_compiler_plan.md`](iree_compiler_plan.md)。
+
+还没做的：L5.5（75 MHz）。各级的实现记录与板上结果见
 §4（L0）、§5.5（L1）、§6.9（L2）、§7.3（L3）、§8.7（L4）、§9.3（L5）、§11.1（L5b），汇总见 §13。
 
 **目标**：在 PYNQ-Z1 上做一个**架构与工业界主流 LLM 推理加速器一致**的完整系统，
@@ -1035,7 +1037,7 @@ IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 →
    转换算子有三种：TRANSPOSE、DIV-D 复制行、经 DDR 的 LD INTERLEAVE。
 5. **代价模型**：功能模拟器的周期估计（§4.3），用计数器校准。
 
-> **详细设计**：本节是概要。编译器与运行时的完整设计、分阶段计划（C0–C5）和验收见
+> **详细设计**：本节是概要。编译器与运行时的完整设计、分阶段计划（C0–C7）、实现记录和验收见
 > [`iree_compiler_plan.md`](iree_compiler_plan.md)。
 
 ### 10.4 两种接入方式
@@ -1048,7 +1050,11 @@ IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 →
 
 两种方式对硬件的要求**相同**，都由 §5.3 和 §6 满足。
 
+**实现情况**：两种都做了。A 是 C3（模板库）；B 是 C5，实际做成两层方言：`sahl`（片上缓冲与 DDR 读写，微内核、内存规划在这一层）与 `sahw`（一个操作对应一条加速器命令），A 的模板改写成 `sahl` 层的微内核，没有微内核时通用降级也能编译全部 dispatch（`iree_compiler_plan.md` §8）。
+
 ### 10.5 L6-IREE 的交付与验收
+
+（实际的位置：编译器插件在 `compiler/plugins/sa`，HAL 驱动在 `compiler/runtime/sa`，见 `compiler/README.md`。）
 
 - **`iree-sa/compiler`**：HAL 目标后端插件，使用模板库，可执行体格式为 `sa-desc-v1`。
 - **`iree-sa/runtime`**：C 写的 HAL 驱动：
@@ -1059,6 +1065,7 @@ IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 →
 - **验收**：
   1. IREE 编译的 MLP、softmax、单个 decoder 层，在“CPU + 加速器”混合执行下，结果与功能模拟器逐位一致；
   2. 用 IREE 编译 stories15M，在板上生成文本，与 L5 手写路径的文本一致（数值约定相同时应逐位一致）。
+- **结果**：第 2 条在 C3 达到（板上 logits 与手写路径逐位一致），第 1 条由逐 dispatch 的差分测试覆盖（每个 dispatch 与 oracle 逐位一致）；之后 C5 换成完整代码生成，C5.5 编译了没有写过专用代码的 SmolLM2-135M（板上）与 Qwen3 结构（sim）。
 
 ---
 
@@ -1170,7 +1177,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | **L5** | Python 运行时；端到端生成文本 | Python | 否 | §9.2 的 4 项 | **完成**（89741a3；15.1 tok/s 墙钟，top-1 96.2%） |
 | L5b | 多序列并发 decode | Python | 否 | §11.1 | **完成**（faf7bc7；8 条序列 63.3 tok/s） |
 | L5.5 | 75 MHz | 时钟与少量时序修复 | 是 | §11.2 | 未做（LUT 已用 83%，时序更难收敛） |
-| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | 未做，方案已写（C0–C5）；IREE 的编译器和运行时已在 L0 于板上验证 |
+| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | **大部分完成**（C0–C3、C5 完成：stories15M 板上 17.7 tok/s、SmolLM2-135M 板上 1.90 tok/s，均逐位一致；C4 部分完成；C6 更大的模型进行中） |
 | L6 | 其他扩展 | — | 视情况 | 每项单独定 | 未做 |
 
 - **建议顺序**：L0 → L1 → L2 → L3 → L4 → L5 → L6-IREE，L5b 和 L5.5 可以穿插进行。
@@ -1237,5 +1244,5 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | `rtl/sysarray/sim/tb_sa_ve_fp.v`，`tb_sa_unit.v`、`firmware/sim/tb_system.v` | L1、L2、L4 | 新测试 |
 | `RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl` | L1、L5.5 | `irqConcat` 改为 2 个端口；时钟改为 75 MHz |
 | `driver/pynq_matmul.py` | L1、L2 | `Device`（命令环、参数块），`DescList` 的新描述符与新字段 |
-| `iree-sa/compiler`、`iree-sa/runtime` | L6-IREE | IREE 目标后端插件与 HAL 驱动 |
+| `compiler/plugins/sa`、`compiler/runtime/sa`（原计划的 `iree-sa/…`） | L6-IREE | IREE 目标后端插件与 HAL 驱动 |
 | `notebooks/llm/l1_ring_demo.py` … `l5_generate.py` | L1–L5 | 板上脚本 |

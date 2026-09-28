@@ -151,7 +151,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   Environment: `SA_PROFILE=1` (one list per dispatch, per-export cycles),
   `SA_PROFILE=batch` (per list), `SA_NO_BATCH=1` (one list per dispatch, to
   find a failing dispatch).
-- **C5 in progress** (docs/iree_compiler_plan.md §8): the code generator is an
+- **C5 done** (docs/iree_compiler_plan.md §8): the code generator is an
   MLIR pipeline (`plugins/sa/transforms/`): IREE bufferization, `iree-sa-to-sahl`
   (explicit DDR traffic, the `sahl` dialect), `iree-sahl-to-sahw` (local
   memory, one single-stage VE per operation, reductions, gathers, masks,
@@ -171,6 +171,17 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   board: bit-exact with the sim, 1.90 tok/s. The device window
   is configurable (`--mb`; SmolLM2 needs 160.5 MB: parameter loads read
   straight into device memory, `sa-llm-run` prints the peak).
+- **C6 in progress** (docs/iree_compiler_plan.md §8.12: models of the
+  Qwen3-0.6B / Llama-3.2-1B class, for larger boards; sim here). Done: the
+  target configuration cross-check (`--iree-sa-spad-kb`, `--iree-sa-acc-kb`;
+  the functional simulator and `dispatch_check.py` take D and the memory
+  sizes from each dispatch's target; stories15M bit-exact for D = 16 and
+  larger SPAD / ACC) and K blocks (a contraction whose K exceeds one bank, one
+  DMA row or the strip's source range accumulates K blocks in ACC); also
+  DMAs beyond 64 KB and element-wise dispatches too large for ACC (lowered in
+  pieces). A random-weight model with K = 16384 is bit-exact per dispatch and
+  end to end. Next: C6.0 (the shared embedding stored once), C6.1 (Qwen3-0.6B,
+  all 28 layers).
 
   ```sh
   python3 compiler/tests/test_c5.py                  # lit, both configurations, dispatch_check at T = 16, 80, 256
