@@ -187,8 +187,23 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   all 28 layers, with no compiler change: 276 dispatches bit-exact at
   T = 16 / 80 / 256, end to end on sim with the eager model's argmax (first
   step within 2e-6), "Once upon a time, there was a man" (587 MB of device
-  memory, 24 s per token on the sim). Next: C6.2 (quantization quality: the
+  memory, 24 s per token on the sim). C6.P (§8.13): a whole LLM compiled
+  with prefill and decode. The module has `main` (decode), `prefill`
+  (M = 8 prompt tokens per call; the linear layers run M rows on the D x D
+  array, `linearRows` with the next chunk's weights prefetched) and
+  `prefill_kv` (the same without the classifier, for all chunks but the
+  last), sharing the packed weights and the KV cache. Both models on the
+  board: prefill + decode bit-exact with the sim, a prompt token costs
+  12 ms (stories15M, decode 57 ms) and 105 ms (SmolLM2, decode 456 ms).
+  M = 16 is only 1.7% better (the linear layers are already near the array
+  limit); what is left is the fp32 SFU latency in SiLU (a hardware option,
+  P6, is written up and deferred). Next: C6.2 (quantization quality: the
   W8A8 Qwen3 agrees with fp32 on 5/8 top-1).
+
+  ```sh
+  compiler/scripts/deploy_c6p.sh stories|smollm2 [M]   # export with prefill, compile, --check, sim prefill vs decode-only, bundle build/deploy_c6p_<model>_m<M>
+  # board: python3 board_llm.py [--decode-only]; python3 board_generate.py; python3 board_profile.py 66 --prompt 64
+  ```
 
   ```sh
   compiler/scripts/run_tests.sh -m 10G qwen3export qwen3   # C6.1 (from your own terminal)

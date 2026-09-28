@@ -830,7 +830,7 @@ C5.5 的模型（§8.9 的第一步）：
 | 5 | 验证：与 torch 比误差、截断层数 | C5.5 起；C funcsim 在 C6 视需要 | 新模型没有手写的 DeviceModel；Python sim 只在大模型上才太慢 |
 | 3c | 注意力按 T 分块（在线 softmax） | C6 | 涉及数值约定（预处理显式改写 IR、oracle 相应支持）；seq ≤ 2048 时是否需要，C5.5 前核实片上容量 |
 | 3d | 大词表、多张列表 | 已具备，C6 验证 | 不需要新代码 |
-| 6 | 批量 prefill | C6 之后（可选） | 只影响速度，不影响能否编译 |
+| 6 | 批量 prefill | 提前到 C6.1 之后：**已完成**（C6.P，§8.13） | 只影响速度，不影响能否编译 |
 
 **补做（2026-09-28）**：C5.5 之后核对发现，第 1 项的交叉验证与第 3a 项其实没做，补上：
 - **目标配置交叉验证**：funcsim 的 SPAD / ACC 大小可配置（`SaFuncSim(d, …, spad_bytes, acc_bytes)`，片上地址是 16 位字地址，每块最多 2^16 字）；编译器加 `--iree-sa-spad-kb` / `--iree-sa-acc-kb`，目标配置不合法时报错（`TargetConfig::invalid`）；`dispatch_check.py` 从 dispatch 的 target 读 D 与存储大小，sim 服务加 `--spad-kb` / `--acc-kb`。`tests/test_c5.py --configs`：stories15M 在 D = 16、SPAD 256 KB / ACC 512 KB、D = 16 + SPAD 512 KB / ACC 1 MB 三种配置下，带与不带微内核都编译出 58 个可执行体，T = 16 / 256 下全部与 oracle 逐位一致。（第一次运行时 dispatch_check 的正则没匹配上 target，结果全按默认配置检查，报了一片假错误；修正后全部通过。）
@@ -887,7 +887,7 @@ C5.5 的模型（§8.9 的第一步）：
 | **C6.4 Llama-3.2-1B** | 前端：Llama3 的 RoPE 频率缩放（预先算成表；现在遇到会报错），词表 128K，GQA 32/8；权重需要 Meta 授权（或用公开镜像） | 同 C6.1 | |
 | **C6.5 注意力按 T 分块** | 在线 softmax 由预处理显式写进 IR（§3.2），oracle 相应支持；KV cache 长度与 `max-dynamic` 由模型配置决定 | T = 2048 时逐 dispatch 一致 | |
 | **C6.6 目标配置交叉验证** | funcsim 按目标配置参数化；同一模型用不同的 D、SPAD / ACC 编译并验证 | `test_c5.py --configs` 全部逐位一致 | **已完成**（§8.9 补做） |
-| C6.7（可选） | 批量 prefill：M > 1 的矩阵乘；权重打包从向量×矩阵推广到矩阵乘 | 与逐 token decode 结果一致 | |
+| C6.7（可选） | 批量 prefill：M > 1 的矩阵乘；权重打包从向量×矩阵推广到矩阵乘 | 与逐 token decode 结果一致 | **已完成**，作为 C6.P（§8.13） |
 
 **C6.0 结果（2026-09-28）**：gather 读打包布局（反过来让分类层读原始布局，要每 token 多一次整表 TRANSPOSE，stories15M 约 +40% 周期）。
 - 预处理（`target/PackLinearWeights.cpp`）：每个常量权重只打包一次（放在它的定义之后）；它的 gather（`tensor.extract W[r, c]`）改成读打包的副本 `Wp[r / D, c, r % D]`，原始表没有读者，不再进 vmfb。条件：K × D ≤ 65535（LDPARAM 的 16 位乘数、一条 DMA 行）。
@@ -909,7 +909,7 @@ C5.5 的模型（§8.9 的第一步）：
 **目标**：一个模块里有 prefill 与 decode 两个函数，共用参数与 KV cache；prompt 按块做 prefill（权重读一次服务 M 个 token，D×D 阵列用满），之后逐 token decode。原计划的可选项（§8.9 第 6 项、C6.7），提到 C6.2 之前做。
 
 **设计**：
-- **固定块长 M**（导出参数，默认 16）：长度 P 的 prompt 分 ⌈P / M⌉ 块，最后一块用填充 token 补齐；填充行写的 KV 在位置 ≥ P，decode 在读之前会覆盖、注意力也按位置屏蔽，所以无害。这样 T 仍是唯一的动态维（不碰“每条描述符最多 2 个动态字段”）。
+- **固定块长 M**（导出参数；原定默认 16，板上对比后默认 8，见 P5）：长度 P 的 prompt 分 ⌈P / M⌉ 块，最后一块用填充 token 补齐；填充行写的 KV 在位置 ≥ P，decode 在读之前会覆盖、注意力也按位置屏蔽，所以无害。这样 T 仍是唯一的动态维（不碰“每条描述符最多 2 个动态字段”）。
 - `prefill(tokens[M], start, valid[T])`：第 i 行的因果掩码是位置 ≤ start + i；一次写 M 行 KV；只算最后一行的 logits（分类层是最大的一层）。两个函数用 iree-turbine 的 `CompiledModule` 导出，KV cache 是共享的可变全局量。
 - **验收的主要依据**：设备上 prefill 最后一个位置的 logits 与只用 decode 的路径逐位一致（线性层每行的运算相同：int32 累加精确、反量化逐元素；注意力在 T 的填充相同时求和顺序相同）。
 
@@ -919,7 +919,7 @@ C5.5 的模型（§8.9 的第一步）：
 | **P1 线性层** | 打包 pass 也认 matmul（打包的权重与 decode 共用，C6.0 的“只打包一次”）；A 条带由 X 的 M 行经 TRANSPOSE 得到；微内核与通用降级 | 逐 dispatch 逐位一致；每块 EX 的效率 |
 | **P2 注意力与其余** | M 行的分数 / P·V；softmax 的掩码按行（第 i 行有效长度 start + i + 1，LDPARAM 的加数）；RoPE 取 M 行；KV cache 一次写 M 行 | 逐 dispatch 逐位一致，T 扫描 |
 | **P3 运行时** | `sa-llm-run` 先分块 prefill 再 decode；`board_generate.py` 用它 | sim：与只用 decode 的 token 相同，最后位置的 logits 逐位一致 |
-| **P4 板上** | stories15M、SmolLM2；M = 8 / 16 / 32 对比 | 逐位一致；prompt 的 tok/s（预计比逐 token 快 5–10 倍）。**M = 8 完成**（见下） |
+| **P4 板上** | stories15M、SmolLM2；M = 8 / 16 / 32 对比 | 逐位一致；prompt 的 tok/s（预计比逐 token 快 5–10 倍）。**已完成**（见下）：M = 8 为默认；M = 16 每 token 只快 1.7%；M = 32 不做 |
 
 **P0 结果（2026-09-28）**：`prefill(tokens[M], positions[M], valid[T])`（positions = start .. start + M − 1 由调用方给出：命令处理器不能把寄存器写回 DDR、VE 没有 iota，设备上算 i64 向量很别扭）；最后一块与前一块重叠而不是填充（从 P − M 开始，重算的行写回相同的 KV），最后一行总是 prompt 的最后一个 token。eager 的 prefill 与 decode 逐位一致（logits、KV cache）；IREE llvm-cpu 上 stories15M 的 prefill 与只用 decode 逐位一致，SmolLM2 相关 1.000000，之后生成的 token 相同。导出：`FxProgramsBuilder`，`main`（decode）与 `prefill` 共用参数与 KV 全局量。
 
@@ -1021,7 +1021,7 @@ C5.5 的模型（§8.9 的第一步）：
 | **C4 性能** | 精简 FENCE、跨 dispatch 预取、更大的 dispatch、代价模型 | 每 token 周期与手写路径相差 ≤ 10%。**部分完成，暂缓**（§7.1：差 13%，板上 17.7 tok/s） | 中 |
 | **C5 代码生成** | `sahl` / `sahw` 两层方言与完整流水线（§8），模板改成 `sahl` 层微内核，分步 C5.0–C5.5（§8.7） | 只用通用代码生成（`--iree-sa-ukernels=none`）也能编译 stories15M，结果与 C3 一致；默认配置每 token 周期不高于 C4；一个模型变体编译通过（§8.1）。**已完成**（§8.7：stories15M 带 / 不带微内核板上逐位一致；SmolLM2-135M 板上 2.23 tok/s，可交互式生成） | 大 |
 
-| **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成） | 大 |
+| **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 

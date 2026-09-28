@@ -184,7 +184,9 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
   HuggingFace SmolLM2-135M (2.22 tok/s) run on the board bit-exact with the
   references, and generate text interactively there; larger models are the
   current stage (C6, on sim: Qwen3-0.6B with all 28 layers compiles bit-exact
-  per dispatch and generates correct text end to end).
+  per dispatch and generates correct text end to end). A model now compiles
+  with both prefill and decode: on the board the prompt is processed 8 tokens
+  per call on the full array, 4.3-4.7x faster per token than decode, bit-exact.
   See [compiler/README.md](compiler/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)
