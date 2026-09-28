@@ -81,7 +81,8 @@ def export(m, cfg, d, out, static_len=None, prefill=0):
     """static_len: attention over a fixed number of positions (valid[static_len],
     masked by pos) instead of a dynamic T; the sa backend's form. prefill = M:
     also prefill(tokens[M], positions[M], valid[T]) (m.prefill), sharing the parameters
-    and the KV cache with main (decode)."""
+    and the KV cache with main (decode), and prefill_kv (the same without the
+    classifier: the chunks before the last)."""
     import iree.turbine.aot as aot
     aot.externalize_module_parameters(m, external_scope="model")
     t0 = time.time()
@@ -99,6 +100,12 @@ def export(m, cfg, d, out, static_len=None, prefill=0):
                             dynamic_shapes={"tokens": None, "positions": None, "valid": {0: T2}}, strict=False)
         def _prefill(module, tokens, positions, valid):
             return module.prefill(tokens, positions, valid)
+
+        # the chunks before the last: no classifier (their logits are not used)
+        @fxb.export_program(name="prefill_kv", args=prefill_inputs([1] * prefill, 0, d),
+                            dynamic_shapes={"tokens": None, "positions": None, "valid": {0: T2}}, strict=False)
+        def _prefill_kv(module, tokens, positions, valid):
+            return module.prefill(tokens, positions, valid, logits=False)
 
         exp = aot.export(fxb)
     elif static_len:

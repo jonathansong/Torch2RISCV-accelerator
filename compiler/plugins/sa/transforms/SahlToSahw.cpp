@@ -1959,8 +1959,9 @@ private:
   // chunk of weight tiles serves every row block. Per chunk of output tiles:
   // its B tiles and per-column inputs, then per row block the EX (output rows
   // crow = nc words apart), the epilogue over D x nc words (per-column inputs
-  // by MOD nc, per-row broadcast words by DIV nc), the store of D rows.
-  // A serial schedule (no prefetch yet).
+  // by MOD nc, per-row broadcast words by DIV nc), the store of D rows. The
+  // next chunk's weights are loaded during this chunk's EX and epilogues (the
+  // other bank, right after its first EX, as decode's linear).
   bool linearRows(LinearPlan &p) {
     auto wt = cast<MemRefType>(p.w.getType());
     const int64_t k = wt.getDimSize(1), nt = wt.getDimSize(0), N = nt * d, M = p.rows, nb = M / d;
@@ -2011,24 +2012,32 @@ private:
     int64_t nc = std::min<int64_t>(std::max<int64_t>(sb / k, 1), 32);
     while (nc > 1 && nt % nc) --nc;
     if (nc * k > int64_t(sb)) return fail("linear rows: one weight tile does not fit a SPAD_B bank");
+    // chunk ci's B tiles in SPAD_B bank ci & 1, its per-column inputs in set ci & 1
+    SmallVector<SmallVector<LocalBuf>> colSets(2);
+    for (int set = 0; set < 2; ++set)
+      for (size_t m = 0; m < cd.size(); ++m) colSets[set].push_back(newLocal(::sa::VT_F32, nc * d));
+    const int64_t nch = nt / nc;
+    auto loadChunk = [&](int64_t ci) {
+      int64_t c0 = ci * nc;
+      sahw::LdOp::create(bb, loc, wd->base, wd->off + c0 * k * d,
+                         int64_t(::sa::laddr(::sa::MEM_SPAD_B, uint32_t(ci & 1) * sb)), nc, k * d, k * d, 0,
+                         ValueRange{});
+      for (size_t m = 0; m < cd.size(); ++m)
+        sahw::LdOp::create(bb, loc, cd[m].base, cd[m].off + c0 * d * 4, int64_t(colSets[ci & 1][m].la), 1,
+                           nc * d * 4, nc * d * 4, 0, ValueRange{});
+    };
+    loadChunk(0);
     for (int64_t c0 = 0, ci = 0; c0 < nt; c0 += nc, ++ci) {
       uint32_t savedTop[2] = {accTop[0], accTop[1]};
       uint32_t bw = uint32_t(ci & 1) * sb;
-      sahw::LdOp::create(bb, loc, wd->base, wd->off + c0 * k * d, int64_t(::sa::laddr(::sa::MEM_SPAD_B, bw)), nc,
-                         k * d, k * d, 0, ValueRange{});
-      SmallVector<LocalBuf> cl;
-      for (const Ddr &r : cd) {
-        LocalBuf l = newLocal(::sa::VT_F32, nc * d);
-        sahw::LdOp::create(bb, loc, r.base, r.off + c0 * d * 4, int64_t(l.la), 1, nc * d * 4, nc * d * 4, 0,
-                           ValueRange{});
-        cl.push_back(l);
-      }
+      const SmallVector<LocalBuf> &cl = colSets[ci & 1];
       for (int64_t rb = 0; rb < nb; ++rb) {
         uint32_t savedRb[2] = {accTop[0], accTop[1]};
         const int64_t n = d * nc * d;
         LocalBuf acc = newLocal(::sa::VT_I32, n);
         sahw::ExOp::create(bb, loc, int64_t(strips[rb] & 0xFFFFFFF), int64_t(bw), int64_t(acc.la & 0xFFFFFFF),
                            k / d, false, nc, k, 1, nc, ValueRange{});
+        if (rb == 0 && ci + 1 < nch) loadChunk(ci + 1);          // prefetch into the other bank
         if (!p.epi) {                                 // the accumulator itself
           sahw::StOp::create(bb, loc, yd->base, yd->off + (rb * d * N + c0 * d) * 4, int64_t(acc.la), d, nc * d * 4,
                              N * 4, ValueRange{});

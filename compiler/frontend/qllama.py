@@ -212,7 +212,7 @@ class QLlama(torch.nn.Module):
         return qlinear(xq, s_x, self.cls_q, self.cls_s)
 
     # ------------------------------------------------------------ prefill (plan §8.13)
-    def prefill(self, tokens, positions, valid):
+    def prefill(self, tokens, positions, valid, logits=True):
         """A chunk of M prompt tokens at positions[M] (start .. start + M - 1, given
         by the caller: no i64 vector arithmetic on the device):
         their KV rows written, the logits of the last one returned; valid[T] only
@@ -249,6 +249,8 @@ class QLlama(torch.nn.Module):
             u = (h1 * torch.reciprocal(1.0 + torch.exp(h1 * -1.0))) * h3
             hq, s_h = quant_act(u)
             x = x + qlinear(hq, s_h, self.w2[l], self.s_w2[l])
+        if not logits:                   # a chunk before the last: its KV rows only (x's last row, cheap)
+            return x[M - 1]
         xq, s_x = quant_act(self.rmsnorm(x[M - 1], self.rms_final))
         return qlinear(xq, s_x, self.cls_q, self.cls_s)
 

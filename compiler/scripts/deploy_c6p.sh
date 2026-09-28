@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Stages the C6.P board test (docs/iree_compiler_plan.md §8.13): prefill + decode.
 #   compiler/scripts/deploy_c6p.sh stories|smollm2 [M]
-# exports the model with prefill chunks of M (default 8) into build/c6p/<model>,
-# compiles it, checks it on the sim (test_c6p.py) and stages build/deploy_c6p_<model>;
+# exports the model with prefill chunks of M (default 8) into build/c6p/<model>_m<M>,
+# compiles it, checks it on the sim (test_c6p.py) and stages build/deploy_c6p_<model>_m<M>;
 # board: python3 board_llm.py [--decode-only]; python3 board_generate.py
-#   scp build/deploy_c6p_<model>/* xilinx@<board>:/home/xilinx/c6p/
+#   scp build/deploy_c6p_<model>_m<M>/* xilinx@<board>:/home/xilinx/c6p/
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 model=${1:?stories or smollm2}
 M=${2:-8}
-O=$SA_REPO/build/c6p/$model
-D=$SA_REPO/build/deploy_c6p_$model
+O=$SA_REPO/build/c6p/${model}_m$M
+D=$SA_REPO/build/deploy_c6p_${model}_m$M
 rm -rf "$D" && mkdir -p "$D"
 case $model in
   stories)
@@ -25,7 +25,7 @@ case $model in
 esac
 "$SA_COMPILER/scripts/build_sa_runtime.sh" armv7 | tail -1
 llvm-strip-18 -o "$D/sa-llm-run" "$SA_REPO/build/iree/build-sa-armv7/runtime/plugins/hal/drivers/sa/sa-llm-run"
-cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/runtime/test/board_launcher.py" \
+cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/tests/board_profile.py" "$SA_COMPILER/runtime/test/board_launcher.py" \
    "$SA_REPO/driver/pynq_matmul.py" "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"
 cp "$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2/picorv32.bit" "$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2/picorv32.hwh" "$D/"
 ls -la "$D"

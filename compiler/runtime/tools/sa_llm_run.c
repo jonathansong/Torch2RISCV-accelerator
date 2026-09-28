@@ -145,6 +145,18 @@ static iree_status_t run(iree_allocator_t host) {
     iree_vm_function_t pf;
     status = iree_vm_module_lookup_function_by_name(main_module, IREE_VM_FUNCTION_LINKAGE_EXPORT, IREE_SV("prefill"),
                                                     &pf);
+    // the chunks before the last through prefill_kv (no classifier) when the module has it
+    iree_vm_function_t pkv = pf;
+    if (iree_status_is_ok(status)) {
+      iree_status_t st = iree_vm_module_lookup_function_by_name(main_module, IREE_VM_FUNCTION_LINKAGE_EXPORT,
+                                                                IREE_SV("prefill_kv"), &pkv);
+      if (!iree_status_is_ok(st)) {
+        iree_status_ignore(st);
+        pkv = pf;
+      }
+    }
+    float* kv_out = NULL;
+    iree_host_size_t kv_n = 0;
     int64_t* pos_buf = malloc((size_t)M * sizeof(int64_t));
     for (int s0 = 0; iree_status_is_ok(status);) {
       int s = s0 + M >= ntok ? ntok - M : s0;
@@ -153,7 +165,10 @@ static iree_status_t run(iree_allocator_t host) {
       iree_host_size_t vlen = FLAG_pad > 0 ? (iree_host_size_t)(((s + M - 1) / FLAG_pad + 1) * FLAG_pad)
                                            : (iree_host_size_t)FLAG_valid_len;
       double t0 = now();
-      status = call3(context, pf, device, allocator, host, toks + s, M, pos_buf, M, valid, vlen, &logits, &vocab);
+      if (s + M >= ntok)
+        status = call3(context, pf, device, allocator, host, toks + s, M, pos_buf, M, valid, vlen, &logits, &vocab);
+      else
+        status = call3(context, pkv, device, allocator, host, toks + s, M, pos_buf, M, valid, vlen, &kv_out, &kv_n);
       prefill_time += now() - t0;
       ++chunks;
       if (chunks == 1) sa_context_profile_reset();   // the first chunk includes loading
@@ -161,6 +176,7 @@ static iree_status_t run(iree_allocator_t host) {
       s0 += M;
     }
     free(pos_buf);
+    free(kv_out);
     if (iree_status_is_ok(status) && chunks > 1 && getenv("SA_PROFILE")) {
       uint64_t nd, cyc, ns;
       sa_context_profile_totals(&nd, &cyc, &ns);
