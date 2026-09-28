@@ -9,6 +9,7 @@
 #define SA_DIALECT_SAHL_OPS
 
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 def Sahl_Dialect : Dialect {
   let name = "sahl";
@@ -27,6 +28,19 @@ def Sahl_StoreOp : Sahl_Op<"store"> {
   let summary = "local buffer -> DDR (the whole view)";
   let arguments = (ins AnyMemRef:$src, AnyMemRef:$dst);
   let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
+}
+
+def Sahl_ToI8Op : Sahl_Op<"to_i8", [Pure]> {
+  let summary = "fp32 -> int8 as qllama.to_i8: clamp(round_even(nan_to_num(x)), -127, 127)";
+  let description = [{
+    Inside a linalg body: the whole quantization chain (NaN -> 0, +-inf ->
+    +-FLT_MAX, round to nearest even, clamp to +-127, fptosi), which the VE's
+    int8 output conversion does in one step. sa-to-sahl replaces each matched
+    chain by this operation.
+  }];
+  let arguments = (ins F32:$x);
+  let results = (outs I8:$y);
+  let assemblyFormat = "$x attr-dict";
 }
 
 def Sahl_KernelOp : Sahl_Op<"kernel", [SingleBlock, NoTerminator]> {

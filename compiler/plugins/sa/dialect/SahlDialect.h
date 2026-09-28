@@ -8,6 +8,7 @@
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 // clang-format off
 #include "SahlDialect.h.inc"  // IWYU pragma: keep

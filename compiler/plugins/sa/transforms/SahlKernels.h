@@ -14,6 +14,7 @@
 #include "SahwPasses.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 
@@ -21,6 +22,11 @@ namespace mlir::iree_compiler::sa {
 
 // An fp32 constant.
 std::optional<float> constF32(Value v);
+// An fp32 constant with exactly these bits.
+bool isF32Const(Value v, float want);
+// qllama.to_i8 = clamp(round(nan_to_num(x)), -127, 127).to(i8) ending in fptosi:
+// x and the chain's operations, consumers first (the fptosi last).
+Value matchToI8(arith::FPToSIOp f, SmallVectorImpl<Operation *> &chain);
 // The Lin of a dynamic size (a push constant, possibly through memref.dim of a binding).
 std::optional<Lin> dynLin(Value size);
 // The sahl.load that fills a local buffer (null if none).

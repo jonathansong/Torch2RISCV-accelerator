@@ -45,7 +45,8 @@ func.func @exp_cols() {
 // Row abs-max, scale = max / 127, int8 quantization by row (the quant chain):
 // REDUCE MAX with FUNC ABS (one broadcast word per row), TRANSPOSE to a packed
 // vector, the scale, DIV-D replication, RECIP, then the I8 output with the
-// per-row operand in DIV mode (period = the row's words).
+// per-row operand in DIV mode (period = the row's words). sahl.to_i8 is the
+// whole quantization chain (sa-to-sahl makes it from arith; sa_to_sahl.mlir).
 // FUSED-LABEL: sahw.template "quant_rows"
 // FUSED: sahw.ld %{{.+}} {ddr = 0 : i64, {{.*}}row_bytes = 2048 : i64, rows = 1 : i64}
 // FUSED-NEXT: sahw.ve {{{.*}}func = 4 : i64, {{.*}}length = 512 : i64, op = 5 : i64, reduce = 2 : i64, rowlen = 8 : i64
@@ -95,18 +96,7 @@ func.func @quant_rows() {
   ^bb0(%in: f32, %sc: f32, %out: i8):
     %r = arith.divf %one, %sc : f32
     %y = arith.mulf %in, %r : f32
-    %n = arith.cmpf une, %y, %y : f32
-    %y1 = arith.select %n, %zero, %y : f32
-    %p = arith.cmpf oeq, %y1, %pinf : f32
-    %y2 = arith.select %p, %fmax, %y1 : f32
-    %ni = arith.cmpf oeq, %y2, %ninf : f32
-    %y3 = arith.select %ni, %fmin, %y2 : f32
-    %rn = math.roundeven %y3 : f32
-    %lo = arith.cmpf ult, %rn, %cm127 : f32
-    %y4 = arith.select %lo, %cm127, %rn : f32
-    %hi = arith.cmpf ugt, %y4, %c127 : f32
-    %y5 = arith.select %hi, %c127, %y4 : f32
-    %i = arith.fptosi %y5 : f32 to i8
+    %i = sahl.to_i8 %y
     linalg.yield %i : i8
   }
   sahl.store %m, %s : memref<8xf32>, memref<8xf32, #hal.descriptor_type<storage_buffer>>

@@ -4,7 +4,8 @@
 // operand of a linalg op is replaced by a local buffer (memref.alloc) with a
 // sahl.load before (inputs, and outputs whose old value is read) and a
 // sahl.store after (outputs); an identity copy into DDR becomes a sahl.store.
-// Computation then only touches local buffers. Then the kernel matcher
+// Computation then only touches local buffers. Each to_i8 chain inside a
+// body becomes one sahl.to_i8. Then the kernel matcher
 // (SahlKernels.h) decides which operations are lowered together: each match
 // (a linear layer or attention micro-kernel, a generic contraction) moves into a
 // sahl.kernel at the position of its contraction (the anchor).
@@ -42,6 +43,26 @@ bool isIdentityCopy(linalg::GenericOp g) {
   Block &b = g.getRegion().front();
   auto y = cast<linalg::YieldOp>(b.getTerminator());
   return b.getOperations().size() == 1 && y.getOperand(0) == b.getArgument(0);
+}
+
+// Each to_i8 chain inside a linalg body -> one sahl.to_i8.
+void replaceToI8(func::FuncOp f) {
+  SmallVector<arith::FPToSIOp> fps;
+  f.walk([&](arith::FPToSIOp fp) {
+    if (fp->getParentOfType<linalg::GenericOp>()) fps.push_back(fp);
+  });
+  for (arith::FPToSIOp fp : fps) {
+    SmallVector<Operation *> chain;
+    Value x = matchToI8(fp, chain);
+    if (!x) continue;
+    OpBuilder b(fp);
+    auto t = sahl::ToI8Op::create(b, fp.getLoc(), b.getI8Type(), x);
+    fp.getResult().replaceAllUsesWith(t.getResult());
+    fp.erase();
+    chain.pop_back();                             // (the fptosi)
+    for (Operation *o : chain)                    // consumers first
+      if (o->use_empty()) o->erase();
+  }
 }
 
 // Moves the operations of each match into a sahl.kernel at its anchor. The
@@ -201,6 +222,7 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
       cfg.accBytes = optAccKB * 1024;
       cfg.ukernels = optUkernels;
     }
+    replaceToI8(f);
     if (failed(groupKernels(f, cfg))) return signalPassFailure();
   }
 };

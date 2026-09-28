@@ -1,9 +1,13 @@
 // Kernel matching (SahlKernels.h; docs/iree_compiler_plan.md §8.14, C8 R1).
 #include "SahlKernels.h"
 
+#include <cmath>
+#include <cstring>
+
 #include "SahlPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 
@@ -48,6 +52,45 @@ void KernelMatcher::matchAll(func::FuncOp f) {
 void KernelMatcher::record(Operation *anchor, ArrayRef<Operation *> ops) {
   for (Operation *o : ops) owned.insert(o);
   covers[anchor].assign(ops.begin(), ops.end());
+}
+
+bool isF32Const(Value v, float want) {
+  auto c = constF32(v);
+  if (!c) return false;
+  uint32_t a, b;
+  std::memcpy(&a, &*c, 4);
+  std::memcpy(&b, &want, 4);
+  return a == b;
+}
+
+// qllama.to_i8 = clamp(round(nan_to_num(x)), -127, 127).to(i8) ending in fptosi:
+// x and the chain's operations (the VE's int8 output conversion does all of it).
+Value matchToI8(arith::FPToSIOp f, SmallVectorImpl<Operation *> &chain) {
+  if (!f.getType().isInteger(8)) return {};
+  const float FMAX = 3.40282347e38f, INF = INFINITY;
+  auto sel = [&](Value v, arith::CmpFPredicate pred, float thr, bool thrIsSelf, float repl, Value &x) -> bool {
+    auto s = v.getDefiningOp<arith::SelectOp>();
+    if (!s) return false;
+    auto c = s.getCondition().getDefiningOp<arith::CmpFOp>();
+    if (!c || c.getPredicate() != pred || !isF32Const(s.getTrueValue(), repl)) return false;
+    x = s.getFalseValue();
+    if (c.getLhs() != x) return false;
+    if (thrIsSelf ? c.getRhs() != x : !isF32Const(c.getRhs(), thr)) return false;
+    chain.push_back(s);
+    chain.push_back(c);
+    return true;
+  };
+  Value s5, s4, s2, s1, x;
+  if (!sel(f.getIn(), arith::CmpFPredicate::UGT, 127.0f, false, 127.0f, s5)) return {};
+  if (!sel(s5, arith::CmpFPredicate::ULT, -127.0f, false, -127.0f, s4)) return {};
+  auto round = s4.getDefiningOp<math::RoundEvenOp>();
+  if (!round) return {};
+  chain.push_back(round);
+  if (!sel(round.getOperand(), arith::CmpFPredicate::OEQ, -INF, false, -FMAX, s2)) return {};
+  if (!sel(s2, arith::CmpFPredicate::OEQ, INF, false, FMAX, s1)) return {};
+  if (!sel(s1, arith::CmpFPredicate::UNE, 0, true, 0.0f, x)) return {};
+  chain.push_back(f);
+  return x;
 }
 
 sahl::LoadOp loadInto(Value local) {

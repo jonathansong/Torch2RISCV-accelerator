@@ -44,6 +44,7 @@ iree_cc_library(
     ::SahlOpsGen
     LLVMSupport
     MLIRIR
+    MLIRSideEffectInterfaces
     MLIRSupport
   PUBLIC
 )
