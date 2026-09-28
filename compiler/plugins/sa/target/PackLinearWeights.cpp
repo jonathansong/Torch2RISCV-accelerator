@@ -148,6 +148,92 @@ static LogicalResult rewriteVecmat(RewriterBase &rewriter, linalg::VecmatOp mm, 
   return success();
 }
 
+// True if |v| is linalg.fill of a zero.
+static bool isZeroFill(Value v) {
+  auto fill = v.getDefiningOp<linalg::FillOp>();
+  if (!fill) return false;
+  auto c = fill.getDpsInputs()[0].getDefiningOp<arith::ConstantOp>();
+  auto a = c ? dyn_cast<IntegerAttr>(c.getValue()) : IntegerAttr();
+  return a && a.getValue().isZero();
+}
+
+// The prefill form (plan §8.13): matmul(X, transpose(extsi(W))) of M rows into a
+// zero-filled accumulator (torch-mlir accumulates the int32 matmul in i64 and
+// truncates) -> a generic over the packed weights,
+//     acc[m, t, j] += ext(X[m, k]) * ext(Wp[t, k, j])     (i32)
+// collapsed to [M, N] (and sign-extended back to the matmul's type: the
+// consumer's trunci then folds away; an int8 x int8 sum over K < 2^17 cannot
+// overflow i32, and i32 wraps as the i64 sum truncated anyway). X is taken
+// before its extsi when it has one, so it stays int8 in memory (the A strip of
+// D rows is then one interleaved DMA).
+static LogicalResult rewriteMatmul(RewriterBase &rewriter, linalg::MatmulOp mm, int64_t d,
+                                   llvm::MapVector<Value, Value> &packs) {
+  if (mm.hasUserDefinedMaps()) return failure();
+  Value x = mm.getDpsInputs()[0], rhs = mm.getDpsInputs()[1], init = mm.getDpsInits()[0];
+  auto tr = rhs.getDefiningOp<linalg::TransposeOp>();
+  if (!tr || tr.getPermutation() != ArrayRef<int64_t>{1, 0}) return failure();
+  auto ext = tr.getInput().getDefiningOp<linalg::GenericOp>();
+  if (!ext || !isExtsiGeneric(ext)) return failure();
+  Value w = ext.getDpsInputs()[0];
+  auto wType = dyn_cast<RankedTensorType>(w.getType());
+  auto outType = dyn_cast<RankedTensorType>(init.getType());
+  if (!wType || !outType || !wType.hasStaticShape() || !outType.hasStaticShape() ||
+      !wType.getElementType().isInteger(8) || !isConstantWeight(w) || !isZeroFill(init))
+    return failure();
+  if (auto xe = x.getDefiningOp<linalg::GenericOp>(); xe && isExtsiGeneric(xe))
+    x = xe.getDpsInputs()[0];
+  auto xType = dyn_cast<RankedTensorType>(x.getType());
+  auto outElem = dyn_cast<IntegerType>(outType.getElementType());
+  auto xElem = xType ? dyn_cast<IntegerType>(xType.getElementType()) : IntegerType();
+  if (!xType || !xType.hasStaticShape() || !outElem || !xElem || outElem.getWidth() < 32 || xElem.getWidth() > 32)
+    return failure();
+  int64_t m = outType.getDimSize(0), n = wType.getDimSize(0), k = wType.getDimSize(1);
+  if (n % d || k % d || k >= (1 << 17)) return failure();
+
+  Location loc = mm.getLoc();
+  Value wp = packOf(rewriter, w, d, packs);
+  rewriter.setInsertionPoint(mm);
+  Type i32 = rewriter.getI32Type();
+  auto acc3Type = RankedTensorType::get({m, n / d, d}, i32);
+  Value zero = arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
+  Value empty = tensor::EmptyOp::create(rewriter, loc, acc3Type.getShape(), i32);
+  Value init3 = linalg::FillOp::create(rewriter, loc, zero, empty).getResult(0);
+  MLIRContext *ctx = rewriter.getContext();
+  AffineExpr r, t, j, kk;
+  bindDims(ctx, r, t, j, kk);
+  SmallVector<AffineMap> maps = {AffineMap::get(4, 0, {r, kk}, ctx), AffineMap::get(4, 0, {t, kk, j}, ctx),
+                                 AffineMap::get(4, 0, {r, t, j}, ctx)};
+  SmallVector<utils::IteratorType> iters = {utils::IteratorType::parallel, utils::IteratorType::parallel,
+                                            utils::IteratorType::parallel, utils::IteratorType::reduction};
+  auto gen = linalg::GenericOp::create(
+      rewriter, loc, TypeRange{acc3Type}, ValueRange{x, wp}, ValueRange{init3}, maps, iters,
+      [&](OpBuilder &b, Location l, ValueRange args) {
+        Value xe = args[0];
+        if (xElem.getWidth() < 32) xe = arith::ExtSIOp::create(b, l, i32, xe);
+        Value we = arith::ExtSIOp::create(b, l, i32, args[1]);
+        Value p = arith::MulIOp::create(b, l, xe, we);
+        linalg::YieldOp::create(b, l, arith::AddIOp::create(b, l, args[2], p).getResult());
+      });
+  auto acc2Type = RankedTensorType::get({m, n}, i32);
+  SmallVector<ReassociationIndices> reassoc = {{0}, {1, 2}};
+  Value y = tensor::CollapseShapeOp::create(rewriter, loc, acc2Type, gen.getResult(0), reassoc).getResult();
+  if (outElem.getWidth() > 32) {
+    Value e = tensor::EmptyOp::create(rewriter, loc, outType.getShape(), outElem);
+    SmallVector<AffineMap> id(2, rewriter.getMultiDimIdentityMap(2));
+    SmallVector<utils::IteratorType> par(2, utils::IteratorType::parallel);
+    y = linalg::GenericOp::create(rewriter, loc, TypeRange{outType}, ValueRange{y}, ValueRange{e}, id, par,
+                                  [&](OpBuilder &b, Location l, ValueRange args) {
+                                    linalg::YieldOp::create(b, l, arith::ExtSIOp::create(b, l, outElem, args[0])
+                                                                      .getResult());
+                                  })
+            .getResult(0);
+  }
+  rewriter.replaceOp(mm, y);
+  if (tr->use_empty()) rewriter.eraseOp(tr);
+  if (ext->use_empty()) rewriter.eraseOp(ext);
+  return success();
+}
+
 // True if the module targets the sa device anywhere (#hal.device.target<"sa", ...>).
 static bool targetsSA(ModuleOp module) {
   bool found = false;
@@ -182,9 +268,12 @@ struct PackLinearWeightsPass : public PassWrapper<PackLinearWeightsPass, Operati
     if (!force && !targetsSA(module)) return;
     SmallVector<linalg::VecmatOp> ops;
     module.walk([&](linalg::VecmatOp op) { ops.push_back(op); });
+    SmallVector<linalg::MatmulOp> mms;
+    module.walk([&](linalg::MatmulOp op) { mms.push_back(op); });
     IRRewriter rewriter(&getContext());
     llvm::MapVector<Value, Value> packs;
     for (linalg::VecmatOp op : ops) (void)rewriteVecmat(rewriter, op, d, packs);
+    for (linalg::MatmulOp op : mms) (void)rewriteMatmul(rewriter, op, d, packs);
     if (gathers)
       for (auto &[w, wp] : packs) redirectGathers(rewriter, w, wp, d);
   }

@@ -1651,6 +1651,10 @@ private:
     sahl::StoreOp store;
     SmallVector<std::pair<int, Value>> chunked;  // epilogue inputs [N / D, D]: (input, DDR source)
     SmallVector<std::pair<int, Value>> whole;    // other epilogue inputs: (input, DDR source)
+    // prefill's form (plan §8.13): M rows of int8 x (0: decode's vecmat); the
+    // epilogue's per-column [N / D, D] and per-row [M] inputs (chunked: [M, N])
+    int64_t rows = 0;
+    SmallVector<std::pair<int, Value>> cols, rowv;
   };
   llvm::DenseMap<Operation *, LinearPlan> linears;
   llvm::DenseSet<Operation *> owned;
@@ -1664,13 +1668,18 @@ private:
   // the pattern (nothing else may use its buffers); records the operations it covers
   bool matchLinear(linalg::GenericOp con) {
     MLIRContext *ctx = con.getContext();
-    AffineExpr d0, d1, d2;
-    bindDims(ctx, d0, d1, d2);
+    AffineExpr d0, d1, d2, d3;
+    bindDims(ctx, d0, d1, d2, d3);
     auto maps = con.getIndexingMapsArray();
     auto it = con.getIteratorTypesArray();
-    if (con.getNumDpsInputs() != 2 || con.getNumDpsInits() != 1 || it.size() != 3 ||
-        it[2] != utils::IteratorType::reduction || maps[0] != AffineMap::get(3, 0, {d2}, ctx) ||
-        maps[1] != AffineMap::get(3, 0, {d0, d2, d1}, ctx) || maps[2] != AffineMap::get(3, 0, {d0, d1}, ctx))
+    if (con.getNumDpsInputs() != 2 || con.getNumDpsInits() != 1) return false;
+    // decode: (t, j, k) x[k] Wp[t, k, j]; prefill: (m, t, j, k) x[m, k] Wp[t, k, j]
+    bool rows4 = it.size() == 4 && it[3] == utils::IteratorType::reduction &&
+                 maps[0] == AffineMap::get(4, 0, {d0, d3}, ctx) && maps[1] == AffineMap::get(4, 0, {d1, d3, d2}, ctx) &&
+                 maps[2] == AffineMap::get(4, 0, {d0, d1, d2}, ctx);
+    if (!rows4 && (it.size() != 3 || it[2] != utils::IteratorType::reduction ||
+                   maps[0] != AffineMap::get(3, 0, {d2}, ctx) || maps[1] != AffineMap::get(3, 0, {d0, d2, d1}, ctx) ||
+                   maps[2] != AffineMap::get(3, 0, {d0, d1}, ctx)))
       return false;
     Block &b = con.getRegion().front();
     auto y = cast<linalg::YieldOp>(b.getTerminator());
@@ -1689,6 +1698,7 @@ private:
     p.con = con;
     auto lx = loadInto(con.getDpsInputs()[0]), lw = loadInto(con.getDpsInputs()[1]);
     SmallVector<Operation *> xOps;
+    if (!lx && rows4) return false;                 // the strip of D rows: int8 x in DDR
     if (!lx) {
       // x through its i8 -> i32 extension (part of the linear layer, as C3)
       Value xi = con.getDpsInputs()[0];
@@ -1717,6 +1727,10 @@ private:
     if (!wt.getElementType().isInteger(8) || wt.getRank() != 3 || wt.getDimSize(2) != d ||
         !(xt.getElementType().isInteger(8) || xt.getElementType().isInteger(32)))
       return false;
+    if (rows4) {
+      p.rows = xt.getDimSize(0);
+      if (!xt.getElementType().isInteger(8) || p.rows % d) return false;
+    }
     p.acc = con.getDpsInits()[0];
     linalg::FillOp fill;
     for (Operation *u : p.acc.getUsers()) {
@@ -1729,7 +1743,7 @@ private:
         *getConstantIntValue(fill.getDpsInputs()[0]) != 0)
       return false;
     linalg::GenericOp e = p.epi;
-    if (e.getNumDpsInits() != 1 || e.getNumReductionLoops() || e.getNumLoops() != 2 ||
+    if (e.getNumDpsInits() != 1 || e.getNumReductionLoops() || e.getNumLoops() != (rows4 ? 3 : 2) ||
         !e.getIndexingMapsArray().back().isIdentity())
       return false;
     Value out = e.getDpsInits()[0];
@@ -1748,9 +1762,15 @@ private:
       if (!l) return false;
       for (Operation *u : in.getUsers())
         if (u != e.getOperation() && u != l.getOperation() && !isa<memref::DeallocOp>(u)) return false;
-      if (e.getIndexingMapsArray()[i].isIdentity()) {
-        if (!cast<MemRefType>(in.getType()).getElementType().isF32()) return false;
+      AffineMap em = e.getIndexingMapsArray()[i];
+      bool f32 = cast<MemRefType>(in.getType()).getElementType().isF32();
+      if (em.isIdentity()) {
+        if (!f32) return false;
         p.chunked.push_back({i, l.getSrc()});
+      } else if (rows4 && f32 && em == AffineMap::get(3, 0, {d1, d2}, ctx)) {
+        p.cols.push_back({i, l.getSrc()});
+      } else if (rows4 && f32 && em == AffineMap::get(3, 0, {d0}, ctx)) {
+        p.rowv.push_back({i, l.getSrc()});
       } else {
         p.whole.push_back({i, l.getSrc()});
       }
@@ -1762,12 +1782,142 @@ private:
     if (k > int64_t(lay.sbank) || k * d > 65535 || k + k / d > 2 * int64_t(lay.sbank) ||
         lay.acc0 + k / d + 2 > lay.cbank)
       return false;
+    if (rows4 && (p.rows / d) * k > 2 * int64_t(lay.sbank)) return false;   // the strips of all row blocks
     for (Operation *o : cover) owned.insert(o);
     linears[con.getOperation()] = p;
     return true;
   }
 
+  // prefill's linear layer (plan §8.13): each block of D rows of int8 x is one
+  // A strip (an interleaved DMA: block c of K, word r = row r's D elements c,
+  // exactly EX's A layout), so the D x D array computes D rows at once and a
+  // chunk of weight tiles serves every row block. Per chunk of output tiles:
+  // its B tiles and per-column inputs, then per row block the EX (output rows
+  // crow = nc words apart), the epilogue over D x nc words (per-column inputs
+  // by MOD nc, per-row broadcast words by DIV nc), the store of D rows.
+  // A serial schedule (no prefetch yet).
+  bool linearRows(LinearPlan &p) {
+    auto wt = cast<MemRefType>(p.w.getType());
+    const int64_t k = wt.getDimSize(1), nt = wt.getDimSize(0), N = nt * d, M = p.rows, nb = M / d;
+    const uint32_t sb = lay.sbank;
+    auto xd = ddrOf(p.x), wd = ddrOf(p.w), yd = ddrOf(p.store.getDst());
+    if (!xd || !wd || !yd) return false;
+    if (xd->off % 8 || wd->off % 8 || yd->off % 8 || k % 8) return fail("linear rows: unaligned operand");
+    SmallVector<uint32_t> strips;
+    for (int64_t rb = 0; rb < nb; ++rb) {
+      LocalBuf st = newLocal(::sa::VT_I8, k * d);
+      sahw::LdOp::create(bb, loc, xd->base, xd->off + rb * d * k, int64_t(st.la), d, k, k, /*INTERLEAVE=*/1,
+                         ValueRange{});
+      strips.push_back(st.la);
+    }
+    std::map<int, LocalBuf> rowB;                       // per-row inputs: a broadcast word per row
+    for (auto &[i, src] : p.rowv) {
+      Value in = p.epi.getDpsInputs()[i];
+      auto l = materialize(src);
+      if (!l) return false;
+      locals[in] = *l;
+      auto b = perElementBcast(in, *l, M);
+      if (!b) return false;
+      rowB[i] = *b;
+    }
+    std::map<int, LocalBuf> scal;                       // other inputs: scalars
+    for (auto &[i, src] : p.whole) {
+      Value in = p.epi.getDpsInputs()[i];
+      if (cast<MemRefType>(in.getType()).getRank() != 0) return fail("linear rows: epilogue input layout");
+      auto l = materialize(src);
+      if (!l) return false;
+      locals[in] = *l;
+      auto b = scalarBcast(in, *l);
+      if (!b) return false;
+      scal[i] = *b;
+    }
+    SmallVector<Ddr> cd, ed;
+    for (auto &[i, src] : p.cols) {
+      auto r = ddrOf(src);
+      if (!r || r->off % 8) return fail("linear rows: per-column input");
+      cd.push_back(*r);
+    }
+    for (auto &[i, src] : p.chunked) {
+      auto r = ddrOf(src);
+      if (!r || r->off % 8) return fail("linear rows: per-element input");
+      ed.push_back(*r);
+    }
+    // chunks: the B tiles in one SPAD_B bank, D x nc words per ACC buffer
+    int64_t nc = std::min<int64_t>(std::max<int64_t>(sb / k, 1), 32);
+    while (nc > 1 && nt % nc) --nc;
+    if (nc * k > int64_t(sb)) return fail("linear rows: one weight tile does not fit a SPAD_B bank");
+    for (int64_t c0 = 0, ci = 0; c0 < nt; c0 += nc, ++ci) {
+      uint32_t savedTop[2] = {accTop[0], accTop[1]};
+      uint32_t bw = uint32_t(ci & 1) * sb;
+      sahw::LdOp::create(bb, loc, wd->base, wd->off + c0 * k * d, int64_t(::sa::laddr(::sa::MEM_SPAD_B, bw)), nc,
+                         k * d, k * d, 0, ValueRange{});
+      SmallVector<LocalBuf> cl;
+      for (const Ddr &r : cd) {
+        LocalBuf l = newLocal(::sa::VT_F32, nc * d);
+        sahw::LdOp::create(bb, loc, r.base, r.off + c0 * d * 4, int64_t(l.la), 1, nc * d * 4, nc * d * 4, 0,
+                           ValueRange{});
+        cl.push_back(l);
+      }
+      for (int64_t rb = 0; rb < nb; ++rb) {
+        uint32_t savedRb[2] = {accTop[0], accTop[1]};
+        const int64_t n = d * nc * d;
+        LocalBuf acc = newLocal(::sa::VT_I32, n);
+        sahw::ExOp::create(bb, loc, int64_t(strips[rb] & 0xFFFFFFF), int64_t(bw), int64_t(acc.la & 0xFFFFFFF),
+                           k / d, false, nc, k, 1, nc, ValueRange{});
+        Chunk ch;
+        ch.n = n;
+        LocalBuf out = newLocal(::sa::VT_F32, n);
+        ch.outLa = out.la;
+        const int64_t off = (rb * d * N + c0 * d) * 4;
+        for (int in = 0; in < p.epi.getNumDpsInputs(); ++in) {
+          Val v;
+          v.kind = Val::Mem;
+          if (p.epi.getDpsInputs()[in] == p.acc) {
+            v.o = {acc.la, ::sa::VT_I32, ::sa::IDX_LIN, 0};
+            ch.inputs[in] = v;
+          }
+        }
+        for (size_t m = 0; m < ed.size(); ++m) {
+          LocalBuf l = newLocal(::sa::VT_F32, n);
+          sahw::LdOp::create(bb, loc, ed[m].base, ed[m].off + off, int64_t(l.la), d, nc * d * 4, N * 4, 0,
+                             ValueRange{});
+          Val v;
+          v.kind = Val::Mem;
+          v.o = {l.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
+          ch.inputs[p.chunked[m].first] = v;
+        }
+        for (size_t m = 0; m < cl.size(); ++m) {
+          Val v;
+          v.kind = Val::Mem;
+          v.o = {cl[m].la, ::sa::VT_F32, ::sa::IDX_MOD, uint32_t(nc)};
+          ch.inputs[p.cols[m].first] = v;
+        }
+        for (auto &[i, b] : rowB) {
+          Val v;
+          v.kind = Val::Mem;
+          v.o = {b.la + uint32_t(rb * d), ::sa::VT_F32, ::sa::IDX_DIV, uint32_t(nc)};
+          ch.inputs[i] = v;
+        }
+        for (auto &[i, b] : scal) {
+          Val v;
+          v.kind = Val::Mem;
+          v.o = {b.la, ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+          v.uni = 1;
+          ch.inputs[i] = v;
+        }
+        if (!generic(p.epi, nullptr, &ch)) return false;
+        sahw::StOp::create(bb, loc, yd->base, yd->off + off, int64_t(out.la), d, nc * d * 4, N * 4, ValueRange{});
+        accTop[0] = savedRb[0];
+        accTop[1] = savedRb[1];
+      }
+      accTop[0] = savedTop[0];
+      accTop[1] = savedTop[1];
+    }
+    return err.empty();
+  }
+
   bool linear(LinearPlan &p) {
+    if (p.rows) return linearRows(p);
     auto wt = cast<MemRefType>(p.w.getType());
     const uint32_t k = uint32_t(wt.getDimSize(1)), nt = uint32_t(wt.getDimSize(0));
     const uint32_t sb = lay.sbank, cb = lay.cbank;

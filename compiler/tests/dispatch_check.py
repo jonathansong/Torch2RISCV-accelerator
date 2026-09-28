@@ -204,15 +204,21 @@ def main():
     ap.add_argument("--t", type=int, default=16)
     ap.add_argument("numbers", nargs="*")
     args = ap.parse_args()
-    srcs = sorted(glob.glob(os.path.join(args.sources, "*.mlir")),
-                  key=lambda p: int(re.findall(r"_(\d+)\.mlir$", p)[0]))
+    # module_<function>$async_dispatch_<n>.mlir: numbered per function (a module
+    # with prefill and main); numbers select "n" (any function) or "function:n"
+    def fn_num(p):
+        m = re.search(r"module_(.*)\$async_dispatch_(\d+)\.mlir$", os.path.basename(p))
+        return (m.group(1), int(m.group(2))) if m else ("", int(re.findall(r"_(\d+)\.mlir$", p)[0]))
+    srcs = sorted(glob.glob(os.path.join(args.sources, "*.mlir")), key=lambda p: (fn_num(p)[0] != "main", fn_num(p)))
     counts = {}
     for p in srcs:
-        num = re.findall(r"_(\d+)\.mlir$", p)[0]
-        if args.numbers and num not in args.numbers:
+        fn, n = fn_num(p)
+        num = str(n) if fn in ("", "main") else f"{fn}:{n}"
+        if args.numbers and str(n) not in args.numbers and num not in args.numbers:
             continue
-        bins = glob.glob(os.path.join(args.binaries, f"*dispatch_{num}_*.sadesc")) + \
-            glob.glob(os.path.join(args.binaries, f"*dispatch_{num}.sadesc"))
+        stem = os.path.basename(p)[:-len(".mlir")]
+        bins = glob.glob(os.path.join(args.binaries, glob.escape(stem) + "_*.sadesc")) + \
+            glob.glob(os.path.join(args.binaries, glob.escape(stem) + ".sadesc"))
         if not bins:
             res = "no binary"
         else:
