@@ -33,6 +33,9 @@ IREE_FLAG(int32_t, pad, 0,
           "Dynamic attention length: valid has length pos + 1 rounded up to a multiple of this (0: valid_len).");
 IREE_FLAG(string, logits_out, "", "File the float32 logits of every step are appended to.");
 IREE_FLAG(int32_t, stop_token, -1, "Stop generating after this token (an end-of-sequence id; -1: none).");
+IREE_FLAG(int32_t, prefill, 0,
+          "Prefill chunk M: a prompt of >= M tokens through the module's prefill(tokens[M], positions[M], valid) "
+          "in chunks at 0, M, 2M, ... and P - M, then decode (plan §8.13).");
 
 static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* allocator, const void* data,
                                iree_host_size_t n, iree_hal_element_type_t type, iree_hal_buffer_view_t** out) {
@@ -44,6 +47,43 @@ static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* 
   return iree_hal_buffer_view_allocate_buffer_copy(
       device, allocator, 1, shape, type, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, params,
       iree_make_const_byte_span(data, n * iree_hal_element_dense_byte_count(type)), out);
+}
+
+// f(a[na]: i64, b[nb]: i64, valid[nv]: f32) -> logits (f32, copied to *logits)
+static iree_status_t call3(iree_vm_context_t* context, iree_vm_function_t function, iree_hal_device_t* device,
+                           iree_hal_allocator_t* allocator, iree_allocator_t host, const int64_t* a, int na,
+                           const int64_t* b, int nb, const float* valid, iree_host_size_t nv, float** logits,
+                           iree_host_size_t* vocab) {
+  iree_vm_list_t *inputs = NULL, *outputs = NULL;
+  iree_hal_buffer_view_t *ba = NULL, *bbv = NULL, *bv = NULL;
+  iree_status_t status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 3, host, &inputs);
+  if (iree_status_is_ok(status)) status = make_view(device, allocator, a, na, IREE_HAL_ELEMENT_TYPE_INT_64, &ba);
+  if (iree_status_is_ok(status)) status = make_view(device, allocator, b, nb, IREE_HAL_ELEMENT_TYPE_INT_64, &bbv);
+  if (iree_status_is_ok(status)) status = make_view(device, allocator, valid, nv, IREE_HAL_ELEMENT_TYPE_FLOAT_32, &bv);
+  iree_hal_buffer_view_t* views[3] = {ba, bbv, bv};
+  for (int i = 0; i < 3 && iree_status_is_ok(status); ++i) {
+    iree_vm_ref_t r = iree_hal_buffer_view_move_ref(views[i]);
+    views[i] = NULL;
+    status = iree_vm_list_push_ref_move(inputs, &r);
+  }
+  for (int i = 0; i < 3; ++i) iree_hal_buffer_view_release(views[i]);
+  if (iree_status_is_ok(status)) status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 1, host, &outputs);
+  if (iree_status_is_ok(status))
+    status = iree_vm_invoke(context, function, IREE_VM_INVOCATION_FLAG_NONE, NULL, inputs, outputs, host);
+  iree_hal_buffer_view_t* out = NULL;
+  if (iree_status_is_ok(status)) {
+    out = iree_vm_list_get_buffer_view_assign(outputs, 0);
+    if (!out) status = iree_make_status(IREE_STATUS_INTERNAL, "no output");
+  }
+  if (iree_status_is_ok(status)) {
+    *vocab = iree_hal_buffer_view_element_count(out);
+    if (!*logits) *logits = malloc(*vocab * sizeof(float));
+    status = iree_hal_device_transfer_d2h(device, iree_hal_buffer_view_buffer(out), 0, *logits, *vocab * sizeof(float),
+                                          IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+  }
+  iree_vm_list_release(inputs);
+  iree_vm_list_release(outputs);
+  return status;
 }
 
 static double now(void) {
@@ -96,7 +136,44 @@ static iree_status_t run(iree_allocator_t host) {
   double total = 0;
   int64_t token = toks[0];
   printf("tokens:");
-  for (int pos = 0; pos < steps && iree_status_is_ok(status); ++pos) {
+  // prefill: the prompt in chunks of M (the last one at P - M), its last
+  // position's logits give the first generated token
+  int pos0 = 0, M = FLAG_prefill;
+  double prefill_time = 0;
+  int chunks = 0;
+  if (iree_status_is_ok(status) && M > 0 && ntok >= M) {
+    iree_vm_function_t pf;
+    status = iree_vm_module_lookup_function_by_name(main_module, IREE_VM_FUNCTION_LINKAGE_EXPORT, IREE_SV("prefill"),
+                                                    &pf);
+    int64_t* pos_buf = malloc((size_t)M * sizeof(int64_t));
+    for (int s0 = 0; iree_status_is_ok(status);) {
+      int s = s0 + M >= ntok ? ntok - M : s0;
+      for (int i = 0; i < M; ++i) pos_buf[i] = s + i;
+      for (int i = 0; i <= s + M - 1; ++i) valid[i] = 1.0f;
+      iree_host_size_t vlen = FLAG_pad > 0 ? (iree_host_size_t)(((s + M - 1) / FLAG_pad + 1) * FLAG_pad)
+                                           : (iree_host_size_t)FLAG_valid_len;
+      double t0 = now();
+      status = call3(context, pf, device, allocator, host, toks + s, M, pos_buf, M, valid, vlen, &logits, &vocab);
+      prefill_time += now() - t0;
+      ++chunks;
+      if (s + M >= ntok) break;
+      s0 += M;
+    }
+    free(pos_buf);
+    if (iree_status_is_ok(status)) {
+      if (lf) fwrite(logits, sizeof(float), vocab, lf);
+      iree_host_size_t best = 0;
+      for (iree_host_size_t i = 1; i < vocab; ++i)
+        if (logits[i] > logits[best]) best = i;
+      for (int i = 0; i < ntok; ++i) printf(" %" PRId64, toks[i]);
+      fflush(stdout);
+      token = (int64_t)best;
+      pos0 = ntok;
+      if (FLAG_stop_token >= 0 && token == FLAG_stop_token) steps = ntok;
+      sa_context_profile_reset();
+    }
+  }
+  for (int pos = pos0; pos < steps && iree_status_is_ok(status); ++pos) {
     if (pos < ntok) token = toks[pos];
     valid[pos] = 1.0f;
     int64_t pos64 = pos;
@@ -154,9 +231,17 @@ static iree_status_t run(iree_allocator_t host) {
   }
   if (iree_status_is_ok(status) && FLAG_generate) printf(" %" PRId64, token);
   printf("\n");
-  if (iree_status_is_ok(status) && steps > 1)
+  if (iree_status_is_ok(status) && pos0 > 0) {
+    printf("prefill: %d prompt tokens in %d chunks of %d, %.1f ms (%.2f tokens/s; the first chunk includes loading)",
+           ntok, chunks, M, 1e3 * prefill_time, ntok / prefill_time);
+    if (steps > pos0)
+      printf("; %d decode steps, %.1f ms per step (%.2f tokens/s)", steps - pos0, 1e3 * total / (steps - pos0),
+             (steps - pos0) / total);
+    printf("\n");
+  } else if (iree_status_is_ok(status) && steps > 1) {
     printf("%d steps, %.1f ms per step after the first (%.2f tokens/s)\n", steps, 1e3 * total / (steps - 1),
            (steps - 1) / total);
+  }
   if (iree_status_is_ok(status)) {
     sa_context_t* sc = NULL;
     if (iree_status_is_ok(sa_context_get(&sc)))
