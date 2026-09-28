@@ -665,6 +665,8 @@ linalg / scf（IREE 的 dispatch）
 | 15 | sahw | `sahw-assign-registers` | BASE / PARAM 分配与装载表（§4.4），BASE15 留给前缀 |
 | 16 | sahw → 字节 | 序列化 | `sahw.template` → sa-desc v3，经 `DescList`（RISC-V 后端改为 `sahw-to-llvm`，§8.10） |
 
+**实现状态（2026-09-29）**：第 1–3、5–9、12–14 项实际上都合在 `sahl-to-sahw` 一个转换里，差距与拆分计划见 §8.14（C8）。
+
 ### 8.5 代价模型
 
 分块、调度，以及 C4 暂缓的融合都需要它。块 1 预取的教训（§7.1）说明，不能凭经验放置加载。
@@ -996,6 +998,62 @@ C5.5 的模型（§8.9 的第一步）：
   - 时序：LUTRAM 读加操作数多路器要在 13.3 ns 内；不满足时操作数加一级寄存器，延迟多 1 拍，8 个槽仍能藏住。
 - **状态**：暂缓（2026-09-28）。生成速度的瓶颈在 decode，先对 SmolLM2 的 decode 做一次板上剖析再决定下一步。
 
+### 8.14 C8 代码生成分层重构：把 `sahl-to-sahw` 拆成 pass
+
+**起因（2026-09-29 的评估）**：§8.3 / §8.4 设计了 16 个 pass，每个决定在自己的 pass 里做，可以用 `iree-opt` 单独运行和测试。实际实现只有：
+
+| 实际的 pass | 做的事 |
+|---|---|
+| IREE 的 comprehensive bufferize | tensor → memref |
+| `iree-sa-to-sahl`（140 行） | 只把 copy 换成 `sahl.load / store`；`sahl` 方言也只有这两个操作 |
+| **`iree-sahl-to-sahw`（3052 行，一个 `Lowerer` 类）** | 其余几乎全部：微内核的匹配与选择、contraction / 注意力 / 线性层的识别、分块与分片（平坦分片、按行分片、K 块、N 块）、片上内存分配（顺序分配）、预取与双缓冲、DDR 视图与动态 DMA、gather / scatter、逐元素运算体的翻译 |
+| `iree-sahw-fuse-ve`、`iree-sahw-split-head`、`iree-sahw-assign-registers` | 与设计一致 |
+
+`SahlToSahw.cpp` 里各部分的大小：逐元素运算（`generic`）约 730 行，通用 contraction 约 520 行，线性层（含 `linearRows`）约 430 行，注意力约 250 行，DDR 与 DMA 约 300 行，分片约 200 行。
+
+**问题**：
+- **特例互相影响**：同一个 `Lowerer` 的成员状态（`piece`、`rowPiece`、`locals`、`bcastOf`、`accTop`）被各条路径共用。例如 C6.P 的 M = 16 错误：平坦分片的偏移用到了列切片的视图上。
+- **决定不可见**：分块、分片、内存位置、预取都只存在于 C++ 的控制流里，IR 上看不到，也不能单独测试（`test/` 下只有 `sahw` 的 lit 测试）。
+- **扩展困难**：T 分块注意力（C6.5）、代价模型（§8.5）、编译期调度（C4 暂缓的融合）、主机退路、C7 都需要在 IR 上可见的分块与内存规划。
+
+**目标**：按 §8.3 / §8.4 的分层把决定移进独立的 pass；`sahl-to-sahw` 最后只做一对一的翻译（目标 < 1000 行）。**每一步生成的描述符逐字节不变**：这是重构，不是优化，所以不需要重新上板。
+
+**验收的护栏：黄金语料**（第一步先做）
+- 现在所有测试用到的可执行体，保存各自的 `.sadesc`：
+  - stories15M decode + prefill（M = 8，181 个）；
+  - SmolLM2 prefill M = 8（777 个）；
+  - Qwen3 两层配置；
+  - 合成的 K = 16384 模型；
+  - `--iree-sa-ukernels=none` 配置；
+  - D = 16、更大 SPAD / ACC 的配置。
+- `compiler/tests/golden.py`：`--record` 保存，默认模式重新编译并逐字节比较，列出不同的可执行体；加进 `run_tests.sh`。
+- 某一步必须改变输出时（例如内存位置的顺序变了），单独说明理由；这些可执行体改用 `dispatch_check`（T = 16 / 80 / 256）与 sim 的端到端逐位一致来验收，并对比 `board_profile` 的周期。
+
+**步骤**
+
+| 步骤 | 内容 | 验收 |
+|---|---|---|
+| **R0 护栏** | 黄金语料与 `golden.py`；给现有的 pass 补 lit 测试的框架（`iree-opt` 能单独运行每个 pass） | 语料可重现（同一编译器两次记录相同） |
+| **R1 `sahl` 操作** | 按 §8.3 补齐 `sahl.matmul`（int8 tile 乘、int32 累加、可累加）、`sahl.elementwise`（带 region，保留 indexing map）、`sahl.reduce`、`sahl.relayout`（转置、DIV-D 复制、打包成广播字）、`sahl.gather`、`sahl.scatter`、`sahl.scalar`；片上 memref 带 `#sa.mem` 与 `#sa.layout`。`sa-to-sahl` 负责识别：to_i8 链、contraction、线性层、注意力的匹配从 `Lowerer` 挪过来；`sahl-to-sahw` 改为读 `sahl` 操作，不再重新匹配 linalg | 黄金语料逐字节相同；每种 `sahl` 操作有 roundtrip 与 verifier 的 lit 测试 |
+| **R2 微内核** | 线性层（含 `linearRows`）与注意力的微内核改成 `sahl` 层的展开（§8.8）：一个 pass 把匹配到的操作展开成 `sahl.load / matmul / elementwise` 的序列，由 `--iree-sa-ukernels` 选择 | 逐字节相同；微内核与 `ukernels=none` 两种配置都在语料里 |
+| **R3 `sahl-tile`** | 分块与分片变成 IR：contraction 的 N 块、K 块，逐元素运算的平坦分片与按行分片，都改写成 scf 循环（或展开的 `sahl` 操作）作用在子视图上；取代 `Lowerer` 里用成员状态重跑 `lowerBody` 的做法 | 逐字节相同；lit：给定目标配置的容量，检查分块的结果 |
+| **R4 `sahl-plan-memory`** | 片上缓冲的 bank 与偏移由一个 pass 写成属性（双缓冲的块放不同 bank，容量不够时报错并给出建议的块大小）；取代 `allocAcc`、`newLocal` 的顺序分配 | 逐字节相同（先照搬现在的分配顺序）；lit：容量检查、bank 冲突 |
+| **R5 `sahl-pipeline`** | 双缓冲与预取变成 IR：第 i 块 EX 之后装第 i + 1 块到另一个 bank（`linearRows` 的预取、线性层的双缓冲） | 逐字节相同 |
+| **R6 翻译与动态值** | `sahl-to-sahw` 只做一对一翻译；动态值（行循环、动态 DMA、PARAM）挪到 `sahw-legalize-dynamic` | 逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 都有 lit 测试 |
+| R7（之后） | 代价模型（§8.5）接进 `sahl-tile` 与 `sahl-pipeline` 的选择；这时才允许输出改变（按周期验收） | 板上逐 dispatch 周期不变差 |
+
+**顺序与依赖**：R0 → R1 → R2 → R3 → R4 → R5 → R6，每步单独提交。R1 是最大的一步（识别逻辑全部搬家）；R3 与 R4 是 C6.5（T 分块注意力）与代价模型的前提。
+
+**风险**：
+- **逐字节相同太严**：某些步骤里操作或分配的顺序很难保持原样。对策：先在新 pass 里照搬现在的顺序，确实做不到的按上面的例外规则验收。
+- **bufferize 与内存空间**：片上 memref 带 `#sa.mem` 后，IREE 的 bufferize 与 memref 的 canonicalize 可能不认识；必要时 `#sa.mem` 只在 `sa-to-sahl` 之后出现。
+- **工作量**：大（约与 C5.1–C5.3 相当）。这一阶段没有可见的功能，价值体现在后面的扩展（T 分块、代价模型、主机退路、C7、前端通用化）。
+
+**之后建议的覆盖面工作**（本节之外，另行规划）：
+1. **主机退路**：sa 编不了的 dispatch 交给 ARM 上的 llvm-cpu（IREE 的异构设备）；现在只能报错。
+2. **前端通用化**：量化与形式改写（gather、KV 的写法、prefill 的逐行展开）从手写模型挪进编译器的预处理 pass，让 HuggingFace 的原始建模代码可以直接编译。
+3. **非 Llama 结构**：例如 GPT-2（LayerNorm、GELU），验证泛化能力。
+
 ## 9. 验证体系
 
 | 层次 | 内容 | 工具 |
@@ -1023,6 +1081,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
+| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**计划中** | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。
