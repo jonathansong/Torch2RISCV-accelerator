@@ -16,6 +16,7 @@ path).
     python3 compiler/tests/test_c3.py [--steps 12] [--generate 20] [--board-bundle DIR]
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -126,6 +127,9 @@ def stage(dst, out, prompt, dm, cfg, w, kv, tok, n_gen):
     np.save(os.path.join(dst, "prompt.npy"), np.array(prompt, np.int64))
     shutil.copy(os.path.join(REPO, "build", "llm_cache", "tokenizer.bin"), os.path.join(dst, "tokenizer.bin"))
     shutil.copy(os.path.join(REPO, "llm", "tokenizer.py"), os.path.join(dst, "tokenizer.py"))
+    # board_generate.py: llama2.c's convention (BOS 1 starts a story, and a new BOS ends it)
+    with open(os.path.join(dst, "model.json"), "w") as f:
+        json.dump({"tokenizer": "llama2", "vocab": cfg.vocab, "bos": 1, "stop": 1, "context": cfg.seq_len}, f)
     print(f"board bundle: {dst} ({len(tokens)} expected tokens)")
 
 

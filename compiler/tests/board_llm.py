@@ -8,14 +8,13 @@ the functional simulator), and the generated text printed.
 Files in one directory on the board: this script, board_launcher.py,
 pynq_matmul.py, picorv32.bit / .hwh (L2), rt_fw.bin, sa-llm-run (armv7),
 sa.vmfb, sa_packed.irpa, expected_tokens.npy, expected_logits.npy, prompt.npy,
-the tokenizer (tokenizer.bin + tokenizer.py, or a HuggingFace tokenizer.json),
+the tokenizer (tokenizer.bin + tokenizer.py, or tokenizer.json + hf_tokenizer.py),
 optional board.txt (the reference's name, the window size in MB) and
 sa_args.txt (extra sa-llm-run arguments).
 
     sudo bash -c 'source /etc/profile.d/pynq_venv.sh && source /etc/profile.d/xrt_setup.sh && \\
         cd /home/xilinx/c3 && python3 board_llm.py'
 """
-import json
 import os
 import subprocess
 import sys
@@ -28,22 +27,10 @@ import board_launcher as BL  # noqa: E402
 
 
 def decoder(vocab):
-    """ids -> text: llama2.c tokenizer.bin, or a byte-level BPE tokenizer.json."""
+    """ids -> text: a byte-level BPE tokenizer.json (hf_tokenizer.py), or llama2.c tokenizer.bin."""
     if os.path.exists(os.path.join(HERE, "tokenizer.json")):
-        tj = json.load(open(os.path.join(HERE, "tokenizer.json")))
-        inv = {i: s for s, i in tj["model"]["vocab"].items()}
-        for t in tj.get("added_tokens", []):
-            inv[t["id"]] = t["content"]
-        bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-        cs, n = bs[:], 0
-        for b in range(256):
-            if b not in bs:
-                bs.append(b)
-                cs.append(256 + n)
-                n += 1
-        u2b = {chr(c): b for b, c in zip(bs, cs)}
-        return lambda ids: bytes(u2b.get(ch, 32) for ch in "".join(inv.get(i, "") for i in ids)).decode(
-            "utf-8", errors="replace")
+        from hf_tokenizer import BpeTokenizer
+        return BpeTokenizer(HERE).decode
     from tokenizer import Tokenizer
     return Tokenizer(os.path.join(HERE, "tokenizer.bin"), vocab).decode
 

@@ -11,7 +11,7 @@ rm -rf "$D" && mkdir -p "$D"
 "$SA_PY" "$SA_COMPILER/tests/test_c3.py" --board-bundle "$D" "$@"
 "$SA_COMPILER/scripts/build_sa_runtime.sh" armv7 | tail -1
 llvm-strip-18 -o "$D/sa-llm-run" "$SA_REPO/build/iree/build-sa-armv7/runtime/plugins/hal/drivers/sa/sa-llm-run"
-cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/runtime/test/board_launcher.py" "$SA_REPO/driver/pynq_matmul.py" \
+cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/runtime/test/board_launcher.py" "$SA_REPO/driver/pynq_matmul.py" \
    "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"
 cp "$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2/picorv32.bit" "$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2/picorv32.hwh" "$D/"
 ls -la "$D"

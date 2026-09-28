@@ -20,6 +20,7 @@ hand-written device model for it, so:
         [--check] [--steps 8] [--generate 8] [--mb 168] [--board-bundle build/deploy_c55]
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -155,6 +156,14 @@ def stage(args, out, prompt, tok):
     np.save(os.path.join(dst, "expected_tokens.npy"), np.array(tokens[:len(logits)], np.int64))
     np.save(os.path.join(dst, "expected_logits.npy"), logits.astype(np.float32))
     shutil.copy(os.path.join(args.model, "tokenizer.json"), os.path.join(dst, "tokenizer.json"))
+    shutil.copy(os.path.join(COMPILER, "frontend", "hf_tokenizer.py"), os.path.join(dst, "hf_tokenizer.py"))
+    mc = json.load(open(os.path.join(args.model, "config.json")))
+    eos = mc.get("eos_token_id")
+    with open(os.path.join(dst, "model.json"), "w") as f:
+        json.dump({"tokenizer": "hf", "bos": None, "stop": eos[0] if isinstance(eos, list) else eos,
+                   "context": 256}, f)
+    with open(os.path.join(dst, "sa_args.txt"), "w") as f:
+        f.write("--pad=8\n")                             # as the sim run: the attention length follows pos
     with open(os.path.join(dst, "board.txt"), "w") as f:
         f.write(f"the functional simulator {args.mb}\n")
     print(f"board bundle: {dst} ({len(tokens)} expected tokens from the sim in {time.time() - t0:.0f} s): "

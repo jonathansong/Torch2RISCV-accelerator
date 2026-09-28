@@ -19,10 +19,10 @@ an `sa` HAL driver through the command ring.
 | `scripts/deploy_c3.sh` | Runs the C3 host test and stages the board test in `build/deploy_c3` | C3 |
 | `scripts/deploy_c55.sh` | Runs the C5.5 host test on SmolLM2-135M and stages the board test in `build/deploy_c55` | C5.5 |
 | `plugins/sa/` | The `sa` HAL target plugin (C++). `dialect/`: the `sahl` (tile) and `sahw` (command) dialects. `transforms/`: the C5 pipeline (sa-to-sahl, sahl-to-sahw with the micro-kernels, sahw-fuse-ve, head split, register assignment), the sahw serializer, the target configuration. `target/`: the `sa` device and backend, the preprocessing passes (weight packing, cheap-producer cloning), `DescList`, `Layout`. `test/`: lit tests (iree-opt + FileCheck). `templates/reference.py`: the Python reference of the linear-layer schedule (test_c2 compares the commands) | C2–C5 |
-| `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories); `qhf.py` (HuggingFace Llama / Qwen3 decoders: config, safetensors, BPE tokenizer, fp32 and quantized models), `export_hf.py` (their export), `synth_hf.py` (random-weight HF models of any shape) | C0, C5.5 |
+| `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories); `qhf.py` (HuggingFace Llama / Qwen3 decoders: config, safetensors, BPE tokenizer, fp32 and quantized models), `export_hf.py` (their export), `synth_hf.py` (random-weight HF models of any shape), `hf_tokenizer.py` (the BPE tokenizer, standard library only: also on the board) | C0, C5.5 |
 | `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports; its own device and command buffer (C4) record a command buffer's dispatches and build one descriptor list per command buffer. `tools/`: sa-desc writer / reader (`sadesc.py`, format versions 1–3), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
 | `sim/` | `sa_sim_server.py` (the `sim` transport's device: `llm/sa_funcsim.py` on a shared-memory DDR), `sa_board_emu.py` (rt_fw's ring emulated on the host, for the `board` transport) | C1 |
-| `tests/` | `test_c2.py` / `test_c3.py` / `test_c5.py` / `test_c55.py` (host), `board_c2.py` / `board_llm.py` / `board_profile.py` (board); `oracle.py` (reference interpreter of dispatch IR with the device's numerics), `dispatch_check.py` (per-dispatch differential test), `summarize.py` | C2– |
+| `tests/` | `test_c2.py` / `test_c3.py` / `test_c5.py` / `test_c55.py` (host), `board_c2.py` / `board_llm.py` / `board_generate.py` (interactive) / `board_profile.py` (board); `oracle.py` (reference interpreter of dispatch IR with the device's numerics), `dispatch_check.py` (per-dispatch differential test), `summarize.py` | C2– |
 
 ## Environment
 
@@ -189,6 +189,8 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   python3 compiler/frontend/export_hf.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2
   python3 compiler/tests/test_c55.py --model build/llm_cache/SmolLM2-135M --out build/c55/smollm2 --check
   compiler/scripts/deploy_c55.sh                     # board: python3 board_llm.py (window 168 MB; the board needs cma=320M in uEnv.txt, see the plan §8.7)
+  # interactive generation on the board (either bundle: deploy_c3 = stories15M, deploy_c55 = SmolLM2-135M):
+  #   python3 board_generate.py [--max-new 64] [--prompt "..."]   (a prompt per line; tokens printed as they come)
   python3 compiler/frontend/export_hf.py --model build/llm_cache/Qwen3-0.6B --out build/c55/qwen3_l2 --layers 2
   python3 compiler/tests/test_c55.py --model build/llm_cache/Qwen3-0.6B --out build/c55/qwen3_l2 --check --mb 384
   # a synthetic model beyond this board's shapes (K = 16384: K blocks; 64 KB vectors: pieces)

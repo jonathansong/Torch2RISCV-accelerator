@@ -4,7 +4,7 @@
 // IREE counterpart of llm/runtime.py LlamaDevice.
 //
 //   sa-llm-run --device=sa --module=sa.vmfb --parameters=model=sa_packed.irpa \
-//       --tokens=1,9038,2501 [--generate=20] [--valid_len=256] [--logits_out=logits.f32]
+//       --tokens=1,9038,2501 [--generate=20] [--stop_token=2] [--valid_len=256] [--logits_out=logits.f32]
 //
 // Each step calls main(token: i64[1], pos: i64[1], valid: f32[valid_len]) with
 // valid = 1.0 for positions 0..pos (the attention reads positions by pos; the
@@ -32,6 +32,7 @@ IREE_FLAG(int32_t, valid_len, 256, "Length of the valid input (the static attent
 IREE_FLAG(int32_t, pad, 0,
           "Dynamic attention length: valid has length pos + 1 rounded up to a multiple of this (0: valid_len).");
 IREE_FLAG(string, logits_out, "", "File the float32 logits of every step are appended to.");
+IREE_FLAG(int32_t, stop_token, -1, "Stop generating after this token (an end-of-sequence id; -1: none).");
 
 static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* allocator, const void* data,
                                iree_host_size_t n, iree_hal_element_type_t type, iree_hal_buffer_view_t** out) {
@@ -146,6 +147,7 @@ static iree_status_t run(iree_allocator_t host) {
       printf(" %" PRId64, token);
       fflush(stdout);
       token = (int64_t)best;                 // next input when generating
+      if (pos + 1 >= ntok && FLAG_stop_token >= 0 && token == FLAG_stop_token) steps = pos + 1;
     }
     iree_vm_list_release(inputs);
     iree_vm_list_release(outputs);
