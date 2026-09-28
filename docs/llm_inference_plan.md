@@ -5,7 +5,7 @@
 - 8 条序列批处理 63.3 tok/s（设备 77 tok/s）；
 - teacher-forced top-1 与 fp32 一致率 96.2%。
 
-L6-IREE（编译器）大部分完成：PyTorch / HuggingFace 模型经 IREE 与自己的 `sa` 后端（两层方言 sahl / sahw）编译，stories15M 与 SmolLM2-135M 在板上运行，logits 与参考逐位一致（stories15M 17.7 tok/s，SmolLM2 2.23 tok/s）；进度与剩下的工作（C4 性能、C6 更大的模型）见 [`iree_compiler_plan.md`](iree_compiler_plan.md)。
+L6-IREE（编译器）大部分完成：PyTorch / HuggingFace 模型经 IREE 与自己的 `sa` 后端（两层方言 sahl / sahw）编译，stories15M 与 SmolLM2-135M 在板上运行，logits 与参考逐位一致（stories15M 17.7 tok/s，SmolLM2 2.22 tok/s）；两者都能在板上交互式生成文本；更大的模型（C6）在 sim 上验证：Qwen3-0.6B 全 28 层逐 dispatch 逐位一致、端到端生成正确。进度与剩下的工作（C4 性能、C6 更大的模型）见 [`iree_compiler_plan.md`](iree_compiler_plan.md)。
 
 还没做的：L5.5（75 MHz）。各级的实现记录与板上结果见
 §4（L0）、§5.5（L1）、§6.9（L2）、§7.3（L3）、§8.7（L4）、§9.3（L5）、§11.1（L5b），汇总见 §13。
@@ -1065,7 +1065,7 @@ IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 →
 - **验收**：
   1. IREE 编译的 MLP、softmax、单个 decoder 层，在“CPU + 加速器”混合执行下，结果与功能模拟器逐位一致；
   2. 用 IREE 编译 stories15M，在板上生成文本，与 L5 手写路径的文本一致（数值约定相同时应逐位一致）。
-- **结果**：第 2 条在 C3 达到（板上 logits 与手写路径逐位一致），第 1 条由逐 dispatch 的差分测试覆盖（每个 dispatch 与 oracle 逐位一致）；之后 C5 换成完整代码生成，C5.5 编译了没有写过专用代码的 SmolLM2-135M（板上）与 Qwen3 结构（sim）。
+- **结果**：第 2 条在 C3 达到（板上 logits 与手写路径逐位一致），第 1 条由逐 dispatch 的差分测试覆盖（每个 dispatch 与 oracle 逐位一致）；之后 C5 换成完整代码生成，C5.5 编译了没有写过专用代码的 SmolLM2-135M（板上）与 Qwen3 结构（sim）。C6：Qwen3-0.6B 全 28 层（sim）。
 
 ---
 
@@ -1177,7 +1177,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | **L5** | Python 运行时；端到端生成文本 | Python | 否 | §9.2 的 4 项 | **完成**（89741a3；15.1 tok/s 墙钟，top-1 96.2%） |
 | L5b | 多序列并发 decode | Python | 否 | §11.1 | **完成**（faf7bc7；8 条序列 63.3 tok/s） |
 | L5.5 | 75 MHz | 时钟与少量时序修复 | 是 | §11.2 | 未做（LUT 已用 83%，时序更难收敛） |
-| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | **大部分完成**（C0–C3、C5 完成：stories15M 板上 17.7 tok/s、SmolLM2-135M 板上 2.23 tok/s，均逐位一致；C4 部分完成；C6 更大的模型进行中） |
+| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | **大部分完成**（C0–C3、C5 完成：stories15M 板上 17.7 tok/s、SmolLM2-135M 板上 2.22 tok/s，均逐位一致；C4 部分完成；C6 更大的模型进行中：Qwen3-0.6B 全 28 层在 sim 上逐位一致） |
 | L6 | 其他扩展 | — | 视情况 | 每项单独定 | 未做 |
 
 - **建议顺序**：L0 → L1 → L2 → L3 → L4 → L5 → L6-IREE，L5b 和 L5.5 可以穿插进行。
