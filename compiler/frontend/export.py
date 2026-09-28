@@ -64,10 +64,11 @@ def load_model(args):
 
 
 def prefill_inputs(tokens, start, d):
-    """(tokens, start, valid) of a prefill chunk (plan §8.13): valid's length is
-    the chunk's end rounded up to D."""
+    """(tokens, positions, valid) of a prefill chunk at start (plan §8.13):
+    positions = start .. start + M - 1, valid's length the chunk's end rounded up to D."""
     n = start + len(tokens)
-    return torch.tensor(tokens), torch.tensor([start]), torch.zeros((n + d - 1) // d * d, dtype=torch.float32)
+    return (torch.tensor(tokens), torch.arange(start, n, dtype=torch.int64),
+            torch.zeros((n + d - 1) // d * d, dtype=torch.float32))
 
 
 def prefill_starts(P, M):
@@ -79,7 +80,7 @@ def prefill_starts(P, M):
 def export(m, cfg, d, out, static_len=None, prefill=0):
     """static_len: attention over a fixed number of positions (valid[static_len],
     masked by pos) instead of a dynamic T; the sa backend's form. prefill = M:
-    also prefill(tokens[M], start, valid[T]) (m.prefill), sharing the parameters
+    also prefill(tokens[M], positions[M], valid[T]) (m.prefill), sharing the parameters
     and the KV cache with main (decode)."""
     import iree.turbine.aot as aot
     aot.externalize_module_parameters(m, external_scope="model")
@@ -95,9 +96,9 @@ def export(m, cfg, d, out, static_len=None, prefill=0):
             return module(token, pos, valid)
 
         @fxb.export_program(name="prefill", args=prefill_inputs([1] * prefill, 0, d),
-                            dynamic_shapes={"tokens": None, "start": None, "valid": {0: T2}}, strict=False)
-        def _prefill(module, tokens, start, valid):
-            return module.prefill(tokens, start, valid)
+                            dynamic_shapes={"tokens": None, "positions": None, "valid": {0: T2}}, strict=False)
+        def _prefill(module, tokens, positions, valid):
+            return module.prefill(tokens, positions, valid)
 
         exp = aot.export(fxb)
     elif static_len:
@@ -149,8 +150,8 @@ class IreeModel:
     def __call__(self, token, pos, valid):
         return self.main.main(token.numpy(), pos.numpy(), valid.numpy()).to_host()
 
-    def prefill(self, tokens, start, valid):
-        return self.main.prefill(tokens.numpy(), start.numpy(), valid.numpy()).to_host()
+    def prefill(self, tokens, positions, valid):
+        return self.main.prefill(tokens.numpy(), positions.numpy(), valid.numpy()).to_host()
 
 
 def check_prefill(vmfb, irpa, eager, prompt, M, d, step, gen=4):

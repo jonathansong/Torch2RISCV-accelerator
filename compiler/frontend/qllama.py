@@ -232,14 +232,15 @@ class QLlama(torch.nn.Module):
         att = torch.matmul(pq, vh)                                                   # (H, M, hs) int32
         return (att.to(F32) * self.a_v[l]).permute(1, 0, 2).reshape(M, c.dim)
 
-    def prefill(self, tokens, start, valid):
-        """A chunk of M prompt tokens at positions start .. start + M - 1 (start: [1]):
+    def prefill(self, tokens, positions, valid):
+        """A chunk of M prompt tokens at positions[M] (start .. start + M - 1, given
+        by the caller: no i64 vector arithmetic on the device):
         their KV rows written, the logits of the last one returned; valid[T] only
         carries the padded attention length. Each row as forward() computes a
         decode step (chunking: compiler/frontend/export.py prefill_starts)."""
         c = self.cfg
         M, T = tokens.shape[0], valid.shape[0]
-        posv = start + torch.arange(M)
+        posv = positions
         x = self.emb_q.index_select(0, tokens).to(F32) * self.emb_s.index_select(0, tokens).unsqueeze(-1)
         cos = self.rope_cos.index_select(0, posv)                                    # (M, dim)
         sin = self.rope_sin.index_select(0, posv)

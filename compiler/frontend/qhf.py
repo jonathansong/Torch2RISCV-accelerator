@@ -376,8 +376,9 @@ class QModel(torch.nn.Module):
         att = (att.to(F32) * self.a_v[l]).reshape(Hk, M, G, hs).permute(1, 0, 2, 3)
         return att.reshape(M, c.q_dim)
 
-    def prefill(self, tokens, start, valid):
-        """A chunk of M prompt tokens at positions start .. start + M - 1 (start: [1]):
+    def prefill(self, tokens, positions, valid):
+        """A chunk of M prompt tokens at positions[M] (start .. start + M - 1, given
+        by the caller: no i64 vector arithmetic on the device):
         their KV rows written, the logits of the last one returned. valid[T] only
         carries the padded attention length (T >= start + M). Each row is computed
         as forward() computes a decode step. A prompt of P >= M tokens runs in
@@ -386,7 +387,7 @@ class QModel(torch.nn.Module):
         last token; a shorter prompt runs as decode steps."""
         c = self.cfg
         M, T, hs = tokens.shape[0], valid.shape[0], c.head_size
-        posv = start + torch.arange(M)                                               # (M,)
+        posv = positions
         x = self.emb_q.index_select(0, tokens).to(F32) * self.emb_s.index_select(0, tokens).unsqueeze(-1)
         cos = self.rope_cos.index_select(0, posv).unsqueeze(1)                       # (M, 1, hs)
         sin = self.rope_sin.index_select(0, posv).unsqueeze(1)

@@ -921,6 +921,18 @@ C5.5 的模型（§8.9 的第一步）：
 | **P3 运行时** | `sa-llm-run` 先分块 prefill 再 decode；`board_generate.py` 用它 | sim：与只用 decode 的 token 相同，最后位置的 logits 逐位一致 |
 | **P4 板上** | stories15M、SmolLM2；M = 8 / 16 / 32 对比 | 逐位一致；prompt 的 tok/s（预计比逐 token 快 5–10 倍） |
 
+**P0 结果（2026-09-28）**：`prefill(tokens[M], positions[M], valid[T])`（positions = start .. start + M − 1 由调用方给出：命令处理器不能把寄存器写回 DDR、VE 没有 iota，设备上算 i64 向量很别扭）；最后一块与前一块重叠而不是填充（从 P − M 开始，重算的行写回相同的 KV），最后一行总是 prompt 的最后一个 token。eager 的 prefill 与 decode 逐位一致（logits、KV cache）；IREE llvm-cpu 上 stories15M 的 prefill 与只用 decode 逐位一致，SmolLM2 相关 1.000000，之后生成的 token 相同。导出：`FxProgramsBuilder`，`main`（decode）与 `prefill` 共用参数与 KV 全局量。
+
+**P1 / P2 的任务**（stories15M 的 prefill 在现有编译器上：decode 的 58 个可执行体全部可编，prefill 失败 47 个，19 类）：
+1. 打包 pass 认 `matmul(X, Wᵀ)`，X 的 extsi 拉进 matmul（X 在 DDR 里保持 int8）；i64 累加器 + trunci 按 i32 累加（模 2³² 相同）。
+2. 多行线性层微内核：EX 的 A 条带是“每 D 个 K 字一块、第 i 字是第 i 行的 D 个元素”，正是 DMA INTERLEAVE 装 D 行 X（int8）的布局，一条 LD 得到 D 行的条带；输出按 `crow` 逐行写；尾部 s_w 按列、s_x 按行。M = 16 时两块行共用一次权重加载。
+3. i64 索引向量：gather / scatter / 掩码按行读 `positions[m]`、`tokens[m]`（每行一条 LDPARAM）；`向量 + 常数` 并进 LDPARAM 的加数。
+4. 三层循环（头 × 行 × T）的 generic，按行的 VALID。
+5. 多行的注意力收缩（每头 M 行的 batch_matmul）。
+6. 按行跨步的 DDR 视图（`h13[:, :hidden]` 等：DMA 的行距）。
+7. 零碎：i32 的 fill、对齐。
+另：两个函数的 dispatch 源文件各自编号（`module_main$…_N`、`module_prefill$…_N`），`dispatch_check` 要按函数名配二进制。
+
 ## 9. 验证体系
 
 | 层次 | 内容 | 工具 |
