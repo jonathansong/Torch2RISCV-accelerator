@@ -35,13 +35,12 @@ void TargetConfig::addTo(Builder &b, SmallVectorImpl<NamedAttribute> &attrs) con
   add("params", params);
 }
 
-CodegenOptions TargetConfig::codegenOptions() const {
-  CodegenOptions o;
-  o.d = d;
-  o.maxDynamic = maxDynamic;
-  o.spadBytes = spadBytes;
-  o.accBytes = accBytes;
-  return o;
+bool TargetConfig::ukernel(StringRef name) const {
+  if (ukernels == "all") return true;
+  if (ukernels == "none" || ukernels.empty()) return false;
+  SmallVector<StringRef> names;
+  StringRef(ukernels).split(names, ',');
+  return llvm::is_contained(names, name);
 }
 
 namespace {
@@ -133,9 +132,9 @@ struct SahwAssignRegistersPass : public PassWrapper<SahwAssignRegistersPass, Ope
 std::unique_ptr<Pass> createSahwSplitHeadPass() { return std::make_unique<SahwSplitHeadPass>(); }
 std::unique_ptr<Pass> createSahwAssignRegistersPass() { return std::make_unique<SahwAssignRegistersPass>(); }
 
-void registerSahwLegacyCodegenPass();
+void registerSaCodegenPass();
 void registerSahwPasses() {
-  registerSahwLegacyCodegenPass();
+  registerSaCodegenPass();
   registerSaToSahlPass();
   registerSahlToSahwPass();
   registerSahwFuseVePass();

@@ -9,9 +9,10 @@ for the LOOP_END form):
   2. compile: iree-compile --iree-hal-target-device=sa, parameters imported and
      the packed weights exported to a new archive (sa-pack-linear-weights +
      const-eval), executables dumped;
-  3. the executable holds one export whose template equals
-     plugins/sa/templates/reference.qlinear byte for byte (the binding
-     assignment is found by search and reported);
+  3. the executable holds one export with the schedule of
+     plugins/sa/templates/reference.qlinear: the same kinds and numbers of
+     commands (LD, ST, EX, VE, SETREG, LOOP_END; since C5 the code generator is
+     the C5 pipeline, not a byte-for-byte port of the reference);
   4. the exported archive holds pack_b(W_q) byte for byte;
   5. run: iree-run-module --device=sa (sim transport: a simulator service is
      started) -> y bit-exact with DeviceModel.linear (SfuExact);
@@ -20,7 +21,7 @@ for the LOOP_END form):
     python3 compiler/tests/test_c2.py [--d 8] [--keep DIR] [--board-bundle DIR]
 """
 import argparse
-import itertools
+import collections
 import os
 import shutil
 import socket
@@ -162,16 +163,14 @@ def main():
                 dd, _, exps = sadesc.read(blob)
                 got = exps[0][1] if len(exps) == 1 else np.zeros((0, 8), np.uint64)
                 prefix = sadesc.read_ext(blob)[0]["prefix"] if len(exps) == 1 else 0
-                match = None
-                for perm in itertools.permutations(range(5)):
-                    if same_template(reference.qlinear(d, k, n, x_i32, *perm).array(), got, prefix):
-                        match = perm
-                        break
+                kinds = lambda rows: collections.Counter(int(r[0]) & 0xFF for r in rows if int(r[0]) & 0xFF != sadesc.OP_RET)
+                ref = reference.qlinear(d, k, n, x_i32, 0, 1, 2, 3, 4).array()
+                same = kinds(got) == kinds(ref)
                 print(f"{name}: k={k} n={n} x={'i32' if x_i32 else 'i8'}: executable D={dd}, "
                       f"{len(exps)} export(s) '{exps[0][0] if exps else ''}', {len(got)} descriptors ({prefix} in the prefix); "
-                      + (f"template == reference (bindings x,W,s_w,s_x,y = {match})" if match else
-                         "template DIFFERENT from the reference"))
-                ok &= match is not None and dd == d
+                      + ("the reference schedule (same commands)" if same else
+                         f"commands DIFFERENT from the reference: {dict(kinds(got))} vs {dict(kinds(ref))}"))
+                ok &= same and dd == d
             # 4. the packed weights
             packed = read_params(os.path.join(out, "packed.irpa"))
             want = pack_b(wq, d).tobytes()
@@ -197,23 +196,6 @@ def main():
     if not args.keep:
         shutil.rmtree(work, ignore_errors=True)
     return 1 if fails else 0
-
-
-def same_template(ref, got, prefix):
-    """got == ref, up to the prefix: the template's first prefix - 1 descriptors
-    (then RET) are descriptors of ref moved to the front (the loads the driver
-    may run early). The tags (w0[63:32], the index) are not compared."""
-    # the prefix loads through BASE15 instead of their own register
-    strip = lambda rows, base=False: [tuple(int(x) for x in r[1:]) + (int(r[0]) & (0xFFFF99FF if base else 0xFFFFFFFF),)
-                                      for r in rows]
-    ref0 = ref
-    body, refb = strip(ref), strip(ref0, True)
-    for row in strip(got[:max(0, prefix - 1)], True):
-        if row not in refb:
-            return False
-        del body[refb.index(row)]
-        del refb[refb.index(row)]
-    return strip(got[prefix:]) == body
 
 
 def stage(work, dst):

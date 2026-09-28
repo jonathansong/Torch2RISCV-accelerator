@@ -19,7 +19,7 @@
 #include <memory>
 
 #include "../target/DescList.h"
-#include "../target/Templates.h"
+#include "../target/Layout.h"
 #include "SaLin.h"
 #include "SahlDialect.h"
 #include "SahlPasses.h"
@@ -197,10 +197,12 @@ public:
   }
 
   bool run() {
-    f.walk([&](linalg::GenericOp g) {
-      if (g->getParentOp() == f.getOperation()) matchLinear(g);
-    });
-    f.walk([&](linalg::BatchMatmulOp m) { matchAttention(m); });
+    // the micro-kernels (§8.8), as --iree-sa-ukernels allows
+    if (cfg.ukernel("linear"))
+      f.walk([&](linalg::GenericOp g) {
+        if (g->getParentOp() == f.getOperation()) matchLinear(g);
+      });
+    if (cfg.ukernel("attention")) f.walk([&](linalg::BatchMatmulOp m) { matchAttention(m); });
     for (Operation &opRef : f.getBody().front()) {
       Operation *op = &opRef;
       loc = op->getLoc();
@@ -960,6 +962,27 @@ private:
     LinearPlan p;
     p.con = con;
     auto lx = loadInto(con.getDpsInputs()[0]), lw = loadInto(con.getDpsInputs()[1]);
+    SmallVector<Operation *> xOps;
+    if (!lx) {
+      // x through its i8 -> i32 extension (part of the linear layer, as C3)
+      Value xi = con.getDpsInputs()[0];
+      linalg::GenericOp ext;
+      for (Operation *u : xi.getUsers())
+        if (auto g = dyn_cast<linalg::GenericOp>(u); g && g != con && g.getNumDpsInits() == 1 && g.getDpsInits()[0] == xi)
+          ext = g;
+      if (!ext || ext.getNumDpsInputs() != 1 ||
+          !llvm::all_of(ext.getIndexingMapsArray(), [](AffineMap m) { return m.isIdentity(); }))
+        return false;
+      Block &eb = ext.getRegion().front();
+      auto ey = cast<linalg::YieldOp>(eb.getTerminator());
+      auto es = ey.getOperand(0).getDefiningOp<arith::ExtSIOp>();
+      if (!es || es.getIn() != eb.getArgument(0) || eb.getOperations().size() != 2) return false;
+      for (Operation *u : xi.getUsers())
+        if (u != ext.getOperation() && u != con.getOperation() && !isa<memref::DeallocOp>(u)) return false;
+      lx = loadInto(ext.getDpsInputs()[0]);
+      if (!lx) return false;
+      xOps.push_back(ext);
+    }
     if (!lx || !lw) return false;
     p.x = lx.getSrc();
     p.w = lw.getSrc();
@@ -991,6 +1014,7 @@ private:
     }
     if (!p.store || !cast<MemRefType>(out.getType()).getElementType().isF32()) return false;
     SmallVector<Operation *> cover = {con, fill, e, p.store, lx, lw};
+    cover.append(xOps.begin(), xOps.end());
     for (int i = 0; i < e.getNumDpsInputs(); ++i) {
       Value in = e.getDpsInputs()[i];
       if (in == p.acc) continue;
