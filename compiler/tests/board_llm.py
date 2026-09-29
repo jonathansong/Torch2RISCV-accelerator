@@ -59,7 +59,7 @@ def main():
         cmd = [os.path.join(HERE, "sa-llm-run"), "--device=sa", f"--module={HERE}/sa.vmfb",
                f"--parameters=model={HERE}/sa_packed.irpa", "--tokens=" + ",".join(str(int(t)) for t in prompt),
                f"--generate={n_gen}", f"--logits_out={logits_path}"] + extra
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=dict(env, SA_STATS="1"))
     finally:
         head, beat = BL.stop(mm, buf)
     if r.returncode:
@@ -71,6 +71,9 @@ def main():
     n = min(len(got), len(want_logits))
     exact = sum(got[i].tobytes() == want_logits[i].tobytes() for i in range(n))
     print(f"sa device (board): {lines[1] if len(lines) > 1 else ''}; rt_fw completed {head} lists")
+    for l in r.stderr.splitlines():                     # the host fallback's split (SA_STATS)
+        if l.startswith("sa:"):
+            print(l)
     print(f"logits bit-exact with {ref_name} in {exact}/{n} steps")
     same = tokens[:len(want_tokens)] == list(want_tokens)
     print(f"generated tokens {'identical to' if same else 'DIFFERENT from'} the host reference")
