@@ -1271,7 +1271,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 **板上**（`compiler/scripts/deploy_hfgen.sh` → `build/deploy_hfgen`，`board_llm.py`，窗口 168 MB）：SmolLM2 prefill（M = 8）+ 16 步 decode，logits 17/17 步与 sim 逐位一致，生成的 token 相同，**board PASS**。211 个描述符列表在加速器上，180 次主机 dispatch（2 个 × 30 层 × 3 块，全在 prefill；decode 0 次）。prefill 20 个 token 8.5 s（2.35 token/s，第一块含加载），decode 681 ms/步（1.47 token/s）——比手写 qhf 路径（约 450 ms/步，2.22 token/s）慢约 50%，dispatch 的划分不同，还没做性能分析。
 
-**通用路径 decode 为什么比手写路径慢约 50%**（681 对约 450 ms/步；sim 上的结构对比，板上逐 export 周期待测：两个包里都有 `board_profile.py`）：
+**通用路径 decode 为什么比手写路径慢约 50%**（681 对约 450 ms/步；sim 上的结构对比，加上板上逐 export 的周期 `board_profile.py`）：
 - 每步的 dispatch：手写 910 次、通用 1000 次，只多 10%；差别在线性层。手写路径每层 4 个线性层（q/k/v 合成一个、gate/up 合成一个），通用路径是 HF 的 7 个。权重字节数相同，decode 又受读权重的带宽限制，dispatch 多出来的固定开销解释不了 50%。
 - 主要原因：**约 66% 的权重走了通用 contraction，而不是线性层微内核**。线性层微内核只匹配手写路径那种尾部（`(acc · s_w) · s_x` 输出 fp32）；通用路径里 IREE 把更多东西融合进了尾部，或者把尾部挪走了：
 
@@ -1283,8 +1283,20 @@ C5.5 的模型（§8.9 的第一步）：
 | q、o 之一 | 576×576 | | 通用 contraction |
 | q、o 之另一、down、分类层 | | `(acc · s_w) · s_x` | 线性层微内核 |
 
-  通用 contraction 没有微内核的调度（SPAD_B 双缓冲、chunk 0 预取、LOOP_END 循环），C5 实测整模型慢约 1.7 倍（stories15M 4.40M 对 2.59M 周期/token）。66% × 0.7 ≈ +46%，与实测的 +51% 相符。
-- **改法**：让线性层微内核接受任意逐元素尾部（与通用 contraction 一样，按 chunk 把累加结果交给 `generic` 的尾部 lowering；输出 fp32 / int32 / int8，逐元素输入 fp32 / int32），没有尾部时直接存 int32 累加。这正好是第 2 项（微内核在 `sahl` 层展开）要做的：调度与尾部分开表达以后，线性层的调度可以套在任意尾部上。
+  通用 contraction 没有微内核的调度（SPAD_B 双缓冲、chunk 0 预取、LOOP_END 循环）。**板上实测**（decode 每步设备约 34.8M 周期 ≈ 696 ms，与墙钟 681–713 ms 相符：decode 的时间基本都在设备上；`board_profile.py` 的“per step”把调用数多除了一半，周期要乘 2）：
+
+| 线性层（每层） | 权重 | lowering | 周期/次 | 读权重的下限（7.8 B/周期） | 倍数 |
+|---|---|---|---|---|---|
+| gate（融合 SwiGLU） | 885 KB | 通用 contraction | 282k | 113k | 2.5× |
+| up（int32 直接输出） | 885 KB | 通用 contraction | 225k | 113k | 2.0× |
+| down | 885 KB | 线性层微内核 | 124k | 113k | 1.1× |
+| q / o 之一 | 331 KB | 通用 contraction | 85k | 42k | 2.0× |
+| q / o 之另一 | 331 KB | 线性层微内核 | 53k | 42k | 1.25× |
+| v（融合 KV 量化） | 110 KB | 通用 contraction | 15k | 14k | 1.05× |
+
+  慢的是大的通用 contraction（小的 k / v 没问题）；gate + up 占 decode 设备时间的 45%。这三个达到微内核的效率时每层约少 290k 周期，每步约少 8.7M（34.8M → 约 26M，约 520 ms）；剩下与手写路径的差距来自手写路径把 q / k / v、gate / up 各合成一个线性层（少了重复的激活量化和每个线性层的固定开销）。
+- **prefill 另有一个更大的问题**：prefill 里融合了 SwiGLU 的 gate（`matmul_like_8x192x8x576`）一个就占 prefill 设备周期的 **48.9%**，每次 1.64M 周期，是同样大小、没有尾部的 up（128k）的 12.8 倍：M = 8 时它的尾部按 chunk、按行做（逐元素输入的小 DMA 与 SFU 串行）。
+- **改法**（第一优先是 prefill 的 gate 与 decode 的 gate / up）：让线性层微内核接受任意逐元素尾部（与通用 contraction 一样，按 chunk 把累加结果交给 `generic` 的尾部 lowering；输出 fp32 / int32 / int8，逐元素输入 fp32 / int32），没有尾部时直接存 int32 累加。这正好是第 2 项（微内核在 `sahl` 层展开）要做的：调度与尾部分开表达以后，线性层的调度可以套在任意尾部上。
 
 **剩下**：通用路径 decode 的线性层走微内核（见上）；prefill 里 Q 的 RoPE 两个主机 dispatch（IREE 把 swap 后的 q 物化成按头在外的布局，gather 带了转置；改前端 swap 的写法反而让 31 个落到主机，没采用）；主机退路改用原生 ARM 代码（`llvm-cpu`，替代 VMVX 解释器，需要重建编译器）。
 

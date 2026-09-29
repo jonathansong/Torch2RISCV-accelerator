@@ -186,7 +186,8 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   slower than the hand-written path: about two thirds of the weights go
   through the generic contraction lowering, not the linear micro-kernel,
   because IREE fuses the KV quantization and SwiGLU into their epilogues;
-  plan §8.19). Decode
+  measured on the board: the gate / up projections run at 2-2.5x their
+  weight-read bound, the linear micro-kernel at 1.1-1.25x; plan §8.19). Decode
   runs entirely on the accelerator; SmolLM2 has 794 executables on the
   accelerator and 2 on the host (prefill only); the device keeps the torch
   W8A8 model's quality (SmolLM2 34/40 teacher-forced top-1 agreement with
