@@ -74,3 +74,48 @@ func.func @quant() {
   }
   return
 }
+
+// -----
+
+// Prefill's RoPE of M rows (three loops: row, head, element; a table per row,
+// a gather indexed by the row) -> one generic per row of the decode form:
+// the row's DDR views and the gather source sliced at the row, a local result
+// per row stored into its row of the DDR result.
+// CHECK-LABEL: func.func @rows_unrolled
+// CHECK: linalg.generic {{.*}} iterator_types = ["parallel", "parallel"]
+// CHECK: sahl.gather "none" %{{.+}}[%{{.+}}, %{{.+}}] : memref<2x4xf32, strided<[4, 1]>, #hal.descriptor_type<storage_buffer>>
+// CHECK: sahl.store %{{.+}}, %{{.+}} : memref<2x4xf32>, memref<2x4xf32, strided<[4, 1]>
+// CHECK: linalg.generic {{.*}} iterator_types = ["parallel", "parallel"]
+// CHECK: sahl.gather "none" %{{.+}}[%{{.+}}, %{{.+}}] : memref<2x4xf32, strided<[4, 1], offset: 8>
+// CHECK: sahl.store %{{.+}}, %{{.+}} : memref<2x4xf32>, memref<2x4xf32, strided<[4, 1], offset: 8>
+// CHECK-NOT: linalg.generic
+// CHECK: return
+#pl = #hal.pipeline.layout<constants = 0, bindings = [#hal.pipeline.binding<storage_buffer, ReadOnly>, #hal.pipeline.binding<storage_buffer>]>
+#x = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#t = affine_map<(d0, d1, d2) -> (d0, d2)>
+func.func @rows_unrolled() {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c64 = arith.constant 64 : index
+  %c128 = arith.constant 128 : index
+  %0 = hal.interface.binding.subspan layout(#pl) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : memref<2x2x4xf32, #hal.descriptor_type<storage_buffer>>
+  %1 = hal.interface.binding.subspan layout(#pl) binding(0) alignment(64) offset(%c64) flags(ReadOnly) : memref<2x4xf32, #hal.descriptor_type<storage_buffer>>
+  %2 = hal.interface.binding.subspan layout(#pl) binding(0) alignment(64) offset(%c128) flags(ReadOnly) : memref<2x2x4xf32, #hal.descriptor_type<storage_buffer>>
+  %3 = hal.interface.binding.subspan layout(#pl) binding(1) alignment(64) offset(%c0) : memref<2x2x4xf32, #hal.descriptor_type<storage_buffer>>
+  %alloc = memref.alloc() : memref<2x2x4xf32>
+  linalg.generic {indexing_maps = [#x, #t, #x], iterator_types = ["parallel", "parallel", "parallel"]} ins(%0, %1 : memref<2x2x4xf32, #hal.descriptor_type<storage_buffer>>, memref<2x4xf32, #hal.descriptor_type<storage_buffer>>) outs(%alloc : memref<2x2x4xf32>) {
+  ^bb0(%in: f32, %t: f32, %out: f32):
+    %r = linalg.index 0 : index
+    %h = linalg.index 1 : index
+    %e = linalg.index 2 : index
+    %g = memref.load %2[%r, %h, %e] : memref<2x2x4xf32, #hal.descriptor_type<storage_buffer>>
+    %p = arith.mulf %in, %t : f32
+    %s = arith.addf %p, %g : f32
+    linalg.yield %s : f32
+  }
+  linalg.generic {indexing_maps = [#x, #x], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc : memref<2x2x4xf32>) outs(%3 : memref<2x2x4xf32, #hal.descriptor_type<storage_buffer>>) {
+  ^bb0(%in: f32, %out: f32):
+    linalg.yield %in : f32
+  }
+  return
+}

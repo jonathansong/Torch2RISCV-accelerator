@@ -151,9 +151,11 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
     G = H // Hk
     kh = key.to(torch.int32).reshape(T, Hk, hd).permute(1, 2, 0)                  # (Hk, hd, T)
     vh = value.to(torch.int32).reshape(T, Hk, hd).permute(1, 0, 2)                # (Hk, T, hd)
+    # the query rows as [M, H, hd] (HF's transpose undone: each row contiguous)
+    qr = query[0].transpose(0, 1)
     outs = []
     for m in range(M):
-        qq, s_q = _quant_act(query[0, :, m, :].reshape(Hk, G, hd))               # (Hk, G, hd), (Hk, G, 1)
+        qq, s_q = _quant_act(qr[m].reshape(Hk, G, hd))                           # (Hk, G, hd), (Hk, G, 1)
         sc = torch.matmul(qq.to(torch.int32), kh)                                # (Hk, G, T) int32
         sc = (sc.to(torch.float32) * s_q) * cache.a_k[l]
         mask = torch.arange(T) <= cache.positions[m:m + 1]
