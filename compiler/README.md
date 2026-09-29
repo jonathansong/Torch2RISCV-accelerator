@@ -181,15 +181,15 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   tables and the pair swap, RMSNorm as the device computes it, an int8 KV
   cache and the sa attention. Prefill + decode (plan §8.19): `prefill` /
   `prefill_kv` exported with decode in one module; on sim bit-exact with
-  decode only for SmolLM2 and Qwen3-0.6B (2 layers, unchanged code). Decode
+  decode only for SmolLM2 and Qwen3-0.6B (2 layers, unchanged code), and
+  SmolLM2 on the board bit-exact with the sim (1.47 tok/s decode). Decode
   runs entirely on the accelerator; SmolLM2 has 794 executables on the
   accelerator and 2 on the host (prefill only); the device keeps the torch
   W8A8 model's quality (SmolLM2 34/40 teacher-forced top-1 agreement with
   plain HF fp32, as the torch W8A8 model; Qwen3's W8A8 quality is a
   quantization item of its own, C6.2). An IREE fix is applied from
-  `compiler/patches/iree/` by `fetch_iree_sources.sh`. Next (plan §8.17): the
-  board run, micro-kernels expanded at the sahl level, memory planning with
-  lifetimes.
+  `compiler/patches/iree/` by `fetch_iree_sources.sh`. Next (plan §8.17):
+  micro-kernels expanded at the sahl level, memory planning with lifetimes.
 
   ```sh
   compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)
