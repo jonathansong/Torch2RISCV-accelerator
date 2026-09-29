@@ -21,6 +21,16 @@ if [ "$have" != "${IREE_REV:0:10}" ]; then
   exit 1
 fi
 
+# local fixes to IREE (compiler/patches/iree/*.patch), applied once
+for p in "$SA_COMPILER"/patches/iree/*.patch; do
+  if git -C "$IREE_SRC" apply --check "$p" 2>/dev/null; then
+    git -C "$IREE_SRC" apply "$p" && echo "applied $(basename "$p")"
+  elif ! git -C "$IREE_SRC" apply --reverse --check "$p" 2>/dev/null; then
+    echo "error: $(basename "$p") does not apply to $IREE_SRC" >&2
+    exit 1
+  fi
+done
+
 avail=$(df -BG --output=avail "$IREE_SRC" | tail -1 | tr -dc 0-9)
 echo "IREE $have in $IREE_SRC; free disk ${avail} GB"
 if [ "$avail" -lt 6 ]; then

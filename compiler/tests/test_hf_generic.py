@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--rope", action="store_true", help="RoPE tables and the pair swap (F3)")
     ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (F4)")
     ap.add_argument("--kv-scales", help="KV scales (.npy) instead of calibrating (F4)")
+    ap.add_argument("--prefill", type=int, default=0, help="also export prefill of M tokens (needs --attn); the "
+                    "sim run with prefill + decode must be bit-exact with decode only (plan §8.17)")
     ap.add_argument("--min-corr", type=float, default=0.999)
     args = ap.parse_args()
     # the wrapper (static cache at the input positions) vs plain HF on the whole prompt
@@ -92,7 +94,7 @@ def main():
         del base, rw
     w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales)
     if not args.skip_export:
-        H.export(w, args.out)
+        H.export(w, args.out, args.prefill)
         t0 = time.time()
         log = subprocess.run([os.path.join(COMPILER, "scripts", "compile_sa.sh"), args.out],
                              capture_output=True, text=True, env=dict(os.environ, SA_COMPILE_FLAGS="--iree-sa-codegen-report"))
@@ -155,6 +157,35 @@ def main():
         mcorr = float(np.mean([np.corrcoef(tf[i], fp[i])[0, 1] for i in range(n)]))
         print(f"teacher-forced, {n} positions: top-1 agreement with plain HF fp32 {agree}/{n}, mean corr {mcorr:.4f}")
         ok = n == len(toks) and agree >= int(0.85 * n) and mcorr > 0.95
+    if args.prefill:
+        # prefill + decode vs decode only: the prompt's last position, then the generated steps
+        M = args.prefill
+        pp = prompt if len(prompt) >= 2 * M else [int(v) for v in np.resize(np.array(prompt), 2 * M + M // 2)]
+        def run(pre):
+            srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb",
+                                    str(args.mb), "--socket", sock, "--once"], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+            time.sleep(3)
+            lp = os.path.join(args.out, f"logits_p{pre}.f32")
+            r2 = subprocess.run([T.RUN, "--device=sa", f"--module={args.out}/sa.vmfb",
+                                 f"--parameters=model={args.out}/sa_packed.irpa", "--abi=hf",
+                                 "--tokens=" + ",".join(map(str, pp)), f"--generate={args.generate}",
+                                 f"--logits_out={lp}"] + ([f"--prefill={pre}"] if pre else []),
+                                capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
+            srv.wait(timeout=120)
+            if r2.returncode:
+                print(r2.stderr[-2000:])
+            lg = np.fromfile(lp, np.float32)
+            return r2.stdout.strip().splitlines()[0], lg.reshape(-1, ref.shape[1]), r2.stdout
+        dt, dl, _ = run(0)
+        pt, pl, pout = run(M)
+        rows = dl[len(pp) - 1:]
+        exact = [pl[i].tobytes() == rows[i].tobytes() for i in range(min(len(pl), len(rows)))]
+        same = dt.split(":")[1].split() == pt.split(":")[1].split()
+        pline = [l for l in pout.splitlines() if l.startswith("prefill")]
+        print(f"prefill M = {M}, a {len(pp)}-token prompt: logits bit-exact with decode only in {sum(exact)}/"
+              f"{len(exact)} rows, tokens {'identical' if same else 'DIFFERENT'}; {pline[0] if pline else ''}")
+        ok &= len(exact) == args.generate + 1 and all(exact) and same
     print("hf_generic PASS" if ok else "hf_generic FAIL")
     return 0 if ok else 1
 

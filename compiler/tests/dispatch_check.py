@@ -13,7 +13,8 @@ both on the same binding contents, and every byte the dispatch may write
 Inputs: push constants that are binding offsets take the first call site's
 values (util.assume.int); dynamic lengths (workload ordinals) take --t;
 fp32 data is normal(0, 1), int8 / int32 data int8-valued, i64 scalars
-(token, position, row) --t - 3 (rows partly masked).
+(token, position, row) --t - 3 (rows partly masked), i64 vectors distinct values
+ending at --t - 3.
 
     python3 compiler/tests/dispatch_check.py <sources dir> <binaries dir> [--d D] [--t 16] [numbers...]
 
@@ -39,6 +40,8 @@ from sa_funcsim import SaError, SaFuncSim  # noqa: E402
 
 from iree.compiler import ir  # noqa: E402
 
+SKEW = 0                                    # --skew
+DIRTY = False                               # --dirty
 ELEM_BYTES = {"f32": 4, "i8": 1, "i32": 4, "i64": 8, "i16": 2, "i1": 1}
 
 
@@ -112,7 +115,9 @@ def fill(rng, et, n, t):
     if et in ("i8", "i32", "i16"):
         return rng.integers(-127, 128, n, dtype=O.NP[et]).tobytes()      # no int64 temporary
     if et == "i64":
-        return np.full(n, max(0, t - 3), np.int64).tobytes()     # pos + 1 < T: partly masked rows
+        # pos + 1 < T: partly masked rows; a vector (prefill's positions of a
+        # chunk) distinct, ending at t - 3 (equal values hide per-row indexing)
+        return np.maximum(0, t - 3 - np.arange(n)[::-1]).astype(np.int64).tobytes()
     return bytes(n)
 
 
@@ -158,12 +163,16 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
     if cfg.get("d", d) != d:
         return f"compiled for D = {cfg['d']}, checked with D = {d}"
     sim = SaFuncSim(d, base, size, spad_bytes=cfg.get("spad_bytes", 131072), acc_bytes=cfg.get("acc_bytes", 262144))
+    if DIRTY:
+        # local memories as an earlier dispatch left them (a fresh simulator's zeros hide reads of unwritten words)
+        for k, m in sim.mem.items():
+            m[:] = np.random.default_rng(seed + 7).integers(0, 256, m.size, dtype=np.uint8)
     sim.ddr_write(base, rows.tobytes())
     phys, a = [0] * max(nb, max(bufs, default=0) + 1), base + tsize
     for b in sorted(bufs):
-        phys[b] = a
-        sim.ddr_write(a, bytes(bufs[b]))
-        a += -(-len(bufs[b]) // 4096) * 4096
+        phys[b] = a + SKEW * (b + 1)          # (--skew: bases not page aligned, as suballocated)
+        sim.ddr_write(phys[b], bytes(bufs[b]))
+        a += -(-(len(bufs[b]) + SKEW * (b + 1)) // 4096) * 4096
     lst = sadesc.dispatch_list(base, phys, consts, setup, ext)
     lst_addr = base + size - 0x10000
     sim.ddr_write(lst_addr, lst.array().tobytes())
@@ -186,6 +195,16 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
                     gv, xv = np.frombuffer(g, O.NP[et]), np.frombuffer(x, O.NP[et])
                     k = int(np.argmax(gv != xv))
                     bad.append(f"b{b}@{o} {et}[{len(gv)}]: {int(np.sum(gv != xv))} differ, first [{k}] {gv[k]} vs {xv[k]}")
+    # and nothing else: the rest of the bindings' pages as they were (a write
+    # outside the stores' regions clobbers live data next to them at run time)
+    for b in sorted(bufs):
+        n = -(-len(bufs[b]) // 4096) * 4096
+        got = np.frombuffer(sim.ddr_read(phys[b], n).tobytes(), np.uint8)
+        exp = np.zeros(n, np.uint8)
+        exp[:len(want[b])] = np.frombuffer(bytes(want[b]), np.uint8)
+        diff = np.nonzero(got != exp)[0]
+        if len(diff):
+            bad.append(f"b{b}: {len(diff)} bytes written outside the stores' regions, at {diff[0]}..{diff[-1]}")
     return "; ".join(bad) if bad else "OK"
 
 
@@ -202,8 +221,12 @@ def main():
     ap.add_argument("binaries")
     ap.add_argument("--d", type=int, help="default: the D the dispatches were compiled for")
     ap.add_argument("--t", type=int, default=16)
+    ap.add_argument("--skew", type=int, default=0, help="binding k's base at a page + skew * (k + 1) bytes")
+    ap.add_argument("--dirty", action="store_true", help="local memories start with garbage, not zeros")
     ap.add_argument("numbers", nargs="*")
     args = ap.parse_args()
+    global SKEW, DIRTY
+    SKEW, DIRTY = args.skew, args.dirty
     # module_<function>$async_dispatch_<n>.mlir: numbered per function (a module
     # with prefill and main); numbers select "n" (any function) or "function:n"
     def fn_num(p):

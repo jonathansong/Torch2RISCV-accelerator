@@ -88,6 +88,7 @@ class SaFuncSim:
         self.dl_status = 0
         self.dl_exec = 0
         self.cmds = {"LD": 0, "ST": 0, "EX": 0, "VE": 0}
+        self.wlog = None                # a list: the STs' (ddr, rows, row bytes, pitch)
 
     # ------------------------------------------------------------ helpers
     def wbytes(self, mem):
@@ -135,6 +136,8 @@ class SaFuncSim:
         self._check_dma(ENG_ST, ddr, mem, word, rows, rb, pitch, 0)
         buf, wb = self.mem[mem], self.wbytes(mem)
         wpr = -(-rb // wb)
+        if self.wlog is not None:
+            self.wlog.append((ddr, rows, rb, pitch))
         for r in range(rows):
             dst = self._ddr(ddr + r * pitch, rb, ENG_ST, XERR_BRESP)
             start = (word + r * wpr) * wb

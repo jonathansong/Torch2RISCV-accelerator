@@ -43,9 +43,9 @@ IREE_FLAG(int32_t, prefill, 0,
 static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* allocator, const void* data,
                                iree_host_size_t n, iree_hal_element_type_t type, iree_hal_buffer_view_t** out) {
   iree_hal_dim_t shape[2] = {n, 1};
-  // --abi=hf: [1, 1] ids / positions
-  iree_host_size_t rank = (strcmp(FLAG_abi, "hf") == 0 && type == IREE_HAL_ELEMENT_TYPE_INT_64 && n == 1) ? 2 : 1;
-  if (rank == 2) shape[0] = 1;
+  // --abi=hf: ids / positions as [1, n]
+  iree_host_size_t rank = (strcmp(FLAG_abi, "hf") == 0 && type == IREE_HAL_ELEMENT_TYPE_INT_64) ? 2 : 1;
+  if (rank == 2) shape[0] = 1, shape[1] = n;
   iree_hal_buffer_params_t params = {
       .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
       .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
@@ -55,7 +55,8 @@ static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* 
       iree_make_const_byte_span(data, n * iree_hal_element_dense_byte_count(type)), out);
 }
 
-// f(a[na]: i64, b[nb]: i64, valid[nv]: f32) -> logits (f32, copied to *logits)
+// f(a[na]: i64, b[nb]: i64, valid[nv]: f32) -> logits (f32, copied to *logits);
+// --abi=hf: f(a[1, na], b[1, nb])
 static iree_status_t call3(iree_vm_context_t* context, iree_vm_function_t function, iree_hal_device_t* device,
                            iree_hal_allocator_t* allocator, iree_allocator_t host, const int64_t* a, int na,
                            const int64_t* b, int nb, const float* valid, iree_host_size_t nv, float** logits,
@@ -63,11 +64,13 @@ static iree_status_t call3(iree_vm_context_t* context, iree_vm_function_t functi
   iree_vm_list_t *inputs = NULL, *outputs = NULL;
   iree_hal_buffer_view_t *ba = NULL, *bbv = NULL, *bv = NULL;
   iree_status_t status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 3, host, &inputs);
+  bool hf = strcmp(FLAG_abi, "hf") == 0;             // (a[1, na], b[1, nb]): no valid
   if (iree_status_is_ok(status)) status = make_view(device, allocator, a, na, IREE_HAL_ELEMENT_TYPE_INT_64, &ba);
   if (iree_status_is_ok(status)) status = make_view(device, allocator, b, nb, IREE_HAL_ELEMENT_TYPE_INT_64, &bbv);
-  if (iree_status_is_ok(status)) status = make_view(device, allocator, valid, nv, IREE_HAL_ELEMENT_TYPE_FLOAT_32, &bv);
+  if (iree_status_is_ok(status) && !hf)
+    status = make_view(device, allocator, valid, nv, IREE_HAL_ELEMENT_TYPE_FLOAT_32, &bv);
   iree_hal_buffer_view_t* views[3] = {ba, bbv, bv};
-  for (int i = 0; i < 3 && iree_status_is_ok(status); ++i) {
+  for (int i = 0; i < (hf ? 2 : 3) && iree_status_is_ok(status); ++i) {
     iree_vm_ref_t r = iree_hal_buffer_view_move_ref(views[i]);
     views[i] = NULL;
     status = iree_vm_list_push_ref_move(inputs, &r);

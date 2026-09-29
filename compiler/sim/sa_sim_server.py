@@ -57,6 +57,7 @@ def serve(args):
     srv.listen(1)
     print(f"sa sim: D = {args.d}, SPAD {args.spad_kb} KB, ACC {args.acc_kb} KB, {args.mb} MB at {BASE:#x} in {shm}, socket {args.socket}", flush=True)
     runs = 0
+    wlog = open(args.wlog, "w") if args.wlog else None
     try:
         while True:
             conn, _ = srv.accept()
@@ -69,6 +70,8 @@ def serve(args):
                         continue
                     if cmd[0] == "RUN":
                         addr = int(cmd[1], 0)
+                        if wlog:
+                            sim.wlog = []
                         try:
                             n = sim.run_list(addr)
                             reply = f"DONE 0 0 {n} {sim.dl_status}"
@@ -78,6 +81,11 @@ def serve(args):
                             if args.verbose:
                                 print(f"list {addr:#x}: {e}", flush=True)
                         runs += 1
+                        if wlog:
+                            lo = min((a for a, *_ in sim.wlog), default=0)
+                            hi = max((a + (r - 1) * p + b for a, r, b, p in sim.wlog), default=0)
+                            wlog.write(f"{runs} {lo:#x} {hi:#x} {len(sim.wlog)}\n")
+                            wlog.flush()
                         if args.verbose:
                             print(f"run {runs}: list {addr:#x} -> {reply}", flush=True)
                         io.write(reply + "\n")
@@ -106,6 +114,7 @@ def main():
     ap.add_argument("--socket", default="/tmp/sa_sim.sock")
     ap.add_argument("--shm", help="shared-memory file (default /dev/shm/sa_ddr_<pid>)")
     ap.add_argument("--once", action="store_true", help="exit after the first client disconnects")
+    ap.add_argument("--wlog", help="per list: the range its stores wrote (debugging)")
     ap.add_argument("-v", "--verbose", action="store_true")
     serve(ap.parse_args())
 

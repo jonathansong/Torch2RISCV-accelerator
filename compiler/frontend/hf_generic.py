@@ -61,6 +61,20 @@ class HFDecoder(torch.nn.Module):
             self.register_buffer(f"k{i}", layer.keys)
             self.register_buffer(f"v{i}", layer.values)
 
+    def prefill(self, input_ids, position_ids, logits=True):
+        """A chunk of M prompt tokens at position_ids[1, M] (given by the caller):
+        their KV rows written; the last one's logits, or (logits=False, the
+        chunks before the last: prefill_kv) the last row's hidden state."""
+        self.cache.positions = position_ids[0]
+        for layer in self.cache.layers:
+            layer.cumulative_length = position_ids.reshape(-1)[0]
+        if logits:
+            return self.model(input_ids=input_ids, position_ids=position_ids, past_key_values=self.cache,
+                              use_cache=True, logits_to_keep=1).logits
+        h = self.model.model(input_ids=input_ids, position_ids=position_ids, past_key_values=self.cache,
+                             use_cache=True).last_hidden_state
+        return h[:, -1]
+
     def forward(self, input_ids, position_ids):
         self.cache.positions = position_ids[0]
         # HF builds the causal mask from the cache's own length (the positions
@@ -108,11 +122,13 @@ class SaCache(StaticCache):
 
         def make_update(i):
             def update(layer, key_states, value_states, *a, **k):
-                kr = key_states[0].transpose(0, 1).reshape(key_states.shape[2], -1)     # (1, kv_heads * hd)
+                kr = key_states[0].transpose(0, 1).reshape(key_states.shape[2], -1)     # (M, kv_heads * hd)
                 vr = value_states[0].transpose(0, 1).reshape(value_states.shape[2], -1)
-                row = cache.positions + i * T
-                owner.kc.index_copy_(0, row, _to_i8(kr * cache.inv_sk[i]))
-                owner.vc.index_copy_(0, row, _to_i8(vr * cache.inv_sv[i]))
+                kq, vq = _to_i8(kr * cache.inv_sk[i]), _to_i8(vr * cache.inv_sv[i])
+                for m in range(kr.shape[0]):          # row by row: a scalar position each (a decode step's write)
+                    row = cache.positions[m:m + 1] + i * T
+                    owner.kc.index_copy_(0, row, kq[m:m + 1])
+                    owner.vc.index_copy_(0, row, vq[m:m + 1])
                 return owner.kc[i * T:(i + 1) * T], owner.vc[i * T:(i + 1) * T]
             return update
         for i, layer in enumerate(self.layers):
@@ -121,29 +137,33 @@ class SaCache(StaticCache):
 
 def sa_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
     """The attention of the sa device (qhf.QModel.attention), registered with
-    transformers' AttentionInterface as "sa": query [1, H, 1, hd] (after RoPE),
-    key / value the layer's int8 cache rows [T, kv_heads * hd] (SaCache); q per
-    head quantized, int32 scores, the prefix mask from the position (HF's mask
-    is not used), softmax, int8 probabilities, int32 P V."""
+    transformers' AttentionInterface as "sa": query [1, H, M, hd] (after RoPE;
+    M = 1 in decode, the chunk's rows in prefill), key / value the layer's int8
+    cache rows [T, kv_heads * hd] (SaCache); per query row (a decode step's
+    form: its scalar position): q per head quantized, int32 scores, the prefix
+    mask from the position (HF's mask is not used), softmax, int8
+    probabilities, int32 P V."""
     cache = module.sa_cache
     l = module.layer_idx
-    H, hd = query.shape[1], query.shape[3]
+    H, M, hd = query.shape[1], query.shape[2], query.shape[3]
     T = key.shape[0]
     Hk = key.shape[1] // hd
     G = H // Hk
     kh = key.to(torch.int32).reshape(T, Hk, hd).permute(1, 2, 0)                  # (Hk, hd, T)
     vh = value.to(torch.int32).reshape(T, Hk, hd).permute(1, 0, 2)                # (Hk, T, hd)
-    qq, s_q = _quant_act(query[0, :, 0, :].reshape(Hk, G, hd))                   # (Hk, G, hd), (Hk, G, 1)
-    sc = torch.matmul(qq.to(torch.int32), kh)                                    # (Hk, G, T) int32
-    sc = (sc.to(torch.float32) * s_q) * cache.a_k[l]
-    mask = torch.arange(T) <= cache.positions
-    m = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
-    e = torch.where(mask, torch.exp(sc - m), torch.tensor(0.0))
-    r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
-    pq = _to_i8((e * r) * 127.0).to(torch.int32)                                 # (Hk, G, T)
-    att = torch.matmul(pq, vh)                                                   # (Hk, G, hd) int32
-    out = (att.to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd)
-    return out, None
+    outs = []
+    for m in range(M):
+        qq, s_q = _quant_act(query[0, :, m, :].reshape(Hk, G, hd))               # (Hk, G, hd), (Hk, G, 1)
+        sc = torch.matmul(qq.to(torch.int32), kh)                                # (Hk, G, T) int32
+        sc = (sc.to(torch.float32) * s_q) * cache.a_k[l]
+        mask = torch.arange(T) <= cache.positions[m:m + 1]
+        mx = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
+        e = torch.where(mask, torch.exp(sc - mx), torch.tensor(0.0))
+        r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
+        pq = _to_i8((e * r) * 127.0).to(torch.int32)                             # (Hk, G, T)
+        att = torch.matmul(pq, vh)                                               # (Hk, G, hd) int32
+        outs.append((att.to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd))
+    return (outs[0] if M == 1 else torch.cat(outs, dim=1)), None
 
 
 class SaDecoder(HFDecoder):
@@ -252,9 +272,11 @@ class QEmbedding(torch.nn.Module):
         self.s = torch.nn.Parameter(s, requires_grad=False)
 
     def forward(self, ids):
-        # index_select by the flat ids: the sa backend's row gather
+        # row by row, each an index_select by one id: the sa backend's row gather
+        # with a scalar index (prefill's M tokens: M gathers)
         flat = ids.reshape(-1)
-        e = torch.index_select(self.q, 0, flat).to(torch.float32) * torch.index_select(self.s, 0, flat).unsqueeze(-1)
+        e = torch.cat([torch.index_select(self.q, 0, flat[m:m + 1]).to(torch.float32) *
+                       torch.index_select(self.s, 0, flat[m:m + 1]).unsqueeze(-1) for m in range(flat.shape[0])])
         return e.reshape(tuple(ids.shape) + (self.q.shape[-1],))
 
 
@@ -275,11 +297,12 @@ class RopeTable(torch.nn.Module):
         self.sin_t = torch.nn.Parameter(sin.contiguous(), requires_grad=False)
 
     def forward(self, x, position_ids):
-        # index_select by the flat positions: the sa backend's row gather
+        # row by row, each an index_select by one position: the sa backend's
+        # row gather with a scalar index (prefill's M positions: M gathers)
         shape = tuple(position_ids.shape) + (self.cos_t.shape[-1],)
         pos = position_ids.reshape(-1)
-        return (torch.index_select(self.cos_t, 0, pos).reshape(shape).to(x.dtype),
-                torch.index_select(self.sin_t, 0, pos).reshape(shape).to(x.dtype))
+        rows = lambda t: torch.cat([torch.index_select(t, 0, pos[m:m + 1]) for m in range(pos.shape[0])])
+        return rows(self.cos_t).reshape(shape).to(x.dtype), rows(self.sin_t).reshape(shape).to(x.dtype)
 
 
 def swapneg(v):
@@ -417,21 +440,45 @@ def square_pow(graph):
 GRAPH_PASSES = [square_pow]
 
 
-def export(w, out):
+class _Fn(torch.nn.Module):
+    """One function of the module (decode, prefill, prefill_kv) as a module to export."""
+    def __init__(self, w, kind):
+        super().__init__()
+        self.w, self.kind = w, kind
+
+    def forward(self, input_ids, position_ids):
+        if self.kind == "main":
+            return self.w(input_ids, position_ids)
+        return self.w.prefill(input_ids, position_ids, logits=self.kind == "prefill")
+
+
+def export(w, out, prefill=0):
+    """main (decode); with prefill = M also prefill / prefill_kv of M tokens, the
+    three sharing the parameters and the KV cache (plan §8.13, §8.17)."""
     from iree.turbine import aot
+    from iree.turbine.aot import decompositions
     os.makedirs(out, exist_ok=True)
     t0 = time.time()
-    args = {"input_ids": torch.tensor([[1]]), "position_ids": torch.tensor([[0]])}
-    ep = torch.export.export(w, (), args, strict=False)
-    # functional ATen (the cache writes as buffer mutations), with iree-turbine's
-    # decomposition table (as aot.export(module) does: the frontend's usual op forms)
-    from iree.turbine.aot import decompositions
-    ep = ep.run_decompositions(decompositions.current_aot_decompositions())
-    for p in GRAPH_PASSES:
-        print(f"  {p.__name__}: {p(ep.graph)}")
-    ep.graph.lint()
+    progs = {"main": 1} | ({"prefill": prefill, "prefill_kv": prefill} if prefill else {})
+    eps = {}
+    for name, M in progs.items():
+        args = {"input_ids": torch.ones(1, M, dtype=torch.int64), "position_ids": torch.arange(M)[None]}
+        ep = torch.export.export(_Fn(w, name), (), args, strict=False)
+        # functional ATen (the cache writes as buffer mutations), with iree-turbine's
+        # decomposition table (as aot.export(module) does: the frontend's usual op forms)
+        ep = ep.run_decompositions(decompositions.current_aot_decompositions())
+        for p in GRAPH_PASSES:
+            print(f"  {name}: {p.__name__}: {p(ep.graph)}")
+        ep.graph.lint()
+        eps[name] = ep
     aot.externalize_module_parameters(w, external_scope="model")   # (after: marked tensors break aot_autograd)
-    exp = aot.export(ep)
+    if not prefill:
+        exp = aot.export(eps["main"])
+    else:
+        fx = aot.FxPrograms()
+        for name, ep in eps.items():
+            fx.programs[name] = ep
+        exp = aot.export(fx)
     mlir, irpa = os.path.join(out, "qllama.mlir"), os.path.join(out, "qllama.irpa")
     exp.save_mlir(mlir)
     aot.save_module_parameters(irpa, w)
@@ -449,8 +496,9 @@ def main():
     ap.add_argument("--rope", action="store_true", help="RoPE tables and the pair swap (RopeTable, swapneg)")
     ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (SaCache, sa_attention)")
     ap.add_argument("--kv-scales", help="KV scales (.npy [layers, 2]) instead of calibrating")
+    ap.add_argument("--prefill", type=int, default=0, help="also prefill / prefill_kv of this many tokens (needs --attn)")
     args = ap.parse_args()
-    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales), args.out)
+    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales), args.out, args.prefill)
 
 
 if __name__ == "__main__":
