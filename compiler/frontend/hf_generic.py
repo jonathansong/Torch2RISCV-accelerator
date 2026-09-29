@@ -67,15 +67,131 @@ class HFDecoder(torch.nn.Module):
                           use_cache=True).logits
 
 
-def load(model_dir, max_len=256, quant=False, rope=False):
+# ------------------------------------------------------------------ KV cache and attention (F4)
+class ObservedCache(PositionedCache):
+    """Calibration: the running max |k|, |v| per layer (after RoPE / QK-norm, as
+    they are written into the cache)."""
+    def __init__(self, config, max_cache_len, owner):
+        super().__init__(config, max_cache_len, owner)
+        self.amax = np.zeros((len(self.layers), 2), np.float32)
+        for i, layer in enumerate(self.layers):
+            upd = layer.update
+
+            def observed(key_states, value_states, *a, _i=i, _upd=upd, **k):
+                self.amax[_i, 0] = max(self.amax[_i, 0], float(key_states.abs().max()))
+                self.amax[_i, 1] = max(self.amax[_i, 1], float(value_states.abs().max()))
+                return _upd(key_states, value_states, *a, **k)
+            layer.update = observed
+
+
+class SaCache(StaticCache):
+    """The sa form of the KV cache (qhf.QModel): int8 rows [layers * T, kv_heads
+    * head_dim], layer l's at l * T + position, with a static per-layer scale;
+    update() returns the layer's T rows for sa_attention. One K and one V
+    buffer for all layers, as qhf: per-layer buffers (60 mutable globals) hit
+    an IREE 3.11 issue (compiler/tests/iree_global_merge_repro.py)."""
+    def __init__(self, config, max_cache_len, owner, kv_scales):
+        super().__init__(config=config, max_cache_len=max_cache_len)
+        self.positions = None
+        self.max_len = max_cache_len
+        kv = np.asarray(kv_scales, np.float32)
+        hd = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        self.inv_sk = [_f32c(1.0 / np.float32(x)) for x in kv[:, 0]]
+        self.inv_sv = [_f32c(1.0 / np.float32(x)) for x in kv[:, 1]]
+        self.a_k = [_f32c(float(x) / np.sqrt(hd)) for x in kv[:, 0]]
+        self.a_v = [_f32c(float(x) / 127.0) for x in kv[:, 1]]
+        cache, T = self, max_cache_len
+
+        def make_update(i):
+            def update(layer, key_states, value_states, *a, **k):
+                kr = key_states[0].transpose(0, 1).reshape(key_states.shape[2], -1)     # (1, kv_heads * hd)
+                vr = value_states[0].transpose(0, 1).reshape(value_states.shape[2], -1)
+                row = cache.positions + i * T
+                owner.kc.index_copy_(0, row, _to_i8(kr * cache.inv_sk[i]))
+                owner.vc.index_copy_(0, row, _to_i8(vr * cache.inv_sv[i]))
+                return owner.kc[i * T:(i + 1) * T], owner.vc[i * T:(i + 1) * T]
+            return update
+        for i, layer in enumerate(self.layers):
+            layer.update = types.MethodType(make_update(i), layer)
+
+
+def sa_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
+    """The attention of the sa device (qhf.QModel.attention), registered with
+    transformers' AttentionInterface as "sa": query [1, H, 1, hd] (after RoPE),
+    key / value the layer's int8 cache rows [T, kv_heads * hd] (SaCache); q per
+    head quantized, int32 scores, the prefix mask from the position (HF's mask
+    is not used), softmax, int8 probabilities, int32 P V."""
+    cache = module.sa_cache
+    l = module.layer_idx
+    H, hd = query.shape[1], query.shape[3]
+    T = key.shape[0]
+    Hk = key.shape[1] // hd
+    G = H // Hk
+    kh = key.to(torch.int32).reshape(T, Hk, hd).permute(1, 2, 0)                  # (Hk, hd, T)
+    vh = value.to(torch.int32).reshape(T, Hk, hd).permute(1, 0, 2)                # (Hk, T, hd)
+    qq, s_q = _quant_act(query[0, :, 0, :].reshape(Hk, G, hd))                   # (Hk, G, hd), (Hk, G, 1)
+    sc = torch.matmul(qq.to(torch.int32), kh)                                    # (Hk, G, T) int32
+    sc = (sc.to(torch.float32) * s_q) * cache.a_k[l]
+    mask = torch.arange(T) <= cache.positions
+    m = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
+    e = torch.where(mask, torch.exp(sc - m), torch.tensor(0.0))
+    r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
+    pq = _to_i8((e * r) * 127.0).to(torch.int32)                                 # (Hk, G, T)
+    att = torch.matmul(pq, vh)                                                   # (Hk, G, hd) int32
+    out = (att.to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd)
+    return out, None
+
+
+class SaDecoder(HFDecoder):
+    """HFDecoder with the sa KV cache and attention (F4)."""
+    def __init__(self, model, max_len, kv_scales):
+        torch.nn.Module.__init__(self)
+        from transformers import AttentionInterface
+        AttentionInterface.register("sa", sa_attention)
+        self.model = model
+        cfg = model.config
+        hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+        kv_dim = cfg.num_key_value_heads * hd
+        self.cache = SaCache(cfg, max_len, self, kv_scales)
+        # K and V start with different contents (see SaCache; the rows are only
+        # read after they are written: the attention masks later positions)
+        L = len(self.cache.layers)
+        self.register_buffer("kc", torch.zeros(L * max_len, kv_dim, dtype=torch.int8))
+        self.register_buffer("vc", torch.ones(L * max_len, kv_dim, dtype=torch.int8))
+        for mod in model.modules():
+            if hasattr(mod, "layer_idx") and hasattr(mod, "q_proj"):
+                mod.sa_cache = self.cache
+        model.set_attn_implementation("sa")
+
+
+def calibrate_kv(model, tokens, max_len):
+    """Static per-layer KV scales: amax / 127 over the fp32 model on the tokens
+    (qhf.calibrate_kv)."""
+    obs = HFDecoder(model, max_len)
+    obs.cache = ObservedCache(model.config, max_len, obs)
+    hd = getattr(model.config, "head_dim", None) or model.config.hidden_size // model.config.num_attention_heads
+    obs.cache.early_initialization(batch_size=1, num_heads=model.config.num_key_value_heads, head_dim=hd,
+                                   dtype=torch.float32, device=torch.device("cpu"))
+    for pos, t in enumerate(tokens[:max_len]):
+        obs(torch.tensor([[t]]), torch.tensor([[pos]]))
+    return (np.maximum(obs.cache.amax, 1e-8) / 127.0).astype(np.float32)
+
+
+def load(model_dir, max_len=256, quant=False, rope=False, attn=False):
     torch.set_grad_enabled(False)
     m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
     if rope:
         print("  rope_rewrite:", rope_rewrite(m, max_len))
         print("  norm_rewrite:", norm_rewrite(m))
+    kv = None
+    if attn:                              # KV scales from the fp32 model (after the RoPE / norm rewrites)
+        import export_hf
+        from hf_tokenizer import BpeTokenizer
+        kv = calibrate_kv(m, BpeTokenizer(model_dir).encode(export_hf.CALIB), max_len)
+        print(f"  calibrate_kv: {len(kv)} layers")
     if quant:
         print("  quantize:", quantize(m))
-    return HFDecoder(m, max_len)
+    return SaDecoder(m, max_len, kv) if attn else HFDecoder(m, max_len)
 
 
 # ------------------------------------------------------------------ module rewrites (before the export)
@@ -323,8 +439,9 @@ def main():
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--quant", action="store_true", help="W8A8: linear layers and embeddings (QLinear / QEmbedding)")
     ap.add_argument("--rope", action="store_true", help="RoPE tables and the pair swap (RopeTable, swapneg)")
+    ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (SaCache, sa_attention)")
     args = ap.parse_args()
-    export(load(args.model, args.max_len, args.quant, args.rope), args.out)
+    export(load(args.model, args.max_len, args.quant, args.rope, args.attn), args.out)
 
 
 if __name__ == "__main__":

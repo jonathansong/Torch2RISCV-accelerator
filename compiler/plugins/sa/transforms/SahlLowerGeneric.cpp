@@ -195,19 +195,39 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     nloops = 1;
     dynInner.reset();
   }
+  // a prefix mask (innermost index <= / < an i64 scalar) over several static
+  // rows: VALID counts the elements of a whole VE, so one row at a time too
+  bool maskRows = false;
+  if (!dynInner && !sel && !chunk && nloops == 2 && ranges[0] > 1 && ranges[1] % d == 0) {
+    const int last = int(g.getNumLoops()) - 1;
+    g.getRegion().front().walk([&](arith::CmpIOp c) {
+      auto isInnerIndex = [&](Value v) {
+        while (Operation *o = v.getDefiningOp()) {
+          if (auto ix = dyn_cast<linalg::IndexOp>(o)) return int(ix.getDim()) == last;
+          if (!isa<arith::IndexCastOp, arith::IndexCastUIOp>(o)) return false;
+          v = o->getOperand(0);
+        }
+        return false;
+      };
+      maskRows |= (isInnerIndex(c.getLhs()) && isa<BlockArgument>(c.getRhs())) ||
+                  (isInnerIndex(c.getRhs()) && isa<BlockArgument>(c.getLhs()));
+    });
+  }
   // a dynamic innermost length: one row at a time (each VE then needs only a
   // dynamic LEN, and VALID for a mask)
-  if (dynInner && !sel) {
+  if ((dynInner || maskRows) && !sel) {
     int64_t H = nloops == 2 ? ranges[0] : 1;
-    if (H > 16) return fail("more than 16 rows of a dynamic length");
-    curLen = paramFor(*dynInner);
-    curLenStatic = (cfg.maxDynamic + d - 1) / d * d;
+    if (H > 16) return fail("more than 16 rows of a dynamic length or with a mask");
+    if (dynInner) {
+      curLen = paramFor(*dynInner);
+      curLenStatic = (cfg.maxDynamic + d - 1) / d * d;
+    }
     for (int64_t r = 0; r < H; ++r) {
       // a row's temps are released after it, unless it allocated something
       // later rows use (a buffer's local, a broadcast: usually the first row)
       auto savedTop = mem.mark();
       size_t nLocals = locals.size(), nBcast = bcastOf.size();
-      RowSel rs{r, *dynInner};
+      RowSel rs{r, dynInner ? *dynInner : Lin{}, !dynInner};
       if (!generic(g, &rs)) return false;
       if (locals.size() == nLocals && bcastOf.size() == nBcast) {
         mem.releaseAcc(savedTop);
@@ -281,8 +301,9 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
       }
       v.o = {l.la, l.vt, ::sa::IDX_LIN, 0};
       if (sel && nloops == 2) {
-        if (!l.rowStride) return fail("row-by-row operand not in the row layout");
-        v.o.la += uint32_t(sel->row) * l.rowStride;
+        uint32_t stride = l.rowStride ? l.rowStride : sel->fixed ? wordsPerRow : 0;
+        if (!stride) return fail("row-by-row operand not in the row layout");
+        v.o.la += uint32_t(sel->row) * stride;
       }
     } else if (nloops == 2 && m.getNumResults() == 1 && m.getResult(0) == getAffineDimExpr(0, g.getContext())) {
       auto b = perElementBcast(in, *lb, ranges[0]);
@@ -726,8 +747,9 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     }
     LocalBuf outRow = *out0;
     if (sel && nloops == 2) {                          // this row of the row layout
-      if (!outRow.rowStride) return fail("row-by-row result not in the row layout");
-      outRow.la += uint32_t(sel->row) * outRow.rowStride;
+      uint32_t stride = outRow.rowStride ? outRow.rowStride : sel->fixed ? wordsPerRow : 0;
+      if (!stride) return fail("row-by-row result not in the row layout");
+      outRow.la += uint32_t(sel->row) * stride;
     }
     const LocalBuf *out = &outRow;
     if (y.kind == Val::Mem) {

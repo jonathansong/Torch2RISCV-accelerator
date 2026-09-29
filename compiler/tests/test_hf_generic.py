@@ -24,6 +24,29 @@ import hf_generic as H  # noqa: E402
 import test_c6p as T  # noqa: E402
 
 
+class device_sfu:
+    """with device_sfu(): torch's exp / reciprocal / rsqrt / sigmoid / silu compute as
+    the sa device's SFU does (llm/ref_model.py SfuExact; as qhf.device_sfu): the
+    reference for a quantized model, whose int8 roundings flip with 1-ulp
+    differences (compare with the device up to reduction order)."""
+    def __enter__(self):
+        import torch.nn.functional as F
+        sys.path.insert(0, os.path.join(COMPILER, "..", "llm"))
+        from ref_model import SfuExact
+        wrap = lambda f: (lambda x, *a, **k: torch.from_numpy(np.ascontiguousarray(
+            f(x.detach().numpy().astype(np.float32)))).reshape(x.shape))
+        self.saved = (torch.exp, torch.reciprocal, torch.rsqrt, torch.sigmoid, F.silu)
+        exp, recip, rsqrt = wrap(SfuExact.exp), wrap(SfuExact.recip), wrap(SfuExact.rsqrt)
+        torch.exp, torch.reciprocal, torch.rsqrt = exp, recip, rsqrt
+        torch.sigmoid = lambda x: recip(1.0 + exp(x * -1.0))
+        F.silu = lambda x, inplace=False: x * recip(1.0 + exp(x * -1.0))
+        return self
+
+    def __exit__(self, *a):
+        import torch.nn.functional as F
+        torch.exp, torch.reciprocal, torch.rsqrt, torch.sigmoid, F.silu = self.saved
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", required=True)
@@ -35,6 +58,7 @@ def main():
     ap.add_argument("--quant", action="store_true", help="W8A8 (QLinear / QEmbedding); the reference is then "
                     "the quantized model in torch (and the fp32 model's argmax for information)")
     ap.add_argument("--rope", action="store_true", help="RoPE tables and the pair swap (F3)")
+    ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (F4)")
     ap.add_argument("--min-corr", type=float, default=0.999)
     args = ap.parse_args()
     if args.rope:                        # the rewrite keeps the fp32 model's logits (checked here)
@@ -46,7 +70,7 @@ def main():
         d = max(float((x - y).abs().max()) for x, y in zip(a, b))
         print(f"rope rewrite vs the original model (fp32, torch): max |diff| {d:.3g}")
         del base, rw
-    w = H.load(args.model, quant=args.quant, rope=args.rope)
+    w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn)
     if not args.skip_export:
         H.export(w, args.out)
         t0 = time.time()
@@ -60,11 +84,14 @@ def main():
         print(f"compiled in {time.time() - t0:.0f} s: {ok_n} executables for the accelerator, {host_n} for the host")
     prompt = [int(t) for t in args.prompt.split(",")]
     ref, tok = [], None
-    for pos in range(len(prompt) + args.generate):
-        tok = prompt[pos] if pos < len(prompt) else tok
-        lg = w(torch.tensor([[tok]]), torch.tensor([[pos]]))[0, -1].numpy()
-        ref.append(lg)
-        tok = int(np.argmax(lg))
+    import contextlib
+    with device_sfu() if args.quant else contextlib.nullcontext():
+        w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn)   # (fresh state)
+        for pos in range(len(prompt) + args.generate):
+            tok = prompt[pos] if pos < len(prompt) else tok
+            lg = w(torch.tensor([[tok]]), torch.tensor([[pos]]))[0, -1].numpy()
+            ref.append(lg)
+            tok = int(np.argmax(lg))
     ref = np.stack(ref)
     sock = f"/tmp/sa_hf_{os.getpid()}.sock"
     srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb", str(args.mb),

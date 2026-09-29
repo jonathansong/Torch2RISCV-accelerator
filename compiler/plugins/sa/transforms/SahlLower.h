@@ -304,10 +304,13 @@ private:
   // a PARAM of the template's own (from 7 down, by sahw-assign-registers)
   Value privateParam() { return sahw::PrivateOp::create(regB, loc, regB.getType<sahw::ParamType>(), IntegerAttr()); }
 
-  // a row of an [H, T] generic with a dynamic T (or the one row of a [T] one)
+  // a row of an [H, T] generic with a dynamic T (or the one row of a [T] one),
+  // or of a static [H, C] one with a prefix mask (fixed: VALID is per VE, so
+  // the rows go one by one; a row of a buffer is C / D words)
   struct RowSel {
     int64_t row = 0;
     Lin len;
+    bool fixed = false;
   };
 
   // a chunk of a linear layer's epilogue: the inputs given, n elements, the
