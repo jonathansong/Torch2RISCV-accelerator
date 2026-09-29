@@ -72,6 +72,7 @@ def load(model_dir, max_len=256, quant=False, rope=False):
     m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
     if rope:
         print("  rope_rewrite:", rope_rewrite(m, max_len))
+        print("  norm_rewrite:", norm_rewrite(m))
     if quant:
         print("  quantize:", quantize(m))
     return HFDecoder(m, max_len)
@@ -129,7 +130,10 @@ class QEmbedding(torch.nn.Module):
         self.s = torch.nn.Parameter(s, requires_grad=False)
 
     def forward(self, ids):
-        return self.q[ids].to(torch.float32) * self.s[ids].unsqueeze(-1)
+        # index_select by the flat ids: the sa backend's row gather
+        flat = ids.reshape(-1)
+        e = torch.index_select(self.q, 0, flat).to(torch.float32) * torch.index_select(self.s, 0, flat).unsqueeze(-1)
+        return e.reshape(tuple(ids.shape) + (self.q.shape[-1],))
 
 
 # RoPE (F3): the rotary module's cos / sin as tables, and rotate_half as the
@@ -149,7 +153,11 @@ class RopeTable(torch.nn.Module):
         self.sin_t = torch.nn.Parameter(sin.contiguous(), requires_grad=False)
 
     def forward(self, x, position_ids):
-        return self.cos_t[position_ids].to(x.dtype), self.sin_t[position_ids].to(x.dtype)
+        # index_select by the flat positions: the sa backend's row gather
+        shape = tuple(position_ids.shape) + (self.cos_t.shape[-1],)
+        pos = position_ids.reshape(-1)
+        return (torch.index_select(self.cos_t, 0, pos).reshape(shape).to(x.dtype),
+                torch.index_select(self.sin_t, 0, pos).reshape(shape).to(x.dtype))
 
 
 def swapneg(v):
@@ -201,6 +209,31 @@ def rope_rewrite(model, max_len):
         if name.startswith("transformers.models.") and "rotate_half" in getattr(m, "__dict__", {}):
             m.rotate_half = swapneg
             n["rotate_half"] += 1
+    return n
+
+
+class SaRMSNorm(torch.nn.Module):
+    """RMSNorm as the sa device computes it (qhf.rmsnorm): sum(x * x) times the
+    constant 1 / n instead of mean() (a division), then rsqrt; the same weight."""
+    def __init__(self, norm):
+        super().__init__()
+        self.weight = norm.weight
+        eps = getattr(norm, "variance_epsilon", None)
+        self.eps = _f32c(eps if eps is not None else norm.eps)
+
+    def forward(self, x):
+        ss = torch.sum(x * x, dim=-1, keepdim=True)
+        return (x * torch.rsqrt(ss * _f32c(1.0 / x.shape[-1]) + self.eps)) * self.weight
+
+
+def norm_rewrite(model):
+    """Modules whose class name ends with RMSNorm -> SaRMSNorm (mean -> sum * 1 / n)."""
+    n = 0
+    for mod in list(model.modules()):
+        for cname, child in list(mod.named_children()):
+            if type(child).__name__.endswith("RMSNorm") and getattr(child, "weight", None) is not None:
+                setattr(mod, cname, SaRMSNorm(child))
+                n += 1
     return n
 
 
