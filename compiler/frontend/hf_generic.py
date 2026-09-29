@@ -300,7 +300,9 @@ def rope_rewrite(model, max_len):
     / k projections (and q / k norms) interleaved (the dot products of q and k
     are unchanged: both permuted alike), the tables' columns alike, and
     rotate_half -> swapneg in every transformers modeling module that defines
-    it (in the interleaved layout the two are the same)."""
+    it (in the interleaved layout the two are the same). The last one holds for
+    the whole process: an unmodified model of the same family loaded afterwards
+    computes RoPE wrongly (compute such references first)."""
     import sys
     cfg = model.config
     hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads

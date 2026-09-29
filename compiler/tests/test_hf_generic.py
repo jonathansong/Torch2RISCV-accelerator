@@ -70,6 +70,13 @@ def main():
     wr = H.HFDecoder(plain, 256)
     dmax = max(float((wr(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] - full[i]).abs().max()) for i, t in enumerate(pr))
     print(f"HFDecoder vs plain HF (the whole prompt at once, fp32): max |diff| {dmax:.3g}")
+    # the teacher-forced reference (plain HF fp32 on a fixed text), before any
+    # rewrite: rope_rewrite replaces rotate_half in the transformers modeling
+    # modules for the whole process
+    import export_hf
+    from hf_tokenizer import BpeTokenizer
+    tf_toks = BpeTokenizer(args.model).encode(export_hf.CALIB)[:40]
+    tf_ref = plain(torch.tensor([tf_toks])).logits[0].detach().numpy()
     if dmax > 1e-3:
         print("hf_generic FAIL (the wrapper)")
         return 1
@@ -126,6 +133,28 @@ def main():
     print(f"{len(got)} steps vs the torch model{' (W8A8)' if args.quant else ' (fp32)'}: min corr {min(corr):.6f}, max |diff| "
           f"{float(np.max(np.abs(got - ref))):.3g}, argmax equal in {sum(same)}/{len(same)}; {stats[-1] if stats else ''}")
     ok = len(got) == len(ref) and min(corr) > args.min_corr and all(same)
+    if args.quant:
+        # a quantized model: int8 roundings flip with the order of operations (the
+        # device's vs torch's), and the flips grow over the steps. The criterion
+        # is the quality: teacher-forced top-1 agreement with plain HF fp32 on a
+        # fixed text (the hand-written qhf path scores 36 / 40 on SmolLM2)
+        toks, fp = tf_toks, tf_ref
+        srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb",
+                                str(args.mb), "--socket", sock, "--once"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+        time.sleep(3)
+        tq = os.path.join(args.out, "logits_tf.f32")
+        subprocess.run([T.RUN, "--device=sa", f"--module={args.out}/sa.vmfb",
+                        f"--parameters=model={args.out}/sa_packed.irpa", "--abi=hf",
+                        "--tokens=" + ",".join(map(str, toks)), "--generate=0", f"--logits_out={tq}"],
+                       capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
+        srv.wait(timeout=120)
+        tf = np.fromfile(tq, np.float32).reshape(-1, fp.shape[1])
+        n = min(len(tf), len(fp))
+        agree = int(np.sum(tf[:n].argmax(1) == fp[:n].argmax(1)))
+        mcorr = float(np.mean([np.corrcoef(tf[i], fp[i])[0, 1] for i in range(n)]))
+        print(f"teacher-forced, {n} positions: top-1 agreement with plain HF fp32 {agree}/{n}, mean corr {mcorr:.4f}")
+        ok = n == len(toks) and agree >= int(0.85 * n) and mcorr > 0.95
     print("hf_generic PASS" if ok else "hf_generic FAIL")
     return 0 if ok else 1
 

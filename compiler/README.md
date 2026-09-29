@@ -175,11 +175,15 @@ directory about 10–15 GB. ccache is capped at 8 GB.
 - **Generic frontend in progress** (docs/iree_compiler_plan.md §8.16): an
   unmodified HuggingFace decoder (transformers' modeling code) exported by
   `frontend/hf_generic.py` (a static KV cache written at the input positions;
-  torch.export -> functional ATen -> graph rewrites -> iree-turbine) and run
-  with `sa-llm-run --abi=hf`. F0/F1: SmolLM2 matches transformers' fp32
-  (correlation 1.000000, argmax 9/9) with 3 of 32 executables on the
-  accelerator and the rest on the host; next the graph rewrites that put it on
-  the accelerator (W8A8, RoPE tables, KV cache and attention).
+  torch.export -> functional ATen -> iree-turbine) and run with
+  `sa-llm-run --abi=hf`. The rewrites are generic (by module type and
+  transformers' AttentionInterface): W8A8 (`QLinear`, `QEmbedding`), RoPE
+  tables and the pair swap, RMSNorm as the device computes it, an int8 KV
+  cache and the sa attention. SmolLM2 on sim: 171 executables on the
+  accelerator, 33 on the host; teacher-forced top-1 agreement with plain HF
+  fp32 35/40 (the hand-written qhf path: 36/40). Next (plan §8.17): the generic
+  path's prefill, micro-kernels expanded at the sahl level, memory planning
+  with lifetimes.
 
   ```sh
   compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)
