@@ -1243,7 +1243,7 @@ C5.5 的模型（§8.9 的第一步）：
 | 顺序 | 工作 | 内容 | 验收 | 风险与依赖 |
 |---|---|---|---|---|
 | 1 | **通用路径的 prefill**（端到端 prefill + decode） | 导出 `prefill(tokens[M], positions[M])`，与 decode 在同一个模块里共用参数和 KV cache；`SaCache` 一次写 M 行；`"sa"` 注意力按行加因果掩码（qhf 的逐行形式）；`sa-llm-run --abi=hf` 支持分块 prefill；顺带 F4 剩下的 int8 尾部 | 与同一模型只用 decode 在设备上逐位一致（C6.P 的判据）；质量指标不下降；Qwen3 不改代码；上板 | 主要复用现有编译器（多行线性层、逐行注意力都已有）；可能再暴露编译器的边界情况。**完成**（2026-09-29，sim 与板上，§8.19） |
-| 2 | **微内核在 `sahl` 层展开** | 线性层、注意力、通用 contraction 的调度（分块、SPAD_B bank 交替、预取、LOOP_END 循环）用 `sahl` 操作显式表达，由一个 pass 展开；`sahl-to-sahw` 只做一对一翻译；`sahl` 需要补上能表达 bank、条带、循环的操作 | 黄金语料逐字节相同，不用上板 | 工作量大；C8 时没做（§8.14 R2：等于把 `sahw` 的概念再造一遍）。现在的价值是让调度能被代价模型和内存规划看见、能被改；也是第 3 项的前提 |
+| 2 | **微内核在 `sahl` 层展开** | 线性层、注意力、通用 contraction 的调度（分块、SPAD_B bank 交替、预取、LOOP_END 循环）用 `sahl` 操作显式表达，由一个 pass 展开；`sahl-to-sahw` 只做一对一翻译；`sahl` 需要补上能表达 bank、条带、循环的操作 | 黄金语料逐字节相同，不用上板 | 工作量大；C8 时没做（§8.14 R2：等于把 `sahw` 的概念再造一遍）。现在的价值是让调度能被代价模型和内存规划看见、能被改；也是第 3 项的前提。第 1 项之后又多了一个直接的收益：线性层的调度能套在任意尾部上，通用路径 decode 约 66% 的权重现在走通用 contraction，比手写路径慢约 50%（§8.19）；这部分会改变输出，按第 3 项的方式验收（逐 dispatch 一致、板上周期） |
 | 3 | **带生存期分析的内存规划** | 所有局部缓冲和临时值都在 IR 上之后（第 2 项），按生存期分配 SPAD / ACC，按 bank 避开冲突，放不下时由规划决定分片（替代现在的估计，包括 `sahl.to_i8` 按 12 个操作计的那处） | 会改变输出：逐 dispatch 检查与 sim 逐位一致；板上逐 dispatch 周期不变差 | 地址与 bank 的变化影响记分板的并发，可能变快也可能变慢，要在板上实测 |
 
 理由：第 1 项是功能上的完整性（通用前端追上手写路径）；第 2 项是纯重构，由黄金语料守着；第 3 项依赖第 2 项，并且是唯一需要上板测性能的一步。
@@ -1271,7 +1271,22 @@ C5.5 的模型（§8.9 的第一步）：
 
 **板上**（`compiler/scripts/deploy_hfgen.sh` → `build/deploy_hfgen`，`board_llm.py`，窗口 168 MB）：SmolLM2 prefill（M = 8）+ 16 步 decode，logits 17/17 步与 sim 逐位一致，生成的 token 相同，**board PASS**。211 个描述符列表在加速器上，180 次主机 dispatch（2 个 × 30 层 × 3 块，全在 prefill；decode 0 次）。prefill 20 个 token 8.5 s（2.35 token/s，第一块含加载），decode 681 ms/步（1.47 token/s）——比手写 qhf 路径（约 450 ms/步，2.22 token/s）慢约 50%，dispatch 的划分不同，还没做性能分析。
 
-**剩下**：通用路径 decode 的性能分析（与手写路径对比）；prefill 里 Q 的 RoPE 两个主机 dispatch（IREE 把 swap 后的 q 物化成按头在外的布局，gather 带了转置；改前端 swap 的写法反而让 31 个落到主机，没采用）；主机退路改用原生 ARM 代码（`llvm-cpu`，替代 VMVX 解释器，需要重建编译器）。
+**通用路径 decode 为什么比手写路径慢约 50%**（681 对约 450 ms/步；sim 上的结构对比，板上逐 export 周期待测：两个包里都有 `board_profile.py`）：
+- 每步的 dispatch：手写 910 次、通用 1000 次，只多 10%；差别在线性层。手写路径每层 4 个线性层（q/k/v 合成一个、gate/up 合成一个），通用路径是 HF 的 7 个。权重字节数相同，decode 又受读权重的带宽限制，dispatch 多出来的固定开销解释不了 50%。
+- 主要原因：**约 66% 的权重走了通用 contraction，而不是线性层微内核**。线性层微内核只匹配手写路径那种尾部（`(acc · s_w) · s_x` 输出 fp32）；通用路径里 IREE 把更多东西融合进了尾部，或者把尾部挪走了：
+
+| 线性层（每层） | 权重 | 尾部 | lowering |
+|---|---|---|---|
+| gate | 1536×576 | `silu(gate) · up`（up 的 int32 累加作逐元素输入） | 通用 contraction |
+| up | 1536×576 | 没有（int32 累加直接输出） | 通用 contraction |
+| k、v | 2 × 192×576 | 反量化后乘 KV scale 再 int8（写 cache） | 通用 contraction（每层一个可执行：KV scale 是常数） |
+| q、o 之一 | 576×576 | | 通用 contraction |
+| q、o 之另一、down、分类层 | | `(acc · s_w) · s_x` | 线性层微内核 |
+
+  通用 contraction 没有微内核的调度（SPAD_B 双缓冲、chunk 0 预取、LOOP_END 循环），C5 实测整模型慢约 1.7 倍（stories15M 4.40M 对 2.59M 周期/token）。66% × 0.7 ≈ +46%，与实测的 +51% 相符。
+- **改法**：让线性层微内核接受任意逐元素尾部（与通用 contraction 一样，按 chunk 把累加结果交给 `generic` 的尾部 lowering；输出 fp32 / int32 / int8，逐元素输入 fp32 / int32），没有尾部时直接存 int32 累加。这正好是第 2 项（微内核在 `sahl` 层展开）要做的：调度与尾部分开表达以后，线性层的调度可以套在任意尾部上。
+
+**剩下**：通用路径 decode 的线性层走微内核（见上）；prefill 里 Q 的 RoPE 两个主机 dispatch（IREE 把 swap 后的 q 物化成按头在外的布局，gather 带了转置；改前端 swap 的写法反而让 31 个落到主机，没采用）；主机退路改用原生 ARM 代码（`llvm-cpu`，替代 VMVX 解释器，需要重建编译器）。
 
 ## 9. 验证体系
 

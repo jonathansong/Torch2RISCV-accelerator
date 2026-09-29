@@ -1054,7 +1054,7 @@ IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 →
 
 ### 10.5 L6-IREE 的交付与验收
 
-（实际的位置：编译器插件在 `compiler/plugins/sa`，HAL 驱动在 `compiler/runtime/sa`，见 `compiler/README.md`。现状与之后的计划见 [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.12–§8.18：prefill + decode、代码生成分层重构、主机退路、HuggingFace 原始模型的通用前端，以及更大模型所需的 FPGA 规模。）
+（实际的位置：编译器插件在 `compiler/plugins/sa`，HAL 驱动在 `compiler/runtime/sa`，见 `compiler/README.md`。现状与之后的计划见 [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.12–§8.19：prefill + decode、代码生成分层重构、主机退路、HuggingFace 原始模型的通用前端（prefill + decode 板上逐位一致）、更大模型所需的 FPGA 规模。）
 
 - **`iree-sa/compiler`**：HAL 目标后端插件，使用模板库，可执行体格式为 `sa-desc-v1`。
 - **`iree-sa/runtime`**：C 写的 HAL 驱动：
@@ -1177,7 +1177,7 @@ xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计�
 | **L5** | Python 运行时；端到端生成文本 | Python | 否 | §9.2 的 4 项 | **完成**（89741a3；15.1 tok/s 墙钟，top-1 96.2%） |
 | L5b | 多序列并发 decode | Python | 否 | §11.1 | **完成**（faf7bc7；8 条序列 63.3 tok/s） |
 | L5.5 | 75 MHz | 时钟与少量时序修复 | 是 | §11.2 | 未做（LUT 已用 83%，时序更难收敛） |
-| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | **大部分完成**（C0–C3、C5 完成：stories15M 板上 17.7 tok/s、SmolLM2-135M 板上 2.22 tok/s，均逐位一致；C4 部分完成；C6 更大的模型进行中：Qwen3-0.6B 全 28 层在 sim 上逐位一致） |
+| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | **大部分完成**（C0–C3、C5 完成：stories15M 板上 17.7 tok/s、SmolLM2-135M 板上 2.22 tok/s，均逐位一致；C4 部分完成；C6 更大的模型进行中：Qwen3-0.6B 全 28 层在 sim 上逐位一致；通用前端：原版 HF 的 SmolLM2 prefill + decode 板上与 sim 逐位一致，Qwen3 不改代码通过） |
 | L6 | 其他扩展 | — | 视情况 | 每项单独定 | 未做 |
 
 - **建议顺序**：L0 → L1 → L2 → L3 → L4 → L5 → L6-IREE，L5b 和 L5.5 可以穿插进行。
