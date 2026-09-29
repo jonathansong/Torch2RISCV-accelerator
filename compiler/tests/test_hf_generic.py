@@ -63,11 +63,13 @@ def main():
     ap.add_argument("--prefill", type=int, default=0, help="also export prefill of M tokens (needs --attn); the "
                     "sim run with prefill + decode must be bit-exact with decode only (plan §8.17)")
     ap.add_argument("--min-corr", type=float, default=0.999)
+    ap.add_argument("--layers", type=int, help="only the first layers (a truncated model)")
+    ap.add_argument("--board-bundle", help="with --prefill: stage the board test here (board_llm.py)")
+    ap.add_argument("--board-generate", type=int, default=16)
     args = ap.parse_args()
     # the wrapper (static cache at the input positions) vs plain HF on the whole prompt
-    from transformers import AutoModelForCausalLM
     pr = [int(t) for t in args.prompt.split(",")]
-    plain = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, attn_implementation="sdpa").eval()
+    plain = H.hf_model(args.model, args.layers)
     full = plain(torch.tensor([pr])).logits[0]
     wr = H.HFDecoder(plain, 256)
     dmax = max(float((wr(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] - full[i]).abs().max()) for i, t in enumerate(pr))
@@ -84,15 +86,15 @@ def main():
         return 1
     del plain, wr
     if args.rope:                        # the rewrite keeps the fp32 model's logits (checked here)
-        base = H.load(args.model)
+        base = H.load(args.model, layers=args.layers)
         pr = [int(t) for t in args.prompt.split(",")]
         a = [base(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] for i, t in enumerate(pr)]
-        rw = H.load(args.model, rope=True)
+        rw = H.load(args.model, rope=True, layers=args.layers)
         b = [rw(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] for i, t in enumerate(pr)]
         d = max(float((x - y).abs().max()) for x, y in zip(a, b))
         print(f"rope rewrite vs the original model (fp32, torch): max |diff| {d:.3g}")
         del base, rw
-    w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales)
+    w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers)
     if not args.skip_export:
         H.export(w, args.out, args.prefill)
         t0 = time.time()
@@ -108,12 +110,16 @@ def main():
     ref, tok = [], None
     import contextlib
     with device_sfu() if args.quant else contextlib.nullcontext():
-        w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales)   # (fresh state)
+        w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers)   # (fresh state)
         for pos in range(len(prompt) + args.generate):
             tok = prompt[pos] if pos < len(prompt) else tok
             lg = w(torch.tensor([[tok]]), torch.tensor([[pos]]))[0, -1].numpy()
             ref.append(lg)
             tok = int(np.argmax(lg))
+        # the torch model on the teacher-forced text (its rows are rewritten in
+        # order; the attention reads only positions <= the current one)
+        eager_tf = np.stack([w(torch.tensor([[t]]), torch.tensor([[p]]))[0, -1].numpy()
+                             for p, t in enumerate(tf_toks)]) if args.quant else None
     ref = np.stack(ref)
     sock = f"/tmp/sa_hf_{os.getpid()}.sock"
     srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb", str(args.mb),
@@ -137,9 +143,12 @@ def main():
     ok = len(got) == len(ref) and min(corr) > args.min_corr and all(same)
     if args.quant:
         # a quantized model: int8 roundings flip with the order of operations (the
-        # device's vs torch's), and the flips grow over the steps. The criterion
-        # is the quality: teacher-forced top-1 agreement with plain HF fp32 on a
-        # fixed text (the hand-written qhf path scores 36 / 40 on SmolLM2)
+        # device's vs torch's), and the flips grow over the steps. The criterion:
+        # teacher-forced on a fixed text, the device's top-1 agreement with plain
+        # HF fp32 as good as the torch W8A8 model's (-2 of 40), mean corr alike
+        # (-0.01): the compiler keeps the quantized model's quality. The quality
+        # of the quantization itself is printed (SmolLM2: 34-36 / 40; Qwen3-0.6B
+        # 25 / 40, plan C6.2), not judged here.
         toks, fp = tf_toks, tf_ref
         srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb",
                                 str(args.mb), "--socket", sock, "--once"], stdout=subprocess.DEVNULL,
@@ -155,13 +164,16 @@ def main():
         n = min(len(tf), len(fp))
         agree = int(np.sum(tf[:n].argmax(1) == fp[:n].argmax(1)))
         mcorr = float(np.mean([np.corrcoef(tf[i], fp[i])[0, 1] for i in range(n)]))
-        print(f"teacher-forced, {n} positions: top-1 agreement with plain HF fp32 {agree}/{n}, mean corr {mcorr:.4f}")
-        ok = n == len(toks) and agree >= int(0.85 * n) and mcorr > 0.95
+        e_agree = int(np.sum(eager_tf.argmax(1) == fp.argmax(1)))
+        e_mcorr = float(np.mean([np.corrcoef(eager_tf[i], fp[i])[0, 1] for i in range(len(fp))]))
+        print(f"teacher-forced, {n} positions: top-1 agreement with plain HF fp32 {agree}/{n}, mean corr {mcorr:.4f} "
+              f"(the torch W8A8 model: {e_agree}/{len(fp)}, {e_mcorr:.4f})")
+        ok = n == len(toks) and agree >= e_agree - 2 and mcorr >= e_mcorr - 0.01
     if args.prefill:
         # prefill + decode vs decode only: the prompt's last position, then the generated steps
         M = args.prefill
         pp = prompt if len(prompt) >= 2 * M else [int(v) for v in np.resize(np.array(prompt), 2 * M + M // 2)]
-        def run(pre):
+        def run(pre, generate=args.generate):
             srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb",
                                     str(args.mb), "--socket", sock, "--once"], stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL)
@@ -169,7 +181,7 @@ def main():
             lp = os.path.join(args.out, f"logits_p{pre}.f32")
             r2 = subprocess.run([T.RUN, "--device=sa", f"--module={args.out}/sa.vmfb",
                                  f"--parameters=model={args.out}/sa_packed.irpa", "--abi=hf",
-                                 "--tokens=" + ",".join(map(str, pp)), f"--generate={args.generate}",
+                                 "--tokens=" + ",".join(map(str, pp)), f"--generate={generate}",
                                  f"--logits_out={lp}"] + ([f"--prefill={pre}"] if pre else []),
                                 capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
             srv.wait(timeout=120)
@@ -186,8 +198,36 @@ def main():
         print(f"prefill M = {M}, a {len(pp)}-token prompt: logits bit-exact with decode only in {sum(exact)}/"
               f"{len(exact)} rows, tokens {'identical' if same else 'DIFFERENT'}; {pline[0] if pline else ''}")
         ok &= len(exact) == args.generate + 1 and all(exact) and same
+        if args.board_bundle and ok:
+            stage(args, pp, run)
     print("hf_generic PASS" if ok else "hf_generic FAIL")
     return 0 if ok else 1
+
+
+def stage(args, prompt, run):
+    """The board bundle (board_llm.py): module, packed parameters, the sim's
+    decode-only run over the prompt and --board-generate tokens (the board runs
+    prefill + decode: compared with the rows from the prompt's last position),
+    the tokenizer, sa_args.txt (--abi=hf --prefill=M), board.txt (the
+    reference, the window in MB)."""
+    import shutil
+    dst = args.board_bundle
+    os.makedirs(dst, exist_ok=True)
+    for f in ("sa.vmfb", "sa_packed.irpa"):
+        shutil.copy(os.path.join(args.out, f), os.path.join(dst, f))
+    line, logits, _ = run(0, args.board_generate)
+    tokens = [int(t) for t in line.split(":")[1].split()]
+    np.save(os.path.join(dst, "prompt.npy"), np.array(prompt, np.int64))
+    np.save(os.path.join(dst, "expected_tokens.npy"), np.array(tokens[:len(logits)], np.int64))
+    np.save(os.path.join(dst, "expected_logits.npy"), logits.astype(np.float32))
+    shutil.copy(os.path.join(args.model, "tokenizer.json"), os.path.join(dst, "tokenizer.json"))
+    shutil.copy(os.path.join(COMPILER, "frontend", "hf_tokenizer.py"), os.path.join(dst, "hf_tokenizer.py"))
+    with open(os.path.join(dst, "sa_args.txt"), "w") as f:
+        f.write(f"--abi=hf --prefill={args.prefill}\n")
+    mb = int(os.path.getsize(os.path.join(args.out, "sa_packed.irpa")) / 2**20 * 1.1) + 24
+    with open(os.path.join(dst, "board.txt"), "w") as f:
+        f.write(f"the functional simulator (decode only) {mb}\n")
+    print(f"board bundle: {dst} ({len(prompt)} prompt tokens, {args.board_generate} generated, window {mb} MB)")
 
 
 if __name__ == "__main__":

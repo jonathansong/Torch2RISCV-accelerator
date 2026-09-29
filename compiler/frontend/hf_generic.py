@@ -203,9 +203,21 @@ def calibrate_kv(model, tokens, max_len):
     return (np.maximum(obs.cache.amax, 1e-8) / 127.0).astype(np.float32)
 
 
-def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=None):
+def hf_model(model_dir, layers=None):
+    """The HF model in fp32 (layers: only the first ones, a truncated model for tests)."""
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(model_dir)
+    if layers:
+        cfg.num_hidden_layers = layers
+        if getattr(cfg, "layer_types", None):
+            cfg.layer_types = cfg.layer_types[:layers]
+    return AutoModelForCausalLM.from_pretrained(model_dir, config=cfg, dtype=torch.float32,
+                                                attn_implementation="sdpa").eval()
+
+
+def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=None, layers=None):
     torch.set_grad_enabled(False)
-    m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
+    m = hf_model(model_dir, layers)
     if rope:
         print("  rope_rewrite:", rope_rewrite(m, max_len))
         print("  norm_rewrite:", norm_rewrite(m))
@@ -503,8 +515,10 @@ def main():
     ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (SaCache, sa_attention)")
     ap.add_argument("--kv-scales", help="KV scales (.npy [layers, 2]) instead of calibrating")
     ap.add_argument("--prefill", type=int, default=0, help="also prefill / prefill_kv of this many tokens (needs --attn)")
+    ap.add_argument("--layers", type=int, help="only the first layers (a truncated model, for tests)")
     args = ap.parse_args()
-    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales), args.out, args.prefill)
+    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales, args.layers), args.out,
+           args.prefill)
 
 
 if __name__ == "__main__":
