@@ -273,8 +273,9 @@ KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int6
   uint32_t extra = p.chunked.size() > 1 ? uint32_t(p.chunked.size()) - 1 : 0;
   uint32_t steps = 0;
   linalg::GenericOp epi = p.epi;
-  for (Operation &o : epi.getRegion().front().without_terminator())
-    if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
+  if (epi)                                        // (none: the accumulator stored as it is)
+    for (Operation &o : epi.getRegion().front().without_terminator())
+      if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
   uint32_t scratchRows = std::max<uint32_t>(steps > 2 ? 2 : 1, 1 + extra);
   ks.chunkTiles = lay.chunkTiles(uint32_t(k), uint32_t(nt), scratchRows);
   ks.loop = ks.chunkTiles && nt / ks.chunkTiles > 4;
@@ -649,17 +650,22 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
     if (u == con.getOperation()) continue;
     if (auto f = dyn_cast<linalg::FillOp>(u)) fill = f;
     else if (auto e = dyn_cast<linalg::GenericOp>(u); e && !p.epi) p.epi = e;
-    else if (auto st = dyn_cast<sahl::StoreOp>(u); st && rows4 && st.getSrc() == p.acc && !p.store) p.store = st;
+    else if (auto st = dyn_cast<sahl::StoreOp>(u); st && st.getSrc() == p.acc && !p.store) p.store = st;
     else if (!isa<memref::DeallocOp>(u)) return false;
   }
   if (!fill || !getConstantIntValue(fill.getDpsInputs()[0]) || *getConstantIntValue(fill.getDpsInputs()[0]) != 0)
     return false;
-  if (p.store) {                                   // rows: the accumulator stored as it is (no epilogue)
+  if (p.store) {                                   // the accumulator stored as it is (no epilogue)
     if (p.epi) return false;
     const int64_t kk = cast<MemRefType>(p.w.getType()).getDimSize(1);
     if (kk * d > 65535 || (p.rows / d) * kk > 2 * int64_t(lay.sbank)) return false;
-    record(con, {con.getOperation(), fill.getOperation(), p.store.getOperation(), lx.getOperation(),
-                 lw.getOperation()});
+    // decode's form: the K its schedule holds (as below)
+    if (!rows4 && (kk > int64_t(lay.sbank) || kk + kk / d > 2 * int64_t(lay.sbank) || lay.acc0 + kk / d + 2 > lay.cbank))
+      return false;
+    SmallVector<Operation *> cover = {con.getOperation(), fill.getOperation(), p.store.getOperation(),
+                                      lx.getOperation(), lw.getOperation()};
+    cover.append(xOps.begin(), xOps.end());
+    record(con, cover);
     linears[con.getOperation()] = p;
     return true;
   }

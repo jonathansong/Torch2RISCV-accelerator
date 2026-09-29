@@ -683,6 +683,12 @@ bool Lowerer::linear(LinearPlan &p) {
     sahw::ExOp::create(bb, loc, int64_t(strip.la & 0xFFFFFFF), int64_t(bank * sb), int64_t(c), int64_t(k / d),
                        false, int64_t(nc), int64_t(k), 1, int64_t(nc), ValueRange{});
     if (prefetch) load(i + 1, dyn);
+    if (!p.epi) {                                 // the accumulator itself (int32: the same bytes as fp32)
+      dynAdd(sahw::StOp::create(bb, loc, yd->base, yd->off + int64_t(i) * fbytes, int64_t(::sa::acc(c)), 1, fbytes,
+                                fbytes, dyn ? ValueRange{pf} : ValueRange{}),
+             dyn);
+      return true;
+    }
     Chunk ch;
     ch.n = int64_t(nc) * d;
     ch.outLa = ::sa::acc(c + oY);
