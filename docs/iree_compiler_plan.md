@@ -1307,7 +1307,18 @@ C5.5 的模型（§8.9 的第一步）：
 | decode 每步设备周期 / 墙钟 | 34.8M / 681 ms | 30.8M / 618 ms（1.62 token/s） |
 
   gate 仍是 up 的 4.3 倍：SwiGLU 的 exp 和倒数（8 × 1536 个元素、每个 2 次 SFU、约 19 周期）约 470k 周期，是 SFU 的延迟（手写路径的 SiLU 相同；P6 SFU 多槽交错，§8.13，暂缓）。decode 还剩 up（225k/次，22%，没有尾部：decode 形式的微内核只收带尾部的）和 q / o 之一（85k/次）走通用 contraction，估计再省约 4.5M 周期/步（约 530 ms）。`sa-llm-run` 带 prefill 时 `SA_PROFILE` 的每步数字原来除以全部步数（只剩一半），已改为除以统计的 decode 步数。
-- **改法**（剩下的：decode 的 up 与 q）：让线性层微内核接受任意逐元素尾部（与通用 contraction 一样，按 chunk 把累加结果交给 `generic` 的尾部 lowering；输出 fp32 / int32 / int8，逐元素输入 fp32 / int32），没有尾部时直接存 int32 累加。这正好是第 2 项（微内核在 `sahl` 层展开）要做的：调度与尾部分开表达以后，线性层的调度可以套在任意尾部上。
+- **decode 的 up、q / o 之一与 prefill 的 k / v 也已修**（2026-09-29）：decode 形式的线性层微内核也接受“没有尾部、直接存 int32 累加”（多行形式原来就支持）；多行形式也接受 int8 输出（k / v 融合了 KV 量化；decode 形式的 v 已接近下限，没改）。板上（逐位一致，board PASS）：
+
+| | 修前 | 修后 |
+|---|---|---|
+| decode 的 up 每次 | 225k 周期 | 123k（与 down 相同） |
+| decode 的 q / o 之一每次 | 85k | 51k（与另一个相同） |
+| decode 每步设备周期 / 墙钟 | 30.8M / 618 ms | 26.7M / 536 ms（1.87 token/s） |
+| prefill 的 k / v 每次 | 152k | 23.7k |
+| prefill 每块设备周期 / 墙钟（20 个 token） | 68.1M / 6.5 s | 65.0M / 6.3 s（3.18 token/s） |
+
+  decode 的大线性层现在都在各自的读权重下限附近。与手写路径（约 450 ms/步）还差约 19%：手写路径把 q / k / v、gate / up 各合成一个线性层（少了重复的激活量化与每个线性层的固定开销）；v 投影每次 29k（下限的 2 倍，每步约 0.9M）；gate 177k 里约 58k 是 SFU 的 SiLU。
+- **改法的方向**（之后，第 2 项）：让线性层微内核接受任意逐元素尾部（与通用 contraction 一样，按 chunk 把累加结果交给 `generic` 的尾部 lowering；输出 fp32 / int32 / int8，逐元素输入 fp32 / int32），没有尾部时直接存 int32 累加。这正好是第 2 项（微内核在 `sahl` 层展开）要做的：调度与尾部分开表达以后，线性层的调度可以套在任意尾部上。
 
 **剩下**：通用路径 decode 的线性层走微内核（见上）；prefill 里 Q 的 RoPE 两个主机 dispatch（IREE 把 swap 后的 q 物化成按头在外的布局，gather 带了转置；改前端 swap 的写法反而让 31 个落到主机，没采用）；主机退路改用原生 ARM 代码（`llvm-cpu`，替代 VMVX 解释器，需要重建编译器）。
 

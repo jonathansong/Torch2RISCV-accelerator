@@ -182,11 +182,10 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   cache and the sa attention. Prefill + decode (plan §8.19): `prefill` /
   `prefill_kv` exported with decode in one module; on sim bit-exact with
   decode only for SmolLM2 and Qwen3-0.6B (2 layers, unchanged code), and
-  SmolLM2 on the board bit-exact with the sim (prefill 3.06 tok/s, decode
-  1.62 tok/s; decode ~35% slower than the hand-written path: the up and one
-  of the q / o projections still go through the generic contraction
-  lowering, not the linear micro-kernel; the SwiGLU gate moved to the
-  micro-kernel, prefill -32% cycles; plan §8.19). Decode
+  SmolLM2 on the board bit-exact with the sim (prefill 3.18 tok/s, decode
+  1.87 tok/s, ~19% slower than the hand-written path, which merges q / k / v
+  and gate / up into one linear layer each; every large linear layer now
+  runs on the linear micro-kernel near its weight-read bound; plan §8.19). Decode
   runs entirely on the accelerator; SmolLM2 has 794 executables on the
   accelerator and 2 on the host (prefill only); the device keeps the torch
   W8A8 model's quality (SmolLM2 34/40 teacher-forced top-1 agreement with
