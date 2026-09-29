@@ -284,20 +284,24 @@ static iree_status_t run(iree_allocator_t host) {
       printf("device memory: peak %.1f MB of the %.1f MB heap\n", sc->heap_peak / 1048576.0,
              (double)(sc->heap_end - sc->heap_begin) / 1048576.0);
   }
-  if (iree_status_is_ok(status) && steps > 1 && getenv("SA_PROFILE")) {
+  // the steps profiled: decode after the prefill (the profile is reset after
+  // it), else every step after the first
+  int np = pos0 > 0 ? steps - pos0 : steps - 1;
+  if (iree_status_is_ok(status) && np > 0 && getenv("SA_PROFILE")) {
     uint64_t nd, cyc, ns;
     sa_context_profile_totals(&nd, &cyc, &ns);
-    printf("per step (after the first): %.1f %s, device %.2f ms (%.0f cycles at 50 MHz), "
+    printf("per step (%s): %.1f %s, device %.2f ms (%.0f cycles at 50 MHz), "
            "submissions %.2f ms, rest of the runtime %.2f ms\n",
-           nd / (double)(steps - 1), strcmp(getenv("SA_PROFILE"), "batch") ? "dispatches" : "lists", cyc / (steps - 1) / 50e3, cyc / (double)(steps - 1),
-           ns / 1e6 / (steps - 1), 1e3 * total / (steps - 1) - ns / 1e6 / (steps - 1));
+           pos0 > 0 ? "decode after the prefill" : "after the first", nd / (double)np,
+           strcmp(getenv("SA_PROFILE"), "batch") ? "dispatches" : "lists", cyc / np / 50e3, cyc / (double)np,
+           ns / 1e6 / np, 1e3 * total / np - ns / 1e6 / np);
     sa_context_t* sc = NULL;
     if (iree_status_is_ok(sa_context_get(&sc)))
       printf("per step: %.1f barriers -> %.1f FENCEs; prefixes run inside an earlier dispatch %.1f, before "
              "their FENCE %.1f\n",
              sc->batch_barriers / (double)steps, sc->batch_fences / (double)steps, sc->batch_hosted / (double)steps,
              sc->batch_hoisted / (double)steps);
-    sa_context_profile_report(stdout, steps - 1);
+    sa_context_profile_report(stdout, np);
   }
   if (lf) fclose(lf);
   free(valid);
