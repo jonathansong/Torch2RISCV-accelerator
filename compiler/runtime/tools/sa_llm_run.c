@@ -33,19 +33,25 @@ IREE_FLAG(int32_t, pad, 0,
           "Dynamic attention length: valid has length pos + 1 rounded up to a multiple of this (0: valid_len).");
 IREE_FLAG(string, logits_out, "", "File the float32 logits of every step are appended to.");
 IREE_FLAG(int32_t, stop_token, -1, "Stop generating after this token (an end-of-sequence id; -1: none).");
+IREE_FLAG(string, abi, "sa",
+          "Calling convention of main: \"sa\" main(token[1], pos[1], valid) (the frontend's QLlama / QModel), "
+          "\"hf\" main(input_ids[1,1], position_ids[1,1]) (an unmodified HuggingFace decoder, plan §8.16).");
 IREE_FLAG(int32_t, prefill, 0,
           "Prefill chunk M: a prompt of >= M tokens through the module's prefill(tokens[M], positions[M], valid) "
           "in chunks at 0, M, 2M, ... and P - M, then decode (plan §8.13).");
 
 static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* allocator, const void* data,
                                iree_host_size_t n, iree_hal_element_type_t type, iree_hal_buffer_view_t** out) {
-  iree_hal_dim_t shape[1] = {n};
+  iree_hal_dim_t shape[2] = {n, 1};
+  // --abi=hf: [1, 1] ids / positions
+  iree_host_size_t rank = (strcmp(FLAG_abi, "hf") == 0 && type == IREE_HAL_ELEMENT_TYPE_INT_64 && n == 1) ? 2 : 1;
+  if (rank == 2) shape[0] = 1;
   iree_hal_buffer_params_t params = {
       .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
       .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
   };
   return iree_hal_buffer_view_allocate_buffer_copy(
-      device, allocator, 1, shape, type, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, params,
+      device, allocator, rank, shape, type, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, params,
       iree_make_const_byte_span(data, n * iree_hal_element_dense_byte_count(type)), out);
 }
 
@@ -209,7 +215,8 @@ static iree_status_t run(iree_allocator_t host) {
     if (iree_status_is_ok(status)) status = make_view(device, allocator, &token, 1, IREE_HAL_ELEMENT_TYPE_INT_64, &bt);
     if (iree_status_is_ok(status)) status = make_view(device, allocator, &pos64, 1, IREE_HAL_ELEMENT_TYPE_INT_64, &bp);
     iree_host_size_t vlen = FLAG_pad > 0 ? (iree_host_size_t)((pos / FLAG_pad + 1) * FLAG_pad) : (iree_host_size_t)FLAG_valid_len;
-    if (iree_status_is_ok(status))
+    bool hf = strcmp(FLAG_abi, "hf") == 0;
+    if (iree_status_is_ok(status) && !hf)
       status = make_view(device, allocator, valid, vlen, IREE_HAL_ELEMENT_TYPE_FLOAT_32, &bv);
     if (iree_status_is_ok(status)) {
       iree_vm_ref_t r = iree_hal_buffer_view_move_ref(bt);
@@ -219,7 +226,7 @@ static iree_status_t run(iree_allocator_t host) {
       iree_vm_ref_t r = iree_hal_buffer_view_move_ref(bp);
       status = iree_vm_list_push_ref_move(inputs, &r);
     }
-    if (iree_status_is_ok(status)) {
+    if (iree_status_is_ok(status) && !hf) {
       iree_vm_ref_t r = iree_hal_buffer_view_move_ref(bv);
       status = iree_vm_list_push_ref_move(inputs, &r);
     }

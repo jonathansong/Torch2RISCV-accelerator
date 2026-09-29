@@ -3,7 +3,7 @@
 # runs from your own terminal (processes started by a Claude Code session end
 # with it).
 #   compiler/scripts/run_tests.sh [-j JOBS] [-t THREADS] [-o LOGDIR] TEST...
-# TEST: golden | fallback | c3 | c5 | c5cfg | smollm2 | qwen3l2 | synth | qwen3export | qwen3 | "any command line"
+# TEST: golden | fallback | hfgen | c3 | c5 | c5cfg | smollm2 | qwen3l2 | synth | qwen3export | qwen3 | "any command line"
 #   -j JOBS     tests at a time (default 1)
 #   -t THREADS  threads per test: OpenMP / BLAS, and iree-compile
 #               single-threaded when 1 (default 2)
@@ -33,6 +33,8 @@ declare -A cmd=(
   [golden]="$IREE_BUILD/llvm-project/bin/llvm-lit -q compiler/plugins/sa/test && $SA_PY -u $T/golden.py"
   # the host fallback (plan §8.15): a small model and stories15M with host linear layers, on sim
   [fallback]="$SA_PY -u $T/test_fallback.py"
+  # the generic frontend (plan §8.16): unmodified HF SmolLM2 on sim vs transformers
+  [hfgen]="$SA_PY -u $T/test_hf_generic.py --model build/llm_cache/SmolLM2-135M --out build/hfgen/smollm2_raw"
   [c3]="$SA_PY -u $T/test_c3.py --skip-export --out build/c4/fuse"
   [c5]="$SA_PY -u $T/test_c5.py"
   [c5cfg]="$SA_PY -u $T/test_c5.py --configs"

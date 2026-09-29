@@ -1145,6 +1145,37 @@ C5.5 的模型（§8.9 的第一步）：
   - llvm-cpu 代替 VMVX；
   - 主机 dispatch 的操作数先拷到缓存内存（或给 CPU 用缓存映射、在加速器列表前后刷新缓存）。
 
+### 8.16 前端通用化：HuggingFace 的原始建模代码直接编译
+
+**目标**：不再手写模型（qhf.py 按 QLlama 的形式重写了 Llama / Qwen3）。transformers 的建模代码原样导出，量化与那些为加速器准备的写法（gather、KV 的布局与 int8、RoPE 表、成对交换、注意力的形式）由编译器前端的通用图改写完成，不针对某个模型。
+
+**F0 / F1：原样导出，端到端跑对（完成，2026-09-29）**（`compiler/frontend/hf_generic.py`，`run_tests.sh hfgen`）：
+- **环境**：前端 venv 装了 transformers 5.17（torch 2.14，iree-turbine 3.9）。
+- **导出**：
+  - `HFDecoder`：`decode(input_ids[1,1], position_ids[1,1]) -> logits`，里面是 `AutoModelForCausalLM`；
+  - transformers 5.x 的静态 KV cache 自己记位置（一个每步递增的标量缓冲），导入 turbine 时出错；`PositionedCache` 改成在调用方给的位置写，写进封装模块的缓冲（通过模块属性访问，torch.export 才认出是缓冲的修改，KV cache 成为可变的全局量）；
+  - transformers 自带的导出封装（`TorchExportableModuleForDecoderOnlyLM`）5.17 的外层 forward 丢了 `cache_position`，没用；
+  - 流程：torch.export（non-strict）→ `run_decompositions()`（函数式 ATen）→ 图改写 → 参数外置（必须在分解之后：先标记会让 aot_autograd 失败）→ iree-turbine。
+- **图改写**（`GRAPH_PASSES`）：目前只有 `pow(x, 2) → x * x`（VMVX 没有 `fpowi`，61 处）。
+- **运行**：`sa-llm-run --abi=hf`（每步 `main(input_ids, position_ids)`，没有 valid）。
+- **结果**（SmolLM2-135M，sim）：
+  - 32 个可执行体，**3 个在加速器、30 个在主机**；
+  - 9 步与 transformers 的 fp32 相比：最小相关 1.000000，最大误差 2.6e-3，argmax 9/9 相同；
+  - 很慢（每步约 3.8 秒）；fp32 权重转置后在编译期求值，嵌进了 vmfb（538 MB），sim 窗口要开到 1.1 GB。
+
+**落到主机的原因（F0 的测量）与对应的通用改写**：
+
+| 数量 | 原因 | 改写 | 步骤 |
+|---|---|---|---|
+| 6 | 线性层是 fp32（EX 只做 int8） | W8A8：权重按通道 int8、激活按 token 动态 int8（qhf 的 qlinear 的形式），作用于每个常量权重的 `aten.linear` | F2 |
+| 6 | ACC 放不下（fp32 的大融合 dispatch） | F2 之后规模变小；剩下的看分块 | F2 |
+| 2 | `sin` / `cos`：HF 每步现算 RoPE | 位置无关的部分常量折叠成表 `[max_len, dim/2]`，按位置 gather | F3 |
+| 1 | `rotate_half`（拼接两半） | q / k 投影的权重按头重排成交错的对，RoPE 变成成对交换（llama2.c 的导出、qhf 的做法） | F3 |
+| 3 + 2 + 3 | 注意力是 fp32 的 `batch_matmul`；KV 按 `[B, H, T, D]` 写；位置是向量 | KV 改成 `[T, H, D]` 的 int8（按层的静态 scale，用 fp32 模型校准），SDPA 改写成分数、带掩码的 softmax、P·V，与 qhf 的形式一致 | F4 |
+| 其余 | 除法等 | 按需 | F5 |
+
+**验收的主要依据**：F2–F4 做完，通用前端产生的程序在编译后与手写的 qhf 路径**逐位一致**（同一个 SmolLM2，同样的量化与校准），并且能上板；再用 Qwen3 验证同一套改写不需要改代码。之后 F6：非 Llama 结构（GPT-2：LayerNorm、GELU、learned position embedding）。
+
 ## 9. 验证体系
 
 | 层次 | 内容 | 工具 |
@@ -1172,6 +1203,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
+| **前端通用化** | HuggingFace 的原始建模代码直接导出，量化与写法由通用图改写完成（§8.16） | 与手写 qhf 路径逐位一致；Qwen3 不改代码；非 Llama 结构。**进行中**（F0 / F1：原样导出、端到端跑对） | 大 |
 | **主机退路** | sa 编不了的 dispatch 在 ARM 上用 VMVX 运行（§8.15） | 任何 dispatch 都能跑；混合执行与只用加速器逐位一致（线性层放主机的 stories15M）。**完成**（sim 与板上） | 中 |
 | **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**完成**（2026-09-29，§8.14：R0–R6；微内核的 `sahl` 展开、带生存期的内存规划、`sahw-legalize-dynamic`、R7 代价模型留给以后） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |

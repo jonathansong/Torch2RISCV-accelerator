@@ -172,6 +172,19 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   interactively on the board (`board_generate.py`). The device window
   is configurable (`--mb`; SmolLM2 needs 160.5 MB: parameter loads read
   straight into device memory, `sa-llm-run` prints the peak).
+- **Generic frontend in progress** (docs/iree_compiler_plan.md §8.16): an
+  unmodified HuggingFace decoder (transformers' modeling code) exported by
+  `frontend/hf_generic.py` (a static KV cache written at the input positions;
+  torch.export -> functional ATen -> graph rewrites -> iree-turbine) and run
+  with `sa-llm-run --abi=hf`. F0/F1: SmolLM2 matches transformers' fp32
+  (correlation 1.000000, argmax 9/9) with 3 of 32 executables on the
+  accelerator and the rest on the host; next the graph rewrites that put it on
+  the accelerator (W8A8, RoPE tables, KV cache and attention).
+
+  ```sh
+  compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)
+  ```
+
 - **Host fallback done** (docs/iree_compiler_plan.md §8.15): a dispatch the
   sa backend cannot compile runs on the ARM host (IREE's VMVX, no LLVM
   toolchain needed), the rest on the accelerator, in one command buffer.
