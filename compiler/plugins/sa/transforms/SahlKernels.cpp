@@ -687,7 +687,8 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
     AffineMap em = e.getIndexingMapsArray()[i];
     bool f32 = cast<MemRefType>(in.getType()).getElementType().isF32();
     if (em.isIdentity()) {
-      if (!f32) return false;
+      // fp32, or int32 (another linear layer's accumulator: SwiGLU's up projection)
+      if (!f32 && !cast<MemRefType>(in.getType()).getElementType().isInteger(32)) return false;
       p.chunked.push_back({i, l.getSrc()});
     } else if (rows4 && f32 && em == AffineMap::get(3, 0, {d1, d2}, ctx)) {
       p.cols.push_back({i, l.getSrc()});

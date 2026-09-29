@@ -473,6 +473,14 @@ bool Lowerer::contraction(ContractPlan &p) {
   return err.empty();
 }
 
+// A per-element epilogue input's type in local memory: fp32, or int32 (the
+// epilogue converts it as it converts the accumulator).
+static VType chunkedVt(const LinearPlan &p, size_t m) {
+  linalg::GenericOp epi = p.epi;
+  Value in = epi.getDpsInputs()[p.chunked[m].first];
+  return cast<MemRefType>(in.getType()).getElementType().isInteger(32) ? ::sa::VT_I32 : ::sa::VT_F32;
+}
+
 bool Lowerer::linearRows(LinearPlan &p) {
   auto wt = cast<MemRefType>(p.w.getType());
   const int64_t k = wt.getDimSize(1), nt = wt.getDimSize(0), N = nt * d, M = p.rows, nb = M / d;
@@ -568,12 +576,13 @@ bool Lowerer::linearRows(LinearPlan &p) {
         }
       }
       for (size_t m = 0; m < ed.size(); ++m) {
-        LocalBuf l = newLocal(::sa::VT_F32, n);
+        VType vt = chunkedVt(p, m);
+        LocalBuf l = newLocal(vt, n);
         sahw::LdOp::create(bb, loc, ed[m].base, ed[m].off + off, int64_t(l.la), d, nc * d * 4, N * 4, 0,
                            ValueRange{});
         Val v;
         v.kind = Val::Mem;
-        v.o = {l.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
+        v.o = {l.la, vt, ::sa::IDX_LIN, 0};
         ch.inputs[p.chunked[m].first] = v;
       }
       for (size_t m = 0; m < cl.size(); ++m) {
@@ -687,7 +696,7 @@ bool Lowerer::linear(LinearPlan &p) {
     for (size_t m = 0; m < p.chunked.size(); ++m) {
       Val a;
       a.kind = Val::Mem;
-      a.o = {::sa::acc(c + slot(m)), ::sa::VT_F32, ::sa::IDX_LIN, 0};
+      a.o = {::sa::acc(c + slot(m)), chunkedVt(p, m), ::sa::IDX_LIN, 0};
       ch.inputs[p.chunked[m].first] = a;
     }
     mem.preferBank = int(bank);
