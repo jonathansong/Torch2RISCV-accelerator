@@ -34,9 +34,19 @@ def main():
     ap.add_argument("--generate", type=int, default=4)
     ap.add_argument("--quant", action="store_true", help="W8A8 (QLinear / QEmbedding); the reference is then "
                     "the quantized model in torch (and the fp32 model's argmax for information)")
+    ap.add_argument("--rope", action="store_true", help="RoPE tables and the pair swap (F3)")
     ap.add_argument("--min-corr", type=float, default=0.999)
     args = ap.parse_args()
-    w = H.load(args.model, quant=args.quant)
+    if args.rope:                        # the rewrite keeps the fp32 model's logits (checked here)
+        base = H.load(args.model)
+        pr = [int(t) for t in args.prompt.split(",")]
+        a = [base(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] for i, t in enumerate(pr)]
+        rw = H.load(args.model, rope=True)
+        b = [rw(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] for i, t in enumerate(pr)]
+        d = max(float((x - y).abs().max()) for x, y in zip(a, b))
+        print(f"rope rewrite vs the original model (fp32, torch): max |diff| {d:.3g}")
+        del base, rw
+    w = H.load(args.model, quant=args.quant, rope=args.rope)
     if not args.skip_export:
         H.export(w, args.out)
         t0 = time.time()

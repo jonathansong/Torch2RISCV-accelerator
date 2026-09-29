@@ -67,9 +67,11 @@ class HFDecoder(torch.nn.Module):
                           use_cache=True).logits
 
 
-def load(model_dir, max_len=256, quant=False):
+def load(model_dir, max_len=256, quant=False, rope=False):
     torch.set_grad_enabled(False)
     m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
+    if rope:
+        print("  rope_rewrite:", rope_rewrite(m, max_len))
     if quant:
         print("  quantize:", quantize(m))
     return HFDecoder(m, max_len)
@@ -128,6 +130,78 @@ class QEmbedding(torch.nn.Module):
 
     def forward(self, ids):
         return self.q[ids].to(torch.float32) * self.s[ids].unsqueeze(-1)
+
+
+# RoPE (F3): the rotary module's cos / sin as tables, and rotate_half as the
+# pair swap of interleaved halves
+class RopeTable(torch.nn.Module):
+    """A rotary-embedding module replaced by its own output for every position:
+    cos / sin tables [max_len, head_dim] computed once by the original module
+    (any RoPE variant, frequency scaling included), then looked up by position."""
+    def __init__(self, rotary, max_len, head_dim, perm=None):
+        super().__init__()
+        x = torch.zeros(1, 1, head_dim)
+        cos, sin = rotary(x, torch.arange(max_len)[None])
+        cos, sin = cos[0].float(), sin[0].float()
+        if perm is not None:
+            cos, sin = cos[:, perm], sin[:, perm]
+        self.cos_t = torch.nn.Parameter(cos.contiguous(), requires_grad=False)
+        self.sin_t = torch.nn.Parameter(sin.contiguous(), requires_grad=False)
+
+    def forward(self, x, position_ids):
+        return self.cos_t[position_ids].to(x.dtype), self.sin_t[position_ids].to(x.dtype)
+
+
+def swapneg(v):
+    """(x0, x1) -> (-x1, x0) for every pair (the sa VE's SWAPNEG): rotate_half of
+    a head whose halves are interleaved."""
+    p = v.reshape(v.shape[:-1] + (-1, 2))
+    return torch.stack((-p[..., 1], p[..., 0]), dim=-1).reshape(v.shape)
+
+
+def interleave_perm(hd):
+    """head dims [0 .. h) and [h .. hd) interleaved: new 2j = old j, new 2j + 1 = old j + h"""
+    h = hd // 2
+    return torch.stack((torch.arange(h), torch.arange(h) + h), dim=1).reshape(-1)
+
+
+def rope_rewrite(model, max_len):
+    """F3 (plan §8.16): the rotary module -> RopeTable; each head's dims of the q
+    / k projections (and q / k norms) interleaved (the dot products of q and k
+    are unchanged: both permuted alike), the tables' columns alike, and
+    rotate_half -> swapneg in every transformers modeling module that defines
+    it (in the interleaved layout the two are the same)."""
+    import sys
+    cfg = model.config
+    hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+    perm = interleave_perm(hd)
+    n = {"rotary": 0, "projections": 0, "norms": 0, "rotate_half": 0}
+    for mod in list(model.modules()):
+        for cname, child in list(mod.named_children()):
+            if type(child).__name__.endswith("RotaryEmbedding"):
+                setattr(mod, cname, RopeTable(child, max_len, hd, perm))
+                n["rotary"] += 1
+    for mod in model.modules():
+        for pname in ("q_proj", "k_proj"):
+            lin = getattr(mod, pname, None)
+            if isinstance(lin, torch.nn.Linear):
+                w = lin.weight.data
+                heads = w.shape[0] // hd
+                lin.weight.data = w.reshape(heads, hd, -1)[:, perm].reshape(w.shape).contiguous()
+                if lin.bias is not None:
+                    lin.bias.data = lin.bias.data.reshape(heads, hd)[:, perm].reshape(-1).contiguous()
+                n["projections"] += 1
+        for pname in ("q_norm", "k_norm"):
+            norm = getattr(mod, pname, None)
+            if norm is not None and getattr(norm, "weight", None) is not None and norm.weight.shape[-1] == hd:
+                norm.weight.data = norm.weight.data[perm].contiguous()
+                n["norms"] += 1
+    for name, m in list(sys.modules.items()):
+        # (the module's own dict: getattr on transformers' lazy modules imports more)
+        if name.startswith("transformers.models.") and "rotate_half" in getattr(m, "__dict__", {}):
+            m.rotate_half = swapneg
+            n["rotate_half"] += 1
+    return n
 
 
 def quantize(model):
@@ -215,8 +289,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-len", type=int, default=256)
     ap.add_argument("--quant", action="store_true", help="W8A8: linear layers and embeddings (QLinear / QEmbedding)")
+    ap.add_argument("--rope", action="store_true", help="RoPE tables and the pair swap (RopeTable, swapneg)")
     args = ap.parse_args()
-    export(load(args.model, args.max_len, args.quant), args.out)
+    export(load(args.model, args.max_len, args.quant, args.rope), args.out)
 
 
 if __name__ == "__main__":
