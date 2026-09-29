@@ -33,6 +33,8 @@ iree_cc_library(
     iree::hal
     iree::hal::local
     iree::hal::local::executable_loader
+    iree::hal::local::loaders::vmvx_module_loader
+    iree::base::internal::fpu_state
     iree::hal::drivers::local_sync::sync_driver
     iree::hal::utils::deferred_command_buffer
     iree::hal::utils::file_transfer

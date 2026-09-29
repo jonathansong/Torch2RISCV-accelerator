@@ -7,6 +7,7 @@
 #include "SahlPasses.h"
 #include "SahwPasses.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/PassManager.h"
@@ -16,17 +17,20 @@ namespace {
 
 struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL::ExecutableVariantOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SaCodegenPass)
-  explicit SaCodegenPass(bool allowUnsupported = false, std::string ukernels = "all", bool report = false)
-      : allowUnsupported(allowUnsupported), ukernels(std::move(ukernels)), report(report) {}
+  explicit SaCodegenPass(bool allowUnsupported = false, std::string ukernels = "all", bool report = false,
+                         bool hostFallback = false, std::string hostDispatches = "")
+      : allowUnsupported(allowUnsupported), ukernels(std::move(ukernels)), report(report), hostFallback(hostFallback),
+        hostDispatches(std::move(hostDispatches)) {}
   SaCodegenPass(const SaCodegenPass &o)
-      : PassWrapper(o), allowUnsupported(o.allowUnsupported), ukernels(o.ukernels), report(o.report) {}
+      : PassWrapper(o), allowUnsupported(o.allowUnsupported), ukernels(o.ukernels), report(o.report),
+        hostFallback(o.hostFallback), hostDispatches(o.hostDispatches) {}
 
   StringRef getArgument() const override { return "iree-sa-codegen"; }
   StringRef getDescription() const override {
     return "Generates every export through the C5 pipeline into a sahw.template";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<sahw::SahwDialect>();
+    registry.insert<sahw::SahwDialect, arith::ArithDialect>();
     OpPassManager pm(ModuleOp::getOperationName());
     buildSahlPipeline(pm, TargetConfig());
     pm.getDependentDialects(registry);
@@ -84,18 +88,36 @@ struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL
       auto layout = exportOp.getLayout();
       int64_t bindings = int64_t(layout.getBindings().size()), constants = int64_t(layout.getConstants());
       std::string why;
-      if (compile(inner, func, cfg, bindings, constants, why)) {
+      bool forced = false;
+      if (hostFallback && !hostDispatches.empty()) {
+        SmallVector<StringRef> pats;
+        StringRef(hostDispatches).split(pats, ',', -1, false);
+        for (StringRef p : pats) forced |= exportOp.getSymName().contains(p);
+        if (forced) why = "--iree-sa-host-dispatches";
+      }
+      if (!forced && compile(inner, func, cfg, bindings, constants, why)) {
         if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": ok\n";
         continue;
       }
       if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": failed (" << why << ")\n";
-      if (!allowUnsupported) {
+      if (hostFallback) {
+        // the runtime takes the host (VMVX) variant: this one's condition is false
+        if (!variant.getConditionOp()) {
+          OpBuilder cb(variant.getContext());
+          variant.createConditionOp(cb);
+          OpBuilder rb = OpBuilder::atBlockBegin(&variant.getConditionOp().getBody().front());
+          Value no = arith::ConstantIntOp::create(rb, variant.getLoc(), 0, 1);
+          IREE::HAL::ReturnOp::create(rb, variant.getLoc(), ValueRange{no});
+        }
+        if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": on the host (" << why << ")\n";
+      } else if (!allowUnsupported) {
         auto diag = func.emitError() << "sa target: cannot compile dispatch '" << exportOp.getSymName()
                                      << "': " << why;
         diag.attachNote() << "dispatch:\n" << *func.getOperation();
         return signalPassFailure();
       }
-      func.emitWarning() << "sa target: dispatch '" << exportOp.getSymName() << "' unsupported: " << why;
+      if (!hostFallback)
+        func.emitWarning() << "sa target: dispatch '" << exportOp.getSymName() << "' unsupported: " << why;
       // an export that faults if run: an LD past the end of ACC
       OpBuilder b = OpBuilder::atBlockEnd(inner.getBody());
       Location loc = func.getLoc();
@@ -110,12 +132,39 @@ struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL
   bool allowUnsupported;
   std::string ukernels;
   bool report;
+  bool hostFallback;
+  std::string hostDispatches;
 };
 
 }  // namespace
 
-std::unique_ptr<Pass> createSaCodegenPass(bool allowUnsupported, const std::string &ukernels, bool report) {
-  return std::make_unique<SaCodegenPass>(allowUnsupported, ukernels, report);
+// Link time (the sa backend's linking pipeline, before the other backends'):
+// the sa variants of dispatches left to the host fallback are removed.
+struct SaDropHostVariantsPass : public PassWrapper<SaDropHostVariantsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SaDropHostVariantsPass)
+  StringRef getArgument() const override { return "iree-sa-drop-host-variants"; }
+  StringRef getDescription() const override { return "Removes the sa variants of dispatches the host runs"; }
+  void runOnOperation() override {
+    SmallVector<IREE::HAL::ExecutableVariantOp> drop;
+    getOperation().walk([&](IREE::HAL::ExecutableVariantOp v) {
+      if (v->hasAttr("sa.host_fallback")) drop.push_back(v);
+    });
+    for (auto v : drop) {
+      auto exe = v->getParentOfType<IREE::HAL::ExecutableOp>();
+      if (llvm::range_size(exe.getOps<IREE::HAL::ExecutableVariantOp>()) < 2) {
+        v.emitError() << "sa: host fallback without a host variant";
+        return signalPassFailure();
+      }
+      v.erase();
+    }
+  }
+};
+
+std::unique_ptr<Pass> createSaDropHostVariantsPass() { return std::make_unique<SaDropHostVariantsPass>(); }
+
+std::unique_ptr<Pass> createSaCodegenPass(bool allowUnsupported, const std::string &ukernels, bool report,
+                                          bool hostFallback, const std::string &hostDispatches) {
+  return std::make_unique<SaCodegenPass>(allowUnsupported, ukernels, report, hostFallback, hostDispatches);
 }
 void registerSaCodegenPass() { PassRegistration<SaCodegenPass>(); }
 

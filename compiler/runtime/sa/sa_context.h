@@ -82,6 +82,7 @@ typedef struct sa_context_t {
     uint32_t name_len;
   } batch_names[1024];
   uint64_t lists;                  // lists submitted (batches or single dispatches)
+  uint64_t host_dispatches;        // dispatches run on the host (the VMVX fallback)
   // statistics: prefixes run inside an earlier dispatch / before their FENCE,
   // barriers, FENCEs emitted
   uint64_t batch_hosted, batch_hoisted, batch_barriers, batch_fences;

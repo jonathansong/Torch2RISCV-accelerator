@@ -4,8 +4,12 @@
 // dispatches of a command buffer as one descriptor list, with the sa pieces: a heap allocator whose buffer
 // memory comes from the device-visible arena, and the sa-desc-v1 loader.
 // Transport selection: SA_TRANSPORT=sim|board (sa_context.c).
-#include "sa_driver.h"
+// Host fallback (docs/iree_compiler_plan.md §8.15): a second loader, VMVX, for
+// the dispatches the sa backend left to the host; the command buffer runs them
+// on the ARM (sa_command_buffer.c).
+#include "iree/hal/local/loaders/vmvx_module_loader.h"
 #include "sa_context.h"
+#include "sa_driver.h"
 #include "sa_loader.h"
 
 static iree_status_t sa_driver_factory_enumerate(void* self, iree_host_size_t* out_count,
@@ -31,8 +35,11 @@ static iree_status_t sa_driver_factory_try_create(void* self, iree_string_view_t
   sa_device_params_t params;
   sa_device_params_initialize(&params);
 
-  iree_hal_executable_loader_t* loader = NULL;
-  iree_status_t status = sa_loader_create(context, host_allocator, &loader);
+  iree_hal_executable_loader_t* loaders[2] = {NULL, NULL};
+  iree_status_t status = sa_loader_create(context, host_allocator, &loaders[0]);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_vmvx_module_loader_create_isolated(0, NULL, host_allocator, &loaders[1]);
+  }
 
   iree_hal_allocator_t* device_allocator = NULL;
   if (iree_status_is_ok(status)) {
@@ -40,11 +47,11 @@ static iree_status_t sa_driver_factory_try_create(void* self, iree_string_view_t
                                             &device_allocator);
   }
   if (iree_status_is_ok(status)) {
-    status = sa_driver_create(driver_name, &params, 1, &loader, device_allocator, host_allocator,
-                                         out_driver);
+    status = sa_driver_create(driver_name, &params, 2, loaders, device_allocator, host_allocator, out_driver);
   }
   iree_hal_allocator_release(device_allocator);
-  if (loader) iree_hal_executable_loader_release(loader);
+  for (int i = 0; i < 2; ++i)
+    if (loaders[i]) iree_hal_executable_loader_release(loaders[i]);
   return status;
 }
 

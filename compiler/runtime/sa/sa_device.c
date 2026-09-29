@@ -12,6 +12,11 @@
 
 #include "sa_device.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "sa_context.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -132,6 +137,13 @@ static void sa_device_destroy(iree_hal_device_t* base_device) {
   sa_device_t* device = sa_device_cast(base_device);
   iree_allocator_t host_allocator = iree_hal_device_host_allocator(base_device);
   IREE_TRACE_ZONE_BEGIN(z0);
+
+  // SA_STATS: the split between the accelerator and the host fallback
+  sa_context_t* context = NULL;
+  if (getenv("SA_STATS") && iree_status_is_ok(sa_context_get(&context))) {
+    fprintf(stderr, "sa: %llu descriptor lists on the accelerator, %llu dispatches on the host\n",
+            (unsigned long long)context->lists, (unsigned long long)context->host_dispatches);
+  }
 
   iree_hal_sync_semaphore_state_deinitialize(&device->semaphore_state);
 

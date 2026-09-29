@@ -51,6 +51,14 @@ struct SAOptions {
   std::string ukernels = "all";
   // A per-dispatch report on stderr.
   bool codegenReport = false;
+  // The host fallback: the device also runs VMVX executables on its ARM host;
+  // each dispatch gets a VMVX variant too, and one the sa backend cannot
+  // compile disables its sa variant (a false condition), so the runtime picks
+  // the VMVX one.
+  bool hostFallback = false;
+  // Testing the fallback: dispatches whose name contains one of these
+  // (comma-separated) run on the host even if the sa backend compiles them.
+  std::string hostDispatches;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -66,6 +74,11 @@ struct SAOptions {
                      llvm::cl::desc("Warn instead of failing on dispatches without a template (development)."));
     binder.opt<std::string>("iree-sa-ukernels", ukernels, llvm::cl::cat(category),
                             llvm::cl::desc("Micro-kernels: all, none, or a list (linear,attention)."));
+    binder.opt<bool>("iree-sa-host-fallback", hostFallback, llvm::cl::cat(category),
+                     llvm::cl::desc("Dispatches the sa backend cannot compile run on the host (VMVX)."));
+    binder.opt<std::string>("iree-sa-host-dispatches", hostDispatches, llvm::cl::cat(category),
+                            llvm::cl::desc("With the host fallback: run these dispatches (name substrings, "
+                                           "comma-separated) on the host (testing)."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -100,6 +113,12 @@ public:
     if (auto backend = targetRegistry.getTargetBackend("sa")) {
       backend->getDefaultExecutableTargets(context, "sa", configAttr,
                                            executableTargetAttrs);
+    }
+    // the host fallback: VMVX variants, after the sa ones (the runtime takes
+    // the first variant whose format and condition hold)
+    if (options.hostFallback) {
+      if (auto vmvx = targetRegistry.getTargetBackend("vmvx"))
+        vmvx->getDefaultExecutableTargets(context, "local", configAttr, executableTargetAttrs);
     }
     return IREE::HAL::DeviceTargetAttr::get(context, b.getStringAttr("sa"),
                                             configAttr, executableTargetAttrs);
@@ -136,7 +155,8 @@ public:
     // Every export becomes a single workgroup; its template is generated
     // here (sahw).
     passManager.addPass(sa::createLowerWorkgroupCountPass());
-    passManager.addPass(sa::createSaCodegenPass(options.allowUnsupported, options.ukernels, options.codegenReport));
+    passManager.addPass(sa::createSaCodegenPass(options.allowUnsupported, options.ukernels, options.codegenReport,
+                                                options.hostFallback, options.hostDispatches));
     passManager.addPass(sa::createSahwSplitHeadPass());
     passManager.addPass(sa::createSahwAssignRegistersPass());
   }

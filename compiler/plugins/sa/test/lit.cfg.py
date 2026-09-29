@@ -11,4 +11,5 @@ config.suffixes = [".mlir"]
 config.test_source_root = os.path.dirname(__file__)
 build = os.environ.get("IREE_BUILD", os.path.join(os.path.dirname(__file__), "../../../../build/iree/build-compiler"))
 config.substitutions.append(("iree-opt", os.path.join(build, "tools", "iree-opt")))
+config.substitutions.append(("iree-compile", os.path.join(build, "tools", "iree-compile")))
 config.substitutions.append(("FileCheck", os.path.join(build, "llvm-project", "bin", "FileCheck")))

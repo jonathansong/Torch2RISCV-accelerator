@@ -49,8 +49,10 @@ struct TargetConfig {
 // the variant's inner module. A dispatch it cannot compile is an error, or
 // with allowUnsupported a warning and an export that faults when run.
 // report: one line per export on stderr.
+std::unique_ptr<Pass> createSaDropHostVariantsPass();
 std::unique_ptr<Pass> createSaCodegenPass(bool allowUnsupported, const std::string &ukernels = "all",
-                                          bool report = false);
+                                          bool report = false, bool hostFallback = false,
+                                          const std::string &hostDispatches = "");
 // The body's leading loads -> sahw.head, for exports that do not touch SPAD_B.
 std::unique_ptr<Pass> createSahwSplitHeadPass();
 // BASE registers from 0, register-setup PARAMs from 0, private PARAMs from 7 down.

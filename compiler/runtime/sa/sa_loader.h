@@ -15,6 +15,9 @@ iree_status_t sa_executable_append(iree_hal_executable_t* executable, uint32_t o
                                    void* const* binding_ptrs, const iree_device_size_t* binding_lengths,
                                    uint32_t constant_count, const uint32_t* constants);
 
+// Whether an executable is an sa-desc one (else: another loader's, run on the host).
+bool sa_executable_isa(iree_hal_executable_t* executable);
+
 iree_status_t sa_loader_create(sa_context_t* context, iree_allocator_t host_allocator,
                                iree_hal_executable_loader_t** out_loader);
 

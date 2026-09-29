@@ -11,6 +11,8 @@
 
 #include <string.h>
 
+#include "iree/base/internal/fpu_state.h"
+#include "iree/hal/local/executable_library.h"
 #include "iree/hal/local/local_executable.h"
 #include "sa_context.h"
 #include "sa_loader.h"
@@ -157,6 +159,70 @@ static iree_status_t sa_command_buffer_collective(iree_hal_command_buffer_t* bas
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "sa: collectives are not supported");
 }
 
+// The host fallback (docs/iree_compiler_plan.md §8.15): an executable of
+// another format (VMVX) runs on the ARM, after the queued accelerator work
+// (its inputs may come from it), every workgroup in turn as IREE's inline
+// command buffer does. The buffers are the device window (sim: the shared
+// file; board: the CMA window), so both sides see the same memory.
+static iree_status_t sa_command_buffer_dispatch_host(sa_command_buffer_t* cb, iree_hal_executable_t* executable,
+                                                     iree_hal_executable_export_ordinal_t ordinal,
+                                                     const iree_hal_dispatch_config_t config,
+                                                     iree_const_byte_span_t constants,
+                                                     iree_hal_buffer_ref_list_t bindings) {
+  IREE_RETURN_IF_ERROR(sa_context_batch_flush(cb->context));
+  iree_hal_local_executable_t* le = iree_hal_local_executable_cast(executable);
+  iree_hal_executable_dispatch_attrs_v0_t attrs = {0};
+  if (le->dispatch_attrs) attrs = le->dispatch_attrs[ordinal];
+  if (constants.data_length % 4 || constants.data_length != attrs.constant_count * 4u) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "host dispatch: %u constants expected",
+                            (unsigned)attrs.constant_count);
+  }
+  if (bindings.count != attrs.binding_count || bindings.count > 32) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "host dispatch: %u bindings expected",
+                            (unsigned)attrs.binding_count);
+  }
+  void* ptrs[32];
+  size_t lengths[32];
+  for (iree_host_size_t i = 0; i < bindings.count; ++i) {
+    if (!bindings.values[i].buffer) {
+      return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "binding %u is NULL", (unsigned)i);
+    }
+    iree_hal_buffer_mapping_t m = {{0}};
+    IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(bindings.values[i].buffer, IREE_HAL_MAPPING_MODE_PERSISTENT,
+                                                   IREE_HAL_MEMORY_ACCESS_ANY, bindings.values[i].offset,
+                                                   bindings.values[i].length, &m));
+    ptrs[i] = m.contents.data;
+    lengths[i] = m.contents.data_length;
+  }
+  iree_hal_executable_dispatch_state_v0_t state;
+  memset(&state, 0, sizeof(state));
+  state.workgroup_size_x = config.workgroup_size[0] ? config.workgroup_size[0] : 1;
+  state.workgroup_size_y = config.workgroup_size[1] ? config.workgroup_size[1] : 1;
+  state.workgroup_size_z = config.workgroup_size[2] ? config.workgroup_size[2] : 1;
+  state.workgroup_count_x = config.workgroup_count[0];
+  state.workgroup_count_y = config.workgroup_count[1];
+  state.workgroup_count_z = config.workgroup_count[2];
+  state.max_concurrency = 1;
+  state.constant_count = attrs.constant_count;
+  state.constants = (const uint32_t*)constants.data;
+  state.binding_count = (uint32_t)bindings.count;
+  state.binding_ptrs = ptrs;
+  state.binding_lengths = lengths;
+  iree_host_size_t local_size =
+      attrs.local_memory_pages * IREE_HAL_EXECUTABLE_WORKGROUP_LOCAL_MEMORY_PAGE_SIZE +
+      config.dynamic_workgroup_local_memory;
+  iree_byte_span_t local_memory = iree_make_byte_span(NULL, local_size);
+  if (local_size) {
+    IREE_RETURN_IF_ERROR(iree_allocator_malloc(cb->host_allocator, local_size, (void**)&local_memory.data));
+  }
+  iree_fpu_state_t fpu = iree_fpu_state_push(IREE_FPU_STATE_FLAG_FLUSH_DENORMALS_TO_ZERO);
+  iree_status_t status = iree_hal_local_executable_issue_dispatch_inline(le, ordinal, &state, 0, local_memory);
+  iree_fpu_state_pop(fpu);
+  if (local_memory.data) iree_allocator_free(cb->host_allocator, local_memory.data);
+  cb->context->host_dispatches++;
+  return status;
+}
+
 static iree_status_t sa_command_buffer_dispatch(iree_hal_command_buffer_t* base, iree_hal_executable_t* executable,
                                                 iree_hal_executable_export_ordinal_t export_ordinal,
                                                 const iree_hal_dispatch_config_t config,
@@ -164,6 +230,10 @@ static iree_status_t sa_command_buffer_dispatch(iree_hal_command_buffer_t* base,
                                                 iree_hal_dispatch_flags_t flags) {
   if (iree_hal_dispatch_uses_custom_arguments(flags)) {
     return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "sa: direct / indirect dispatch arguments");
+  }
+  if (!sa_executable_isa(executable)) {
+    return sa_command_buffer_dispatch_host(sa_command_buffer_cast(base), executable, export_ordinal, config, constants,
+                                           bindings);
   }
   if (constants.data_length % 4) return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "constants not 4-byte");
   if (bindings.count > 16) return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa: more than 16 bindings");
