@@ -32,8 +32,11 @@ def main():
     ap.add_argument("--mb", type=int, default=1100, help="sim window (the fp32 weights: ~4 bytes per parameter)")
     ap.add_argument("--prompt", default="1,504,3144,17,1812")
     ap.add_argument("--generate", type=int, default=4)
+    ap.add_argument("--quant", action="store_true", help="W8A8 (QLinear / QEmbedding); the reference is then "
+                    "the quantized model in torch (and the fp32 model's argmax for information)")
+    ap.add_argument("--min-corr", type=float, default=0.999)
     args = ap.parse_args()
-    w = H.load(args.model)
+    w = H.load(args.model, quant=args.quant)
     if not args.skip_export:
         H.export(w, args.out)
         t0 = time.time()
@@ -70,9 +73,9 @@ def main():
     corr = [float(np.corrcoef(got[i], ref[i])[0, 1]) for i in range(len(got))]
     same = [int(np.argmax(got[i])) == int(np.argmax(ref[i])) for i in range(len(got))]
     stats = [l for l in r.stderr.splitlines() if l.startswith("sa:")]
-    print(f"{len(got)} steps vs transformers fp32: min corr {min(corr):.6f}, max |diff| "
+    print(f"{len(got)} steps vs the torch model{' (W8A8)' if args.quant else ' (fp32)'}: min corr {min(corr):.6f}, max |diff| "
           f"{float(np.max(np.abs(got - ref))):.3g}, argmax equal in {sum(same)}/{len(same)}; {stats[-1] if stats else ''}")
-    ok = len(got) == len(ref) and min(corr) > 0.999 and all(same)
+    ok = len(got) == len(ref) and min(corr) > args.min_corr and all(same)
     print("hf_generic PASS" if ok else "hf_generic FAIL")
     return 0 if ok else 1
 

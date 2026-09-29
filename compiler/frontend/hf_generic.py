@@ -20,6 +20,7 @@ import os
 import time
 import types
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import StaticCache
@@ -66,10 +67,105 @@ class HFDecoder(torch.nn.Module):
                           use_cache=True).logits
 
 
-def load(model_dir, max_len=256):
+def load(model_dir, max_len=256, quant=False):
     torch.set_grad_enabled(False)
     m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
+    if quant:
+        print("  quantize:", quantize(m))
     return HFDecoder(m, max_len)
+
+
+# ------------------------------------------------------------------ module rewrites (before the export)
+def _f32c(v):
+    return float(np.float32(v))
+
+
+def _to_i8(x):
+    return torch.clamp(torch.round(torch.nan_to_num(x, nan=0.0)), -127.0, 127.0).to(torch.int8)
+
+
+def _quant_act(x):
+    """per-token int8: (x / s_x rounded, s_x = max |x| / 127) as qhf.quant_act"""
+    amax = torch.amax(torch.abs(x), dim=-1, keepdim=True)
+    s_x = amax * _f32c(1.0 / 127.0)
+    return _to_i8(x * torch.reciprocal(s_x)), s_x
+
+
+def _quantize_rows(w):
+    """int8 rows with one fp32 scale each (qhf.quantize_rows)"""
+    w = w.detach().float()
+    amax = w.abs().amax(dim=1)
+    s = (amax / 127.0).to(torch.float32)
+    s[s == 0] = 1.0
+    q = torch.clamp(torch.round(w / s[:, None]), -127, 127).to(torch.int8)
+    return q, s
+
+
+class QLinear(torch.nn.Module):
+    """W8A8 linear layer: int8 weight rows with a per-row scale, per-token int8
+    activations, an int32 product, dequantized (acc * s_w) * s_x (qhf.qlinear)."""
+    def __init__(self, lin, qs=None):
+        super().__init__()
+        q, s = qs if qs is not None else _quantize_rows(lin.weight)
+        self.wq = torch.nn.Parameter(q, requires_grad=False)
+        self.s_w = torch.nn.Parameter(s, requires_grad=False)
+        self.bias = None if lin.bias is None else torch.nn.Parameter(lin.bias.detach().float(), requires_grad=False)
+
+    def forward(self, x):
+        xq, s_x = _quant_act(x)
+        acc = torch.matmul(xq.to(torch.int32), self.wq.to(torch.int32).t())
+        y = (acc.to(torch.float32) * self.s_w) * s_x
+        return y if self.bias is None else y + self.bias
+
+
+class QEmbedding(torch.nn.Module):
+    """int8 embedding rows with a per-row scale: e[t] = q[t] * s[t]."""
+    def __init__(self, emb, qs=None):
+        super().__init__()
+        q, s = qs if qs is not None else _quantize_rows(emb.weight)
+        self.q = torch.nn.Parameter(q, requires_grad=False)
+        self.s = torch.nn.Parameter(s, requires_grad=False)
+
+    def forward(self, ids):
+        return self.q[ids].to(torch.float32) * self.s[ids].unsqueeze(-1)
+
+
+def quantize(model):
+    """Every nn.Linear -> QLinear, nn.Embedding -> QEmbedding (W8A8, qhf's
+    scheme). A weight shared by several modules (a classifier tied to the
+    embedding) is quantized once and the int8 tensor shared (the packed-gather
+    optimization of the sa backend reads it once, plan §8.12 C6.0)."""
+    shared, n = {}, {"linear": 0, "embedding": 0}
+
+    def qs_of(weight):
+        key = weight.data_ptr()
+        if key not in shared:
+            shared[key] = _quantize_rows(weight)
+        return shared[key]
+
+    for name, mod in list(model.named_modules()):
+        for cname, child in list(mod.named_children()):
+            if isinstance(child, torch.nn.Linear):
+                q = QLinear(child, qs_of(child.weight))
+                n["linear"] += 1
+            elif isinstance(child, torch.nn.Embedding):
+                q = QEmbedding(child, qs_of(child.weight))
+                n["embedding"] += 1
+            else:
+                continue
+            setattr(mod, cname, q)
+    # tied tensors: one Parameter object for each shared int8 table
+    params = {}
+    for mod in model.modules():
+        for pname in ("wq", "q"):
+            p = getattr(mod, pname, None)
+            if isinstance(p, torch.nn.Parameter):
+                key = id(p.data) if False else p.data_ptr()
+                if key in params:
+                    setattr(mod, pname, params[key])
+                else:
+                    params[key] = p
+    return n
 
 
 # ------------------------------------------------------------------ graph rewrites
@@ -96,7 +192,10 @@ def export(w, out):
     t0 = time.time()
     args = {"input_ids": torch.tensor([[1]]), "position_ids": torch.tensor([[0]])}
     ep = torch.export.export(w, (), args, strict=False)
-    ep = ep.run_decompositions()              # functional ATen (the cache writes as buffer mutations)
+    # functional ATen (the cache writes as buffer mutations), with iree-turbine's
+    # decomposition table (as aot.export(module) does: the frontend's usual op forms)
+    from iree.turbine.aot import decompositions
+    ep = ep.run_decompositions(decompositions.current_aot_decompositions())
     for p in GRAPH_PASSES:
         print(f"  {p.__name__}: {p(ep.graph)}")
     ep.graph.lint()
@@ -115,8 +214,9 @@ def main():
     ap.add_argument("--model", required=True, help="a HuggingFace directory (config.json, *.safetensors)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-len", type=int, default=256)
+    ap.add_argument("--quant", action="store_true", help="W8A8: linear layers and embeddings (QLinear / QEmbedding)")
     args = ap.parse_args()
-    export(load(args.model, args.max_len), args.out)
+    export(load(args.model, args.max_len, args.quant), args.out)
 
 
 if __name__ == "__main__":

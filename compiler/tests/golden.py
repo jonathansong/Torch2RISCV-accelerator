@@ -42,6 +42,7 @@ CASES = [
     ("smollm2_m16", "build/c6p/smollm2_m16/sa_sources", []),
     ("qwen3", "build/c6/qwen3/sa_sources", []),                             # QK-norm, 28 layers
     ("k16k", "build/c6/k16k/sa_sources", []),                               # K blocks
+    ("hf_smollm2_q", "build/hfgen/smollm2_q/sa_sources", []),               # generic frontend (unmodified HF, W8A8)
     ("cfg_d16", "build/c6/cfg/d16/sa_sources", []),                         # other targets
     ("cfg_big", "build/c6/cfg/big/sa_sources", []),
 ]

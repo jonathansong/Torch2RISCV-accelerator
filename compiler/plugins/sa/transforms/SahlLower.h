@@ -311,11 +311,13 @@ private:
   };
 
   // a chunk of a linear layer's epilogue: the inputs given, n elements, the
-  // result into outLa
+  // result into outLa (of type outVt: fp32, or int32 for an epilogue that only
+  // truncates the accumulator)
   struct Chunk {
     std::map<int, Val> inputs;
     int64_t n = 0;
     uint32_t outLa = 0;
+    VType outVt = ::sa::VT_F32;
   };
 
   bool generic(linalg::GenericOp g, const RowSel *sel = nullptr, const Chunk *chunk = nullptr);

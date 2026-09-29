@@ -398,7 +398,11 @@ bool Lowerer::contraction(ContractPlan &p) {
         // the epilogue on this chunk: n elements at (b, g, c0)
         Chunk ch;
         ch.n = int64_t(nc) * d;
-        LocalBuf out = newLocal(::sa::VT_F32, ch.n);
+        // the epilogue's result: fp32, or int32 (an epilogue that only truncates the accumulator)
+        Type oet = cast<MemRefType>(p.epi.getDpsInits()[0].getType()).getElementType();
+        if (!oet.isF32() && !oet.isInteger(32)) return fail("contraction epilogue result other than fp32 / int32");
+        ch.outVt = oet.isF32() ? ::sa::VT_F32 : ::sa::VT_I32;
+        LocalBuf out = newLocal(ch.outVt, ch.n);
         ch.outLa = out.la;
         for (int i = 0; i < p.epi.getNumDpsInputs(); ++i) {
           Val v;

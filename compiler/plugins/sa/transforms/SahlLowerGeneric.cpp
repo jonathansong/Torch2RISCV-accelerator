@@ -699,7 +699,7 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     Val y = valOf(yield.getOperand(r));
     if (chunk) {
       if (y.kind != Val::Mem || y.negInf) return fail("linear epilogue result");
-      ve(y.o, std::nullopt, chunk->outLa, ::sa::VT_F32, chunk->n, ::sa::VOP_COPY);
+      ve(y.o, std::nullopt, chunk->outLa, chunk->outVt, chunk->n, ::sa::VOP_COPY);
       continue;
     }
     if (y.negInf) return fail("-inf mask outside a max reduction");
