@@ -47,6 +47,22 @@ CASES = [
 ]
 
 
+def sa_only(text):
+    """The source without the host fallback's other variants (plan §8.15): the
+    corpus is the sa code generator's."""
+    lines, out, skip = text.split("\n"), [], None
+    for l in lines:
+        if skip is None and l.lstrip().startswith("hal.executable.variant") and '<"sa"' not in l:
+            skip = len(l) - len(l.lstrip())           # its indentation: the variant ends at the same one
+            continue
+        if skip is not None:
+            if l.strip() == "}" and len(l) - len(l.lstrip()) == skip:
+                skip = None
+            continue
+        out.append(l)
+    return "\n".join(out)
+
+
 def key_of(text, flags):
     return hashlib.sha256((" ".join(flags) + "\n" + text).encode()).hexdigest()[:20]
 
@@ -83,7 +99,7 @@ def record(args):
             continue
         entries = []
         for name in sorted(os.listdir(d)):
-            text = open(os.path.join(d, name)).read()
+            text = sa_only(open(os.path.join(d, name)).read())
             k = key_of(text, flags)
             entries.append({"name": name, "key": k})
             items.setdefault(k, (name, text, flags))

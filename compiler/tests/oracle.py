@@ -521,7 +521,7 @@ def red_sum(e2, d):
 
 
 def load_dispatch(path):
-    """(context, module, func op) of a dumped dispatch source."""
+    """(context, module, func op) of a dumped dispatch source (its sa variant)."""
     ctx = ir.Context()
     m = ir.Module.parse(open(path).read(), ctx)
     funcs = []
@@ -532,6 +532,9 @@ def load_dispatch(path):
                 for o in b.operations:
                     if o.operation.name == "func.func":
                         funcs.append(o.operation)
+                    elif o.operation.name == "hal.executable.variant" and \
+                            '"sa"' not in str(o.operation.attributes["target"]):
+                        continue                    # the host fallback's VMVX variant (plan §8.15)
                     else:
                         walk(o.operation)
     walk(m.operation)
