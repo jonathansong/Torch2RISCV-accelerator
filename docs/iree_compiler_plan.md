@@ -1134,12 +1134,16 @@ C5.5 的模型（§8.9 的第一步）：
 **验证**（`run_tests.sh fallback`，`test_fallback.py`；lit `sa_host_fallback.mlir`）：
 - 小模型：`tanh`（sa 没有，主机）→ `exp`（加速器的 SFU）：与 numpy 的最大相对误差 1.6e-5（来自 SFU 的 exp 近似）；分工为加速器 1 张列表、主机 1 个 dispatch；
 - stories15M 把 decode 的全部线性层（25 个 dispatch / token）强制放到主机：16 个 token 的 prompt 加 4 步生成，logits 与只用加速器的版本 20/20 行逐位一致（线性层是整数乘加加 fp32 乘法，两边同样的位）；
-- 默认打开退路后，stories15M 的 prefill + decode 仍逐位一致，182 个 sa 可执行体与之前逐字节相同；黄金语料不受影响；ARM 版运行时能编出来（板上还没跑）。
+- 默认打开退路后，stories15M 的 prefill + decode 仍逐位一致，182 个 sa 可执行体与之前逐字节相同；黄金语料不受影响。
+- **板上（2026-09-29）**：
+  - 线性层放 ARM 的 stories15M（`deploy_fallback.sh`）：与 sim 9/9 步逐位一致，文本相同；分工为加速器 354 张列表、主机 201 个 dispatch（8 步 × 25，加 prefill 最后一块的分类层）。很慢：decode 每步 16.8 s，prefill 10.5 s（其中的分类层 288 × 32000 也在主机上）。按权重字节算约 0.7 µs / 字节：VMVX 在 ARM 上解释执行，操作数直接读不缓存的 CMA 窗口；
+  - 默认打开退路、不强制任何 dispatch 的普通 stories15M：61/61 步逐位一致，0 个主机 dispatch，prefill 211.3 ms（之前 211.6）、64 个 token 981.0 ms（之前 981.7）、decode 57.5 ms / 步（之前 57）：**不用时没有代价**。
 - **代价**：SmolLM2 M = 8 的编译从 140 秒到 261 秒，vmfb 从 6.6 MB 到 10.1 MB（每个 dispatch 都多编一个 VMVX 变体）；运行时没有代价（sa 编得了的 dispatch 照旧选 sa 变体）。
 - **以后可以做**：
   - 只给编不了的 dispatch 编 VMVX 变体（需要在翻译之前判断能不能编）；
   - 主机 dispatch 与加速器并行（现在是先等加速器做完）；
-  - llvm-cpu 代替 VMVX。
+  - llvm-cpu 代替 VMVX；
+  - 主机 dispatch 的操作数先拷到缓存内存（或给 CPU 用缓存映射、在加速器列表前后刷新缓存）。
 
 ## 9. 验证体系
 
@@ -1168,7 +1172,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
-| **主机退路** | sa 编不了的 dispatch 在 ARM 上用 VMVX 运行（§8.15） | 任何 dispatch 都能跑；混合执行与只用加速器逐位一致（线性层放主机的 stories15M）。**完成**（sim；板上待验证） | 中 |
+| **主机退路** | sa 编不了的 dispatch 在 ARM 上用 VMVX 运行（§8.15） | 任何 dispatch 都能跑；混合执行与只用加速器逐位一致（线性层放主机的 stories15M）。**完成**（sim 与板上） | 中 |
 | **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**完成**（2026-09-29，§8.14：R0–R6；微内核的 `sahl` 展开、带生存期的内存规划、`sahw-legalize-dynamic`、R7 代价模型留给以后） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
