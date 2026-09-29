@@ -168,7 +168,8 @@ bool Lowerer::contraction(ContractPlan &p) {
   if (mem.spadUsed()) return fail("contraction after other SPAD_A buffers");
   mem.takeSpad(2 * sb);                                      // the A strip at 0, raw rows in bank 1
   const uint32_t strip = 0, raw = sb;
-  auto xs = ddrStart(p.x.view, esize(p.x.et)), ms = ddrStart(p.m.view, 1), ys = ddrStart(p.store.getDst(), 4);
+  auto xs = ddrStart(p.x.view, esize(p.x.et)), ms = ddrStart(p.m.view, 1),
+       ys = ddrStart(p.store.getDst(), esize(cast<MemRefType>(p.store.getDst().getType()).getElementType()));
   if (!xs || !ms || !ys) return fail("contraction: operands not in DDR");
   auto dyn = [](auto op, SmallVector<std::tuple<int32_t, Value, bool>> f) {
     SmallVector<Value> vs;
@@ -398,10 +399,17 @@ bool Lowerer::contraction(ContractPlan &p) {
         // the epilogue on this chunk: n elements at (b, g, c0)
         Chunk ch;
         ch.n = int64_t(nc) * d;
-        // the epilogue's result: fp32, or int32 (an epilogue that only truncates the accumulator)
+        // the epilogue's result: fp32, int32 (an epilogue that only truncates
+        // the accumulator) or int8 (one that ends in to_i8, e.g. a KV row)
         Type oet = cast<MemRefType>(p.epi.getDpsInits()[0].getType()).getElementType();
-        if (!oet.isF32() && !oet.isInteger(32)) return fail("contraction epilogue result other than fp32 / int32");
-        ch.outVt = oet.isF32() ? ::sa::VT_F32 : ::sa::VT_I32;
+        if (!oet.isF32() && !oet.isInteger(32) && !oet.isInteger(8))
+          return fail("contraction epilogue result other than fp32 / int32 / int8");
+        ch.outVt = oet.isF32() ? ::sa::VT_F32 : oet.isInteger(32) ? ::sa::VT_I32 : ::sa::VT_I8;
+        const int64_t es = oet.isInteger(8) ? 1 : 4;     // bytes per result element
+        if (es == 1 && Nr.dyn) return fail("contraction epilogue: an int8 result of dynamic N");
+        // the epilogue's SPAD temps (an int8 result): SPAD_A bank 1 after x
+        // (the strip is in bank 0; released with the chunk)
+        if (!xI32 && p.layout != MatLayout::RowsK) mem.takeSpad(raw + uint32_t((K + d - 1) / d));
         LocalBuf out = newLocal(ch.outVt, ch.n);
         ch.outLa = out.la;
         for (int i = 0; i < p.epi.getNumDpsInputs(); ++i) {
@@ -450,11 +458,11 @@ bool Lowerer::contraction(ContractPlan &p) {
           dyn(st, {{::sa::DYN_DMA_DDR, rowAcc, true}, {::sa::DYN_DMA_ROW_BYTES, bytes, false}});
           if (row + 1 < H * G) addRow(bytes);
         } else {
-          int64_t yoff = ys->second + (row * N + int64_t(c0) * d) * 4;
+          int64_t yoff = ys->second + (row * N + int64_t(c0) * d) * es;
           if (yoff % 8) return fail("contraction: unaligned result");
-          sahw::StOp::create(bb, loc, ys->first, yoff, int64_t(out.la), 1, ch.n * 4, ch.n * 4, ValueRange{});
+          sahw::StOp::create(bb, loc, ys->first, yoff, int64_t(out.la), 1, ch.n * es, ch.n * es, ValueRange{});
         }
-        mem.releaseAcc(savedTop);
+        mem.release(savedTop);                           // (SPAD_A: back to the two banks taken)
       }
     }
   }

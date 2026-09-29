@@ -202,7 +202,13 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
         got = np.frombuffer(sim.ddr_read(phys[b], n).tobytes(), np.uint8)
         exp = np.zeros(n, np.uint8)
         exp[:len(want[b])] = np.frombuffer(bytes(want[b]), np.uint8)
-        diff = np.nonzero(got != exp)[0]
+        # (a store's DMA moves whole 8-byte words: its region rounded out to 8
+        # bytes is its own; IREE aligns every allocation to at least 16)
+        own = np.zeros(n, bool)
+        for o, m, _, w in regions.get(b, []):
+            if w:
+                own[o // 8 * 8:-(-(o + m) // 8) * 8] = True
+        diff = np.nonzero((got != exp) & ~own)[0]
         if len(diff):
             bad.append(f"b{b}: {len(diff)} bytes written outside the stores' regions, at {diff[0]}..{diff[-1]}")
     return "; ".join(bad) if bad else "OK"

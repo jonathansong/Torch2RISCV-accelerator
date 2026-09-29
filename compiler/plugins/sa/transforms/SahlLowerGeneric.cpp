@@ -719,7 +719,12 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     Value init = g.getDpsInits()[r];
     Val y = valOf(yield.getOperand(r));
     if (chunk) {
-      if (y.kind != Val::Mem || y.negInf) return fail("linear epilogue result");
+      if (y.kind == Val::ToI8 && chunk->outVt == ::sa::VT_I8) {   // int8 (e.g. a KV row): the VE's output conversion
+        if (y.inner->kind != Val::Mem || y.inner->negInf) return fail("linear epilogue result");
+        ve(y.inner->o, std::nullopt, chunk->outLa, ::sa::VT_I8, chunk->n, ::sa::VOP_COPY);
+        continue;
+      }
+      if (y.kind != Val::Mem || y.negInf || chunk->outVt == ::sa::VT_I8) return fail("linear epilogue result");
       ve(y.o, std::nullopt, chunk->outLa, chunk->outVt, chunk->n, ::sa::VOP_COPY);
       continue;
     }
