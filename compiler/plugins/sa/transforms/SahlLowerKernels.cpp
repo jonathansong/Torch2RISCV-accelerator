@@ -209,7 +209,9 @@ bool Lowerer::contraction(ContractPlan &p) {
     EpiIn e;
     e.src = src;
     if (em.isIdentity()) {
-      if (Nr.dyn || !mt.getElementType().isF32()) return fail("contraction epilogue input per element");
+      // fp32, or int32 (another contraction's accumulator: SwiGLU's up projection)
+      if (Nr.dyn || !(mt.getElementType().isF32() || mt.getElementType().isInteger(32)))
+        return fail("contraction epilogue input per element");
       e.kind = EpiKind::PerElement;
       epiIn[i] = e;
       continue;
@@ -424,11 +426,13 @@ bool Lowerer::contraction(ContractPlan &p) {
           if (e.kind == EpiKind::PerElement || e.kind == EpiKind::PerColumn) {
             auto r = ddrStart(e.src, 4);
             if (!r) return fail("contraction epilogue input not in DDR");
-            LocalBuf l = newLocal(::sa::VT_F32, ch.n);
+            bool i32 = cast<MemRefType>(p.epi.getDpsInputs()[i].getType()).getElementType().isInteger(32);
+            VType vt = i32 ? ::sa::VT_I32 : ::sa::VT_F32;
+            LocalBuf l = newLocal(vt, ch.n);
             int64_t off = r->second + ((e.kind == EpiKind::PerElement ? row * N : 0) + int64_t(c0) * d) * 4;
             if (off % 8) return fail("contraction epilogue input not 8-byte aligned");
             sahw::LdOp::create(bb, loc, r->first, off, int64_t(l.la), 1, ch.n * 4, ch.n * 4, 0, ValueRange{});
-            v.o = {l.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
+            v.o = {l.la, vt, ::sa::IDX_LIN, 0};
           } else if (e.kind == EpiKind::Scalar) {
             auto bc = scalarBcast(p.epi.getDpsInputs()[i], e.l);
             if (!bc) return false;
