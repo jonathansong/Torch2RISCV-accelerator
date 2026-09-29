@@ -1198,7 +1198,7 @@ C5.5 的模型（§8.9 的第一步）：
   - 逐步与 torch 量化模型比较不适合作判据：int8 舍入对运算顺序敏感（设备与 torch 的求和顺序不同），翻转随步数放大；两个都正确的程序（手写 qhf 与通用路径，同样的 KV scale）在设备上也会逐渐分开。
   - **质量**（固定文本逐位置喂入 40 个 token，top-1 与原版 fp32 HF 一致）：**通用路径 35/40（平均相关 0.9567），手写 qhf 36/40（0.9569）**，两者之间 39/40（这次通用路径用的是 qhf 的 KV scale）；用自己校准的 KV scale（与 qhf 只差最低位）是 **34/40（0.9566）**，`run_tests.sh hfgen` 通过。
   - 测试判据改为这个质量指标（≥ 85%，平均相关 > 0.95）。参照模型必须在任何改写之前算好：`rope_rewrite` 替换 `rotate_half` 对整个进程生效。
-- **F4 剩下的**：尾部带 int8 输出的线性层上加速器（通用 contraction 的尾部支持 int8 输出）。
+- **F4 剩下的**：尾部带 int8 输出的线性层上加速器（通用 contraction 的尾部支持 int8 输出）。**已完成**（§8.19：int8 尾部、SwiGLU 的 int32 逐元素输入；decode 全部在加速器上）。
 
 **落到主机的原因（F0 的测量）与对应的通用改写**：
 
@@ -1242,11 +1242,34 @@ C5.5 的模型（§8.9 的第一步）：
 
 | 顺序 | 工作 | 内容 | 验收 | 风险与依赖 |
 |---|---|---|---|---|
-| 1 | **通用路径的 prefill**（端到端 prefill + decode） | 导出 `prefill(tokens[M], positions[M])`，与 decode 在同一个模块里共用参数和 KV cache；`SaCache` 一次写 M 行；`"sa"` 注意力按行加因果掩码（qhf 的逐行形式）；`sa-llm-run --abi=hf` 支持分块 prefill；顺带 F4 剩下的 int8 尾部 | 与同一模型只用 decode 在设备上逐位一致（C6.P 的判据）；质量指标不下降；Qwen3 不改代码；上板 | 主要复用现有编译器（多行线性层、逐行注意力都已有）；可能再暴露编译器的边界情况 |
+| 1 | **通用路径的 prefill**（端到端 prefill + decode） | 导出 `prefill(tokens[M], positions[M])`，与 decode 在同一个模块里共用参数和 KV cache；`SaCache` 一次写 M 行；`"sa"` 注意力按行加因果掩码（qhf 的逐行形式）；`sa-llm-run --abi=hf` 支持分块 prefill；顺带 F4 剩下的 int8 尾部 | 与同一模型只用 decode 在设备上逐位一致（C6.P 的判据）；质量指标不下降；Qwen3 不改代码；上板 | 主要复用现有编译器（多行线性层、逐行注意力都已有）；可能再暴露编译器的边界情况。**sim 上完成，待上板**（§8.19） |
 | 2 | **微内核在 `sahl` 层展开** | 线性层、注意力、通用 contraction 的调度（分块、SPAD_B bank 交替、预取、LOOP_END 循环）用 `sahl` 操作显式表达，由一个 pass 展开；`sahl-to-sahw` 只做一对一翻译；`sahl` 需要补上能表达 bank、条带、循环的操作 | 黄金语料逐字节相同，不用上板 | 工作量大；C8 时没做（§8.14 R2：等于把 `sahw` 的概念再造一遍）。现在的价值是让调度能被代价模型和内存规划看见、能被改；也是第 3 项的前提 |
 | 3 | **带生存期分析的内存规划** | 所有局部缓冲和临时值都在 IR 上之后（第 2 项），按生存期分配 SPAD / ACC，按 bank 避开冲突，放不下时由规划决定分片（替代现在的估计，包括 `sahl.to_i8` 按 12 个操作计的那处） | 会改变输出：逐 dispatch 检查与 sim 逐位一致；板上逐 dispatch 周期不变差 | 地址与 bank 的变化影响记分板的并发，可能变快也可能变慢，要在板上实测 |
 
 理由：第 1 项是功能上的完整性（通用前端追上手写路径）；第 2 项是纯重构，由黄金语料守着；第 3 项依赖第 2 项，并且是唯一需要上板测性能的一步。
+
+### 8.19 通用路径的 prefill（§8.17 第 1 项的结果，2026-09-29）
+
+**结果**（sim；SmolLM2-135M 与 Qwen3-0.6B 截断到 2 层，都用原版 HF 建模代码，W8A8，M = 8）：
+
+| | SmolLM2-135M | Qwen3-0.6B（2 层，不改代码） |
+|---|---|---|
+| prefill + decode 与只用 decode | 逐位一致（5/5 行，token 相同） | 逐位一致（5/5 行，token 相同） |
+| decode 每步 | 一个描述符列表，**0 个主机 dispatch** | 一个描述符列表，0 个主机 dispatch |
+| 可执行（decode + prefill） | 794 个上加速器，2 个在主机（prefill 里 Q 的 RoPE） | — |
+| 质量（teacher-forced top-1 与 fp32 HF） | 设备 34/40（0.9573），torch W8A8 34/40（0.9558） | 设备 22/40，torch W8A8 21/40 |
+| 逐 dispatch 检查（`--dirty`） | 794 个全部一致 | — |
+
+**做了什么**：
+- 前端：`prefill(tokens[1, M], positions[1, M])` / `prefill_kv` 与 decode 一起导出（`aot.FxPrograms`，共用参数和 KV cache）；`SaCache` 逐行写 KV；`"sa"` 注意力逐行加前缀掩码；嵌入、RoPE 表逐行 gather；`QLinear` 在二维行上做乘法（三维 int32 matmul 会导出成 i64 累加的 `batch_matmul`，只能在主机上跑）；`sa_attention` 把 query 转回 `[M, H, hd]`（每行连续）。`sa-llm-run --abi=hf` 支持分块 prefill。
+- 编译器：通用 contraction 的尾部支持 int8 输出（K / V 投影融合了 KV 量化）和 int32 的逐元素输入（MLP 的 `silu(gate) · up` 融合进 gate 的尾部）；`sa-to-sahl` 把 lowering 不收的三层循环（外层是小的静态行循环：M 行的 RoPE 与 KV 量化）按行展开成 decode 的两层形式，gather 的源按行切片。
+- 测试：`test_hf_generic.py --prefill M`（prefill + decode 与只用 decode 逐位一致）、`--layers N`（截断模型）、`--board-bundle`；`dispatch_check.py` 加了不同值的 i64 向量、存储区域以外不得写（8 字节对齐的范围除外）、`--skew`、`--dirty`；`sa_sim_server.py --wlog`。
+
+**找到的 IREE 缺陷**：prefill 一开始与 decode 完全对不上（相关 ≈ 0），而每个 dispatch 单独检查都一致。用 `--iree-sa-host-dispatches` 把 prefill 的 dispatch 分批放到主机上二分，定位到一个 sa 上的 dispatch（27）；它的输出逐位正确，但紧跟着的主机 dispatch（28）在两次运行里输入相同、输出不同——workgroup 数不同（1 与 3）。原因是 IREE 的 `MergeIndexSwitchPattern` 合并相邻的 `scf.index_switch` 时只比较 case 值，不比较选择值；主机退路下相邻两个 dispatch 的变体选择值不同（一个选 sa，一个选 VMVX），合并后主机上的 dispatch 用了 sa 变体的 workgroup 数，只算了三分之一。修正是一行（要求选择值相同），放在 `compiler/patches/iree/`，`fetch_iree_sources.sh` 自动打上，`merge_index_switch.mlir` 守着。教训：逐 dispatch 检查看不到 dispatch 之间和运行时的问题；二分 + 两次运行逐 dispatch 比较绑定内容的哈希是有效的办法。
+
+**质量判据改了**：原来是“与 fp32 HF 的 top-1 一致 ≥ 85%”，这其实在评判量化方案，不是编译器：完整的 Qwen3-0.6B 上 torch 的 W8A8 模型本身只有 25/40（2 层 21/40）。现在的判据是设备保持量化模型的质量：一致数不低于 torch W8A8 模型的减 2，平均相关不低于它的减 0.01；两者都打印出来。**Qwen3 的 W8A8 质量是单独的问题**（C6.2 量化质量：逐 token 激活 + 逐行权重 + 每层静态 KV int8 + int8 概率在 Qwen3 上损失明显），不在第 1 项里。
+
+**剩下**：上板（`compiler/scripts/deploy_hfgen.sh` → `build/deploy_hfgen`，板上 `board_llm.py` 与 sim 逐位比较）；prefill 里 Q 的 RoPE 两个主机 dispatch（IREE 把 swap 后的 q 物化成按头在外的布局，gather 带了转置；改前端 swap 的写法反而让 31 个落到主机，没采用）；主机退路改用原生 ARM 代码（`llvm-cpu`，替代 VMVX 解释器，需要重建编译器）。
 
 ## 9. 验证体系
 
@@ -1275,7 +1298,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
-| **前端通用化** | HuggingFace 的原始建模代码直接导出，量化与写法由通用图改写完成（§8.16） | sa 的 dispatch 与 oracle 逐位一致，质量（与原版 fp32 HF 的 top-1）不低于手写 qhf 路径；Qwen3 不改代码；上板；非 Llama 结构。**进行中**（F0–F3 完成；F4：KV 与注意力上了加速器，质量与手写路径相当，int8 尾部的线性层还在主机；下一步见 §8.17） | 大 |
+| **前端通用化** | HuggingFace 的原始建模代码直接导出，量化与写法由通用图改写完成（§8.16） | sa 的 dispatch 与 oracle 逐位一致，质量（与原版 fp32 HF 的 top-1）不低于手写 qhf 路径；Qwen3 不改代码；上板；非 Llama 结构。**进行中**（F0–F4 完成；通用路径的 prefill + decode 在 sim 上与只用 decode 逐位一致，decode 全部在加速器上，Qwen3 不改代码通过，§8.19；待上板） | 大 |
 | **主机退路** | sa 编不了的 dispatch 在 ARM 上用 VMVX 运行（§8.15） | 任何 dispatch 都能跑；混合执行与只用加速器逐位一致（线性层放主机的 stories15M）。**完成**（sim 与板上） | 中 |
 | **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**完成**（2026-09-29，§8.14：R0–R6；微内核的 `sahl` 展开、带生存期的内存规划已排进下一步（§8.17）；`sahw-legalize-dynamic`、R7 代价模型留给以后） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |

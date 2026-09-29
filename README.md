@@ -193,8 +193,9 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
   accelerator backend cannot compile run on the ARM host (VMVX host fallback).
   An unmodified HuggingFace decoder (transformers' own modeling code) now
   compiles too: generic rewrites (W8A8, RoPE tables, an int8 KV cache and the
-  accelerator's attention) put it on the accelerator with the quality of the
-  hand-written path (sim).
+  accelerator's attention) put it on the accelerator, prefill and decode, with
+  the quantized model's quality; its decode runs entirely on the accelerator,
+  and Qwen3 compiles through the same path without code changes (sim).
   See [compiler/README.md](compiler/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)

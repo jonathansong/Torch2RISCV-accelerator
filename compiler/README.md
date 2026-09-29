@@ -179,14 +179,22 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   `sa-llm-run --abi=hf`. The rewrites are generic (by module type and
   transformers' AttentionInterface): W8A8 (`QLinear`, `QEmbedding`), RoPE
   tables and the pair swap, RMSNorm as the device computes it, an int8 KV
-  cache and the sa attention. SmolLM2 on sim: 171 executables on the
-  accelerator, 33 on the host; teacher-forced top-1 agreement with plain HF
-  fp32 35/40 (the hand-written qhf path: 36/40). Next (plan §8.17): the generic
-  path's prefill, micro-kernels expanded at the sahl level, memory planning
-  with lifetimes.
+  cache and the sa attention. Prefill + decode (plan §8.19): `prefill` /
+  `prefill_kv` exported with decode in one module; on sim bit-exact with
+  decode only for SmolLM2 and Qwen3-0.6B (2 layers, unchanged code). Decode
+  runs entirely on the accelerator; SmolLM2 has 794 executables on the
+  accelerator and 2 on the host (prefill only); the device keeps the torch
+  W8A8 model's quality (SmolLM2 34/40 teacher-forced top-1 agreement with
+  plain HF fp32, as the torch W8A8 model; Qwen3's W8A8 quality is a
+  quantization item of its own, C6.2). An IREE fix is applied from
+  `compiler/patches/iree/` by `fetch_iree_sources.sh`. Next (plan §8.17): the
+  board run, micro-kernels expanded at the sahl level, memory planning with
+  lifetimes.
 
   ```sh
   compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)
+  compiler/scripts/run_tests.sh -m 12G '$SA_PY -u compiler/tests/test_hf_generic.py --model build/llm_cache/SmolLM2-135M --out build/hfgen/smollm2_p8 --quant --rope --attn --prefill 8 --mb 400'
+  compiler/scripts/deploy_hfgen.sh                     # board bundle build/deploy_hfgen (board_llm.py)
   ```
 
 - **Host fallback done** (docs/iree_compiler_plan.md §8.15): a dispatch the
