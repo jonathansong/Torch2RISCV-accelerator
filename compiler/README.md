@@ -172,6 +172,22 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   interactively on the board (`board_generate.py`). The device window
   is configurable (`--mb`; SmolLM2 needs 160.5 MB: parameter loads read
   straight into device memory, `sa-llm-run` prints the peak).
+- **Host fallback done** (docs/iree_compiler_plan.md §8.15): a dispatch the
+  sa backend cannot compile runs on the ARM host (IREE's VMVX, no LLVM
+  toolchain needed), the rest on the accelerator, in one command buffer.
+  `compile_sa.sh` turns it on by default (`SA_HOST_FALLBACK=0` turns it off):
+  every dispatch also gets a VMVX variant, an unsupported one a false
+  condition on its sa variant. The sa driver registers IREE's VMVX loader and
+  runs such dispatches on the host after the queued descriptor list;
+  `SA_STATS=1` prints the split. Verified on sim: tanh (host) + exp
+  (accelerator), and stories15M with every decode linear layer forced to the
+  host (`--iree-sa-host-dispatches=matvec`): logits bit-exact with the
+  accelerator-only build.
+
+  ```sh
+  compiler/scripts/run_tests.sh fallback             # test_fallback.py (sim)
+  ```
+
 - **C8 done** (docs/iree_compiler_plan.md §8.14): the code generator's
   decisions are passes with lit tests, visible in the IR: `iree-sa-to-sahl`
   groups each micro-kernel / generic contraction into a `sahl.kernel` and

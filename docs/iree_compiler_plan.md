@@ -1109,6 +1109,38 @@ C5.5 的模型（§8.9 的第一步）：
 2. **前端通用化**：量化与形式改写（gather、KV 的写法、prefill 的逐行展开）从手写模型挪进编译器的预处理 pass，让 HuggingFace 的原始建模代码可以直接编译。
 3. **非 Llama 结构**：例如 GPT-2（LayerNorm、GELU），验证泛化能力。
 
+### 8.15 主机退路：sa 编不了的 dispatch 在 ARM 上运行
+
+**目标**：任何模型都能跑：sa 后端编不了的 dispatch 交给 ARM 主机，其余照旧在加速器上，两者在同一个设备、同一张命令缓冲里按顺序执行。业界编译器的标准做法（加速器不支持的算子回退到 CPU）。
+
+**做法**（2026-09-29 完成）：
+- **主机代码用 VMVX**：IREE 的参考 CPU 后端，把 dispatch 编成 VM 字节码，运行时解释执行（带微内核）。编译器构建里已经有，ARM 版运行时也带了 VMVX 加载器，不需要 LLVM 工具链、不需要重新构建编译器。慢，但只用于退路；以后需要速度可以换成 llvm-cpu（编译器要打开 LLVM_CPU 后端并交叉编译 armv7）。
+- **编译器**（`--iree-sa-host-fallback`，`compile_sa.sh` 默认打开，`SA_HOST_FALLBACK=0` 关掉）：
+  - sa 设备的目标同时列出 `sa-desc-v1` 与 `vmvx-bytecode-fb` 两种执行体格式，每个 dispatch 都编出两个变体（sa 在前）；
+  - sa 后端编不了某个 dispatch 时，不再报错，而是给它的 sa 变体加一个恒为假的 `hal.executable.condition`：
+    - IREE 在翻译之后生成 dispatch 调用处的变体选择（格式可用且条件成立的第一个），所以这个 dispatch 选 VMVX 变体；
+    - 执行体创建时的选择（`MaterializeResourceCaches`）也一样；
+  - 关掉 IREE 的执行体链接（`--iree-hal-link-executables=false`）：VMVX 的链接会把所有 VMVX 变体并进一个执行体，并把原执行体的引用整体改指过去（IREE 源码里标注为有风险），与仍保留 sa 变体的执行体冲突（编译器崩溃）。sa 本来就不链接，VMVX 不链接只是每个 dispatch 一个小模块；
+  - 测试用：`--iree-sa-host-dispatches=<名字片段,...>` 把指定的 dispatch 强制放到主机上。
+- **运行时**：
+  - sa 驱动多注册一个 IREE 的 VMVX 加载器，执行体缓存按格式选加载器；
+  - 命令缓冲遇到非 sa 的执行体时，先提交已排队的描述符列表（它的输入可能来自加速器），再按 IREE inline 命令缓冲的方式在 ARM 上逐个 workgroup 执行；
+  - 缓冲就是设备窗口（sim：共享文件；板上：CMA 窗口），两边看到同一份内存；
+  - `SA_STATS=1`：结束时打印加速器上的描述符列表数与主机上的 dispatch 数。
+- **本来想用、没用的做法**：
+  - 在链接阶段删掉编不了的 sa 变体：dispatch 调用处的变体选择在链接之前已经生成，删掉会留下悬空引用；
+  - 两个设备（sa + local）按 dispatch 指定 affinity：是否支持要到 sa 代码生成时才知道，而 affinity 要在 dispatch 划分之前定。
+
+**验证**（`run_tests.sh fallback`，`test_fallback.py`；lit `sa_host_fallback.mlir`）：
+- 小模型：`tanh`（sa 没有，主机）→ `exp`（加速器的 SFU）：与 numpy 的最大相对误差 1.6e-5（来自 SFU 的 exp 近似）；分工为加速器 1 张列表、主机 1 个 dispatch；
+- stories15M 把 decode 的全部线性层（25 个 dispatch / token）强制放到主机：16 个 token 的 prompt 加 4 步生成，logits 与只用加速器的版本 20/20 行逐位一致（线性层是整数乘加加 fp32 乘法，两边同样的位）；
+- 默认打开退路后，stories15M 的 prefill + decode 仍逐位一致，182 个 sa 可执行体与之前逐字节相同；黄金语料不受影响；ARM 版运行时能编出来（板上还没跑）。
+- **代价**：SmolLM2 M = 8 的编译从 140 秒到 261 秒，vmfb 从 6.6 MB 到 10.1 MB（每个 dispatch 都多编一个 VMVX 变体）；运行时没有代价（sa 编得了的 dispatch 照旧选 sa 变体）。
+- **以后可以做**：
+  - 只给编不了的 dispatch 编 VMVX 变体（需要在翻译之前判断能不能编）；
+  - 主机 dispatch 与加速器并行（现在是先等加速器做完）；
+  - llvm-cpu 代替 VMVX。
+
 ## 9. 验证体系
 
 | 层次 | 内容 | 工具 |
@@ -1136,6 +1168,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **C6 更大的模型** | HuggingFace 导入与通用量化、目标配置参数化、K / T 分块、GQA / QK-norm（§8.9） | Qwen3-0.6B、Llama-3.2-1B 在 sim 上编译，逐 dispatch 逐位一致，截断层数的端到端误差在范围内；有资源更多的板子后上板。**进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层 sim 逐位一致已完成；C6.P prefill + decode 两个模型板上逐位一致，prompt 每 token 比 decode 快 4.3–4.7 倍，§8.13） | 大 |
 
+| **主机退路** | sa 编不了的 dispatch 在 ARM 上用 VMVX 运行（§8.15） | 任何 dispatch 都能跑；混合执行与只用加速器逐位一致（线性层放主机的 stories15M）。**完成**（sim；板上待验证） | 中 |
 | **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**完成**（2026-09-29，§8.14：R0–R6；微内核的 `sahl` 展开、带生存期的内存规划、`sahw-legalize-dynamic`、R7 代价模型留给以后） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
