@@ -63,6 +63,10 @@ class HFDecoder(torch.nn.Module):
 
     def forward(self, input_ids, position_ids):
         self.cache.positions = position_ids[0]
+        # HF builds the causal mask from the cache's own length (the positions
+        # seen so far): here the input position, set (not mutated) each step
+        for layer in self.cache.layers:
+            layer.cumulative_length = position_ids.reshape(-1)[0]
         return self.model(input_ids=input_ids, position_ids=position_ids, past_key_values=self.cache,
                           use_cache=True).logits
 
@@ -177,14 +181,16 @@ def calibrate_kv(model, tokens, max_len):
     return (np.maximum(obs.cache.amax, 1e-8) / 127.0).astype(np.float32)
 
 
-def load(model_dir, max_len=256, quant=False, rope=False, attn=False):
+def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=None):
     torch.set_grad_enabled(False)
     m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
     if rope:
         print("  rope_rewrite:", rope_rewrite(m, max_len))
         print("  norm_rewrite:", norm_rewrite(m))
     kv = None
-    if attn:                              # KV scales from the fp32 model (after the RoPE / norm rewrites)
+    if attn and kv_scales is not None:    # given (e.g. qhf's, for a bit-exact comparison)
+        kv = np.load(kv_scales).astype(np.float32)
+    elif attn:                            # KV scales from the fp32 model (after the RoPE / norm rewrites)
         import export_hf
         from hf_tokenizer import BpeTokenizer
         kv = calibrate_kv(m, BpeTokenizer(model_dir).encode(export_hf.CALIB), max_len)
@@ -440,8 +446,9 @@ def main():
     ap.add_argument("--quant", action="store_true", help="W8A8: linear layers and embeddings (QLinear / QEmbedding)")
     ap.add_argument("--rope", action="store_true", help="RoPE tables and the pair swap (RopeTable, swapneg)")
     ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (SaCache, sa_attention)")
+    ap.add_argument("--kv-scales", help="KV scales (.npy [layers, 2]) instead of calibrating")
     args = ap.parse_args()
-    export(load(args.model, args.max_len, args.quant, args.rope, args.attn), args.out)
+    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales), args.out)
 
 
 if __name__ == "__main__":

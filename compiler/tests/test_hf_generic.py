@@ -59,8 +59,21 @@ def main():
                     "the quantized model in torch (and the fp32 model's argmax for information)")
     ap.add_argument("--rope", action="store_true", help="RoPE tables and the pair swap (F3)")
     ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (F4)")
+    ap.add_argument("--kv-scales", help="KV scales (.npy) instead of calibrating (F4)")
     ap.add_argument("--min-corr", type=float, default=0.999)
     args = ap.parse_args()
+    # the wrapper (static cache at the input positions) vs plain HF on the whole prompt
+    from transformers import AutoModelForCausalLM
+    pr = [int(t) for t in args.prompt.split(",")]
+    plain = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, attn_implementation="sdpa").eval()
+    full = plain(torch.tensor([pr])).logits[0]
+    wr = H.HFDecoder(plain, 256)
+    dmax = max(float((wr(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] - full[i]).abs().max()) for i, t in enumerate(pr))
+    print(f"HFDecoder vs plain HF (the whole prompt at once, fp32): max |diff| {dmax:.3g}")
+    if dmax > 1e-3:
+        print("hf_generic FAIL (the wrapper)")
+        return 1
+    del plain, wr
     if args.rope:                        # the rewrite keeps the fp32 model's logits (checked here)
         base = H.load(args.model)
         pr = [int(t) for t in args.prompt.split(",")]
@@ -70,7 +83,7 @@ def main():
         d = max(float((x - y).abs().max()) for x, y in zip(a, b))
         print(f"rope rewrite vs the original model (fp32, torch): max |diff| {d:.3g}")
         del base, rw
-    w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn)
+    w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales)
     if not args.skip_export:
         H.export(w, args.out)
         t0 = time.time()
@@ -86,7 +99,7 @@ def main():
     ref, tok = [], None
     import contextlib
     with device_sfu() if args.quant else contextlib.nullcontext():
-        w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn)   # (fresh state)
+        w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales)   # (fresh state)
         for pos in range(len(prompt) + args.generate):
             tok = prompt[pos] if pos < len(prompt) else tok
             lg = w(torch.tensor([[tok]]), torch.tensor([[pos]]))[0, -1].numpy()
