@@ -189,8 +189,12 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
   per call on the full array, 4.3-4.7x faster per token than decode, bit-exact.
   The code generator's decisions (kernels, gathers, pieces, memory places,
   schedules) are separate passes visible in the IR, guarded by a
-  byte-for-byte golden corpus of 3962 dispatches (C8). Dispatches the
+  byte-for-byte golden corpus of 4002 dispatches (C8). Dispatches the
   accelerator backend cannot compile run on the ARM host (VMVX host fallback).
+  An unmodified HuggingFace decoder (transformers' own modeling code) now
+  compiles too: generic rewrites (W8A8, RoPE tables, an int8 KV cache and the
+  accelerator's attention) put it on the accelerator with the quality of the
+  hand-written path (sim).
   See [compiler/README.md](compiler/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)

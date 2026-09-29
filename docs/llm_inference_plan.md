@@ -1054,7 +1054,7 @@ IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 →
 
 ### 10.5 L6-IREE 的交付与验收
 
-（实际的位置：编译器插件在 `compiler/plugins/sa`，HAL 驱动在 `compiler/runtime/sa`，见 `compiler/README.md`。）
+（实际的位置：编译器插件在 `compiler/plugins/sa`，HAL 驱动在 `compiler/runtime/sa`，见 `compiler/README.md`。现状与之后的计划见 [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.12–§8.18：prefill + decode、代码生成分层重构、主机退路、HuggingFace 原始模型的通用前端，以及更大模型所需的 FPGA 规模。）
 
 - **`iree-sa/compiler`**：HAL 目标后端插件，使用模板库，可执行体格式为 `sa-desc-v1`。
 - **`iree-sa/runtime`**：C 写的 HAL 驱动：

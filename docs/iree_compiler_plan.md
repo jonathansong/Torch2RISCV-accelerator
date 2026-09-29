@@ -1213,6 +1213,29 @@ C5.5 的模型（§8.9 的第一步）：
 
 **验收的主要依据**：原定与手写 qhf 路径逐位一致；实际上两个前端各自的算式细节（HF 用 fp32 算 RoPE 表、qhf 用 float64；注意力的求和长度）不同，int8 舍入又对运算顺序敏感，逐位一致不是合适的目标。改为：sa 的每个 dispatch 与 oracle 逐位一致（编译器的正确性），加上与原版 fp32 HF 比较的质量不低于手写路径（前端的正确性），并且能上板；再用 Qwen3 验证同一套改写不需要改代码。之后 F6：非 Llama 结构（GPT-2：LayerNorm、GELU、learned position embedding）。
 
+### 8.18 可用的 Qwen3 需要多大的 FPGA（估计，2026-09-29）
+
+单序列生成受内存带宽限制：每生成一个 token，全部权重（加上分类层）要从 DDR 读一遍，生成速度 ≈ 可用带宽 ÷ 每 token 读的字节数。以下按公开的 Qwen3 配置推算，没有实测；“可用”按交互生成 ≥ 10 token/s、上下文 2K。
+
+| 型号 | 每 token 读的权重（int8 / int4） | KV cache（int8，2K） | 10 token/s 需要的带宽（int8 / int4） |
+|---|---|---|---|
+| Qwen3-0.6B（28 层，隐藏维 1024） | 约 0.6 GB / 0.3 GB | 约 117 MB | 约 6 / 3 GB/s |
+| Qwen3-1.7B（28 层，2048） | 约 1.7 GB / 0.9 GB | 约 117 MB | 约 17 / 9 GB/s |
+| Qwen3-4B（36 层，2560） | 约 4.0 GB / 2.0 GB | 约 150 MB | 约 40 / 20 GB/s |
+| Qwen3-8B（36 层，4096） | 约 7.6 GB / 3.8 GB | 约 150 MB | 约 76 / 38 GB/s |
+
+- 小模型里分类层（词表 15 万 × 隐藏维）占每 token 读取量的很大一部分（0.6B 约四分之一）；生成时还要读 KV cache（平均上下文 1K 时每 token 约 60–75 MB）。
+- 算力要求不高：decode 每 token 约“参数量”次乘加（0.6B 在 10 token/s 时约 6 GMAC/s）；prefill 才吃算力（512 个 token 约 300 GMAC，1–2 秒内完成需要 150–300 GMAC/s）。
+- **PYNQ-Z1 不行**：512 MB DDR 装不下 0.6B 的 int8 权重（int4 能装下）；实测读权重约 0.39 GB/s（一个 64 位 HP 口、50 MHz），int4 也只有约 1 token/s；8×8 阵列、50 MHz 峰值 3.2 GMAC/s；LUT 已用 83%。
+
+| 级别 | 典型器件 / 板子 | 内存与带宽 | 能跑的 Qwen3 |
+|---|---|---|---|
+| 入门 Zynq UltraScale+ | Kria KV260（K26 SOM，约 25 万逻辑单元、1248 个 DSP，4 GB 64 位 DDR4，理论约 19 GB/s，PL 实际约 10 GB/s） | 4 GB | 0.6B int8 约 10–15 token/s；1.7B int4 约 8–10 token/s |
+| 中档 Zynq UltraScale+ | ZCU104 / ZCU102（PS 与 PL 各有 DDR4） | 4–6 GB，合计约 20–30 GB/s | 1.7B int8 约 10 token/s；4B int4 约 5 token/s |
+| 带 HBM | Alveo U55C / U280，Versal HBM | 8–16 GB，约 400–460 GB/s | 4B / 8B int8 几十 token/s |
+
+**结论**：Qwen3-0.6B / 1.7B 要“可用”，需要 KV260（K26）这一级；4B / 8B 需要 HBM。加速器要跟着改：DMA 加宽到 2–4 个 128 位 HP 口、200–300 MHz（提速的主要来源）；LD 路径上解包 int4（带宽减半）；阵列 D = 16 或 32（prefill 的算力，M4 已验证 D = 16）；SPAD / ACC 用 URAM 加大；编译器的 T 分块注意力（C6.5）。编译器这边已具备：硬件参数来自目标配置，Qwen3-0.6B 全 28 层 sim 上逐 dispatch 验证过，通用前端可直接用 HF 的 Qwen3 代码。
+
 ### 8.17 下一步（2026-09-29 定）
 
 按顺序：
