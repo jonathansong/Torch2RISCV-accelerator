@@ -258,7 +258,11 @@ class QLinear(torch.nn.Module):
 
     def forward(self, x):
         xq, s_x = _quant_act(x)
-        acc = torch.matmul(xq.to(torch.int32), self.wq.to(torch.int32).t())
+        # on rows [tokens, in] (qhf's form): a 3-D int32 matmul is exported as a
+        # batch_matmul accumulating in i64, which the sa backend leaves to the host
+        rows = xq.reshape(-1, xq.shape[-1])
+        acc = torch.matmul(rows.to(torch.int32), self.wq.to(torch.int32).t())
+        acc = acc.reshape(tuple(xq.shape[:-1]) + (acc.shape[-1],))
         y = (acc.to(torch.float32) * self.s_w) * s_x
         return y if self.bias is None else y + self.bias
 
