@@ -564,7 +564,12 @@ bool Lowerer::linearRows(LinearPlan &p) {
       }
       Chunk ch;
       ch.n = n;
-      LocalBuf out = newLocal(::sa::VT_F32, n);
+      // the result: fp32 (in ACC), or int8 (in SPAD_A; a KV row's quantization)
+      const bool i8 = cast<MemRefType>(p.epi.getDpsInits()[0].getType()).getElementType().isInteger(8);
+      const int64_t es = i8 ? 1 : 4;
+      ch.outVt = i8 ? ::sa::VT_I8 : ::sa::VT_F32;
+      LocalBuf out = newLocal(ch.outVt, n);
+      if (!err.empty()) return false;
       ch.outLa = out.la;
       const int64_t off = (rb * d * N + c0 * d) * 4;
       for (int in = 0; in < p.epi.getNumDpsInputs(); ++in) {
@@ -605,8 +610,9 @@ bool Lowerer::linearRows(LinearPlan &p) {
         ch.inputs[i] = v;
       }
       if (!generic(p.epi, nullptr, &ch)) return false;
-      sahw::StOp::create(bb, loc, yd->base, yd->off + off, int64_t(out.la), d, nc * d * 4, N * 4, ValueRange{});
-      mem.releaseAcc(savedRb);
+      sahw::StOp::create(bb, loc, yd->base, yd->off + (rb * d * N + c0 * d) * es, int64_t(out.la), d, nc * d * es,
+                         N * es, ValueRange{});
+      mem.release(savedRb);                         // (the row block's temps: ACC and SPAD_A)
     }
     mem.releaseAcc(savedTop);
   }
