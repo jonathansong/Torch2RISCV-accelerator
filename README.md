@@ -255,4 +255,4 @@ target is complete.
 
 ## License
 
-MIT (or your choice — update before publishing).
+Apache-2.0 WITH LLVM-exception. See LICENSE and NOTICE; third-party parts keep their own licenses.
