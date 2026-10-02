@@ -1,6 +1,6 @@
 # PYNQ-Z1 → Kria KV260 升级方案
 
-状态：草案（2026-10-02）。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
+状态：草案（2026-10-02，按实现前评审修订：K1 拆为 50 / 100 MHz 两步，K2 改为 DMA 与片上存储接口重构，K4 拆为正确性与性能两步验收）。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
 
 相关文档：[`iree_compiler_plan.md`](iree_compiler_plan.md) §8.18（FPGA 规模估计）、[`double_buffer_design.md`](double_buffer_design.md)（加速器架构）、[`memory_model.md`](memory_model.md)（地址与一致性）。
 
@@ -11,13 +11,14 @@
 **目标**
 
 1. 现有全部功能在 KV260 上逐位一致地运行（stories15M、SmolLM2-135M，prefill + decode）。
-2. 把 decode 的瓶颈——权重读取带宽——从约 0.39 GB/s 提高到 **6–10 GB/s**。
-3. 让 **Qwen3-0.6B（int8，全 28 层）** 在板上以可交互的速度运行（估计 10–15 token/s）。
+2. 把 decode 的瓶颈——权重读取带宽——从约 0.39 GB/s 提高到**实测写入 SPAD 的有效带宽 6–10 GB/s**。这需要重构 DMA 接收端与片上存储写入接口（K2），不只是加宽数据通路。
+3. 让 **Qwen3-0.6B（int8，全 28 层）** 先在板上正确运行，再按实测耗时分解调优（10–15 token/s 是冲刺目标，6 GB/s 时仅权重读取的上限约 10 token/s）。
 4. 为后续的 int4、64 位地址、更大模型、RVV 核留出空间。
 
 **原则**（沿用项目约定）
 
-- **一次只改一类东西**：先换平台、参数不变，再提频率和带宽，再扩存储，最后上大模型。每一步出问题都能定位到这一步的改动。
+- **一次只改一类东西**：先换平台（时钟、参数都不变），再提频率，再改带宽架构，再扩存储，最后上大模型。每一步出问题都能定位到这一步的改动。
+- **正确性与性能分开验收**：平台移植和大模型上板先以逐位一致验收；性能数字在硬件稳定后按实测设目标。
 - **每一步先 sim、再上板、逐位一致后提交**。逐位一致的参照：功能仿真器（`llm/sa_funcsim.py`）与 PYNQ-Z1 上已验证的结果。
 - **编译器尽量不动**：硬件参数通过目标配置（`--iree-sa-d`、`--iree-sa-spad-kb`、`--iree-sa-acc-kb`）传入，黄金语料（4002 个 dispatch）守护代码生成不变。
 - **PYNQ-Z1 先保留、后冻结**：K1 完成前，新平台用新目录和参数，不破坏现有 bitstream 与测试；K1 验收后，Z1 冻结在 tag `v1.0-pynq-z1` 和分支 `pynq-z1`，main 完全转向 KV260（见 §7）。
@@ -30,11 +31,11 @@
 |---|---|---|
 | 器件 | Zynq-7020（xc7z020clg400-1） | Zynq UltraScale+（XCK26，与 ZU5EV 同级） |
 | 处理器 | 2 × Cortex-A9（armv7，32 位），650 MHz | 4 × Cortex-A53（aarch64），约 1.3 GHz；另有 2 × R5F |
-| 逻辑资源 | 约 53K LUT、220 DSP48E1、140 BRAM36；LUT 已用约 83% | 约 117K LUT、1248 DSP48E2、144 BRAM36、**64 URAM（约 2.25 MB）** |
+| 逻辑资源 | 约 53K LUT、220 DSP48E1、140 BRAM36；LUT 已用约 83% | 约 117K LUT、1248 DSP48E2、144 BRAM36、**64 URAM（约 2.25 MB）**。BRAM 数量与 Z1 接近，新增的存储能力主要来自 URAM |
 | DDR | 512 MB DDR3 | **4 GB DDR4（64 位）**，理论约 19 GB/s |
 | PS-PL 数据口 | HP0–HP3，各 **64 位**，AXI3 | HP0–HP3（及 HPC），各 **128 位**，AXI4 |
-| 加速器时钟 | 50 MHz（实测时序约束） | 目标 200–250 MHz |
-| 读权重带宽 | **实测约 0.39 GB/s**（1 个 HP 口，约 7.8 B/周期，利用率 99%） | 目标 6–10 GB/s（2–4 个 128 位 HP 口） |
+| 加速器时钟 | 50 MHz（实测时序约束） | K1a 50 MHz → K1b 100 MHz → K2 目标 200–250 MHz |
+| 读权重带宽 | **实测约 0.39 GB/s**（1 个 HP 口，约 7.8 B/周期，利用率 99%；LD 入口 64 位 × 50 MHz 的上限是 0.4 GB/s） | 目标：写入 SPAD 有效带宽 6–10 GB/s（多口接收 + 存储分银行，见 K2） |
 | 软件 | PYNQ（armv7 Linux） | Kria-PYNQ 或 Ubuntu for Kria（aarch64） |
 
 资源数字来自公开资料，按 AMD 数据手册核对。
@@ -49,8 +50,8 @@
 
 | 模块 | 分类 | 说明 |
 |---|---|---|
-| `rtl/sysarray/*.v`（阵列、VE、LD/ST、调度器、记分板） | 小改 | 通用 Verilog。`sa_unit` 已有参数 `D`、`DSP_COLS`、`NPORTS`、`SPAD_WORDS`、`ACC_WORDS`、`PERF`。DSP 推断从 DSP48E1 变为 DSP48E2（一般自动），`DSP_COLS` 的 DSP/LUT 列分配需重新评估；BRAM 推断模板（`sa_tdpram.v`、`sa_bankmem.v`）在 UltraScale+ 上需确认推断结果，SPAD/ACC 加大时改用 URAM |
-| `rtl/sysarray/sa_ld.v`、`sa_st.v`（DMA） | 小改 → 中改 | 当前每个口 64 位数据（`m_rdata[NPORTS*64-1:0]`），本地写入每周期一个 64 位 lane。K1 用 AXI 位宽转换器接 128 位 HP 口；K2 再把数据通路加宽到 128 位 |
+| `rtl/sysarray/*.v`（阵列、VE、LD/ST、调度器、记分板） | 小改 | 通用 Verilog。`sa_unit` 已有参数 `D`、`DSP_COLS`、`NPORTS`、`SPAD_WORDS`、`ACC_WORDS`、`PERF`。DSP 推断从 DSP48E1 变为 DSP48E2（一般自动），`DSP_COLS` 的 DSP/LUT 列分配需重新评估；BRAM 推断模板（`sa_tdpram.v`、`sa_bankmem.v`）在 UltraScale+ 上需确认推断结果。SPAD/ACC 加大时改用 URAM，但 `sa_tdpram.v` 是 read-first、1 周期读延迟、上电清零的 BRAM 模板，URAM 的端口行为、读延迟和初值都不同，需要先抽象存储接口（K3） |
+| `rtl/sysarray/sa_ld.v`、`sa_st.v`（DMA）及 SPAD/ACC 写入接口 | K1 不改 → **K2 重构** | 当前每个口 64 位数据（`m_rdata[NPORTS*64-1:0]`），返回端每周期只选一个口（`r_sel`），本地写入每周期一个 64 位 lane；多口只能隐藏延迟，接收带宽不能相加。K1 把 HP 口直接配置为 64 位，不需要位宽转换器；K2a 入口加宽到 128 位，K2b 多口接收 + 存储分银行 |
 | `picorv32.v`、PCPI（`sa_pcpi.v`） | 不改 | 纯 RTL |
 | `scripts/pico_bit.tcl`（block design） | **重写** | 器件写死为 `xc7z020clg400-1`；PS 是 `processing_system7`，要换成 `zynq_ultra_ps_e`；GP0 → HPM0_FPD/LPD；HP0/HP2（64 位，加 AXI4→AXI3 转换器 `matmulHpConverter`）→ HP0–HP3（128 位 AXI4，不再需要 AXI3 转换） |
 | `scripts/build_bitstream.tcl/.sh` | 小改 | 增加 `-board kv260`；沿用 `-sa_d`、`-jobs` |
@@ -72,22 +73,29 @@
 |---|---|---|
 | `driver/pynq_matmul.py`、`notebooks/` | 小改 | `BRAM_ARM_BASE = 0x40010000` 等基地址改为 ZynqMP 的 HPM 地址窗口（如 `0xA000_0000` 起，以 block design 为准）；overlay 名、CMA 分配 |
 | IREE 运行时交叉编译（`iree-sa/l0/toolchain-armv7hf.cmake`、`build_runtime_armv7.sh`、`compiler/scripts/build_sa_runtime.sh armv7`） | 小改 | 新增 aarch64 工具链文件和 `build_sa_runtime.sh aarch64`；`armv7_libm_shim.c` 在 aarch64 上可能不再需要（待确认） |
-| `compiler/runtime/sa/sa_transport_board.c` | 小改 | 通过 `/dev/mem` 映射设备窗口（`SA_BOARD_MEM=<phys>:<bytes>`、`SA_BOARD_MBOX=<phys>`），物理地址是 `uint32_t`。K1 保持 32 位，窗口必须在低 2 GB（见 2.4） |
+| `compiler/runtime/sa/sa_transport_board.c` | 小改 | 通过 `/dev/mem` 映射设备窗口（`SA_BOARD_MEM=<phys>:<bytes>`、`SA_BOARD_MBOX=<phys>`），物理地址目前是 `uint32_t`（`sa_devmem_map(uint32_t phys, ...)`）。改为 64 位解析与检查，描述符中仍用 32 位，窗口必须在低 2 GB（见 2.4） |
 | `compiler/tests/board_*.py`、`scripts/deploy_*.sh` | 小改 | 路径、架构、窗口大小、mailbox 地址 |
 
 ### 2.4 关键约束：32 位 DDR 地址
 
 - 描述符的 DDR 地址字段是 32 位（`DescList`：`ddr & M32`），PicoRV32 也是 32 位核；运行时传物理地址用 `uint32_t`。
 - KV260 的 4 GB DDR 在 ZynqMP 地址空间里分两段：**低 2 GB 在 `0x0000_0000` 起，高 2 GB 在 `0x8_0000_0000` 起**。
-- **K1–K4 的做法：所有给加速器的缓冲（权重、KV cache、激活、描述符列表、环形队列）都放在低 2 GB。** 用设备树的 reserved-memory 或 CMA 区域固定在低地址，并在运行时检查分配到的物理地址 < 2 GB，否则报错。
-- 容量够用：Qwen3-0.6B int8 权重约 0.6 GB，加 KV（2K 上下文约 117 MB）和激活，远小于可用空间。
+- **K1–K4 的做法：所有给加速器的缓冲（权重、KV cache、激活、描述符列表、环形队列）都放在低 2 GB。** 这样不需要立即改描述符的地址格式。
+- **地址检查的顺序**：物理地址（来自环境变量、驱动或分配器）一律先用 64 位类型（`uint64_t`）解析；检查**整个范围** `[phys, phys + size)` 都在保留区内、且末端 ≤ 2 GB 之后，才转成 32 位写进描述符。不能先截断再检查，否则高 2 GB 的地址会被静默折回低地址。
+- **分配与映射**：reserved-memory 只是把一段内存留出来，不等于现有驱动能直接分配和映射。需要明确：
+  - 分配方式（设备树 reserved-memory + `/dev/mem`、CMA、或 udmabuf 一类的驱动）；
+  - 映射属性（ARM 侧非缓存 / 写合并 / 可缓存加显式刷新）；
+  - CPU ↔ 设备的同步边界（提交描述符前、读取结果前分别做什么）。
+  这些写进 `docs/memory_model.md` 的 KV260 一节。
+- **ABI 审计**：aarch64 上 `long` 与指针是 64 位。主机与固件共享的结构（mailbox、环形队列项、完成记录、描述符）**全部使用定宽字段**（`uint32_t` 等），不含指针、`long`、`size_t`；用 `static_assert` 检查大小与字段偏移，确认对齐与填充与固件一致。不能只把主机程序重新编译一遍就认为 ABI 不变。
+- 容量够用：Qwen3-0.6B int8 权重约 0.6 GB，加 INT8 KV（2048 token 约 112 MiB，未计 scale 与填充）和激活，远小于可用空间。
 - 64 位地址放到 K5（可选），只有上 1.7B int8 或 3B 以上模型才需要。
 
 ### 2.5 编译器（`compiler/plugins/sa/`）
 
 | 模块 | 分类 | 说明 |
 |---|---|---|
-| sa 后端插件、`sahl`/`sahw` 流水线 | 不改 | 硬件参数来自目标配置 |
+| sa 后端插件、`sahl`/`sahw` 流水线 | K1 不改；K2 起复查 | 硬件参数来自目标配置。K2 / K3 若改变银行组织、读延迟、DMA 对齐或并行度，目标配置、内存规划、预取与调度需要相应更新，才能用上新硬件 |
 | `TargetConfig::invalid()` | 视情况 | 目前要求 D ∈ {8, 16}、片上存储不超过 2^16 字（16 位本地字地址）。SPAD/ACC 超过这个范围或 D = 32 时，需要同时改描述符编码、RTL 和这里的检查（见 K3） |
 | 主机退路（VMVX） | 不改 | 与 CPU 架构无关 |
 | 功能仿真器、`dispatch_check.py` | 不改 | 已支持任意 D 与存储大小 |
@@ -98,96 +106,171 @@
 
 | 阶段 | 内容 | 主要风险 | 工作量 |
 |---|---|---|---|
-| **K0** | 准备：工具链、板卡上电、系统镜像 | 低 | 小 |
-| **K1** | 平台移植，加速器参数不变（D = 16、1 个 HP 口、100 MHz） | block design、地址映射、aarch64 运行时 | 中 |
-| **K2** | 带宽：200 MHz 以上、128 位 DMA、2–4 个 HP 口 | 时序收敛、DMA 改动 | 中–大 |
-| **K3** | 片上存储：URAM 加大 SPAD/ACC；可选 D = 32 | 地址位宽、编码改动 | 中 |
-| **K4** | 大模型：Qwen3-0.6B 全模型上板，性能调优 | 量化质量、注意力 T 分块 | 中 |
-| **K5** | 可选扩展：64 位地址、int4、RVV 核、MoE | 各自独立 | 大 |
+| **K0** | 准备：固定系统镜像、启动固件、Vivado / Kria-PYNQ 版本；保存 Z1 可复现基线 | 版本组合 | 小 |
+| **K1a** | 平台移植，加速器**完全不变**：D = 16、1 个 64 位 HP 口、**50 MHz**、原存储容量 | block design、地址映射、aarch64 运行时 | 中 |
+| **K1b** | 只提频到 100 MHz，重新记录时序与性能 | 时序 | 小 |
+| **K2a** | 单口 128 位：LD 入口、DMA 与 SPAD 写入加宽；测 DMA → SPAD 的端到端有效带宽 | DMA 与存储写入接口改动 | 中 |
+| **K2b** | 多口接收 + 存储分银行，逐步追求 6–10 GB/s | **DMA + 片上存储接口重构**、时序收敛、内存规划 | 大 |
+| **K3** | URAM 扩展 SPAD/ACC 容量；优先保持 D = 16 | URAM 的端口语义、初值、读延迟 | 中 |
+| **K4a** | Qwen3-0.6B 全模型板上正确运行 | 地址与容量、长上下文 | 中 |
+| **K4b** | 长上下文分块（C6.5）与性能调优，按实测耗时分解定目标 | 注意力 T 分块、调度 | 中 |
+| **K5** | 可选扩展：int4、64 位地址、RVV 核、MoE，各自单独评估 | 各自独立 | 大 |
+| **Q（并行）** | Qwen3 量化质量（C6.2），在 CPU / sim 上进行，不等 K4 | 量化方法的数学等价与 scale 语义 | 中 |
 
 ### K0 准备
 
 1. **工具**：安装支持 K26 的 Vivado / Vitis 版本，下载 KV260 板级文件（board files）。确认所用 Vivado 版本的免费授权覆盖 XCK26。
-2. **系统镜像**：Kria-PYNQ（推荐，Python 驱动和 notebook 基本可沿用）或 Ubuntu for Kria，写入 microSD，上电确认 Linux、网络、`/dev/mem` 访问权限。
-3. **基线**：在板上跑 ARM 的 CPU 基线（对应 `notebooks/llm/arm_baseline.sh`），记录 A53 上 llama 推理的 token/s，作为加速器的对比对象。
+2. **系统镜像与启动固件**：Kria-PYNQ（推荐，Python 驱动和 notebook 基本可沿用）或 Ubuntu for Kria，写入 microSD；**记录并固定**镜像版本、启动固件（boot firmware）版本和对应的 Vivado 版本，写进 `boards/kv260/README.md`。上电确认 Linux、网络、`/dev/mem` 访问权限。
+3. **ARM 基线**：在板上跑 ARM 的 CPU 基线（对应 `notebooks/llm/arm_baseline.sh`），记录 A53 上 llama 推理的 token/s，作为加速器的对比对象。
 4. **仓库结构**：在 `kv260` 分支上新建 `KV260/`（与 `RISCV-on-PYNQ-Z1/` 并列），放 block design 脚本、约束、构建脚本和 bitstream 结果目录。K1 验收后再整理目录（§7.4）。
 5. **Z1 基线**：开始 K1 之前，先完成 §7.2 的 Z1 冻结和基线文件。
 
-**验收**：板子能启动，能用 PYNQ（或 Python + `/dev/mem`）加载一个空 overlay。
+**验收**：板子能启动，能用 PYNQ（或 Python + `/dev/mem`）加载一个空 overlay；版本组合已记录。
 
-### K1 平台移植（参数不变）
+### K1a 平台移植（加速器完全不变）
+
+目标是在 KV260 上**以与 Z1 相同的加速器**完成闭环，把平台问题和时序问题分开：这一步出错，只可能是平台（block design、地址、运行时）的问题。
 
 **硬件**
 
 1. 新 block design（`KV260/scripts/kv260_bd.tcl`）：
-   - `zynq_ultra_ps_e`，打开 HPM0_FPD（ARM → BRAM、CSR）、S_AXI_HP0_FPD（加速器 DMA）、`pl_clk0`（**100 MHz**）、`pl_ps_irq0`、EMIO GPIO（RISC-V 复位）；
-   - PicoRV32（`picorv32_axi`）、程序 BRAM（8 KB，ARM 侧和 RISC-V 侧双口）、`sa_unit`（D = 16，`NPORTS = 1`）；
-   - 加速器 64 位 AXI master → **AXI 位宽转换器** → 128 位 HP0（先不改 DMA RTL）；
+   - `zynq_ultra_ps_e`，打开 HPM0_FPD（ARM → BRAM、CSR）、S_AXI_HP0_FPD（加速器 DMA）、`pl_clk0`（**50 MHz**，与 Z1 相同）、`pl_ps_irq0`、EMIO GPIO（RISC-V 复位）；
+   - PicoRV32（`picorv32_axi`）、程序 BRAM（8 KB，ARM 侧和 RISC-V 侧双口）、`sa_unit`（D = 16，`NPORTS = 1`，SPAD/ACC 与 Z1 相同）；
+   - **HP0 直接配置为 64 位**（ZynqMP 的 HP 口支持 32 / 64 / 128 位），加速器的 64 位 AXI master 直接连接，不需要位宽转换器，也不需要 Z1 上的 AXI4→AXI3 转换；
    - PicoRV32 的 DDR 口（原 HP0，用于读环形队列）接 HP1 或经 SmartConnect 共用。
 2. 地址映射：记录 ARM 侧的 BRAM、CSR、mailbox 新地址，写进 `docs/memory_model.md` 的 KV260 一节。
-3. `synth_ooc.tcl` 加 K26 器件选项，先做脱离上下文的综合，确认资源与 100 MHz 时序。
+3. `synth_ooc.tcl` 加 K26 器件选项，先做脱离上下文的综合，确认资源。
 
 **软件**
 
 4. aarch64 交叉编译：`toolchain-aarch64.cmake`、`build_sa_runtime.sh aarch64`，构建 `sa-llm-run`、`sa_hal_test`、L0 的 `iree-run-module`。
-5. 驱动与部署：`pynq_matmul.py` 和 `deploy_*.sh` 增加 `--board kv260`，读入新的基地址；`sa_transport_board.c` 的窗口参数改为低 2 GB 内的保留区域，并检查物理地址 < 2 GB。
-6. 编译器：生成 D = 16、默认 SPAD/ACC 的模块，与 PYNQ-Z1 的 D = 16 bitstream（M4 起）相同。
+5. **地址与 ABI**（细节见 §2.4）：`sa_transport_board.c` 改为用 64 位类型解析物理地址，检查整个窗口在保留区内之后再转成 32 位；明确保留区的分配、映射属性和同步边界；审计主机与固件共享的结构体。
+6. 驱动与部署：`pynq_matmul.py` 和 `deploy_*.sh` 增加 `--board kv260`，读入新的基地址。
+7. 编译器：生成 D = 16、默认 SPAD/ACC 的模块，与 PYNQ-Z1 的 D = 16 bitstream（M4 起）相同。
 
-**验证顺序**（每项都与 sim 逐位一致）
+**验证顺序**（每项都与 sim 逐位一致，并与 §7.2 的 Z1 基线文件对比）
 
 | 步骤 | 测试 | 预期 |
 |---|---|---|
-| 1 | `tests/ddr_access`：RISC-V 读写 DDR | 通过 |
-| 2 | `bwtest`：DMA 带宽 | 100 MHz、64 位：约 0.8 GB/s（Z1 的 2 倍，来自频率） |
+| 1 | `tests/ddr_access`：RISC-V 读写 DDR，包括保留区的首尾地址 | 通过 |
+| 2 | `bwtest`：DMA 带宽 | 记录；观测值应接近 Z1（同为 64 位 × 50 MHz，入口上限 0.4 GB/s） |
 | 3 | `gemm`、`vector`、`desc_run` 固件 | 与 NumPy 逐位一致 |
 | 4 | C1：`sa_hal_test`（手工模板） | 逐位一致 |
-| 5 | C3：stories15M（`board_llm.py`） | 76/76 步与 DeviceModel 逐位一致 |
-| 6 | SmolLM2-135M prefill + decode | 与 sim 逐位一致；记录 token/s |
+| 5 | C3：stories15M（`board_llm.py`） | 76/76 步与 DeviceModel 逐位一致，token 序列与 Z1 基线相同 |
+| 6 | SmolLM2-135M prefill + decode | 与 sim 逐位一致，token 序列与 Z1 基线相同 |
 
-**验收**：第 5、6 步通过。速度预计约为 Z1 的 2 倍（频率 50 → 100 MHz）。
+**验收**：第 5、6 步通过。**只以正确性验收**；token/s 记录为观测值（ARM 主机、DDR 延迟、驱动开销都变了，不能预设与 Z1 的比例）。
 
-### K2 带宽
+### K1b 提频到 100 MHz
 
-decode 受权重读取带宽限制，这一阶段是性能提升的主要来源。
+1. 只改 `pl_clk0` 为 100 MHz，其他不变；记录 WNS / TNS、关键路径。
+2. 重跑 K1a 的验证顺序第 2–6 步。
 
-1. **提频率**：`pl_clk0` 提到 200 MHz，再试 250 MHz。关键路径大概率在 VE 的 fp32 单元（`sa_fp32_*.v`、`sa_vefp.v`）和 SFU 查表，按需加流水级；用 `synth_ooc.tcl` 迭代。
-2. **加宽 DMA**：`sa_ld`/`sa_st` 的数据通路改为 128 位（或参数化 `DMA_W`），本地写入按 128 位一次两个 64 位 lane；去掉位宽转换器。
-3. **多口**：`NPORTS` = 2，再试 4，分别接 HP0–HP3；`sa_ld` 已按口轮转发起读（`ar_rr`），需确认多口的乱序返回与写回顺序。
-4. **测量**：`bwtest` 目标 **6–10 GB/s**（DDR4 理论约 19 GB/s，PL 侧通常能拿到一半左右）。
-5. **编译器与运行时**：不需要改。带宽变大以后，每个 dispatch 的固定开销占比上升，用性能计数器（`board_profile.py`）看是否需要更大的 chunk 或更多的跨 dispatch 预取。
+**验收**：时序收敛，第 5、6 步逐位一致。性能为观测项：`bwtest` 的入口上限变为 0.8 GB/s（64 位 × 100 MHz），decode 的 token/s 预计有提升，但主机开销与 DDR 延迟使它不一定是 Z1 的两倍。
 
-| 配置 | 估计读带宽 |
-|---|---|
-| 1 口 × 128 位 × 200 MHz | 约 3.2 GB/s |
-| 2 口 × 128 位 × 200 MHz | 约 6.4 GB/s |
-| 3–4 口 × 128 位 × 250 MHz | 受 DDR 控制器限制，约 8–10 GB/s |
+### K2 带宽：DMA 与片上存储接口
 
-**验收**：`bwtest` 实测达到目标；stories15M、SmolLM2 逐位一致；SmolLM2 decode 的 token/s 随带宽近似线性提升。
+decode 受权重读取带宽限制，这一阶段是性能提升的主要来源。**它不只是加宽 DMA，而是 DMA 与片上存储写入接口的一起重构。**
 
-### K3 片上存储（与可选的 D = 32）
+**现状（`rtl/sysarray/sa_ld.v`、`sa_unit.v`）**
 
-1. **SPAD/ACC 用 URAM 加大**：例如 SPAD 256 KB × 2、ACC 512 KB。更大的 chunk 减少每层的固定开销，也是长上下文注意力的前提。
-   - 现有本地地址是 **16 位字地址**（`TargetConfig::invalid()` 要求每块存储不超过 2^16 字）。D = 16 时 SPAD 一字 16 字节，2^16 字 = 1 MB，ACC 一字 64 字节，上限更大，所以上述配置不需要改地址位宽。超过时需同步改描述符编码、RTL 和编译器检查。
+- `sa_ld` 可以向 `NPORTS` 个口轮流发起读（`ar_rr`），但**返回端每周期只选一个口**（`r_sel`）：`lw_data = m_rdata[64*r_sel +: 64]` 只有 64 位，每周期一个 `lw_en`，`m_rready` 只对选中的口拉高。多口只能隐藏延迟，不能让接收带宽相加。
+- 写入端：每个 `lw_en` 只写 SPAD 字中的一个 64 位 lane（`spad_we = 8'hFF << (8*lw_lane)`）。D = 16 时一个 SPAD 字是 128 位，需要两个周期才能写满一个字。
+- `sa_bankmem` 的两个银行按字地址最高位划分，用于双缓冲，不是给多口并行写入的；side A 的两个请求者之一已被 ST 的本地读取（`lr_word`）占用。
+
+**入口带宽上限**（零停顿，入口宽度 × 时钟；实测只会更低）
+
+| 入口 | 50 MHz | 100 MHz | 200 MHz | 250 MHz |
+|---|---|---|---|---|
+| 64 位（现状） | 0.4 GB/s | 0.8 GB/s | 1.6 GB/s | 2.0 GB/s |
+| 128 位（K2a） | — | 1.6 GB/s | 3.2 GB/s | 4.0 GB/s |
+| 256 位（K2b，2 字/周期） | — | — | 6.4 GB/s | 8.0 GB/s |
+| 384 位（K2b，3 字/周期） | — | — | 9.6 GB/s | 12 GB/s |
+
+Z1 实测 0.39 GB/s，已经贴着 64 位 × 50 MHz 的入口上限。实测 6–10 GB/s 意味着 250 MHz 时每周期向片上存储**写入 24–40 字节，即 2–3 个 SPAD 字**（D = 16）。
+
+#### K2a 单口 128 位
+
+1. **频率**：`pl_clk0` 提到 200 MHz（再试 250 MHz）。关键路径大概率在 VE 的 fp32 单元（`sa_fp32_*.v`、`sa_vefp.v`）和 SFU 查表，按需加流水级；用 `synth_ooc.tcl` 迭代。
+2. **LD 入口加宽到 128 位**：HP0 配置为 128 位；`sa_ld` 的 `lw_data` 改为 128 位（参数化 `DMA_W`），一次写满一个 SPAD 字（D = 16）；ACC 的写入（64 字节一字）按 128 位 lane 写。`sa_st` 同步加宽。
+3. **加性能计数器**：除 DDR 侧的 AXI 计数外，新增"**写入 SPAD/ACC 的有效字节数**"计数器（`sa_perf.v`），`bwtest` 同时报告两者。
+4. **编译器**：DMA 的对齐与最小粒度如有变化，相应更新目标配置和内存规划的对齐约束；黄金语料重新确认。
+
+**验收**：`bwtest` 的 DMA → SPAD 有效带宽接近单口 128 位的入口上限（200 MHz 时 3.2 GB/s 以内的实测值，记录实际比例）；stories15M、SmolLM2 逐位一致。
+
+#### K2b 多口接收 + 存储分银行
+
+1. **先在 sim 里确定架构**，两种候选：
+
+   | 方案 | 做法 | 编译器影响 | 风险 |
+   |---|---|---|---|
+   | **A（首选）汇聚 + 按字地址低位分银行** | 每个 HP 口一个接收 FIFO（允许乱序返回）；汇聚成 256 / 384 位内部总线；SPAD 按字地址低位分为 2 / 4 个子银行（偶 / 奇字），每周期写 2–3 个相邻字 | 地址空间仍连续；DMA 块要求按 2 / 4 字对齐，进入目标配置与内存规划的对齐约束 | 汇聚逻辑与 FIFO 资源；EX / VE 读端也要适应子银行 |
+   | B 每口独立银行 | 每个 HP 口固定对应一组存储银行 | 内存规划需按银行放置数据，地址到银行的映射由编译器与硬件共同维护 | 编译器改动大；放置不均时带宽打折 |
+
+   同时明确：每个子银行的读写端口分配（LD 写、EX / VE 读、ST 读）、读延迟、读写碰撞语义、字节写使能，以及记分板（scoreboard）按子银行的冲突检查。
+2. **RTL**：`sa_ld` 返回端改为多口同时接收（每口独立 `m_rready`）；汇聚与按序写回；`sa_bankmem` 增加子银行维度。先做独立的存储与 DMA 测试平台，再接 EX / VE。
+3. **多口**：`NPORTS` = 2，再试 3–4，接 HP0–HP3；逐口测量，并对比 HP 与 HPC 口。
+4. **编译器与运行时**：按所选方案更新目标配置（对齐、银行数）、内存规划、预取与调度；带宽变大后每个 dispatch 的固定开销占比上升，用性能计数器（`board_profile.py`）判断是否需要更大的 chunk 或更多的跨 dispatch 预取。
+
+**验收**：
+
+- `bwtest` 同时报告 DDR 侧带宽与**写入 SPAD 的有效带宽**；目标是后者实测达到 6–10 GB/s，按"DDR 能给多少"和"片上存储能收多少"分别记录，找出实际瓶颈。
+- stories15M、SmolLM2 逐位一致；SmolLM2 decode 的 token/s 随有效带宽提升，记录实测比例（不预设线性）。
+
+### K3 URAM 容量扩展（优先保持 D = 16）
+
+1. **存储接口先抽象**：`sa_tdpram.v` 是 UG901 的 BRAM 模板（read-first、1 周期读延迟、byte-write），不能只改 `ram_style` 就认为行为不变。存储接口改为：
+   - 可配置读延迟（URAM 通常需要额外的流水寄存器才能跑到高频）；
+   - 明确的读写碰撞语义（同地址同周期读写返回旧值还是新值，或禁止）；
+   - 字节写使能；
+   - 支持 K2 的写入宽度与银行布局。
+2. **初值**：`sa_tdpram.v` 注释写明 legacy sequencer **依赖存储上电内容为零**（D > 8 时保留的 tile 槽位）。UltraScale+ 的 URAM 不能在 bitstream 中设置初值，必须确认上电内容，或去掉这个依赖（例如复位后显式清零）。
+3. **独立存储测试**：URAM 版本的存储先单独仿真和上板测试（读延迟、碰撞、字节写、子银行），再接 EX / VE。资源与时序重新验证。
+4. **容量**：例如 SPAD 256 KB × 2、ACC 512 KB。更大的 chunk 减少每层的固定开销，也是长上下文注意力的前提。
+   - 现有本地地址是 **16 位字地址**（`TargetConfig::invalid()` 要求每块存储不超过 2^16 字）。D = 16 时 SPAD 一字 16 字节，2^16 字 = 1 MB；ACC 一字 64 字节，上限更大，所以上述配置不需要改地址位宽。超过时需同步改描述符编码、RTL 和编译器检查。
    - 编译器：`--iree-sa-spad-kb`、`--iree-sa-acc-kb` 传入新大小；C6 已在 sim 上验证过 SPAD 256 KB / ACC 512 KB 和更大的配置（D = 16）。
-2. **D = 32（可选）**：主要提升 prefill 的算力（decode 用不上）。需要 RTL（阵列、VE 宽度、存储字宽）、描述符编码、`TargetConfig`（目前只允许 8、16）、功能仿真器同时支持。建议放在 K4 之后、确认 prefill 是瓶颈再做。
+5. **D = 32 暂不做**：decode 受带宽限制，D = 32 只提升 prefill 的算力；需要 RTL（阵列、VE 宽度、存储字宽）、描述符编码、`TargetConfig`（目前只允许 8、16）、功能仿真器同时支持。放到 K4b 之后，确认 prefill 是瓶颈再评估。
 
-**验收**：新配置下黄金语料按新目标重新记录，逐 dispatch 检查全部一致；上板逐位一致。
+**验收**：独立存储测试通过；新配置下黄金语料按新目标重新记录，逐 dispatch 检查全部一致；上板逐位一致。
 
-### K4 大模型：Qwen3-0.6B
+### K4a Qwen3-0.6B 全模型正确运行
 
 1. **全模型上板**：28 层，int8 权重约 0.6 GB。C6.1 已在 sim 上逐 dispatch 逐位一致。
-2. **量化质量（C6.2）**：torch W8A8 的 Qwen3 与 fp32 的 top-1 一致率只有 25/40。先按 `iree_compiler_plan.md` 的方法逐项定位误差来源（激活、KV、概率），再决定用 SmoothQuant（只改权重，硬件和编译器不变）还是更细的 KV scale。
-3. **注意力按 T 分块（C6.5）**：head_dim = 128，上下文变长时一个头的 K 行放不进一个 SPAD bank，需要分块；这是剩下唯一的编译器新功能。
-4. **性能调优**：用 `SA_PROFILE` 和性能计数器看每个 dispatch 与读权重下限的比值；通用 contraction 路径的线性层改走微内核（§8.19 的做法）。
+2. **容量与地址**：权重、KV cache、激活、描述符列表全部在低 2 GB 保留区内（§2.4）。INT8 KV：28 层 × 8 个 KV head × head_dim 128 × 2（K、V），2048 token 约 **112 MiB**，未计 scale 与布局填充。
+3. 在短上下文（不超过当前不分块注意力能处理的长度）下，prefill + decode 与 sim 逐位一致。
 
-**验收**：Qwen3-0.6B 在板上 prefill + decode 与 sim 逐位一致，生成文本正常；decode 达到 **≥ 10 token/s**（估计 10–15）。
+**验收**：Qwen3-0.6B 在板上 prefill + decode 与 sim 逐位一致，生成文本正常（文本质量取决于并行的 Q 工作）。**不设 token/s 门槛。**
 
-### K5 可选扩展
+### K4b 长上下文与性能
+
+1. **注意力按 T 分块（C6.5）**：head_dim = 128，上下文变长时一个头的 K 行放不进一个 SPAD bank，需要分块。
+2. **编译器随硬件复查**：如果 K2 / K3 改变了银行组织、读延迟或 DMA 并行度，目标配置、内存规划、预取与调度都要复查，确认能用上新硬件的带宽；这不只是 T 分块一项。
+3. **耗时分解**：用 `SA_PROFILE` 和性能计数器，把每个 token 的耗时分成**权重读取、KV 读取、计算（EX / VE / SFU）、调度（描述符处理、dispatch 固定开销、主机）**四部分，分别在上下文长度 **128、512、2048** 下测量。
+4. **性能目标按分解设定**：仅权重读取的上限是 有效带宽 ÷ 每 token 读取的权重字节数。Qwen3-0.6B 的嵌入与分类层共享一份权重（151936 × 1024，约 155 MB），分类层每个 token 读一遍，每 token 读取的权重合计约 0.6 GB：6 GB/s 时上限约 10 token/s，10 GB/s 时约 16 token/s。实际还要加上 KV 读取、计算与调度中不能重叠的部分，所以 **10–15 token/s 是冲刺目标，不是推算结果**。
+5. **调优**：通用 contraction 路径的线性层改走微内核（§8.19 的做法）；按分解结果决定优先优化哪一部分。
+
+**验收**：T = 2048 时逐 dispatch 一致、板上逐位一致；在三种上下文长度下给出耗时分解；性能目标以分解结果为依据设定并达到。
+
+### Q（并行）Qwen3 量化质量（C6.2）
+
+不需要等 K4，现在就可以在 CPU / sim 上进行。
+
+1. **定位误差来源**：torch W8A8 的 Qwen3 与 fp32 的 top-1 一致率只有 25/40。按 `iree_compiler_plan.md` 的方法逐项替换成 fp32（激活、KV、概率），找出主要误差来源。
+2. **SmoothQuant 类方法**：按通道把激活除以 s、权重乘以 s，这是**激活与权重的成对变换**。能折叠进相邻参数的部分（RMSNorm 增益 → q/k/v、gate/up；`w3` 的行 → `down_proj`；`Wv` 的行 → `wo`）折叠后，硬件与编译器不变，但要满足：
+   - **数学等价**：在 fp32 下变换前后输出一致（容差内）；
+   - **scale 语义**：变换改变了激活与 KV 的数值范围，int8 的 per-token 激活 scale 与 KV scale 要按变换后的数值重新校准；
+   - **GQA 约束**：`Wv` 只有 8 × 128 个输出通道，而 `wo` 的输入有 16 × 128 个通道；共享同一个 KV head 的 Q head 必须用同一组 s，`wo` 处的平滑效果因此受限；
+   - 分类层与嵌入共享权重，不做变换。
+3. 其他候选：更细的 KV scale、个别层保留更高精度（如需硬件或编译器改动，单独评估）。
+
+**验收**：与 fp32 的 top-1 一致率与困惑度达到 C6.2 定义的可接受范围；所选方法在 sim 上逐位一致。
+
+### K5 可选扩展（分别评估）
 
 | 项 | 内容 | 收益 | 依赖 |
 |---|---|---|---|
+| int4 权重 | LD 通路上解包 int4；按组的 scale（每 64/128 个 K 一组），微内核按 K 组分段 EX、VE 缩放后累加 | 读取量减半，decode 约 2 倍上限 | 质量需配合 GPTQ / AWQ 一类方法；LD 解包位于 K2 的新入口上 |
 | 64 位 DDR 地址 | 描述符地址字段、DMA 地址、PicoRV32 访存（或高位段寄存器）、运行时 `uint64_t` | 用满 4 GB：Qwen3-1.7B int8、3B–4B int4 | 改描述符格式（sa-desc 新版本） |
-| int4 权重 | LD 通路上解包 int4；按组的 scale（每 64/128 个 K 一组），微内核按 K 组分段 EX、VE 缩放后累加 | 读取量减半，decode 约 2 倍；1.7B int4 约 8–10 token/s | 质量需配合 GPTQ/AWQ 一类方法 |
 | RVV RISC-V 核 | 独立实验或替换 PicoRV32；评估 SiFive SKL、IREE 的 RISC-V 后端 | 不规则运算（采样、top-k、MoE 路由）、全 RISC-V 栈 | 资源、工具链 |
 | MoE | 专家权重打包、动态权重基址的线性层微内核（`LDPARAM` + 动态 DMA 地址） | Granite-1B-A400M 这类小 MoE | K4、可能 64 位地址 |
 
@@ -197,37 +280,45 @@ decode 受权重读取带宽限制，这一阶段是性能提升的主要来源�
 
 | 风险 | 影响 | 对策 |
 |---|---|---|
-| 缓冲分配到高 2 GB（≥ `0x8_0000_0000`） | 加速器读写错地址，结果错误且难查 | 保留区固定在低 2 GB；运行时检查物理地址并报错 |
+| **多口接收与存储写入吞吐不足**（K2b） | 多加 HP 口带宽不增加 | 先在 sim 中确定汇聚 + 分银行架构；`bwtest` 分别测 DDR 侧与 SPAD 写入侧；子银行冲突纳入记分板检查 |
+| 缓冲分配到高 2 GB（≥ `0x8_0000_0000`），或地址先截断再检查 | 加速器读写错地址，结果错误且难查 | 保留区固定在低 2 GB；64 位解析、整段范围检查后再转 32 位；运行时报错而非静默截断 |
+| 主机与固件共享结构在 AArch64 上布局变化 | 字段错位，偶发错误 | 共享结构只用定宽字段；`static_assert` 大小与偏移；固件 ABI 不随主机重编译而变 |
 | 200 MHz 以上时序不收敛 | 带宽目标达不到 | 先 200 MHz；VE fp32 和 SFU 加流水级；必要时 DMA 和计算分时钟域 |
-| HP 口多口并发的实际带宽低于预期 | K2 收益打折 | `bwtest` 逐口测；对比 HP 与 HPC 口；调整突发长度和 outstanding 数 |
-| PS 侧 cache 一致性 | ARM 写的数据加速器读不到最新值 | 沿用现有约定（非缓存映射 / 显式刷新），在 `memory_model.md` 补充 ZynqMP 的说明；不用 HPC 的一致性端口，除非测量证明有必要 |
-| Kria-PYNQ 版本与 Vivado 版本不匹配 | overlay 加载失败 | K0 先确认版本组合；必要时用 Ubuntu + 自写的 FPGA manager 加载 |
-| 编译器在新参数下出新的边界情况 | 某些 dispatch 错误 | 逐 dispatch 检查（`dispatch_check.py --dirty --skew`）、黄金语料、功能仿真器先行 |
-| Qwen3 量化质量不够 | 输出文本质量差 | K4 第 2 步先定位误差来源，再选择修正方法 |
+| URAM 语义与 BRAM 不同（读延迟、碰撞、无初值） | K3 后结果错误或时序失败 | 存储接口抽象；去掉对零初值的依赖；独立存储测试先行 |
+| HP 口多口并发的实际带宽低于预期 | K2b 收益打折 | `bwtest` 逐口测；对比 HP 与 HPC 口；调整突发长度和 outstanding 数 |
+| PS 侧 cache 一致性 | ARM 写的数据加速器读不到最新值 | 沿用现有约定（非缓存映射 / 显式刷新），在 `memory_model.md` 补充 ZynqMP 的说明；明确每个缓冲的映射属性与同步点；不用 HPC 的一致性端口，除非测量证明有必要 |
+| Kria-PYNQ 版本与 Vivado 版本不匹配 | overlay 加载失败 | K0 固定版本组合；必要时用 Ubuntu + 自写的 FPGA manager 加载 |
+| 编译器在新参数或新银行组织下出新的边界情况 | 某些 dispatch 错误 | 逐 dispatch 检查（`dispatch_check.py --dirty --skew`）、黄金语料、功能仿真器先行 |
+| Qwen3 量化质量不够 | 输出文本质量差 | Q 工作并行进行，先定位误差来源，再选择修正方法 |
 
 ---
 
 ## 5. 各阶段指标汇总
 
-| 阶段 | 加速器时钟 | 读带宽 | SmolLM2-135M decode | Qwen3-0.6B decode |
+| 阶段 | 加速器时钟 | LD 入口上限 | 读带宽（实测 / 目标） | 性能 |
 |---|---|---|---|---|
-| PYNQ-Z1（实测） | 50 MHz | 约 0.39 GB/s | 约 2.2 token/s | 放不下（512 MB） |
-| K1（估计） | 100 MHz | 约 0.8 GB/s | 约 4 token/s | 能放下，约 1 token/s |
-| K2（估计） | 200–250 MHz | 6–10 GB/s | 带宽不再是唯一瓶颈，几十 token/s | 约 10–15 token/s |
-| K4（目标） | 同 K2 | 同 K2 | — | **≥ 10 token/s，逐位一致** |
+| PYNQ-Z1（实测） | 50 MHz | 0.4 GB/s | 实测约 0.39 GB/s | SmolLM2-135M 约 2.2 token/s；Qwen3-0.6B 放不下 |
+| K1a | 50 MHz | 0.4 GB/s | 观测 | 正确性验收，token/s 为观测值 |
+| K1b | 100 MHz | 0.8 GB/s | 观测 | 观测 |
+| K2a | 200–250 MHz | 3.2–4.0 GB/s | DMA → SPAD 有效带宽接近上限 | 观测 |
+| K2b | 200–250 MHz | 6.4–12 GB/s | **写入 SPAD 有效带宽 6–10 GB/s** | SmolLM2 随有效带宽提升（实测比例） |
+| K4a | 同 K2b | 同 K2b | — | Qwen3-0.6B 正确运行，不设速度门槛 |
+| K4b | 同 K2b | 同 K2b | — | 按耗时分解设目标；仅权重读取的上限：6 GB/s 约 10 token/s、10 GB/s 约 16 token/s；10–15 token/s 为冲刺目标 |
 
-估算方法：decode 每 token 读一遍全部权重，速度 ≈ 可用带宽 ÷ 每 token 读取的字节数；K2 之后，小模型的每 dispatch 固定开销和 VE 的 SFU 延迟会成为新的上限，需实测。
+估算方法：decode 每 token 读一遍全部权重，**仅权重读取的上限** ≈ 有效带宽 ÷ 每 token 读取的权重字节数。实际还包括 KV 读取、量化、SFU、描述符处理以及不能完全重叠的计算，需按 K4b 的耗时分解实测。
 
 ---
 
 ## 6. 待确认事项
 
 - Vivado 版本与免费授权是否覆盖 XCK26；KV260 板级文件版本。
-- Kria-PYNQ 的当前版本与对应的 Vivado 版本。
+- Kria-PYNQ 的当前版本、启动固件版本与对应的 Vivado 版本。
 - ZynqMP 上 ARM 访问 PL 的 HPM 地址窗口（以 block design 生成的地址为准）。
+- 低 2 GB 保留区的分配方式（设备树 reserved-memory、CMA 或 udmabuf）、映射属性，以及现有驱动能否直接使用。
 - `armv7_libm_shim.c` 在 aarch64 构建中是否还需要。
 - 固件和驱动中是否还有其他写死的 ARM 侧地址（逐个 grep `0x4001`、`0x4000` 等）。
-- UltraScale+ 上 `sa_tdpram.v`、`sa_bankmem.v` 的 BRAM/URAM 推断结果。
+- UltraScale+ 上 `sa_tdpram.v`、`sa_bankmem.v` 的 BRAM 推断结果；URAM 的上电内容与读延迟配置。
+- K2b 架构 A 中，EX / VE 读端与子银行的端口分配是否会降低现有的计算吞吐。
 - 多个 HP 口并发时 DDR 控制器的实际可用带宽。
 
 ---
@@ -271,7 +362,7 @@ decode 受权重读取带宽限制，这一阶段是性能提升的主要来源�
 ### 7.3 KV260 开发（K0–K1）
 
 - 在 `kv260` 分支上开发，main 在这期间仍然是可用的 Z1 版本。
-- K1 的验收（§3 K1 验证顺序第 5、6 步）通过后，把 `kv260` 合入 main。从这一刻起，main 是 KV260 版本。
+- K1（K1a 与 K1b）验收通过后，把 `kv260` 合入 main。从这一刻起，main 是 KV260 版本。
 - 合入的同一个 PR 里更新 README（7.5）。
 
 ### 7.4 合入之后整理 main
