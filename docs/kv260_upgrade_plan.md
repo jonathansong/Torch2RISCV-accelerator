@@ -20,7 +20,7 @@
 - **一次只改一类东西**：先换平台、参数不变，再提频率和带宽，再扩存储，最后上大模型。每一步出问题都能定位到这一步的改动。
 - **每一步先 sim、再上板、逐位一致后提交**。逐位一致的参照：功能仿真器（`llm/sa_funcsim.py`）与 PYNQ-Z1 上已验证的结果。
 - **编译器尽量不动**：硬件参数通过目标配置（`--iree-sa-d`、`--iree-sa-spad-kb`、`--iree-sa-acc-kb`）传入，黄金语料（4002 个 dispatch）守护代码生成不变。
-- **保留 PYNQ-Z1 可构建**：新平台用新目录和参数，不破坏现有 bitstream 与测试。
+- **PYNQ-Z1 先保留、后冻结**：K1 完成前，新平台用新目录和参数，不破坏现有 bitstream 与测试；K1 验收后，Z1 冻结在 tag `v1.0-pynq-z1` 和分支 `pynq-z1`，main 完全转向 KV260（见 §7）。
 
 ---
 
@@ -110,7 +110,8 @@
 1. **工具**：安装支持 K26 的 Vivado / Vitis 版本，下载 KV260 板级文件（board files）。确认所用 Vivado 版本的免费授权覆盖 XCK26。
 2. **系统镜像**：Kria-PYNQ（推荐，Python 驱动和 notebook 基本可沿用）或 Ubuntu for Kria，写入 microSD，上电确认 Linux、网络、`/dev/mem` 访问权限。
 3. **基线**：在板上跑 ARM 的 CPU 基线（对应 `notebooks/llm/arm_baseline.sh`），记录 A53 上 llama 推理的 token/s，作为加速器的对比对象。
-4. **仓库结构**：新建 `KV260/`（与 `RISCV-on-PYNQ-Z1/` 并列），放 block design 脚本、约束、构建脚本和 bitstream 结果目录。
+4. **仓库结构**：在 `kv260` 分支上新建 `KV260/`（与 `RISCV-on-PYNQ-Z1/` 并列），放 block design 脚本、约束、构建脚本和 bitstream 结果目录。K1 验收后再整理目录（§7.4）。
+5. **Z1 基线**：开始 K1 之前，先完成 §7.2 的 Z1 冻结和基线文件。
 
 **验收**：板子能启动，能用 PYNQ（或 Python + `/dev/mem`）加载一个空 overlay。
 
@@ -228,3 +229,96 @@ decode 受权重读取带宽限制，这一阶段是性能提升的主要来源�
 - 固件和驱动中是否还有其他写死的 ARM 侧地址（逐个 grep `0x4001`、`0x4000` 等）。
 - UltraScale+ 上 `sa_tdpram.v`、`sa_bankmem.v` 的 BRAM/URAM 推断结果。
 - 多个 HP 口并发时 DDR 控制器的实际可用带宽。
+
+---
+
+## 7. 仓库策略：Z1 冻结，main 转向 KV260
+
+**决定**：不新建仓库。PYNQ-Z1 版本冻结成一个 tag 和一个分支，作为遗留版本保留；main 在 K1 验收后完全转向 KV260。
+
+### 7.1 为什么不新建仓库
+
+- 仓库名 `Torch2RISCV-accelerator` 与板子无关，KV260 版本继续用这个名字。
+- star、关注者和 LinkedIn 帖子里的链接都留在原仓库，不需要引导读者跳转。
+- 完整的提交历史和 `git blame` 保留在同一个仓库里，NOTICE 列出的第三方来源可以追溯。
+- 编译器、固件、功能仿真器和黄金语料在两块板子之间不变，放在同一个仓库里，K1 的逐位一致验收可以直接对比。
+
+### 7.2 Z1 冻结（K1 开始之前）
+
+1. **完善 Z1**：完成计划中 Z1 上剩下的工作，main 上所有测试通过（黄金语料、`dispatch_check.py`、C3 的 stories15M、SmolLM2）。
+2. **保存基线文件**，放在 `tests/baselines/pynq-z1/`，作为 KV260 逐位一致验收的参照（不再需要 Z1 板子在场）：
+
+   | 文件 | 内容 |
+   |---|---|
+   | `golden_manifest.txt` | 黄金语料 4002 个 dispatch 的列表与哈希 |
+   | `dispatch_check.json` | `dispatch_check.py` 的逐 dispatch 结果 |
+   | `stories15m_tokens.txt` | stories15M 76 步的 token 序列（固定 prompt 和种子） |
+   | `smollm2_tokens.txt` | SmolLM2-135M prefill + decode 的 token 序列 |
+   | `perf.md` | 实测 token/s、`bwtest` 带宽、资源占用和时序（每个 bitstream 一行） |
+
+   大的二进制输出（logits、中间张量）不进 git，放到 Release 附件里。
+3. **打 tag 和分支**：
+
+   ```sh
+   git checkout main && git pull
+   git tag -a v1.0-pynq-z1 -m "PYNQ-Z1: final release (stories15M 17.7 tok/s, SmolLM2-135M, bit-exact)"
+   git branch pynq-z1 v1.0-pynq-z1
+   git push origin v1.0-pynq-z1 pynq-z1
+   ```
+
+4. **GitHub Release**：在 `v1.0-pynq-z1` 上建一个 Release，附上最终的 bitstream / `.hwh`、固件二进制和 7.2 第 2 步中的大文件。读者不用装 Vivado 就能在 Z1 上复现。
+
+### 7.3 KV260 开发（K0–K1）
+
+- 在 `kv260` 分支上开发，main 在这期间仍然是可用的 Z1 版本。
+- K1 的验收（§3 K1 验证顺序第 5、6 步）通过后，把 `kv260` 合入 main。从这一刻起，main 是 KV260 版本。
+- 合入的同一个 PR 里更新 README（7.5）。
+
+### 7.4 合入之后整理 main
+
+1. **目录**：
+
+   ```
+   rtl/              # 共用 RTL，参数化（D、NPORTS、SPAD/ACC 用 BRAM 或 URAM）
+   rtl/picorv32/     # 从 RISCV-on-PYNQ-Z1/picorv32/ 移过来，保留 COPYING（ISC）
+   firmware/         # 不变
+   compiler/         # TargetConfig 默认值改为 KV260
+   boards/kv260/     # block design tcl、约束、构建脚本、系统镜像说明
+   driver/           # 板级地址从 board 配置读入，不写死
+   ```
+
+2. **删除 Z1 专用部分**：`RISCV-on-PYNQ-Z1/` 下的 Z1 block design、约束、bitstream 结果目录、armv7 相关的构建选项。它们都保留在 `pynq-z1` 分支和 tag 里。
+3. **许可证**：如果 main 上还保留从 `RISCV-on-PYNQ-Z1`（Jinzzj，MIT）改来的脚本，NOTICE 中的那一项继续保留并更新路径；完全删除后再从 NOTICE 移除。
+4. **bitstream 不再进 git**：KV260 的 bitstream 和 `.xsa` 比 Z1 的大得多，统一放 GitHub Releases（或 Git LFS）。
+5. **文档**：`memory_model.md`、`hardware_learning_path.md` 等文档中 Z1 专用的内容，改成"历史：PYNQ-Z1"小节，或注明"见 `pynq-z1` 分支"。
+
+### 7.5 README 说明
+
+放在 README 最上方：
+
+```markdown
+> **Platform update:** Development has moved to the AMD Kria KV260.
+> The PYNQ-Z1 version is frozen at tag
+> [`v1.0-pynq-z1`](../../tree/v1.0-pynq-z1) (branch `pynq-z1`):
+> stories15M at 17.7 tok/s and SmolLM2-135M, bit-exact on the board.
+> It still works and is the cheapest way to try the full stack, but it
+> only receives critical fixes.
+```
+
+在 K1 合入前，可以先放一个预告版本："KV260 port in progress on branch `kv260`"。
+
+### 7.6 `pynq-z1` 分支的维护
+
+- 只修严重问题：结果错误、构建失败、文档中的错误步骤。不加新功能、不做性能优化。
+- 修复先在 `pynq-z1` 上提交，打小版本 tag（`v1.0.1-pynq-z1` …）；如果 main 上也有同样的问题，再单独移植过去。
+- Issue 模板中加一个"Board: PYNQ-Z1 / KV260"选项，方便区分。
+
+### 7.7 时间线
+
+| 时间点 | main | 其他 |
+|---|---|---|
+| 现在 → Z1 完善完成 | Z1 版本 | — |
+| Z1 冻结 | Z1 版本 | tag `v1.0-pynq-z1`、分支 `pynq-z1`、Release、基线文件 |
+| K0–K1 | Z1 版本（README 预告 KV260） | `kv260` 分支开发 |
+| K1 验收 | **合入 KV260**，README 更新，目录整理 | `pynq-z1` 只修严重问题 |
+| K2 及以后 | KV260 版本 | — |
