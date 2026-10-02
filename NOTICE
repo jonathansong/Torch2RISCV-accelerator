@@ -1,0 +1,36 @@
+Torch2RISCV-accelerator
+Copyright 2026 Jonathan Song
+
+Licensed under the Apache License v2.0 with LLVM Exceptions (see LICENSE).
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+This repository includes or is derived from the following third-party work,
+which remains under its own license:
+
+* RISCV-on-PYNQ-Z1/ (base project)
+  Copyright (c) 2023 Jinzzj
+  MIT License, see RISCV-on-PYNQ-Z1/LICENSE
+
+* RISCV-on-PYNQ-Z1/picorv32/ (PicoRV32 RISC-V CPU core)
+  Copyright (C) 2015-2021 Claire Xenia Wolf <claire@yosyshq.com>
+  ISC License, see RISCV-on-PYNQ-Z1/picorv32/COPYING
+
+* RISCV-on-PYNQ-Z1/ip/nobuild.mk
+  Copyright (c) 2017, Xilinx, Inc.
+  BSD 3-Clause License, see the header of that file
+
+* compiler/runtime/sa/sa_driver.{c,h}, sa_device.{c,h}
+  Derived from the IREE HAL local_sync driver (https://github.com/iree-org/iree)
+  Copyright The IREE Authors
+  Apache License v2.0 with LLVM Exceptions
+
+* llm/tokenizer.py, llm/checkpoint.py, llm/ref_model.py,
+  notebooks/llm/quantize_q80.py
+  Python ports of the tokenizer, checkpoint format, forward pass and Q8_0
+  export of llama2.c (https://github.com/karpathy/llama2.c)
+  Copyright (c) 2023 Andrej Karpathy
+  MIT License
+
+Model weights (stories15M, SmolLM2, Qwen3, ...) are not part of this
+repository. They are downloaded separately and are subject to their own
+licenses.
