@@ -25,10 +25,20 @@
 //   SA_BOARD_RING=<entries>  SA_BOARD_D=<array size>
 // O_SYNC makes the DDR mapping non-cacheable (ARM: write-combining normal
 // memory for RAM, strongly ordered for the BRAM), so no cache maintenance.
+//
+// Addresses (docs/kv260_upgrade_plan.md §2.4): physical addresses are parsed
+// as 64-bit values and checked over the whole range before anything narrows
+// them. The window must end at or below 2 GB: descriptors and ring entries
+// carry 32-bit DDR addresses, and the PicoRV32 reaches DDR only below its CSR
+// window at 0x8000_0000 (on the KV260 the high 2 GB of DDR start at
+// 0x8_0000_0000 and must not fold back). The mailbox is only mapped by this
+// process, so it may be anywhere (a 64-bit PL window on the ZynqMP).
 // SA_BOARD_DEVMEM=<file> replaces /dev/mem (the ring emulator on the host).
 //
 // Completion is polled (RING_HEAD); the notify interrupt is not used here.
+#include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,7 +58,14 @@ enum {
 #define MBOX_PERF_COUNT 0x8Cu
 #define SA_PERF_AREA_BELOW_MBOX 0x100u            // perf area BRAM + 0x1E00, mailbox BRAM + 0x1F00
 #define SA_BOARD_CPL_OFFSET 0x2000u
+#define SA_BOARD_DDR_LIMIT 0x80000000ull           // the window ends at or below 2 GB (see the top)
 #define SA_BOARD_HEAP_OFFSET 0x10000u
+// The ring protocol's layout (rt_fw, firmware/include/mailbox.h) is the same
+// bytes on armv7 and aarch64: 64-byte entries of 64-bit words and 32-byte
+// completion records of 32-bit words, written by offset (no structs, pointers
+// or longs cross to the firmware).
+_Static_assert(SA_BOARD_CPL_OFFSET >= 128u * 64u && SA_BOARD_CPL_OFFSET + 128u * 32u <= SA_BOARD_HEAP_OFFSET,
+               "a ring of up to 128 entries, then its completion records, before the arena");
 
 typedef struct sa_board_t {
   volatile uint32_t* mbox;
@@ -120,16 +137,44 @@ static iree_status_t sa_board_run(sa_transport_t* t, uint32_t list_phys, sa_comp
 
 static void sa_board_close(sa_transport_t* t) { (void)t; }
 
-// Maps [phys, phys + size) through /dev/mem (O_SYNC); returns NULL on failure.
-static void* sa_devmem_map(uint32_t phys, uint32_t size) {
+// Maps [phys, phys + size) through /dev/mem (O_SYNC); returns NULL on failure
+// (also when the page base does not fit off_t: 32-bit off_t on armv7).
+static void* sa_devmem_map(uint64_t phys, uint64_t size) {
+  uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+  uint64_t base = phys & ~(page - 1);
+  if (sizeof(off_t) < 8 && base > (uint64_t)INT32_MAX) return NULL;
+  if (size + (phys - base) > (uint64_t)SIZE_MAX) return NULL;
   const char* devmem = getenv("SA_BOARD_DEVMEM");  // compiler/sim/sa_board_emu.py
   int fd = open(devmem ? devmem : "/dev/mem", O_RDWR | O_SYNC);
   if (fd < 0) return NULL;
-  long page = sysconf(_SC_PAGESIZE);
-  uint32_t base = phys & ~(uint32_t)(page - 1);
-  void* p = mmap(NULL, size + (phys - base), PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)base);
+  void* p = mmap(NULL, (size_t)(size + (phys - base)), PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)base);
   close(fd);
   return p == MAP_FAILED ? NULL : (uint8_t*)p + (phys - base);
+}
+
+// A whole unsigned number (decimal, 0x hex, 0 octal) into 64 bits; *end: the
+// first character after it (NULL: nothing may follow). Returns 0 on failure.
+static int sa_parse_u64(const char* s, uint64_t* out, const char** end) {
+  if (!s || !*s || *s == '-') return 0;
+  char* e = NULL;
+  errno = 0;
+  unsigned long long v = strtoull(s, &e, 0);
+  if (errno || e == s || (!end && *e)) return 0;
+  if (end) *end = e;
+  *out = (uint64_t)v;
+  return 1;
+}
+
+// The device window [phys, phys + size): a valid range below SA_BOARD_DDR_LIMIT.
+static iree_status_t sa_board_check_window(uint64_t phys, uint64_t size) {
+  if (size == 0 || phys > SA_BOARD_DDR_LIMIT || size > SA_BOARD_DDR_LIMIT - phys) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "sa board: memory window [%#llx, %#llx) must be non-empty and lie below %#llx (32-bit device "
+                            "addresses; the PicoRV32 reaches DDR below 2 GB)",
+                            (unsigned long long)phys, (unsigned long long)(phys + size),
+                            (unsigned long long)SA_BOARD_DDR_LIMIT);
+  }
+  return iree_ok_status();
 }
 
 // SA_BOARD_* (see the top of this file) -> sa_board_attach.
@@ -137,26 +182,33 @@ static iree_status_t sa_board_attach_from_env(void) {
   const char* mem = getenv("SA_BOARD_MEM");
   const char* mbox = getenv("SA_BOARD_MBOX");
   if (!mem || !mbox) return iree_ok_status();
-  unsigned long phys = 0, size = 0, mbox_phys = strtoul(mbox, NULL, 0);
-  char* end = NULL;
-  phys = strtoul(mem, &end, 0);
-  if (end && *end == ':') size = strtoul(end + 1, NULL, 0);
-  const char* ring = getenv("SA_BOARD_RING");
-  const char* d = getenv("SA_BOARD_D");
-  if (!size || !mbox_phys || !ring || !d) {
+  uint64_t phys = 0, size = 0, mbox_phys = 0, ring = 0, d = 0;
+  const char* colon = NULL;
+  if (!sa_parse_u64(mem, &phys, &colon) || *colon != ':' || !sa_parse_u64(colon + 1, &size, NULL) ||
+      !sa_parse_u64(mbox, &mbox_phys, NULL) || !sa_parse_u64(getenv("SA_BOARD_RING"), &ring, NULL) ||
+      !sa_parse_u64(getenv("SA_BOARD_D"), &d, NULL)) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                            "SA_BOARD_MEM=<phys>:<bytes>, SA_BOARD_MBOX, SA_BOARD_RING and SA_BOARD_D are needed");
+                            "SA_BOARD_MEM=<phys>:<bytes>, SA_BOARD_MBOX=<phys>, SA_BOARD_RING=<entries> and "
+                            "SA_BOARD_D=<array size> are needed (unsigned numbers)");
   }
-  void* m = sa_devmem_map((uint32_t)phys, (uint32_t)size);
+  // the whole range checked before the 32-bit device addresses are formed
+  IREE_RETURN_IF_ERROR(sa_board_check_window(phys, size));
+  if (mbox_phys < SA_PERF_AREA_BELOW_MBOX || ring == 0 || ring > 128 || (ring & (ring - 1)) || (d != 8 && d != 16)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "sa board: SA_BOARD_MBOX %#llx, SA_BOARD_RING %llu (a power of 2 up to 128), "
+                            "SA_BOARD_D %llu (8 or 16)",
+                            (unsigned long long)mbox_phys, (unsigned long long)ring, (unsigned long long)d);
+  }
+  void* m = sa_devmem_map(phys, size);
   // the mailbox and the perf area below it (SA_PROFILE_PERF)
-  void* b = sa_devmem_map((uint32_t)mbox_phys - SA_PERF_AREA_BELOW_MBOX, 0x100 + SA_PERF_AREA_BELOW_MBOX);
+  void* b = sa_devmem_map(mbox_phys - SA_PERF_AREA_BELOW_MBOX, 0x100 + SA_PERF_AREA_BELOW_MBOX);
   if (b) b = (uint8_t*)b + SA_PERF_AREA_BELOW_MBOX;
   if (!m || !b) {
-    return iree_make_status(IREE_STATUS_PERMISSION_DENIED, "sa board: cannot map /dev/mem (%#lx, %#lx); run as root",
-                            phys, mbox_phys);
+    return iree_make_status(IREE_STATUS_PERMISSION_DENIED,
+                            "sa board: cannot map /dev/mem (%#llx, %#llx); run as root",
+                            (unsigned long long)phys, (unsigned long long)mbox_phys);
   }
-  sa_board_attach(m, (uint32_t)phys, (uint32_t)size, b, (uint32_t)strtoul(ring, NULL, 0),
-                  (uint32_t)strtoul(d, NULL, 0));
+  sa_board_attach(m, (uint32_t)phys, (uint32_t)size, b, (uint32_t)ring, (uint32_t)d);
   return iree_ok_status();
 }
 
@@ -168,6 +220,7 @@ iree_status_t sa_transport_board_open(iree_allocator_t host_allocator, sa_transp
     return iree_make_status(IREE_STATUS_UNAVAILABLE,
                             "sa board: no board attached (SA_BOARD_* or sa_board_attach)");
   }
+  IREE_RETURN_IF_ERROR(sa_board_check_window(sa_board_attached.mem_phys, sa_board_attached.mem_size));
   sa_transport_t* t = NULL;
   IREE_RETURN_IF_ERROR(iree_allocator_malloc(host_allocator, sizeof(*t) + sizeof(sa_board_t), (void**)&t));
   memset(t, 0, sizeof(*t) + sizeof(sa_board_t));
