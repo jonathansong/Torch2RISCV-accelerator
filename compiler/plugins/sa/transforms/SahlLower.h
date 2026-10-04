@@ -146,6 +146,7 @@ private:
   bool mma(sahl::MmaOp m);
   bool loop(sahl::LoopOp lp);
   int64_t leadingPitch(Value v, int64_t rb);
+  int64_t placedElems(memref::AllocOp alloc, LocalBuf &l);
   // inside a sahl.loop: the PARAM a DMA's sa.advance names (none: Value()), and marking the DMA dynamic
   Value advanceOf(Operation *op);
   void advanced(Operation *op, Value adv);
@@ -160,6 +161,7 @@ private:
     std::optional<Lin> dyn;    // a dynamic innermost length (rows of it, contiguous)
     int64_t rows = 1;
     int64_t pitch = 0;         // static rows `pitch` bytes apart (a column slice), 0: contiguous
+    std::optional<Lin> dynRows;  // a view of a dynamic number of rows (the fields at max_dynamic rows)
   };
   std::optional<Ddr> ddrOf(Value v, bool allowPitch = false);
 

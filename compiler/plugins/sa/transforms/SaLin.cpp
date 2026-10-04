@@ -36,6 +36,15 @@ std::optional<Lin> linOf(Value v) {
         if (auto l = linOf(op->getOperand(i)); l && l->shift == 0) return Lin{l->ord, l->mul * *c, 0, l->add * *c};
     return std::nullopt;
   }
+  if (isa<arith::ShRUIOp, arith::DivUIOp>(op)) {
+    // x >> c, x / 2^c (a tile count: a length over D)
+    auto c = getConstantIntValue(op->getOperand(1));
+    auto l = linOf(op->getOperand(0));
+    if (!c || !l || l->add != 0 || *c <= 0) return std::nullopt;
+    int sh = isa<arith::ShRUIOp>(op) ? int(*c) : int(llvm::Log2_64(uint64_t(*c)));
+    if (isa<arith::DivUIOp>(op) && (int64_t(1) << sh) != *c) return std::nullopt;
+    return Lin{l->ord, l->mul, l->shift + sh, 0};
+  }
   if (isa<arith::AddIOp>(op)) {
     for (int i = 0; i < 2; ++i)
       if (auto c = getConstantIntValue(op->getOperand(1 - i)))

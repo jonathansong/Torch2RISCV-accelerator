@@ -77,15 +77,18 @@ def canonical(data):
     _, _, exps = sadesc.read(data)
     for (name, rows, nb, nc, cyc, setup), ext in zip(exps, sadesc.read_ext(data)):
         names = {s[1]: f"<b{s[2]}+c{s[3]}*{s[4]}/{s[5]}+{s[6]}>" for s in setup if s[0] == 0}
+        pnames = {s[1]: f"<c{s[3]}*{s[4]}/{s[5]}+{s[6]}>" for s in setup if s[0] != 0}   # setup PARAMs
         ext = dict(ext)
         if "prefix_reg" in ext:                      # (the BASE register the prefix was generated for; unused without one)
             ext["prefix_reg"] = names.get(ext["prefix_reg"], ext["prefix_reg"]) if ext.get("prefix") else None
         out.append(f"{name} {rows.shape[0]} {nb} {nc} {ext}")
-        out += sorted(f"setup {names[s[1]]}" if s[0] == 0 else f"setup PARAM{s[1]} {s[2:]}" for s in setup)
+        out += sorted(f"setup {names[s[1]]}" if s[0] == 0 else f"setup PARAM {pnames[s[1]]}" for s in setup)
         for i, w in enumerate(rows):
             t = sadis.line(i, w)
             t = re.sub(r"base=(\d+)", lambda m: "base=" + names.get(int(m.group(1)), m.group(1)), t)
             t = re.sub(r"\bBASE(\d+)\b", lambda m: "BASE" + names.get(int(m.group(1)), m.group(1)), t)
+            t = re.sub(r"dyn\(f(\d+),p(\d+)", lambda m: f"dyn(f{m.group(1)},p" + pnames.get(int(m.group(2)), m.group(2)), t)
+            t = re.sub(r"param=(\d+)", lambda m: "param=" + pnames.get(int(m.group(1)), m.group(1)), t)
             out.append(t)
     return "\n".join(out)
 
@@ -184,14 +187,14 @@ def compare(args):
         ks = [e for e in v["entries"] if e["key"] in bad]
         nr = sum(e["key"] in renamed for e in v["entries"])
         print(f"{c}: {len(v['entries']) - len(ks)}/{len(v['entries'])} identical"
-              + (f" ({nr} up to the numbering of BASE registers)" if nr else ""))
+              + (f" ({nr} up to the numbering of BASE / PARAM registers)" if nr else ""))
         for e in ks[:args.show]:
             print(f"  {e['name']} [{e['key']}]: {bad[e['key']]}")
         if len(ks) > args.show:
             print(f"  ... {len(ks) - args.show} more")
     print(f"{len(keys)} unique dispatches in {time.time() - t0:.0f} s: "
           + ("golden corpus IDENTICAL" if not bad else f"{len(bad)} DIFFER")
-          + (f" ({len(renamed)} up to the numbering of BASE registers)" if renamed else ""))
+          + (f" ({len(renamed)} up to the numbering of BASE / PARAM registers)" if renamed else ""))
     print("golden PASS" if not bad else "golden FAIL")
     return 1 if bad else 0
 

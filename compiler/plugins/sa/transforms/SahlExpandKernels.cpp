@@ -41,13 +41,25 @@
 //   - per chunk and row a sahl.scope {keep}: EX, the epilogue as a 1-D
 //     generic over the chunk (per-row inputs: their word for (b, g)), the
 //     store; an int8-x layout's SPAD temps after x (spad_from).
+// Attention (sahl.kernel "attention": decode's micro-kernel of C3, one
+// query row per head, the cache's length T dynamic): SPAD_A claimed, per head
+// the scores q . K^T (K's T rows into bank 1, transposed into SPAD_B, the
+// query copied over the D rows, EX, times s_q and the scale into the head's
+// row of T scores; the H rows stored back to back) or P . V (the H rows of p
+// loaded back to back, per head p copied over the D rows, V's T rows
+// interleaved into SPAD_B bank 1, EX, the scale, the head's row stored).
+// Dynamic sizes are views and buffers sized by T (the fields at the bound,
+// the count a dynamic field).
 // The order of the operations and of the first uses of the local buffers is
 // the order in which the lowering emitted the commands and allocated the
 // words before, so the descriptors are the same (the golden corpus).
+#include <cstdlib>
 #include "SahlDialect.h"
+#include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "SahlKernels.h"
 #include "SahlLocalMemory.h"
 #include "SahlPasses.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -691,6 +703,129 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   return true;
 }
 
+// Decode's attention micro-kernel (AttnPlan).
+bool expandAttention(sahl::KernelOp k, AttnPlan p, const ::sa::Layout &lay, int64_t d, int64_t maxDyn) {
+  const int64_t H = p.H, hs = p.hs, sb = lay.sbank, hw = hs / d, logd = int64_t(llvm::Log2_64(uint64_t(d)));
+  if (maxDyn % d || hs % d || maxDyn * hw > sb) return false;
+  auto sv = p.cache.getDefiningOp<memref::SubViewOp>();
+  if (!sv || sv.getSizes().size() != 1) return false;
+  linalg::GenericOp epi;
+  Value acc = p.bmm.getDpsInits()[0];
+  for (Operation *u : acc.getUsers())
+    if (auto g = dyn_cast<linalg::GenericOp>(u)) epi = g;
+  if (!epi) return false;
+  Type accT = cast<MemRefType>(acc.getType()).getElementType();
+  Expander e{OpBuilder(k), k.getLoc(), d};
+  MLIRContext *ctx = k.getContext();
+  Type f32 = Float32Type::get(ctx), i8 = IntegerType::get(ctx, 8);
+  Value T = sv.getSizes()[0];
+  auto subT = [&](Value v, ArrayRef<int64_t> offs, ArrayRef<OpFoldResult> sizes, ArrayRef<int64_t> shape) {
+    auto mt = cast<MemRefType>(v.getType());
+    SmallVector<OpFoldResult> o, st;
+    for (int64_t x : offs) o.push_back(e.b.getIndexAttr(x)), st.push_back(e.b.getIndexAttr(1));
+    auto rt = memref::SubViewOp::inferRankReducedResultType(shape, mt, o, sizes, st);
+    return memref::SubViewOp::create(e.b, e.loc, cast<MemRefType>(rt), v, o, sizes, st);
+  };
+  auto I = [&](int64_t x) -> OpFoldResult { return e.b.getIndexAttr(x); };
+  const int64_t DYN = ShapedType::kDynamic;
+  auto placed = [&](ArrayRef<int64_t> shape, ValueRange dyn, StringRef mem, int64_t at) {
+    auto a = memref::AllocOp::create(e.b, e.loc, MemRefType::get(shape, i8), dyn);
+    a->setAttr("sa.mem", e.b.getStringAttr(mem));
+    a->setAttr(mem == "spad_b" ? "sa.bank" : "sa.word", e.b.getI64IntegerAttr(at));
+    return Value(a);
+  };
+  auto accAlloc = [&](int64_t n) {
+    Value c = e.alloc({n}, accT, "acc", "packed");
+    if (accT.isInteger(64)) c.getDefiningOp()->setAttr("sa.accumulator", e.b.getUnitAttr());
+    sahl::ReserveOp::create(e.b, e.loc, c, false);
+    return c;
+  };
+  // the epilogue on a head: its inputs (the accumulator view, a per-head word) -> out
+  auto epilogue = [&](Value accView, Value headWord, Value out) {
+    SmallVector<Value> ins;
+    SmallVector<AffineMap> maps;
+    AffineMap id1 = AffineMap::getMultiDimIdentityMap(1, ctx), none = AffineMap::get(1, 0, ctx);
+    for (Value in : epi.getDpsInputs()) {
+      if (in == acc) ins.push_back(accView), maps.push_back(id1);
+      else if (headWord) ins.push_back(headWord), maps.push_back(none);
+      else return false;
+    }
+    maps.push_back(id1);
+    auto g = linalg::GenericOp::create(e.b, e.loc, TypeRange{}, ins, ValueRange{out}, maps,
+                                       SmallVector<utils::IteratorType>{utils::IteratorType::parallel});
+    IRMapping map;
+    epi.getRegion().cloneInto(&g.getRegion(), map);
+    return true;
+  };
+  sahl::ClaimSpadOp::create(e.b, e.loc, 2 * sb);
+  auto shift = arith::ShRUIOp::create(e.b, e.loc, T, arith::ConstantIndexOp::create(e.b, e.loc, logd));
+  Value tiles = shift.getResult();
+  Value y = p.store.getDst();
+  if (p.scores) {
+    if (epi.getNumDpsInputs() != 2) return false;
+    Value sqv = e.alloc({H}, f32, "acc", "packed");
+    sahl::LoadOp::create(e.b, e.loc, p.sq, sqv);
+    Value sqb = e.alloc({H}, f32, "acc", "bcast");
+    sahl::BcastOp::create(e.b, e.loc, sqv, sqb);
+    Value srcw = e.alloc({hs}, cast<MemRefType>(p.small.getType()).getElementType(), "acc", "packed");
+    sahl::ReserveOp::create(e.b, e.loc, srcw, false);
+    Value c = accAlloc(d * (maxDyn / d) * d);
+    auto ra = memref::AllocOp::create(e.b, e.loc, MemRefType::get({H, DYN}, f32), ValueRange{T});
+    ra->setAttr("sa.mem", e.b.getStringAttr("acc"));
+    ra->setAttr("sa.layout", e.b.getStringAttr("rows"));
+    Value res = ra;
+    sahl::ReserveOp::create(e.b, e.loc, res, false);
+    for (int64_t h = 0; h < H; ++h) {
+      Value kraw = placed({DYN, hs}, ValueRange{T}, "spad_a", sb);
+      auto l = sahl::LoadOp::create(e.b, e.loc, subT(p.cache, {0, h, 0}, {T, I(1), I(hs)}, {DYN, hs}), kraw);
+      l->setAttr("sa.rows", e.b.getUnitAttr());
+      Value kt = placed({DYN, hs, d}, ValueRange{tiles}, "spad_b", 0);
+      sahl::TransposeOp::create(e.b, e.loc, kraw, kt);
+      sahl::LoadOp::create(e.b, e.loc, subT(p.small, {h, 0, 0}, {I(1), I(hs), I(1)}, {hs}), srcw);
+      Value strip = placed({d, hs}, ValueRange{}, "spad_a", 0);
+      sahl::StripOp::create(e.b, e.loc, srcw, strip);
+      sahl::MmaOp::create(e.b, e.loc, strip, kt, c, false);
+      Value word = subT(sqb, {h}, {I(1)}, {});
+      if (!epilogue(subT(c, {0}, {T}, {DYN}), word, subT(res, {h, 0}, {I(1), T}, {DYN}))) return false;
+    }
+    // the H rows of T scores, back to back
+    auto yt = cast<MemRefType>(y.getType());
+    Value yv = y;
+    if (yt.getRank() == 3 && yt.getDimSize(2) == 1) {
+      SmallVector<ReassociationIndices> re = {{0}, {1, 2}};
+      yv = memref::CollapseShapeOp::create(e.b, e.loc, y, re);
+    }
+    sahl::StoreOp::create(e.b, e.loc, res, yv);
+  } else {
+    if (epi.getNumDpsInputs() != 1) return false;
+    auto pt = cast<MemRefType>(p.small.getType());
+    auto psub = ddrRoot(p.small).getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+    if (!psub || psub.getDynamicDims().size() != 1 || pt.getRank() != 3 || pt.getDimSize(1) != 1) return false;
+    // the H rows of p (its own length), back to back
+    auto pa = memref::AllocOp::create(e.b, e.loc, MemRefType::get({H, DYN}, pt.getElementType()),
+                                      ValueRange{psub.getDynamicDims()[0]});
+    pa->setAttr("sa.mem", e.b.getStringAttr("acc"));
+    pa->setAttr("sa.layout", e.b.getStringAttr("rows"));
+    Value pl = pa;
+    sahl::LoadOp::create(e.b, e.loc, p.small, pl);
+    Value c = accAlloc(d * hw * d);
+    Value res = e.alloc({hs}, f32, "acc", "packed");
+    sahl::ReserveOp::create(e.b, e.loc, res, false);
+    for (int64_t h = 0; h < H; ++h) {
+      Value strip = placed({d, maxDyn}, ValueRange{}, "spad_a", 0);
+      sahl::StripOp::create(e.b, e.loc, subT(pl, {h, 0}, {I(1), T}, {DYN}), strip);
+      Value vb = placed({hw, DYN, d}, ValueRange{T}, "spad_b", 1);
+      auto l = sahl::LoadOp::create(e.b, e.loc, subT(p.cache, {0, h, 0}, {T, I(1), I(hs)}, {DYN, hs}), vb);
+      l->setAttr("sa.interleave", e.b.getUnitAttr());
+      sahl::MmaOp::create(e.b, e.loc, strip, vb, c, false);
+      if (!epilogue(subT(c, {0}, {I(hs)}, {hs}), Value(), res)) return false;
+      sahl::StoreOp::create(e.b, e.loc, res, subT(y, {h, 0, 0}, {I(1), I(1), I(hs)}, {hs}));
+    }
+  }
+  eraseKernel(k);
+  return true;
+}
+
 struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SahlExpandKernelsPass)
   SahlExpandKernelsPass() = default;
@@ -724,6 +859,16 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
         }
         continue;
       }
+      if (k.getKind() == "attention") {
+        for (Operation &o : k.getBody().front()) {
+          auto bm = dyn_cast<linalg::BatchMatmulOp>(&o);
+          if (!bm || !o.hasAttr("sahl.anchor")) continue;
+          KernelMatcher km(cfg);
+          if (km.matchAttention(bm)) expandAttention(k, km.attns[bm.getOperation()], lay, cfg.d, cfg.maxDynamic);
+          break;
+        }
+        continue;
+      }
       if (k.getKind() != "linear") continue;
       for (Operation &o : k.getBody().front()) {
         auto g = dyn_cast<linalg::GenericOp>(&o);
@@ -736,6 +881,11 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
         break;
       }
     }
+    // SA_EXPAND_STATS: the kernels left to the old lowering (to drop it once none remain)
+    if (getenv("SA_EXPAND_STATS"))
+      f.walk([&](sahl::KernelOp k) {
+        llvm::errs() << "sa-expand: unexpanded " << k.getKind() << " kernel in " << f.getName() << "\n";
+      });
   }
 
   TargetConfig cfg;

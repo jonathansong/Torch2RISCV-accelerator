@@ -276,7 +276,13 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     if (!mt) return fail("scalar generic input");
     Val v;
     auto placedAcc = [&] {                            // an expanded kernel's i64 accumulator (int32 words)
-      auto a = in.getDefiningOp<memref::AllocOp>();
+      Value r = in;
+      while (Operation *d = r.getDefiningOp()) {
+        if (auto sv = dyn_cast<memref::SubViewOp>(d)) r = sv.getSource();
+        else if (auto cs = dyn_cast<memref::CollapseShapeOp>(d)) r = cs.getSrc();
+        else break;
+      }
+      auto a = r.getDefiningOp<memref::AllocOp>();
       return a && (a->hasAttr("sa.word") || a->hasAttr("sa.accumulator"));
     };
     if (mt.getElementType().isInteger(64) && !placedAcc()) {
