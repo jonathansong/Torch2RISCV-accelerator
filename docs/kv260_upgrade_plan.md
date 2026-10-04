@@ -145,8 +145,8 @@
 
 **软件**
 
-4. aarch64 交叉编译：`toolchain-aarch64.cmake`、`build_sa_runtime.sh aarch64`，构建 `sa-llm-run`、`sa_hal_test`、L0 的 `iree-run-module`。
-5. **地址与 ABI**（细节见 §2.4）：`sa_transport_board.c` 改为用 64 位类型解析物理地址，检查整个窗口在保留区内之后再转成 32 位；明确保留区的分配、映射属性和同步边界；审计主机与固件共享的结构体。
+4. aarch64 交叉编译：`toolchain-aarch64.cmake`、`build_sa_runtime.sh aarch64`，构建 `sa-llm-run`、`sa_hal_test`、L0 的 `iree-run-module`。**已完成**（2026-10-04，`kv260` 分支）：`compiler/runtime/toolchains/aarch64-linux-gnu.cmake`，三个程序静态链接；不用板子的检查 `compiler/scripts/test_aarch64_runtime.sh`（qemu-aarch64 用户态 + 环形队列仿真器 `sa_board_emu.py`）：C1 HAL 测试 PASS，stories15M decode 与 prefill + decode 的 logits 与参照逐位一致。
+5. **地址与 ABI**（细节见 §2.4）：`sa_transport_board.c` 改为用 64 位类型解析物理地址，检查整个窗口在保留区内之后再转成 32 位；明确保留区的分配、映射属性和同步边界；审计主机与固件共享的结构体。运行时部分**已完成**：`SA_BOARD_*` 按 64 位解析，窗口整段检查（非空、末端 ≤ 2 GB）后才形成 32 位设备地址，mailbox 可在任意物理地址；与固件共享的只有环形队列项（64 位字）与完成记录（32 位字），按偏移写，不含结构体、指针或 `long`。保留区的分配方式与映射属性等板子到手再定。
 6. 驱动与部署：`pynq_matmul.py` 和 `deploy_*.sh` 增加 `--board kv260`，读入新的基地址。
 7. 编译器：不改；生成与 Z1 基线相同的模块（D = 8、默认 SPAD/ACC），描述符应与 `tests/baselines/pynq-z1/golden_manifest.txt` 逐字节相同。
 
