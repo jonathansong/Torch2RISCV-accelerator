@@ -70,6 +70,17 @@ directory about 10–15 GB. ccache is capped at 8 GB.
 
 ## Status
 
+- **PYNQ-Z1 frozen** (2026-10-04, tag `v1.0-pynq-z1`, docs/iree_compiler_plan.md
+  §8.21): `scripts/deploy_z1_freeze.sh` stages every board test in
+  `build/deploy_z1` (bwtest, c3, c55, c6p stories / smollm2, the generic
+  hfgen), `tests/board_regress.py` runs them on the board (all bit-exact),
+  `tests/make_z1_baselines.py` writes `tests/baselines/pynq-z1/` (golden
+  manifest, dispatch checks, token sequences, `perf.md`, `z1_profile.md`).
+  Profiling with the unit's event counters: `SA_PROFILE=1
+  SA_PROFILE_PERF=<file>` (board: each list with `RT_F_PERF`, the counters
+  summed per export into a CSV), `tests/z1_profile.py` splits the cycles per
+  dispatch type into loads (and their floor), EX, VE / SFU, ST, fixed overhead
+  and overlap. Further work goes on with the KV260 (docs/kv260_upgrade_plan.md).
 - Setup: the frontend Python environment is checked. A turbine export of a
   small torch model (matmul + softmax), compiled with the pip `iree-compile`,
   matches torch.

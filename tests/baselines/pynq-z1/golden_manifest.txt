@@ -1,4 +1,4 @@
-# golden corpus at 689965a: case, dispatch source, key, sha256 of the descriptors (- : fails to compile)
+# golden corpus at ce3cf11: case, dispatch source, key, sha256 of the descriptors (- : fails to compile)
 stories_m8 module_main$async_dispatch_0.mlir a65107768cd373550f42 5b367c55798ffc0a16eb7d6770cd5a1530cb88f3f10079db45c275bee744083e
 stories_m8 module_main$async_dispatch_1.mlir f7581392fc09e3fe96e5 2729910be8982cac189e1e1d89eec9b6bb160a0a63042880f243a762a8fd48be
 stories_m8 module_main$async_dispatch_106.mlir 8f62a97223b536f36db7 c43787936b3f3c986bd0650250c74dafac33a5d0ad3ce2c44c0e0e53373e9939

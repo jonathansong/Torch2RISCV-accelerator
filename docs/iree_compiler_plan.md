@@ -1244,9 +1244,9 @@ C5.5 的模型（§8.9 的第一步）：
 |---|---|---|---|---|
 | 1 | **通用路径的 prefill**（端到端 prefill + decode） | 导出 `prefill(tokens[M], positions[M])`，与 decode 在同一个模块里共用参数和 KV cache；`SaCache` 一次写 M 行；`"sa"` 注意力按行加因果掩码（qhf 的逐行形式）；`sa-llm-run --abi=hf` 支持分块 prefill；顺带 F4 剩下的 int8 尾部 | 与同一模型只用 decode 在设备上逐位一致（C6.P 的判据）；质量指标不下降；Qwen3 不改代码；上板 | 主要复用现有编译器（多行线性层、逐行注意力都已有）；可能再暴露编译器的边界情况。**完成**（2026-09-29，sim 与板上，§8.19） |
 | 2 | **微内核在 `sahl` 层展开** | 线性层、注意力、通用 contraction 的调度（分块、SPAD_B bank 交替、预取、LOOP_END 循环）用 `sahl` 操作显式表达，由一个 pass 展开；`sahl-to-sahw` 只做一对一翻译；`sahl` 需要补上能表达 bank、条带、循环的操作 | 黄金语料逐字节相同，不用上板 | 工作量大；C8 时没做（§8.14 R2：等于把 `sahw` 的概念再造一遍）。现在的价值是让调度能被代价模型和内存规划看见、能被改；也是第 3 项的前提。**完成**（2026-10-04，黄金语料全部相同，旧内核 lowering 已删除，§8.20）。第 1 项之后又多了一个直接的收益：线性层的调度能套在任意尾部上，通用路径 decode 约 66% 的权重现在走通用 contraction，比手写路径慢约 50%（§8.19）；这部分会改变输出，按第 3 项的方式验收（逐 dispatch 一致、板上周期） |
-| 3 | **带生存期分析的内存规划** | 所有局部缓冲和临时值都在 IR 上之后（第 2 项），按生存期分配 SPAD / ACC，按 bank 避开冲突，放不下时由规划决定分片（替代现在的估计，包括 `sahl.to_i8` 按 12 个操作计的那处） | 会改变输出：逐 dispatch 检查与 sim 逐位一致；板上逐 dispatch 周期不变差 | 地址与 bank 的变化影响记分板的并发，可能变快也可能变慢，要在板上实测 |
+| 3 | **带生存期分析的内存规划** | 所有局部缓冲和临时值都在 IR 上之后（第 2 项），按生存期分配 SPAD / ACC，按 bank 避开冲突，放不下时由规划决定分片（替代现在的估计，包括 `sahl.to_i8` 按 12 个操作计的那处） | 会改变输出：逐 dispatch 检查与 sim 逐位一致；板上逐 dispatch 周期不变差 | 地址与 bank 的变化影响记分板的并发，可能变快也可能变慢，要在板上实测。**移到 KV260**（2026-10-04，§8.21）：Z1 上 decode 受带宽限制，规划的收益测不出来，而它要满足的约束（K2b 的子银行、K3 的容量）在 KV260 上才定下来；拆成 3a 框架（复现现有分配，不改输出）与 3b 优化，写进 `kv260_upgrade_plan.md` K2b 的编译器工作项 |
 
-理由：第 1 项是功能上的完整性（通用前端追上手写路径）；第 2 项是纯重构，由黄金语料守着；第 3 项依赖第 2 项，并且是唯一需要上板测性能的一步。
+理由：第 1 项是功能上的完整性（通用前端追上手写路径）；第 2 项是纯重构，由黄金语料守着；第 3 项依赖第 2 项，并且是唯一需要上板测性能的一步。第 1、2 项在 Z1 上完成后 Z1 冻结（§8.21），之后的工作按 `kv260_upgrade_plan.md` 进行。
 
 ### 8.19 通用路径的 prefill（§8.17 第 1 项的结果，2026-09-29）
 
@@ -1360,6 +1360,33 @@ C5.5 的模型（§8.9 的第一步）：
 
 **之后**：调度现在在 IR 上，能被看见、能被改：(1) §8.19 的方向——线性层的调度套在任意尾部上（会改变输出，按第 3 项的方式验收）；(2) 第 3 项带生存期的内存规划：展开后所有局部缓冲都是 `memref.alloc`，`sa.word` / `sa.bank` / `sahl.scope` 由规划决定，而不是照抄旧 lowering 的地址。
 
+### 8.21 Z1 冻结（2026-10-04）
+
+§8.17 的第 1、2 项完成后，PYNQ-Z1 版本冻结在 tag `v1.0-pynq-z1`（分支 `pynq-z1`，GitHub Release 附 bitstream、固件、运行时和板上的完整结果）；之后的优化全部在 KV260 上做（`kv260_upgrade_plan.md`，第 3 项移到那里的 K2b）。
+
+**冻结前的板上回归**（`compiler/scripts/deploy_z1_freeze.sh` 生成测试包，`compiler/tests/board_regress.py` 在板上跑，L2 bitstream，D = 8，50 MHz）：全部逐位一致。
+
+| 测试 | 板上 |
+|---|---|
+| bwtest | LD / ST 397 MB/s（64 位 × 50 MHz 上限的 99%），LD 与 ST 同时 788 MB/s |
+| C3 stories15M decode | 76/76 步与 DeviceModel（手写 L5 路径）逐位一致，17.60 token/s |
+| C5.5 SmolLM2 decode（qhf） | 38/38 步，450 ms/步（2.22 token/s） |
+| C6.P stories15M prefill + decode | 61/61 步；prefill 75.6 token/s，decode 17.39 token/s |
+| C6.P SmolLM2 prefill + decode（qhf） | 25/25 步；prefill 7.13 token/s，decode 460 ms/步 |
+| 通用路径 SmolLM2 prefill + decode | 17/17 步；prefill 3.18 token/s，decode 535.5 ms/步（1.87 token/s） |
+
+**基线**（`tests/baselines/pynq-z1/`，`compiler/tests/make_z1_baselines.py`）：黄金语料用冻结时的编译器重录后的描述符哈希（4002 个 dispatch）、五个模型的逐 dispatch 检查（`--dirty`，全部一致；通用路径 prefill 里两个在主机上的 dispatch 为 UNSUPPORTED）、板上的 token 序列、速度与带宽（`perf.md`）、耗时分解（`z1_profile.md`）。KV260 的 K1a（同一个加速器）以它们为参照。
+
+**耗时分解**：运行时新增 `SA_PROFILE_PERF=<file>`：profile 模式下每个列表带 `RT_F_PERF`，rt_fw 把加速器的 32 个事件计数器（`rtl/sysarray/sa_defs.vh` 的 `PC_*`）写进 BRAM 的 perf 区，运行时读出、按 export 累加、写成 CSV；`compiler/tests/z1_profile.py` 按 dispatch 类型拆成读入（及按 bwtest 7.94 B/周期的下限）、EX、VE / SFU、ST、全部引擎空闲（固定开销）与引擎之间的重叠。decode 每步：
+
+| 路径 | 设备周期 | 读入下限 | 没被读入掩盖 | 固定开销 |
+|---|---|---|---|---|
+| stories15M 手写 | 2.71M | 1.99M | 0.72M（26%） | 2% |
+| SmolLM2 手写 qhf | 22.22M | 17.44M | 4.78M（22%） | 1% |
+| SmolLM2 通用 | 26.67M | 17.75M | 8.92M（33%） | 1% |
+
+线性层贴着读入下限（EX 与 LD 几乎完全重叠）；固定开销很小；没被掩盖的是 VE / SFU 的工作（线性层尾部、RMSNorm / softmax 的归约、注意力）——通用路径的 8.92M 里线性层尾部约 4.0M、注意力 2.4M、归约 2.6M。prefill 每块 VE / SFU 占 52–54%。带宽提高（KV260 的 K2）之后这部分会成为主要耗时，是那里性能工作的依据。
+
 ## 9. 验证体系
 
 | 层次 | 内容 | 工具 |
@@ -1390,6 +1417,7 @@ C5.5 的模型（§8.9 的第一步）：
 | **前端通用化** | HuggingFace 的原始建模代码直接导出，量化与写法由通用图改写完成（§8.16） | sa 的 dispatch 与 oracle 逐位一致，质量（与原版 fp32 HF 的 top-1）不低于手写 qhf 路径；Qwen3 不改代码；上板；非 Llama 结构。**进行中**（F0–F4 完成；通用路径的 prefill + decode 与只用 decode 逐位一致（sim 与板上），decode 全部在加速器上，Qwen3 不改代码通过，§8.19） | 大 |
 | **主机退路** | sa 编不了的 dispatch 在 ARM 上用 VMVX 运行（§8.15） | 任何 dispatch 都能跑；混合执行与只用加速器逐位一致（线性层放主机的 stories15M）。**完成**（sim 与板上） | 中 |
 | **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**完成**（2026-09-29，§8.14：R0–R6；微内核的 `sahl` 展开 2026-10-04 完成（§8.20，`sahl-expand-kernels`，旧内核 lowering 已删除）；带生存期的内存规划是下一步（§8.17 第 3 项）；`sahw-legalize-dynamic`、R7 代价模型留给以后） | 大 |
+| **Z1 冻结** | 第 1、2 项完成后冻结 PYNQ-Z1 版本，之后的优化转到 KV260（§8.21） | 板上回归全部逐位一致；基线文件（含耗时分解）；tag `v1.0-pynq-z1`、分支 `pynq-z1`、Release。**完成**（2026-10-04） | 小 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。
