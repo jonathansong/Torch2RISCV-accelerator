@@ -67,6 +67,8 @@ def main():
         return 1
     lines = r.stdout.strip().splitlines()
     tokens = [int(t) for t in lines[0].split(":")[1].split()]
+    with open(os.path.join(HERE, "tokens_board.txt"), "w") as f:   # (the freeze baselines: board_regress.py)
+        f.write(" ".join(map(str, tokens)) + "\n")
     got = np.fromfile(logits_path, np.float32).reshape(-1, want_logits.shape[1])
     n = min(len(got), len(want_logits))
     exact = sum(got[i].tobytes() == want_logits[i].tobytes() for i in range(n))
