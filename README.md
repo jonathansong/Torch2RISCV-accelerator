@@ -189,7 +189,9 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
   per call on the full array, 4.3-4.7x faster per token than decode, bit-exact.
   The code generator's decisions (kernels, gathers, pieces, memory places,
   schedules) are separate passes visible in the IR, guarded by a
-  byte-for-byte golden corpus of 4002 dispatches (C8). Dispatches the
+  byte-for-byte golden corpus of 4002 dispatches (C8); the micro-kernels'
+  schedules (strips, EX, SPAD_B banks, prefetch, loops) are written out as
+  `sahl` operations, so the last stage only translates one to one. Dispatches the
   accelerator backend cannot compile run on the ARM host (VMVX host fallback).
   An unmodified HuggingFace decoder (transformers' own modeling code) now
   compiles too: generic rewrites (W8A8, RoPE tables, an int8 KV cache and the

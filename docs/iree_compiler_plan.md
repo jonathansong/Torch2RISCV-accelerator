@@ -1243,7 +1243,7 @@ C5.5 的模型（§8.9 的第一步）：
 | 顺序 | 工作 | 内容 | 验收 | 风险与依赖 |
 |---|---|---|---|---|
 | 1 | **通用路径的 prefill**（端到端 prefill + decode） | 导出 `prefill(tokens[M], positions[M])`，与 decode 在同一个模块里共用参数和 KV cache；`SaCache` 一次写 M 行；`"sa"` 注意力按行加因果掩码（qhf 的逐行形式）；`sa-llm-run --abi=hf` 支持分块 prefill；顺带 F4 剩下的 int8 尾部 | 与同一模型只用 decode 在设备上逐位一致（C6.P 的判据）；质量指标不下降；Qwen3 不改代码；上板 | 主要复用现有编译器（多行线性层、逐行注意力都已有）；可能再暴露编译器的边界情况。**完成**（2026-09-29，sim 与板上，§8.19） |
-| 2 | **微内核在 `sahl` 层展开** | 线性层、注意力、通用 contraction 的调度（分块、SPAD_B bank 交替、预取、LOOP_END 循环）用 `sahl` 操作显式表达，由一个 pass 展开；`sahl-to-sahw` 只做一对一翻译；`sahl` 需要补上能表达 bank、条带、循环的操作 | 黄金语料逐字节相同，不用上板 | 工作量大；C8 时没做（§8.14 R2：等于把 `sahw` 的概念再造一遍）。现在的价值是让调度能被代价模型和内存规划看见、能被改；也是第 3 项的前提。第 1 项之后又多了一个直接的收益：线性层的调度能套在任意尾部上，通用路径 decode 约 66% 的权重现在走通用 contraction，比手写路径慢约 50%（§8.19）；这部分会改变输出，按第 3 项的方式验收（逐 dispatch 一致、板上周期） |
+| 2 | **微内核在 `sahl` 层展开** | 线性层、注意力、通用 contraction 的调度（分块、SPAD_B bank 交替、预取、LOOP_END 循环）用 `sahl` 操作显式表达，由一个 pass 展开；`sahl-to-sahw` 只做一对一翻译；`sahl` 需要补上能表达 bank、条带、循环的操作 | 黄金语料逐字节相同，不用上板 | 工作量大；C8 时没做（§8.14 R2：等于把 `sahw` 的概念再造一遍）。现在的价值是让调度能被代价模型和内存规划看见、能被改；也是第 3 项的前提。**完成**（2026-10-04，黄金语料全部相同，旧内核 lowering 已删除，§8.20）。第 1 项之后又多了一个直接的收益：线性层的调度能套在任意尾部上，通用路径 decode 约 66% 的权重现在走通用 contraction，比手写路径慢约 50%（§8.19）；这部分会改变输出，按第 3 项的方式验收（逐 dispatch 一致、板上周期） |
 | 3 | **带生存期分析的内存规划** | 所有局部缓冲和临时值都在 IR 上之后（第 2 项），按生存期分配 SPAD / ACC，按 bank 避开冲突，放不下时由规划决定分片（替代现在的估计，包括 `sahl.to_i8` 按 12 个操作计的那处） | 会改变输出：逐 dispatch 检查与 sim 逐位一致；板上逐 dispatch 周期不变差 | 地址与 bank 的变化影响记分板的并发，可能变快也可能变慢，要在板上实测 |
 
 理由：第 1 项是功能上的完整性（通用前端追上手写路径）；第 2 项是纯重构，由黄金语料守着；第 3 项依赖第 2 项，并且是唯一需要上板测性能的一步。
@@ -1322,6 +1322,44 @@ C5.5 的模型（§8.9 的第一步）：
 
 **剩下**：通用路径 decode 的线性层走微内核（见上）；prefill 里 Q 的 RoPE 两个主机 dispatch（IREE 把 swap 后的 q 物化成按头在外的布局，gather 带了转置；改前端 swap 的写法反而让 31 个落到主机，没采用）；主机退路改用原生 ARM 代码（`llvm-cpu`，替代 VMVX 解释器，需要重建编译器）。
 
+### 8.20 微内核在 `sahl` 层展开（§8.17 第 2 项的结果，2026-10-04）
+
+**结果**：新 pass `sahl-expand-kernels`（`sahl-schedule` 之后、`sahl-to-sahw` 之前）把三类微内核——线性层（decode 形式、多行 prefill 形式）、注意力（decode 的 scores / PV，动态 T）、通用 contraction（静态、动态 K 或 N）——的调度写成显式的 `sahl` 操作；`sahl-to-sahw` 里的内核 lowering（`SahlLowerKernels.cpp`，747 行）**删除**，剩下的 `sahl.kernel` 报错（该 dispatch 走主机）。黄金语料 4002 个 dispatch 的描述符**全部相同**（384 个只差 BASE / PARAM 寄存器的编号，见下）；旧 lowering 删除后语料仍全部相同，即没有一个内核留给它（`SA_EXPAND_STATS=1` 也可统计）。纯重构，不用上板。
+
+**`sahl` 新增的操作与属性**（够表达旧 lowering 的全部调度）：
+
+| | 含义 |
+|---|---|
+| `sahl.strip` | DDR 的行 → 交错 LD 成 A 条带；或局部向量 → VE DIV 复制成条带 |
+| `sahl.mma {accumulate}` | 一次 EX（条带 × SPAD_B 的 B 块 → ACC）；KT / BSTEP / REPEAT 从操作数形状来，动态维给动态字段 |
+| `sahl.bcast` | 逐行 / 标量值 → 广播布局（每个值一个字） |
+| `sahl.transpose` | SPAD_A 的行 → SPAD_B 的 B 块（TRANSPOSE） |
+| `sahl.loop {count, strides}` | LOOP_END 循环；循环里的 load / store 用 `sa.advance` 指明每轮前进的步长 |
+| `sahl.claim_spad {words}` | SPAD_A 的 `[0, words)` 归后面的固定位置缓冲（条带在 0，x 或待转置的行在 bank 1） |
+| `sahl.cursor_reset` | 行游标（设备上累加的 DDR 偏移，SETREG）归零；`sa.cursor` 的 load / store 把它加到地址上，`sa.cursor_step` 之后前进一行的字节数——长度动态、行距动态的行（prefill 注意力的 p 行、scores 行） |
+| `sahl.scope {keep, spad_from}` | 局部缓冲的生存期（chunk / 行）；`keep` 保留外面的缓存，`spad_from` 指定 SPAD 临时区的起点 |
+| `sa.word` / `sa.bank` | 缓冲的固定位置：SPAD_A / ACC 的字地址、SPAD_B 的 bank |
+| `sa.accumulator` | IREE 的 i64 累加器（实际是 int32 字，尾部截断） |
+| `sa.prefix`、`sa.rows`、`sa.interleave`、`sa.prefer_bank` | 权重放进模板前缀（可在上一个 dispatch 期间运行）、每行一个 DMA 行、K 优先交错、尾部输入优先的 bank |
+
+动态大小（T）用 `memref` 的 `?` 维表达，大小是 SSA 值（cache subview 的大小；块数 `T >> log2 D` 用 `arith.shrui`）；lowering 把上界（`max_dynamic`）放进静态字段，`Lin`（push constant 的线性函数）放进动态字段。
+
+**怎么保证是纯重构**：每一步展开之后跑黄金语料，与旧 lowering 逐字节比较。展开后的 IR 创建寄存器的顺序和旧 lowering 不同（BASE、setup PARAM 按首次使用编号），所以 `golden.py` 比较的是规范化的反汇编：BASE 与 setup PARAM 按它们的设置表达式（binding + 偏移、push constant 的线性函数）命名，不按编号；没有前缀时忽略 prefix 寄存器字段。私有 PARAM（从 7 往下）按创建顺序，没有规范化——行游标的位置也因此和旧 lowering 完全一致。
+
+**分步**（每步黄金语料相同后提交）：
+- E1 prefill 的多行线性层：每个行块一个交错 LD 的条带，按 chunk 的 B 块、逐行块 EX、尾部、存 D 行。
+- E2 decode 的线性层：chunk 循环（`sahl.loop` + `sa.advance`）、SPAD_B bank 交替、chunk 0 的权重进前缀（`sa.prefix`）、ACC 固定位置（`sa.word`）。
+- E3a 通用 contraction（静态）：三种矩阵布局（packed 原样、K 行 → 转置、N 行 → 交错），K 分块累加，尾部的四类输入（逐元素、逐列、逐行、标量）。DDR 操作数的“维 → 循环”映射由它的 stride 和每个循环的元素偏移推出（视图可以相对 contraction 的操作数转置）。x 在 ACC 时 K 分块依赖它的地址：重放局部内存分配器得到（只在内核是 dispatch 里第一个发命令的操作时；这处耦合由第 3 项的内存规划去掉）。
+- E4 注意力（decode，动态 T）：K 行 `sa.rows` 载入后转置成 `T / D` 个块、V 行交错载入、q / p 的条带、EX、按头的尾部；scores 的 H 行连续存。
+- E4a 通用 contraction 的动态 K / N（prefill 注意力的 `batch_matmul`：`q · K^T` 的 N = T、`p · V` 的 K = T；`ukernels=none` 时 decode 的注意力也走这里）：一个 K 块、一个 chunk；p 的行和 scores 的行行距是动态的（动态维之后可以有大小为 1 的维），用行游标逐行走。
+- E5 删除 `SahlLowerKernels.cpp` 与 `generic` 里只给它用的 chunk 路径；`sahl_kernels.mlir` 的 LOW 改为经过展开。
+
+**验证**：黄金语料（4002 个 dispatch）；lit：`sahl_expand_kernels.mlir`（E1）、`sahl_kernels.mlir` 的 EXP / EXPGEN（E2 / E3a）、`sahl_expand_dynamic.mlir`（E4a：scores / PV 的游标与动态字段），lit 共 14 个；SmolLM2 通用路径（prefill M = 8 + decode）：794 个可执行上加速器，展开后没有剩下的内核，`dispatch_check --dirty` 全部一致，prefill + decode 与只用 decode 逐位一致（5/5 行），teacher-forced 34/40。
+
+**代码量**：`SahlExpandKernels.cpp` 989 行（展开），`SahlToSahw.cpp` 892 行（一对一翻译），`SahlLowerGeneric.cpp` 771 行。
+
+**之后**：调度现在在 IR 上，能被看见、能被改：(1) §8.19 的方向——线性层的调度套在任意尾部上（会改变输出，按第 3 项的方式验收）；(2) 第 3 项带生存期的内存规划：展开后所有局部缓冲都是 `memref.alloc`，`sa.word` / `sa.bank` / `sahl.scope` 由规划决定，而不是照抄旧 lowering 的地址。
+
 ## 9. 验证体系
 
 | 层次 | 内容 | 工具 |
@@ -1351,7 +1389,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 | **前端通用化** | HuggingFace 的原始建模代码直接导出，量化与写法由通用图改写完成（§8.16） | sa 的 dispatch 与 oracle 逐位一致，质量（与原版 fp32 HF 的 top-1）不低于手写 qhf 路径；Qwen3 不改代码；上板；非 Llama 结构。**进行中**（F0–F4 完成；通用路径的 prefill + decode 与只用 decode 逐位一致（sim 与板上），decode 全部在加速器上，Qwen3 不改代码通过，§8.19） | 大 |
 | **主机退路** | sa 编不了的 dispatch 在 ARM 上用 VMVX 运行（§8.15） | 任何 dispatch 都能跑；混合执行与只用加速器逐位一致（线性层放主机的 stories15M）。**完成**（sim 与板上） | 中 |
-| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**完成**（2026-09-29，§8.14：R0–R6；微内核的 `sahl` 展开、带生存期的内存规划已排进下一步（§8.17）；`sahw-legalize-dynamic`、R7 代价模型留给以后） | 大 |
+| **C8 代码生成分层重构** | 把 `sahl-to-sahw` 拆成 §8.4 设计的 pass：`sahl` 操作、微内核展开、分块、内存规划、流水、动态值（§8.14） | 每步黄金语料的描述符逐字节相同；`SahlToSahw.cpp` < 1000 行；每个 pass 有 lit 测试。**完成**（2026-09-29，§8.14：R0–R6；微内核的 `sahl` 展开 2026-10-04 完成（§8.20，`sahl-expand-kernels`，旧内核 lowering 已删除）；带生存期的内存规划是下一步（§8.17 第 3 项）；`sahw-legalize-dynamic`、R7 代价模型留给以后） | 大 |
 | **C7 RISC-V 后端**（可选） | `sahw` → LLVM → riscv32，PicoRV32 用 PCPI 指令发命令（§8.10） | 一个 dispatch 由 PicoRV32 代码执行，与描述符路径逐位一致 | 中 |
 
 - **顺序**：C0 → C1 → C2 → C3 → C4 → C5。C1 和 C0 可以并行；C2 依赖 C1 的驱动与 sim。
