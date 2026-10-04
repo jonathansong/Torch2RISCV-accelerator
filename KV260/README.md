@@ -6,15 +6,35 @@ unchanged (D = 8, 128 KB per SPAD, 256 KB ACC, one 64-bit DMA port, 50 MHz);
 the plan's later stages change one thing at a time (K1b 100 MHz, K1c D = 16).
 
 ```sh
-KV260/scripts/build_bitstream.sh -jobs 4                 # K1a: D = 8, 50 MHz
-KV260/scripts/build_bitstream.sh -jobs 4 -sa_mhz 100     # K1b
-KV260/scripts/build_bitstream.sh -jobs 4 -sa_d 16 -sa_mhz 100   # K1c
+KV260/scripts/build_bitstream.sh -jobs 2                 # K1a: D = 8, 50 MHz (~25 min)
+KV260/scripts/build_bitstream.sh -jobs 2 -sa_mhz 100     # K1b
+KV260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100   # K1c
 KV260/scripts/build_bitstream.sh -bd_only                # block design + address map only (minutes)
+KV260/scripts/build_bitstream.sh -jobs 2 -synth_only     # stop after synthesis (~9 min)
 ```
 
 Outputs in `KV260/build/output/`: `picorv32.bit` / `picorv32.hwh` (same
 basename for PYNQ), `timing_summary.rpt`, `utilization.rpt`, `clocks.rpt`,
 `check_timing.rpt`, `address_map.txt`.
+
+## Builds
+
+| Build | Date | LUT | FF | DSP | BRAM36 | URAM | Setup WNS / hold WHS | Notes |
+|---|---|---|---|---|---|---|---|---|
+| K1a: D = 8, 50 MHz (`-jobs 2`) | 2026-10-04 | 40,351 (34.5%) | 31,576 (13.5%) | 115 (9.2%) | 130 / 144 (90.3%) | 0 / 64 | +9.050 / +0.010 ns | no unclocked or unconstrained endpoints (`check_timing`); one clock `clk_pl_0` (20 ns) |
+
+K1a: the worst setup path (10.5 ns data path, 14 levels including a DSP
+multiplier) runs from the DMA port's read data (`PS8_i/SAXIGP3RCLK`, HP1)
+to the descriptor fetch unit's `fetch/param_reg`, so about 90-95 MHz is the
+limit as built: K1b (100 MHz) needs a register stage on that path. BRAM is
+at 90%: SPAD / ACC growth (K3, D = 32's wider words) goes to URAM.
+
+Memory: the build runs in one Vivado process (global IP synthesis, in-process
+synth / place / route) inside a systemd scope with MemoryMax = 12G; the
+project-mode out-of-context runs reloaded the UltraScale+ device data per IP
+run and systemd-oomd killed the terminal / the build on this 15 GB machine.
+`-synth_only -jobs 2`: peak RSS 11.9 GB (with the mapped device data), at
+least 3.1 GB left.
 
 ## Block design (`scripts/kv260_bd.tcl`)
 

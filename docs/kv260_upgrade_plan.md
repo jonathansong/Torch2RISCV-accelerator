@@ -161,7 +161,7 @@
    - **HP0 直接配置为 64 位**（ZynqMP 的 HP 口支持 32 / 64 / 128 位），加速器的 64 位 AXI master 直接连接，不需要位宽转换器，也不需要 Z1 上的 AXI4→AXI3 转换；
    - PicoRV32 的 DDR 口（原 HP0，用于读环形队列）接 HP1 或经 SmartConnect 共用。
    - **时钟域**：沿用 Z1 的做法，PicoRV32 与加速器在**同一个时钟**（Z1 的 `pico_bit.tcl` 中 `riscv_clk` 与 `matmul_0/aclk` 都接 `subprocessorClk`），PS 侧 AXI-Lite 经互连跨时钟域。之后提频时两者一起提：PCPI 是紧耦合接口，拆成两个时钟域需要在 PCPI 与命令路径上都做跨时钟域处理。只有当 PicoRV32 或 PCPI（`sa_pcpi.v`）的路径成为完整实现中的关键路径时，才评估拆分。
-   **已写好**（2026-10-04，`kv260` 分支）：`KV260/scripts/kv260_bd.tcl` + `build_bitstream.{tcl,sh}`（`-sa_d`、`-sa_mhz`、`-bd_only`），block design 在 Vivado 2024.1 中验证通过（`-bd_only`）；与 Z1 的差别：只有一个 PL 时钟 `pl_clk0`（不用 clk_wiz），加速器 DMA 直接接 `S_AXI_HP1_FPD`（AXI4，不要协议转换），没有 PL 引脚。完整构建（综合、实现、bitstream）待跑。见 `KV260/README.md`。
+   **已写好**（2026-10-04，`kv260` 分支）：`KV260/scripts/kv260_bd.tcl` + `build_bitstream.{tcl,sh}`（`-sa_d`、`-sa_mhz`、`-bd_only`），block design 在 Vivado 2024.1 中验证通过（`-bd_only`）；与 Z1 的差别：只有一个 PL 时钟 `pl_clk0`（不用 clk_wiz），加速器 DMA 直接接 `S_AXI_HP1_FPD`（AXI4，不要协议转换），没有 PL 引脚。**完整构建通过**（2026-10-04）：LUT 34.5%、DSP 115、BRAM36 130 / 144（90%）、URAM 0；50 MHz 下 setup WNS +9.05 ns、hold WHS +0.010 ns，`check_timing` 无未约束路径。最差路径从 DMA 口（HP1）的读数据经 DSP 乘法到描述符取指单元的 `fetch/param_reg`（数据路径 10.5 ns），按现状约 90–95 MHz，**K1b 的 100 MHz 需要在这条路径上加一级寄存器**。构建在一个 Vivado 进程里完成（这台 15 GB 的机器上，分 IP 单独综合的子进程会被 systemd-oomd 杀掉）。见 `KV260/README.md`。
 2. 地址映射：记录 ARM 侧的 BRAM、CSR、mailbox 新地址，写进 `docs/memory_model.md` 的 KV260 一节。ARM 侧：BRAM `0xA001_0000`（mailbox `0xA001_1F00`，perf 区 `0xA001_1E00`）、中断控制器 `0xA002_0000`；RISC-V 与加速器侧与 Z1 相同，DDR 为低 2 GB。
 3. `synth_ooc.tcl` 加 K26 器件选项，先做脱离上下文的综合，确认资源。
 
@@ -189,6 +189,8 @@
 
 1. 只改 `pl_clk0` 为 100 MHz，其他不变；记录 WNS / TNS、关键路径。
 2. 重跑 K1a 的验证顺序第 2–6 步。
+
+K1a 的构建显示最差路径（DMA 读数据 → DSP 乘法 → 描述符取指单元的 `fetch/param_reg`，数据路径 10.5 ns）只能到约 90–95 MHz：100 MHz 前先在这条路径上加一级寄存器（`sa_cmdfetch.v`），以功能仿真与板上逐位一致验收。
 
 **验收**：时序收敛，第 5、6 步逐位一致。性能为观测项：`bwtest` 的入口上限变为 0.8 GB/s（64 位 × 100 MHz），decode 的 token/s 预计有提升，但主机开销与 DDR 延迟使它不一定是 Z1 的两倍。
 
