@@ -161,7 +161,8 @@
    - **HP0 直接配置为 64 位**（ZynqMP 的 HP 口支持 32 / 64 / 128 位），加速器的 64 位 AXI master 直接连接，不需要位宽转换器，也不需要 Z1 上的 AXI4→AXI3 转换；
    - PicoRV32 的 DDR 口（原 HP0，用于读环形队列）接 HP1 或经 SmartConnect 共用。
    - **时钟域**：沿用 Z1 的做法，PicoRV32 与加速器在**同一个时钟**（Z1 的 `pico_bit.tcl` 中 `riscv_clk` 与 `matmul_0/aclk` 都接 `subprocessorClk`），PS 侧 AXI-Lite 经互连跨时钟域。之后提频时两者一起提：PCPI 是紧耦合接口，拆成两个时钟域需要在 PCPI 与命令路径上都做跨时钟域处理。只有当 PicoRV32 或 PCPI（`sa_pcpi.v`）的路径成为完整实现中的关键路径时，才评估拆分。
-2. 地址映射：记录 ARM 侧的 BRAM、CSR、mailbox 新地址，写进 `docs/memory_model.md` 的 KV260 一节。
+   **已写好**（2026-10-04，`kv260` 分支）：`KV260/scripts/kv260_bd.tcl` + `build_bitstream.{tcl,sh}`（`-sa_d`、`-sa_mhz`、`-bd_only`），block design 在 Vivado 2024.1 中验证通过（`-bd_only`）；与 Z1 的差别：只有一个 PL 时钟 `pl_clk0`（不用 clk_wiz），加速器 DMA 直接接 `S_AXI_HP1_FPD`（AXI4，不要协议转换），没有 PL 引脚。完整构建（综合、实现、bitstream）待跑。见 `KV260/README.md`。
+2. 地址映射：记录 ARM 侧的 BRAM、CSR、mailbox 新地址，写进 `docs/memory_model.md` 的 KV260 一节。ARM 侧：BRAM `0xA001_0000`（mailbox `0xA001_1F00`，perf 区 `0xA001_1E00`）、中断控制器 `0xA002_0000`；RISC-V 与加速器侧与 Z1 相同，DDR 为低 2 GB。
 3. `synth_ooc.tcl` 加 K26 器件选项，先做脱离上下文的综合，确认资源。
 
 **软件**

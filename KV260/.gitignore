@@ -1,0 +1,13 @@
+# Vivado build output (scripts/build_bitstream.sh)
+/build/
+.Xil/
+vivado*.log
+vivado*.jou
+
+# tests/ddr_access build + xsim artifacts (ddr_test.bin is kept)
+/tests/ddr_access/ddr_test.elf
+/tests/ddr_access/sim/ddr_test.hex
+/tests/ddr_access/sim/xsim.dir/
+/tests/ddr_access/sim/*.log
+/tests/ddr_access/sim/*.jou
+/tests/ddr_access/sim/*.pb
