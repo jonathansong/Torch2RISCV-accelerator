@@ -99,6 +99,7 @@ struct ContractPlan {
 struct Range {
   int64_t size = 1;
   std::optional<Lin> dyn;
+  Value val;                                    // (dynamic) the size's SSA value
 };
 
 // ------------------------------------------------------------ linear layers (C5.2)

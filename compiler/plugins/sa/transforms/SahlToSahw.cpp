@@ -2,7 +2,8 @@
 // sahw.template per dispatch function in sahl form. The decisions come from
 // the sahl passes before it (sa-to-sahl: kernels, gathers, to_i8, scatters;
 // sahl-tile: pieces; sahl-plan-memory: places and layouts; sahl-schedule:
-// the linear kernels' chunks); this pass translates them into commands:
+// the linear kernels' chunks; sahl-expand-kernels: the micro-kernels as
+// strips, tiles, EX, loops, scopes); this pass translates them into commands:
 //   - local buffers: words of SPAD_A / ACC in order at first use
 //     (SahlLocalMemory.h), released after a piece, a chunk or a row;
 //   - DDR views: binding subspan + subview offsets -> a BASE register (binding
@@ -10,7 +11,9 @@
 //   - linalg.generic: every arith / math operation of the body becomes one
 //     single-stage VE (sahw-fuse-ve merges them); indexing maps give the
 //     operand index modes (SahlLowerGeneric.cpp);
-//   - kernels: the linear, attention and contraction schedules (SahlLowerKernels.cpp).
+//   - the micro-kernel ops (sahl.strip / mma / bcast / transpose / loop /
+//     scope / claim_spad / cursor_reset) and the placed buffers (sa.word, sa.bank);
+//     a sahl.kernel left over is an error (the dispatch runs on the host).
 // This file: the pass, the block walk, registers, local memory, DDR / DMA,
 // the VE helpers, scatter.
 #include "SahlLower.h"
@@ -19,20 +22,10 @@ namespace mlir::iree_compiler::sa {
 namespace lower {
 
 bool Lowerer::run() {
-  // the kernels sa-to-sahl grouped: each one's plan from its anchor
-  for (auto k : f.getBody().front().getOps<sahl::KernelOp>()) {
-    Operation *a = nullptr;
-    for (Operation &o : k.getBody().front())
-      if (o.hasAttr("sahl.anchor")) a = &o;
-    StringRef kind = k.getKind();
-    bool ok = false;
-    if (!a) ok = false;
-    else if (kind == "linear") ok = isa<linalg::GenericOp>(a) && km.matchLinear(cast<linalg::GenericOp>(a));
-    else if (kind == "attention") ok = isa<linalg::BatchMatmulOp>(a) && km.matchAttention(cast<linalg::BatchMatmulOp>(a));
-    else if (kind == "contraction") ok = isa<linalg::LinalgOp>(a) && km.matchContraction(cast<linalg::LinalgOp>(a));
-    if (!ok) return fail("sahl.kernel \"" + kind.str() + "\": no plan for its operations");
-    anchorOf[k] = a;
-  }
+  // the micro-kernels are written out by sahl-expand-kernels; one left has a
+  // form it does not cover (the dispatch then runs on the host)
+  for (auto k : f.getBody().front().getOps<sahl::KernelOp>())
+    return fail("sahl.kernel \"" + k.getKind().str() + "\" not expanded by sahl-expand-kernels");
   return lowerBlock(f.getBody().front());
 }
 
@@ -56,6 +49,11 @@ bool Lowerer::lowerBlock(Block &block) {
       bcastOf.clear();
       if (!lowerBlock(sc.getBody().front())) return false;
       mem.release(mark);
+      continue;
+    }
+    if (isa<sahl::CursorResetOp>(op)) {
+      if (!rowAcc) rowAcc = privateParam();
+      sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 0, ValueRange{});
       continue;
     }
     if (auto cs = dyn_cast<sahl::ClaimSpadOp>(op)) {
@@ -114,20 +112,6 @@ bool Lowerer::lowerBlock(Block &block) {
       reserved[rs.getBuffer()] = *l;
       continue;
     }
-    if (auto k = dyn_cast<sahl::KernelOp>(op)) {
-      Operation *a = anchorOf.lookup(k);
-      if (auto it = km.linears.find(a); it != km.linears.end()) {
-        curKernel = k;
-        bool ok = linear(it->second);
-        curKernel = {};
-        if (!ok) return false;
-      } else if (auto it = km.attns.find(a); it != km.attns.end()) {
-        if (!attention(it->second)) return false;
-      } else if (!contraction(km.contracts[a])) {
-        return false;
-      }
-      continue;
-    }
     if (isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CastOp,
             memref::DimOp, memref::CollapseShapeOp, IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp,
             IREE::TensorExt::DispatchWorkloadOrdinalOp, func::ReturnOp>(op))
@@ -166,15 +150,6 @@ bool Lowerer::lowerBlock(Block &block) {
     return fail("unsupported operation " + op->getName().getStringRef().str());
   }
   return err.empty();
-}
-
-KernelSchedule Lowerer::scheduleOf(const LinearPlan &p) {
-  KernelSchedule ks = linearSchedule(p, lay, d);
-  if (curKernel) {
-    if (auto c = curKernel->getAttrOfType<IntegerAttr>("chunk_tiles")) ks.chunkTiles = c.getInt();
-    if (auto l = curKernel->getAttrOfType<BoolAttr>("loop")) ks.loop = l.getValue();
-  }
-  return ks;
 }
 
 bool Lowerer::fail(const std::string &m) {
@@ -415,6 +390,7 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
       int64_t so;
       if (failed(st.getStridesAndOffset(ss, so))) return fail("subview source strides"), std::nullopt;
       for (auto [o, str] : llvm::zip(s.getStaticOffsets(), ss)) {
+        if (o == 0) continue;                      // (row 0 of rows a dynamic stride apart: a cursor's view)
         if (ShapedType::isDynamic(o) || ShapedType::isDynamic(str)) return fail("dynamic subview"), std::nullopt;
         elem += o * str;
       }
@@ -520,12 +496,32 @@ int64_t Lowerer::leadingPitch(Value v, int64_t rb) {
   return st[0] * esize(mt.getElementType());
 }
 
+bool Lowerer::cursorDma(Operation *op, bool isLoad, const Ddr &r, uint32_t la) {
+  if (!r.dynRows || r.rows != 1 || r.pitch || r.off % 8) return fail("cursor DMA other than a dynamic-length row");
+  uint32_t es = esize(r.et);
+  Lin b = *r.dynRows;
+  b.mul *= es;
+  b.add *= es;
+  Value bp = paramFor(b);
+  if (!rowAcc) rowAcc = privateParam();
+  int64_t maxBytes = cfg.maxDynamic * es;
+  if (isLoad) dynDma(sahw::LdOp::create(bb, loc, r.base, r.off, int64_t(la), 1, maxBytes, maxBytes, 0, ValueRange{rowAcc, bp}), rowAcc, bp);
+  else dynDma(sahw::StOp::create(bb, loc, r.base, r.off, int64_t(la), 1, maxBytes, maxBytes, ValueRange{rowAcc, bp}), rowAcc, bp);
+  if (op->hasAttr("sa.cursor_step")) {
+    auto s = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{bp});
+    s.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});
+    s.setDynAdd(ArrayRef<bool>{false});
+  }
+  return true;
+}
+
 bool Lowerer::load(sahl::LoadOp l) {
   auto r = ddrOf(l.getSrc(), /*allowPitch=*/true);
   if (!r) return false;
   if (r->et.isInteger(64)) return fail("i64 load");
   auto dst = bufOf(l.getDst());
   if (!dst) return false;
+  if (l->hasAttr("sa.cursor")) return cursorDma(l, true, *r, dst->la);
   Value adv = advanceOf(l);
   if ((dst->la >> 28) == uint32_t(::sa::MEM_SPAD_B)) {
     // weight tiles [nc, K, D] into a SPAD_B bank: one row per tile; with
@@ -587,8 +583,12 @@ bool Lowerer::store(sahl::StoreOp s) {
   auto r = ddrOf(s.getDst(), /*allowPitch=*/true);
   if (!r) return false;
   auto it = locals.find(s.getSrc());
-  if (it == locals.end()) return fail("stored buffer not computed");
-  LocalBuf l = it->second;
+  std::optional<LocalBuf> sl;
+  if (it != locals.end()) sl = it->second;
+  else if (s.getSrc().getDefiningOp<memref::SubViewOp>()) sl = bufOf(s.getSrc());   // (a view of a computed buffer)
+  if (!sl) return fail("stored buffer not computed");
+  LocalBuf l = *sl;
+  if (s->hasAttr("sa.cursor")) return cursorDma(s, false, *r, l.la);
   if (Value adv = advanceOf(s)) {                  // a contiguous row moving on with the loop
     uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
     if (r->pitch || r->dyn || r->off % 8 || bytes > 65535) return fail("advancing store");

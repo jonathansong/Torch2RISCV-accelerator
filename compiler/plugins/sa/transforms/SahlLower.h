@@ -1,10 +1,10 @@
 // The lowering of sahl-to-sahw (docs/iree_compiler_plan.md §8.4 step 10,
 // §8.14 C8 R6): one sahw.template per dispatch function, translating the
-// decisions the sahl passes made (kernels, gathers, pieces, memory places,
-// schedules) into commands. Definitions: SahlToSahw.cpp (the pass, the block
-// walk, registers, local memory, DDR / DMA, VE helpers, scatter),
-// SahlLowerGeneric.cpp (linalg.generic: element-wise, reductions, gathers),
-// SahlLowerKernels.cpp (linear layers, attention, generic contractions).
+// decisions the sahl passes made (gathers, pieces, memory places, the
+// micro-kernels written out by sahl-expand-kernels) into commands.
+// Definitions: SahlToSahw.cpp (the pass, the block walk, registers, local
+// memory, DDR / DMA, the micro-kernel ops, VE helpers, scatter),
+// SahlLowerGeneric.cpp (linalg.generic: element-wise, reductions, gathers).
 #ifndef SA_TRANSFORMS_SAHLLOWER_H_
 #define SA_TRANSFORMS_SAHLLOWER_H_
 
@@ -96,7 +96,7 @@ class Lowerer {
 public:
   Lowerer(func::FuncOp f, const TargetConfig &cfg, sahw::TemplateOp t, sahw::BodyOp body)
       : f(f), cfg(cfg), d(cfg.d), lay(uint32_t(cfg.d), uint32_t(cfg.spadBytes), uint32_t(cfg.accBytes)),
-        regB(body), bb(OpBuilder::atBlockEnd(&body.getRegion().front())), loc(f.getLoc()), mem(lay), km(cfg) {
+        regB(body), bb(OpBuilder::atBlockEnd(&body.getRegion().front())), loc(f.getLoc()), mem(lay) {
   }
 
   bool run();
@@ -123,11 +123,7 @@ private:
   Value curLen;                                  // row mode: the dynamic LEN of full-length VEs
   int64_t curLenStatic = -1;
   std::map<std::pair<void *, int>, Value> validParams;   // (i64 scalar, predicate) -> VALID count
-  KernelMatcher km;                              // the plans of the kernels (SahlKernels.h)
-  llvm::DenseMap<Operation *, Operation *> anchorOf;   // sahl.kernel -> its anchor
-  sahl::KernelOp curKernel;                      // the kernel being lowered
   // its schedule: as sahl-schedule chose (the attributes), else chosen here
-  KernelSchedule scheduleOf(const LinearPlan &p);
 
   bool fail(const std::string &m);
 
@@ -191,6 +187,8 @@ private:
     op.setDynAdd(a);
   }
   bool dynamicDma(const Ddr &r, const LocalBuf &l, bool isLoad);
+  // a row of a dynamic length at the row cursor (sa.cursor; sa.cursor_step: then the cursor on)
+  bool cursorDma(Operation *op, bool isLoad, const Ddr &r, uint32_t la);
 
   // A contiguous DMA of `bytes` (a multiple of 8) between DDR and local memory:
   // one row, or beyond the 16-bit row length rows of the largest multiple of
@@ -249,61 +247,6 @@ private:
   // (the form is checked by sa-to-sahl: rowScatter)
   bool scatter(sahl::ScatterOp sc);
 
-  // ------------------------------------------------------------ attention (C5.3)
-  // scores: bmm(ext(K^T), q) -> [H, T, 1], epilogue (f32(acc) * s_q[h]) * a_k;
-  // P V:    bmm(p, ext(V))   -> [H, 1, hs], epilogue f32(acc) * a_v;
-  // K / V: i8 [T, H, hs], a slice of the KV cache in DDR, through an extsi
-  // generic with map (t, h, j) -> (h, t, j). Per head, as C3 (compile_model.
-  // attention): K rows -> TRANSPOSE -> K^T tiles, or V rows loaded interleaved;
-  // q_h or p_h as a replicated int8 A strip; EX; one VE for the epilogue. T
-  // is dynamic (PARAMs from push constants).
-
-  // the byte offset of a DDR view with static offsets from its binding subspan
-  std::optional<std::pair<Value, int64_t>> ddrStart(Value v, int64_t es);
-
-  bool attention(AttnPlan &p);
-
-  // ------------------------------------------------------------ contractions (C5.4, generic)
-  // y[b, n] = sum_k x[b, k] * M[b, n, k] over int8 values (int32 accumulator),
-  // the result consumed by one element-wise epilogue that is stored. Each
-  // operand is followed back to DDR (through its sahl.load and an extsi
-  // generic, possibly transposing), giving its element offset as a linear
-  // function of the contraction's loops; the loops then split into batch (in
-  // x and M), output n (in M only) and reduction k. The matrix becomes B tiles
-  // by its layout:
-  //   packed [N/D, K, D] (the packed weights): loaded as is;
-  //   rows of K (n stride sN, k contiguous): rows loaded, TRANSPOSE;
-  //   rows of N (k stride sK, n contiguous): loaded INTERLEAVE;
-  // x becomes the A strip (each element over the D rows). Per batch, per chunk
-  // of output tiles: the B tiles, EX, the epilogue on the chunk (element-wise
-  // lowering), the store. A plain serial schedule (the micro-kernels are the
-  // tuned ones); dynamic N or K (one chunk of all tiles) from PARAMs.
-
-  bool contraction(ContractPlan &p);
-
-  // ------------------------------------------------------------ linear layers (C5.2)
-  // y = epilogue(sum_k x[k] * W[n, k], ...): a contraction generic with the
-  // packed weights (i8 [N / D, K, D], iree-sa-pack-linear-weights) and x (i8 or
-  // int8 values in i32), its int32 accumulator consumed by one element-wise
-  // epilogue generic [N / D, D] whose result is stored. Lowered as C3's
-  // qlinear schedule (compile_layer.linear): chunks of output tiles, the
-  // weights of chunk i + 1 loaded into the other SPAD_B bank while chunk i
-  // computes, each chunk's epilogue through the element-wise lowering, many
-  // chunks as a LOOP_END loop over pairs, chunk 0's weights in the prefix.
-
-  // prefill's linear layer (plan §8.13): each block of D rows of int8 x is one
-  // A strip (an interleaved DMA: block c of K, word r = row r's D elements c,
-  // exactly EX's A layout), so the D x D array computes D rows at once and a
-  // chunk of weight tiles serves every row block. Per chunk of output tiles:
-  // its B tiles and per-column inputs, then per row block the EX (output rows
-  // crow = nc words apart), the epilogue over D x nc words (per-column inputs
-  // by MOD nc, per-row broadcast words by DIV nc), the store of D rows. The
-  // next chunk's weights are loaded during this chunk's EX and epilogues (the
-  // other bank, right after its first EX, as decode's linear).
-  bool linearRows(LinearPlan &p);
-
-  bool linear(LinearPlan &p);
-
   // ------------------------------------------------------------ linalg.generic
   // an i64 scalar: x + c (positions), as C3: the value v in every lane, then
   // (swapneg(v) - v) * -0.5 = [v, 0, v, 0, ...], the i64 (v, 0) in lanes 0, 1
@@ -324,17 +267,7 @@ private:
     bool fixed = false;
   };
 
-  // a chunk of a linear layer's epilogue: the inputs given, n elements, the
-  // result into outLa (of type outVt: fp32, or int32 for an epilogue that only
-  // truncates the accumulator)
-  struct Chunk {
-    std::map<int, Val> inputs;
-    int64_t n = 0;
-    uint32_t outLa = 0;
-    VType outVt = ::sa::VT_F32;
-  };
-
-  bool generic(linalg::GenericOp g, const RowSel *sel = nullptr, const Chunk *chunk = nullptr);
+  bool generic(linalg::GenericOp g, const RowSel *sel = nullptr);
 };
 
 }  // namespace mlir::iree_compiler::sa::lower

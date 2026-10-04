@@ -4,7 +4,7 @@
 // dispatch main 28, before sa-to-sahl).
 // RUN: iree-opt --iree-sa-to-sahl %s | FileCheck %s --check-prefix=UK
 // RUN: iree-opt --iree-sa-to-sahl="ukernels=none" %s | FileCheck %s --check-prefix=GEN
-// RUN: iree-opt --iree-sa-to-sahl --iree-sahl-to-sahw %s | FileCheck %s --check-prefix=LOW
+// RUN: iree-opt --iree-sa-to-sahl --iree-sahl-schedule --iree-sahl-expand-kernels --iree-sahl-to-sahw %s | FileCheck %s --check-prefix=LOW
 // RUN: iree-opt --iree-sa-to-sahl --iree-sahl-schedule %s | FileCheck %s --check-prefix=SCHED
 // RUN: iree-opt --iree-sa-to-sahl --iree-sahl-schedule --iree-sahl-expand-kernels %s | FileCheck %s --check-prefix=EXP
 // RUN: iree-opt --iree-sa-to-sahl="ukernels=none" --iree-sahl-schedule --iree-sahl-expand-kernels %s | FileCheck %s --check-prefix=EXPGEN

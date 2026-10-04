@@ -149,6 +149,16 @@ def Sahl_ClaimSpadOp : Sahl_Op<"claim_spad"> {
   let assemblyFormat = "attr-dict";
 }
 
+def Sahl_CursorResetOp : Sahl_Op<"cursor_reset"> {
+  let summary = "The row cursor (a DDR offset kept on the device) back to 0";
+  let description = [{
+    Rows of a dynamic length (bytes per row = f(T)) are walked with a cursor:
+    a load / store with `sa.cursor` adds it to its DDR address (its view is
+    row 0), and with `sa.cursor_step` moves it on by its row's bytes after.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
 def Sahl_TransposeOp : Sahl_Op<"transpose"> {
   let summary = "Rows [R, C] in SPAD_A -> weight tiles in a SPAD_B bank (TRANSPOSE: B tiles of a row-major matrix)";
   let arguments = (ins Arg<AnyMemRef, "the rows", [MemRead]>:$src, Arg<AnyMemRef, "the tiles", [MemWrite]>:$dst);

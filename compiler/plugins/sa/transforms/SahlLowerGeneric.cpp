@@ -90,7 +90,7 @@ std::optional<LocalBuf> Lowerer::scalarI64(Value v) {
   return l;
 }
 
-bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk) {
+bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
   auto iters = g.getIteratorTypesArray();
   int nloops = int(iters.size());
   SmallVector<AffineMap> maps = g.getIndexingMapsArray();
@@ -101,7 +101,7 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
   bool collapse = false, merge = false;
   int indexShift = 0, split = 0;
   SmallVector<AffineMap> maps2;
-  if (nloops > 2 && !chunk) {
+  if (nloops > 2) {
     bool noIndex = g.getRegion().front().getOps<linalg::IndexOp>().empty();
     bool red = llvm::any_of(iters, [](utils::IteratorType t) { return t == utils::IteratorType::reduction; });
     if (llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }) && !red && noIndex) {
@@ -149,7 +149,7 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
   }
   SmallVector<int64_t> ranges(nloops, -1);
   std::optional<Lin> dynInner;
-  for (int i = 0; i < int(g->getNumOperands()) && !chunk; ++i) {
+  for (int i = 0; i < int(g->getNumOperands()); ++i) {
     Value opnd = g->getOperand(i);
     auto mt = dyn_cast<MemRefType>(opnd.getType());
     if (!mt) continue;
@@ -171,7 +171,7 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     }
   }
   for (int64_t r : ranges)
-    if (r < 0 && !chunk) return fail("loop range not given by an operand");
+    if (r < 0) return fail("loop range not given by an operand");
   if (merge) {
     int64_t rows = 1, inner = 1;
     for (int L = 0; L < split; ++L) rows *= ranges[L];
@@ -190,15 +190,10 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     ranges = {prod};
     nloops = 1;
   }
-  if (chunk) {                                          // a slice of n elements, all inputs given
-    ranges = {chunk->n};
-    nloops = 1;
-    dynInner.reset();
-  }
   // a prefix mask (innermost index <= / < an i64 scalar) over several static
   // rows: VALID counts the elements of a whole VE, so one row at a time too
   bool maskRows = false;
-  if (!dynInner && !sel && !chunk && nloops == 2 && ranges[0] > 1 && ranges[1] % d == 0) {
+  if (!dynInner && !sel && nloops == 2 && ranges[0] > 1 && ranges[1] % d == 0) {
     const int last = int(g.getNumLoops()) - 1;
     g.getRegion().front().walk([&](arith::CmpIOp c) {
       auto isInnerIndex = [&](Value v) {
@@ -251,7 +246,7 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
   // is rounded up to D (local buffers are whole words; the store of the
   // result rounds its bytes to 8, inside IREE's 64-byte aligned allocations)
   bool allIdentity = !reduction && llvm::all_of(maps, [](AffineMap m) { return m.isIdentity(); }) &&
-                     g.getRegion().front().getOps<linalg::IndexOp>().empty() && !dynInner && !chunk;
+                     g.getRegion().front().getOps<linalg::IndexOp>().empty() && !dynInner;
   if (nloops == 2 && inner % d && allIdentity) {
     ranges = {n};
     nloops = 1;
@@ -267,10 +262,6 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
   // inputs
   for (int i = 0; i < nin; ++i) {
     Value in = g.getDpsInputs()[i];
-    if (chunk && chunk->inputs.count(i)) {
-      vals[body.getArgument(i)] = chunk->inputs.at(i);
-      continue;
-    }
     AffineMap m = maps[i];
     auto mt = dyn_cast<MemRefType>(in.getType());
     if (!mt) return fail("scalar generic input");
@@ -724,20 +715,9 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
        uint32_t(inner / d));
     return combine();
   }
-  if (chunk && (reduction || g.getNumDpsInits() != 1)) return fail("linear epilogue with a reduction or two results");
   for (unsigned r = 0; r < unsigned(g.getNumDpsInits()); ++r) {
     Value init = g.getDpsInits()[r];
     Val y = valOf(yield.getOperand(r));
-    if (chunk) {
-      if (y.kind == Val::ToI8 && chunk->outVt == ::sa::VT_I8) {   // int8 (e.g. a KV row): the VE's output conversion
-        if (y.inner->kind != Val::Mem || y.inner->negInf) return fail("linear epilogue result");
-        ve(y.inner->o, std::nullopt, chunk->outLa, ::sa::VT_I8, chunk->n, ::sa::VOP_COPY);
-        continue;
-      }
-      if (y.kind != Val::Mem || y.negInf || chunk->outVt == ::sa::VT_I8) return fail("linear epilogue result");
-      ve(y.o, std::nullopt, chunk->outLa, chunk->outVt, chunk->n, ::sa::VOP_COPY);
-      continue;
-    }
     if (y.negInf) return fail("-inf mask outside a max reduction");
     if (!sel && y.kind == Val::Mem && y.fresh && !locals.count(init) && init.getDefiningOp<memref::AllocOp>() &&
         vtOf(cast<MemRefType>(init.getType()).getElementType()) == y.o.vt) {

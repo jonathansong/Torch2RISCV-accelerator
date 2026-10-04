@@ -323,6 +323,7 @@ std::optional<SmallVector<Range>> KernelMatcher::loopRanges(linalg::LinalgOp op)
         if (!l) continue;
         r[de.getPosition()].size = cfg.maxDynamic;
         r[de.getPosition()].dyn = l;
+        r[de.getPosition()].val = sz;
       }
       seen[de.getPosition()] = true;
     }

@@ -87,10 +87,10 @@ struct Expander {
     return a;
   }
   // a view of v whose dimensions follow loops (map: dimension -> loop):
-  // per loop an offset and size, others whole; dimensions of the loops in
-  // `drop` and constant ones removed
+  // per loop an offset and size (a loop in `dyn`: from 0, its size that
+  // value), others whole; dimensions of the loops in `drop` and constant ones removed
   Value view(Value v, AffineMap map, const llvm::DenseMap<int, std::pair<int64_t, int64_t>> &at,
-             ArrayRef<int> drop) {
+             ArrayRef<int> drop, const llvm::DenseMap<int, Value> &dyn = llvm::DenseMap<int, Value>()) {
     auto mt = cast<MemRefType>(v.getType());
     SmallVector<OpFoldResult> o, sz, st;
     SmallVector<int64_t> shape;
@@ -101,6 +101,13 @@ struct Expander {
         int L = int(de.getPosition());
         if (auto it = at.find(L); it != at.end()) off = it->second.first, size = it->second.second;
         keep = !llvm::is_contained(drop, L);
+        if (auto it = dyn.find(L); it != dyn.end()) {
+          o.push_back(b.getIndexAttr(0));
+          sz.push_back(it->second);
+          st.push_back(b.getIndexAttr(1));
+          if (keep) shape.push_back(ShapedType::kDynamic);
+          continue;
+        }
       } else {
         keep = false, size = 1;
       }
@@ -110,6 +117,40 @@ struct Expander {
       if (keep) shape.push_back(size);
     }
     auto rt = memref::SubViewOp::inferRankReducedResultType(shape, mt, o, sz, st);
+    return memref::SubViewOp::create(b, loc, cast<MemRefType>(rt), v, o, sz, st);
+  }
+  // the dimension of rows of a dynamic length: the one dynamic dimension,
+  // only unit dimensions after it (-1: another form)
+  static int64_t rowDim(MemRefType mt) {
+    int64_t dd = -1;
+    for (int64_t r = 0; r < mt.getRank(); ++r) {
+      if (mt.isDynamicDim(r)) {
+        if (dd >= 0) return -1;
+        dd = r;
+      } else if (dd >= 0 && mt.getDimSize(r) != 1) {
+        return -1;
+      }
+    }
+    return dd;
+  }
+  // row 0 of rows of a dynamic length (rowDim, `len` long) a dynamic stride
+  // apart: [?] (the row cursor's view)
+  Value row0(Value v, Value len) {
+    auto mt = cast<MemRefType>(v.getType());
+    int64_t dd = rowDim(mt);
+    SmallVector<OpFoldResult> o, sz, st;
+    for (int64_t r = 0; r < mt.getRank(); ++r) {
+      o.push_back(b.getIndexAttr(0));
+      sz.push_back(r != dd ? OpFoldResult(b.getIndexAttr(1)) : OpFoldResult(len));
+      st.push_back(b.getIndexAttr(1));
+    }
+    auto rt = memref::SubViewOp::inferRankReducedResultType({ShapedType::kDynamic}, mt, o, sz, st);
+    return memref::SubViewOp::create(b, loc, cast<MemRefType>(rt), v, o, sz, st);
+  }
+  // [0, len) of a local 1-D buffer
+  Value prefix(Value v, Value len) {
+    SmallVector<OpFoldResult> o{b.getIndexAttr(0)}, sz{len}, st{b.getIndexAttr(1)};
+    auto rt = memref::SubViewOp::inferRankReducedResultType({ShapedType::kDynamic}, cast<MemRefType>(v.getType()), o, sz, st);
     return memref::SubViewOp::create(b, loc, cast<MemRefType>(rt), v, o, sz, st);
   }
   // rows [r0, r0 + D) and tiles [c0, c0 + nc) of a [M, nt, D] or [M, N] view
@@ -382,16 +423,24 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   return true;
 }
 
-// A generic contraction with static sizes (ContractPlan): false when it has
-// a form not written out here (dynamic K / N / rows of x: the lowering).
+// A generic contraction (ContractPlan): false when it has a form not written
+// out here (the lowering). A dynamic K or N (the cache's T: attention's
+// batch_matmuls in prefill) has one K block and one chunk; rows of x of a
+// dynamic length, or results of a dynamic length, are walked with the row cursor.
 bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, const ::sa::Layout &lay, int64_t d) {
   auto rr = km.loopRanges(p.op);
   if (!rr) return false;
   auto ranges = *rr;
   Range B = p.bLoop >= 0 ? ranges[p.bLoop] : Range{}, Gr = p.gLoop >= 0 ? ranges[p.gLoop] : Range{};
   Range Kr = ranges[p.kLoop], Nr = ranges[p.nLoop];
-  if (B.dyn || Gr.dyn || Kr.dyn || Nr.dyn) return false;
+  if (B.dyn || Gr.dyn || (Kr.dyn && Nr.dyn)) return false;
   const int64_t K = Kr.size, N = Nr.size * (p.laneLoop >= 0 ? d : 1), H = B.size, G = Gr.size;
+  const bool xRows = (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0) || (p.gLoop >= 0 && p.x.coef[p.gLoop] < 0);
+  const bool dyn = Kr.dyn || Nr.dyn;
+  if (xRows != bool(Kr.dyn)) return false;          // (x of a dynamic K: its rows a dynamic stride apart)
+  if (dyn && (p.laneLoop >= 0 || p.layout == MatLayout::Packed)) return false;
+  if (Kr.dyn && p.layout == MatLayout::RowsK) return false;
+  if (Nr.dyn && p.layout != MatLayout::RowsK) return false;
   if (K % d || N % d) return false;
   const int64_t sb = lay.sbank, nt = N / d;
   Type accT = cast<MemRefType>(p.op.getDpsInits()[0].getType()).getElementType();
@@ -411,16 +460,17 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
     auto mt = cast<MemRefType>(v.getType());
     SmallVector<int64_t> st;
     int64_t off;
-    if (!mt.hasStaticShape() || failed(mt.getStridesAndOffset(st, off))) return std::nullopt;
+    if (failed(mt.getStridesAndOffset(st, off))) return std::nullopt;
     SmallVector<AffineExpr> rs;
     for (int64_t r = 0; r < mt.getRank(); ++r) {
+      if (ShapedType::isDynamic(st[r])) return std::nullopt;
       if (mt.getDimSize(r) == 1) {
         rs.push_back(getAffineConstantExpr(0, k.getContext()));
         continue;
       }
       int found = -1;
       for (int L = 0; L < int(coef.size()); ++L)
-        if (coef[L] == st[r] && ranges[L].size == mt.getDimSize(r)) {
+        if (coef[L] == st[r] && (mt.isDynamicDim(r) ? bool(ranges[L].dyn) : ranges[L].size == mt.getDimSize(r))) {
           if (found >= 0) return std::nullopt;
           found = L;
         }
@@ -429,9 +479,13 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
     }
     return AffineMap::get(int(coef.size()), 0, rs, k.getContext());
   };
-  auto xm = viewMap(p.x.view, p.x.coef), mm = viewMap(p.m.view, p.m.coef);
+  // (rows of x a dynamic stride apart: through the row cursor, no map)
+  auto xm = xRows ? std::optional<AffineMap>(AffineMap()) : viewMap(p.x.view, p.x.coef), mm = viewMap(p.m.view, p.m.coef);
   if (!xm || !mm) return false;
   AffineMap xMap = *xm, mMap = *mm, outMap = maps[2];
+  if (xRows && Expander::rowDim(cast<MemRefType>(p.x.view.getType())) < 0) return false;
+  // results of a dynamic length: rows back to back
+  if (Nr.dyn && Expander::rowDim(cast<MemRefType>(p.store.getDst().getType())) < 0) return false;
   if (int64_t(outMap.getNumResults()) != cast<MemRefType>(p.store.getDst().getType()).getRank()) return false;
   auto outPos = [&](int L) -> int {
     if (L < 0) return -1;
@@ -460,7 +514,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       e.src = src;
       e.map = em;
       if (em.isIdentity()) {
-        if (!(mt.getElementType().isF32() || mt.getElementType().isInteger(32))) return false;
+        if (Nr.dyn || !(mt.getElementType().isF32() || mt.getElementType().isInteger(32))) return false;
         e.kind = 1;
         epiIn[i] = e;
         continue;
@@ -482,7 +536,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
           onlyRow = onlyCol = false;
         }
       }
-      if (!onlyRow && onlyCol && sn == (el >= 0 ? d : 1) && (el < 0 || sl == 1) && mt.getElementType().isF32()) {
+      if (!onlyRow && onlyCol && sn == (el >= 0 ? d : 1) && (el < 0 || sl == 1) && !Nr.dyn && mt.getElementType().isF32()) {
         e.kind = 2;
         epiIn[i] = e;
         continue;
@@ -495,6 +549,9 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       if (epi.getDpsInputs()[i] != p.op.getDpsInits()[0] && !epiIn.count(i)) return false;
     Type oet = cast<MemRefType>(epi.getDpsInits()[0].getType()).getElementType();
     if (!oet.isF32() && !oet.isInteger(32) && !oet.isInteger(8)) return false;
+    if (oet.isInteger(8) && Nr.dyn) return false;
+  } else if (Nr.dyn) {
+    return false;
   }
   // x's place; K blocks (the strip of a block in one bank, its B tile in one DMA row); chunks
   const bool xI32 = p.x.et.isInteger(32), xInRaw = !xI32 && p.layout != MatLayout::RowsK;
@@ -529,14 +586,15 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   kmax = std::min<int64_t>(kmax, (xDepth - xAt - K / d) / d * d);
   if (kmax < d) return false;
   const int64_t kc = K > kmax ? kmax : K, nk = (K + kc - 1) / kc;
-  if (nk > 1 && G != 1) return false;
+  if (nk > 1 && (G != 1 || dyn)) return false;
   int64_t nc = nt;
-  {
+  if (!Nr.dyn) {
     int64_t cap = std::max<int64_t>(sb / kc, 1);
     for (nc = std::min(cap, nt); nc > 1 && nt % nc; --nc) {
     }
   }
   if (kc * nc > sb) return false;
+  if (xRows && nc != nt) return false;
 
   Expander e{OpBuilder(k), k.getLoc(), d};
   MLIRContext *ctx = k.getContext();
@@ -568,19 +626,41 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   }
   const int64_t nOut = nc * d;
   Value y = p.store.getDst();
+  Value Kv = Kr.dyn ? Kr.val : Value(), Nv = Nr.dyn ? Nr.val : Value();
+  if (xRows || Nr.dyn) sahl::CursorResetOp::create(e.b, e.loc);
   auto loadX = [&](int64_t b, int64_t g) {
+    if (xRows) {                                    // row (b, g) of x at the cursor, the cursor on
+      auto l = sahl::LoadOp::create(e.b, e.loc, e.row0(p.x.view, Kv), e.prefix(xl, Kv));
+      l->setAttr("sa.cursor", e.b.getUnitAttr());
+      l->setAttr("sa.cursor_step", e.b.getUnitAttr());
+      return;
+    }
     llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
     if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
     if (p.gLoop >= 0) at[p.gLoop] = {g, 1};
     sahl::LoadOp::create(e.b, e.loc, e.view(p.x.view, xMap, at, {p.bLoop, p.gLoop}), xl);
   };
   auto replicate = [&](int64_t k0, int64_t kl) {
-    sahl::StripOp::create(e.b, e.loc, e.sub(xl, {k0}, {kl}), placedA({d, kl}, 0));
+    sahl::StripOp::create(e.b, e.loc, Kv ? e.prefix(xl, Kv) : e.sub(xl, {k0}, {kl}), placedA({d, kl}, 0));
   };
+  // a placed buffer of dynamic dimensions (SPAD_A word / SPAD_B bank)
+  auto placedDyn = [&](ArrayRef<int64_t> shape, ValueRange dv, StringRef mem, int64_t at) -> Value {
+    auto a = memref::AllocOp::create(e.b, e.loc, MemRefType::get(shape, i8), dv);
+    a->setAttr("sa.mem", e.b.getStringAttr(mem));
+    a->setAttr(mem == "spad_b" ? "sa.bank" : "sa.word", e.b.getI64IntegerAttr(at));
+    return Value(a);
+  };
+  Value nTiles;
+  if (Nv)
+    nTiles = arith::ShRUIOp::create(e.b, e.loc, Nv,
+                                    arith::ConstantIndexOp::create(e.b, e.loc, int64_t(llvm::Log2_64(uint64_t(d)))));
   int64_t step = 0;
   auto loadB = [&](int64_t b, int64_t c0, int64_t k0, int64_t kl) -> Value {
-    Value tiles = e.alloc({nc, kl, d}, i8, "spad_b", "");
-    tiles.getDefiningOp()->setAttr("sa.bank", e.b.getI64IntegerAttr(step++ & 1));
+    const int64_t bank = step++ & 1;
+    // the tiles: [nc, K, D] (dynamic: N / D tiles, or K rows)
+    Value tiles = Nv   ? placedDyn({ShapedType::kDynamic, kl, d}, ValueRange{nTiles}, "spad_b", bank)
+                  : Kv ? placedDyn({nc, ShapedType::kDynamic, d}, ValueRange{Kv}, "spad_b", bank)
+                       : placedDyn({nc, kl, d}, ValueRange{}, "spad_b", bank);
     llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
     if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
     at[p.kLoop] = {k0, kl};
@@ -590,13 +670,17 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}), tiles);
     } else if (p.layout == MatLayout::RowsK) {
       at[p.nLoop] = {c0 * d, nc * d};
-      Value raw = placedA({nc * d, kl}, sb);
-      auto l = sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}), raw);
+      Value raw = Nv ? placedDyn({ShapedType::kDynamic, kl}, ValueRange{Nv}, "spad_a", sb) : placedA({nc * d, kl}, sb);
+      llvm::DenseMap<int, Value> dv;
+      if (Nv) dv[p.nLoop] = Nv;
+      auto l = sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}, dv), raw);
       l->setAttr("sa.rows", e.b.getUnitAttr());
       sahl::TransposeOp::create(e.b, e.loc, raw, tiles);
     } else {
       at[p.nLoop] = {c0 * d, nc * d};
-      auto l = sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}), tiles);
+      llvm::DenseMap<int, Value> dv;
+      if (Kv) dv[p.kLoop] = Kv;
+      auto l = sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}, dv), tiles);
       l->setAttr("sa.interleave", e.b.getUnitAttr());
     }
     return tiles;
@@ -639,7 +723,8 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
             sahl::MmaOp::create(e.b, e.loc, placedA({d, kl}, 0), bt, acc, kb > 0);
           }
         }
-        Value ys = outView(y, outMap, b, g, c0);
+        const bool lastRow = b + 1 == H && g + 1 == G;
+        Value ys = Nv ? e.row0(y, Nv) : outView(y, outMap, b, g, c0);
         if (!epi) {
           sahl::StoreOp::create(e.b, e.loc, acc, ys);
           continue;
@@ -652,7 +737,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
         AffineMap id1 = AffineMap::getMultiDimIdentityMap(1, ctx), none = AffineMap::get(1, 0, ctx);
         for (int i = 0; i < epi.getNumDpsInputs(); ++i) {
           if (epi.getDpsInputs()[i] == p.op.getDpsInits()[0]) {
-            ins.push_back(acc), m1.push_back(id1);
+            ins.push_back(Nv ? e.prefix(acc, Nv) : acc), m1.push_back(id1);
             continue;
           }
           const EpiIn &ei = epiIn[i];
@@ -691,11 +776,16 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
           }
         }
         m1.push_back(id1);
-        auto g1 = linalg::GenericOp::create(e.b, e.loc, TypeRange{}, ins, ValueRange{out}, m1,
+        Value outv = Nv ? e.prefix(out, Nv) : out;
+        auto g1 = linalg::GenericOp::create(e.b, e.loc, TypeRange{}, ins, ValueRange{outv}, m1,
                                             SmallVector<utils::IteratorType>{utils::IteratorType::parallel});
         IRMapping map;
         epi.getRegion().cloneInto(&g1.getRegion(), map);
-        sahl::StoreOp::create(e.b, e.loc, out, ys);
+        auto st = sahl::StoreOp::create(e.b, e.loc, outv, ys);
+        if (Nv) {                                   // row (b, g) at the cursor, then the cursor on
+          st->setAttr("sa.cursor", e.b.getUnitAttr());
+          if (!lastRow) st->setAttr("sa.cursor_step", e.b.getUnitAttr());
+        }
       }
     }
   }
