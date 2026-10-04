@@ -27,6 +27,8 @@ typedef struct sa_completion_t {
   uint32_t cycles;       // device cycles (0 in the simulator)
   uint32_t descriptors;  // descriptors decoded (on failure: the failing one's index)
   uint32_t end;          // the END value
+  uint32_t perf_n;       // board with SA_PROFILE_PERF: the unit's event counters over this list
+  uint32_t perf[32];     //   (rtl/sysarray/sa_defs.vh PC_*; rt_fw's perf area), else 0
 } sa_completion_t;
 
 typedef struct sa_transport_t sa_transport_t;
@@ -144,8 +146,10 @@ iree_status_t sa_context_batch_flush(sa_context_t* context);
 
 // Profiling (SA_PROFILE=1): per export, the dispatch count, the device cycles
 // (rt_fw's completion records) and the host time of the submission (list
-// build, ring, wait).
-void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, uint32_t cycles, uint64_t host_ns);
+// build, ring, wait); with SA_PROFILE_PERF=<file> on the board also the sums of
+// the unit's event counters (|done|), written to <file> as CSV by each report.
+void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, uint32_t cycles, uint64_t host_ns,
+                               const sa_completion_t* done);
 // Prints the profile (sorted by device cycles) to |f| (a FILE*); per_step
 // divides the totals (e.g. by the number of tokens). No-op without SA_PROFILE.
 void sa_context_profile_report(void* f, double per_step);

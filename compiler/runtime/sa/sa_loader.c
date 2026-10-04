@@ -173,7 +173,8 @@ static iree_status_t sa_export_run_now(sa_executable_t* e, const sa_export_t* x,
   IREE_RETURN_IF_ERROR(sa_context_dispatch(e->context, &dispatch, &done));
   clock_gettime(CLOCK_MONOTONIC, &t1);
   sa_context_profile_record(e->context, x->name, done.cycles,
-                            (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(t1.tv_nsec - t0.tv_nsec));
+                            (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (uint64_t)(t1.tv_nsec - t0.tv_nsec),
+                            &done);
   if (done.status != 0) {
     // extended status (rtl/sysarray/sa_sched.v): [11:8] code, [15:12] engine
     static const char* engines[] = {"LD", "ST", "EX", "VE", "FETCH"};

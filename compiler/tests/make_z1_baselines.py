@@ -14,6 +14,8 @@ Writes tests/baselines/pynq-z1/:
   stories15m_tokens.txt the board's tokens of the stories15M runs (c3, c6p_stories)
   smollm2_tokens.txt    the board's tokens of the SmolLM2-135M runs (c55, c6p_smollm2, hfgen)
   perf.md               speeds, bandwidth, profiles, resources and timing of the bitstream
+  z1_profile.md         the decode / prefill time breakdown from the event counters
+                        (compiler/tests/z1_profile.py on results/*_perf.csv)
 """
 import argparse
 import hashlib
@@ -157,6 +159,14 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     tokens(args.deploy, results)
     perf(results, commit)
+    if any(f.endswith("_perf.csv") for f in os.listdir(results)):
+        rc, out = sh([PY, os.path.join(REPO, "compiler", "tests", "z1_profile.py"), results,
+                      "-o", os.path.join(OUT, "z1_profile.md")])
+        print(out.strip().splitlines()[-1] if out.strip() else "z1_profile.py: no output")
+        if rc:
+            sys.exit("z1_profile.py failed")
+    else:
+        print("no *_perf.csv in the results: z1_profile.md not written")
     if not args.skip_golden:
         golden_manifest(commit)
     if not args.skip_dcheck:

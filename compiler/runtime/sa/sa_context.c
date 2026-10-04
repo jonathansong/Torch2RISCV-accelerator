@@ -450,7 +450,7 @@ iree_status_t sa_context_batch_flush(sa_context_t* c) {
     status = iree_make_status(IREE_STATUS_INTERNAL, "sa: batch ended with %#x (expected 0x5a)", done.end);
   }
   iree_slim_mutex_unlock(&c->mutex);
-  if (iree_status_is_ok(status)) sa_context_profile_record(c, IREE_SV("(list of dispatches)"), done.cycles, host_ns);
+  if (iree_status_is_ok(status)) sa_context_profile_record(c, IREE_SV("(list of dispatches)"), done.cycles, host_ns, &done);
   return status;
 }
 
@@ -458,7 +458,10 @@ iree_status_t sa_context_batch_flush(sa_context_t* c) {
 typedef struct sa_profile_entry_t {
   char name[96];
   uint64_t count, cycles, host_ns;
+  uint64_t perf[32];                       // event counter sums (SA_PROFILE_PERF)
 } sa_profile_entry_t;
+static uint32_t sa_profile_perf_n;         // counters seen (0: none)
+static int sa_profile_section;
 static sa_profile_entry_t sa_profile[512];
 static int sa_profile_n = -1;              // -1: not initialized, -2: disabled
 
@@ -467,7 +470,8 @@ static int sa_profile_enabled(void) {
   return sa_profile_n >= 0;
 }
 
-void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, uint32_t cycles, uint64_t host_ns) {
+void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, uint32_t cycles, uint64_t host_ns,
+                               const sa_completion_t* done) {
   (void)context;
   if (!sa_profile_enabled()) return;
   int i = 0;
@@ -483,6 +487,9 @@ void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, u
   sa_profile[i].count++;
   sa_profile[i].cycles += cycles;
   sa_profile[i].host_ns += host_ns;
+  uint32_t pn = done && done->perf_n <= 32 ? done->perf_n : 0;
+  for (uint32_t k = 0; k < pn; ++k) sa_profile[i].perf[k] += done->perf[k];
+  if (pn > sa_profile_perf_n) sa_profile_perf_n = pn;
 }
 
 void sa_context_profile_totals(uint64_t* dispatches, uint64_t* cycles, uint64_t* host_ns) {
@@ -520,4 +527,23 @@ void sa_context_profile_report(void* fp, double per_step) {
   }
   fprintf(f, "%-58s %8.1f %12.0f %8s %10.1f   (per step)\n", "total", n / per_step, cyc / per_step, "",
           ns / per_step / 1e3);
+  // SA_PROFILE_PERF=<file>: the raw sums (not divided) with the event counters,
+  // one section per report (prefill chunks, then decode steps)
+  const char* path = getenv("SA_PROFILE_PERF");
+  if (path && sa_profile_perf_n) {
+    FILE* c = fopen(path, sa_profile_section++ ? "a" : "w");
+    if (c) {
+      fprintf(c, "# section %d per_step %.3f\nexport,calls,cycles,host_ns", sa_profile_section - 1, per_step);
+      for (uint32_t k = 0; k < sa_profile_perf_n; ++k) fprintf(c, ",c%u", k);
+      fprintf(c, "\n");
+      for (int i = 0; i < sa_profile_n; ++i) {
+        const sa_profile_entry_t* e = &sa_profile[i];
+        fprintf(c, "%s,%llu,%llu,%llu", e->name, (unsigned long long)e->count, (unsigned long long)e->cycles,
+                (unsigned long long)e->host_ns);
+        for (uint32_t k = 0; k < sa_profile_perf_n; ++k) fprintf(c, ",%llu", (unsigned long long)e->perf[k]);
+        fprintf(c, "\n");
+      }
+      fclose(c);
+    }
+  }
 }

@@ -44,11 +44,15 @@ enum {
 };
 #define RT_READY 0x52554E00u
 #define RT_RUN_LIST 0x01u
+#define RT_F_PERF (1u << 9)                       // rt_fw copies the event counters into its perf area
+#define MBOX_PERF_COUNT 0x8Cu
+#define SA_PERF_AREA_BELOW_MBOX 0x100u            // perf area BRAM + 0x1E00, mailbox BRAM + 0x1F00
 #define SA_BOARD_CPL_OFFSET 0x2000u
 #define SA_BOARD_HEAP_OFFSET 0x10000u
 
 typedef struct sa_board_t {
   volatile uint32_t* mbox;
+  volatile uint32_t* perf_area;  // SA_PROFILE_PERF: just below the mailbox, else NULL
   uint32_t ring_entries;
   uint32_t tail;           // entries submitted
 } sa_board_t;
@@ -83,7 +87,7 @@ static iree_status_t sa_board_run(sa_transport_t* t, uint32_t list_phys, sa_comp
   uint32_t seq = b->tail, slot = seq % b->ring_entries;
   volatile uint64_t* e = (volatile uint64_t*)(t->mem + 64u * slot);
   volatile uint32_t* c = (volatile uint32_t*)(t->mem + SA_BOARD_CPL_OFFSET + 32u * slot);
-  e[0] = (uint64_t)RT_RUN_LIST | (uint64_t)seq << 32;
+  e[0] = (uint64_t)(RT_RUN_LIST | (b->perf_area ? RT_F_PERF : 0u)) | (uint64_t)seq << 32;
   e[1] = list_phys;
   for (int i = 2; i < 8; ++i) e[i] = 0;          // count 0 (to END), BASE0..3 0, no parameter block
   __sync_synchronize();
@@ -105,6 +109,12 @@ static iree_status_t sa_board_run(sa_transport_t* t, uint32_t list_phys, sa_comp
   out->cycles = c[2];
   out->descriptors = c[3];
   out->end = c[4];
+  out->perf_n = 0;
+  if (b->perf_area) {                            // written by rt_fw before the completion record
+    uint32_t n = mbox_rd(b, MBOX_PERF_COUNT);
+    out->perf_n = n > 32 ? 32 : n;
+    for (uint32_t k = 0; k < out->perf_n; ++k) out->perf[k] = b->perf_area[k];
+  }
   return iree_ok_status();
 }
 
@@ -138,7 +148,9 @@ static iree_status_t sa_board_attach_from_env(void) {
                             "SA_BOARD_MEM=<phys>:<bytes>, SA_BOARD_MBOX, SA_BOARD_RING and SA_BOARD_D are needed");
   }
   void* m = sa_devmem_map((uint32_t)phys, (uint32_t)size);
-  void* b = sa_devmem_map((uint32_t)mbox_phys, 0x100);
+  // the mailbox and the perf area below it (SA_PROFILE_PERF)
+  void* b = sa_devmem_map((uint32_t)mbox_phys - SA_PERF_AREA_BELOW_MBOX, 0x100 + SA_PERF_AREA_BELOW_MBOX);
+  if (b) b = (uint8_t*)b + SA_PERF_AREA_BELOW_MBOX;
   if (!m || !b) {
     return iree_make_status(IREE_STATUS_PERMISSION_DENIED, "sa board: cannot map /dev/mem (%#lx, %#lx); run as root",
                             phys, mbox_phys);
@@ -162,6 +174,8 @@ iree_status_t sa_transport_board_open(iree_allocator_t host_allocator, sa_transp
   sa_board_t* b = (sa_board_t*)(t + 1);
   b->mbox = (volatile uint32_t*)sa_board_attached.mailbox;
   b->ring_entries = sa_board_attached.ring_entries;
+  if (getenv("SA_PROFILE_PERF"))                 // (the BRAM is mapped from the perf area on)
+    b->perf_area = (volatile uint32_t*)((uint8_t*)sa_board_attached.mailbox - SA_PERF_AREA_BELOW_MBOX);
   if (mbox_rd(b, MBOX_FW_STATE) != RT_READY) {
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "sa board: rt_fw not ready (FW_STATE %#x)",
                             mbox_rd(b, MBOX_FW_STATE));
