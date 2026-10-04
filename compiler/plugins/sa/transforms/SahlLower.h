@@ -144,6 +144,11 @@ private:
   // an expanded kernel's steps (sahl-expand-kernels)
   bool strip(sahl::StripOp st);
   bool mma(sahl::MmaOp m);
+  bool loop(sahl::LoopOp lp);
+  // inside a sahl.loop: the PARAM a DMA's sa.advance names (none: Value()), and marking the DMA dynamic
+  Value advanceOf(Operation *op);
+  void advanced(Operation *op, Value adv);
+  SmallVector<Value> loopParams;
 
   // ------------------------------------------------------------ DDR
   struct Ddr {

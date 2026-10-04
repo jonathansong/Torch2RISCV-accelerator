@@ -91,10 +91,12 @@ def Sahl_ReserveOp : Sahl_Op<"reserve"> {
 }
 
 def Sahl_StripOp : Sahl_Op<"strip"> {
-  let summary = "Rows of int8 x (a DDR view [D, K]) -> an A strip of EX in SPAD_A (the rows interleaved)";
+  let summary = "x -> an A strip of EX in SPAD_A";
   let description = [{
-    The A operand of sahl.mma for D rows at once (prefill's rows): element k
-    of row r at word k, lane r. One LD with INTERLEAVE.
+    The A operand of sahl.mma. From rows of int8 x in DDR ([D, K], prefill's
+    rows): element k of row r at word k, lane r (one LD with INTERLEAVE).
+    From a local vector [K] (decode): every element over the D rows (a VE
+    copy in the DIV mode).
   }];
   let arguments = (ins Arg<AnyMemRef, "the rows", [MemRead]>:$src, Arg<AnyMemRef, "the strip", [MemWrite]>:$dst);
   let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
@@ -121,6 +123,18 @@ def Sahl_BcastOp : Sahl_Op<"bcast"> {
   }];
   let arguments = (ins Arg<AnyMemRef, "the values", [MemRead]>:$src, Arg<AnyMemRef, "the broadcast words", [MemWrite]>:$dst);
   let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
+}
+
+def Sahl_LoopOp : Sahl_Op<"loop", [SingleBlock, NoTerminator]> {
+  let summary = "A hardware loop (LOOP_END): the body `count` times, its DDR views advancing each time";
+  let description = [{
+    Each DMA of the body whose operation carries `sa.advance = j` moves on by
+    `strides[j]` bytes per iteration (decode's linear layer: two chunks of
+    weights, two chunks of per-chunk inputs and results).
+  }];
+  let arguments = (ins I64Attr:$count, DenseI64ArrayAttr:$strides);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "attr-dict-with-keyword $body";
 }
 
 def Sahl_KernelOp : Sahl_Op<"kernel", [SingleBlock, NoTerminator]> {

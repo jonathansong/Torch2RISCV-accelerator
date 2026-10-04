@@ -57,6 +57,10 @@ bool Lowerer::lowerBlock(Block &block) {
       mem.release(mark);
       continue;
     }
+    if (auto lp = dyn_cast<sahl::LoopOp>(op)) {
+      if (!loop(lp)) return false;
+      continue;
+    }
     if (auto st = dyn_cast<sahl::StripOp>(op)) {
       if (!strip(st)) return false;
       continue;
@@ -116,7 +120,12 @@ bool Lowerer::lowerBlock(Block &block) {
       continue;
     }
     if (auto g = dyn_cast<linalg::GenericOp>(op)) {
-      if (!generic(g)) return false;
+      // an expanded kernel's epilogue: its temps next to its accumulator (that ACC bank first)
+      auto pb = g->getAttrOfType<IntegerAttr>("sa.prefer_bank");
+      if (pb) mem.preferBank = int(pb.getInt());
+      bool ok = generic(g);
+      mem.preferBank = -1;
+      if (!ok) return false;
       continue;
     }
     if (auto sc = dyn_cast<sahl::ScatterOp>(op)) {
@@ -204,6 +213,18 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
   auto alloc = v.getDefiningOp<memref::AllocOp>();
   if (!alloc) return fail("operand is not a local buffer"), std::nullopt;
   auto vt = vtOf(mt.getElementType());
+  if (auto w = alloc->getAttrOfType<IntegerAttr>("sa.word")) {
+    // a fixed place in ACC (sahl-expand-kernels: decode's linear chunk buffers;
+    // an i64 accumulator, as IREE types it, holds int32 words: its epilogue truncates)
+    Type et = mt.getElementType();
+    if (!mt.hasStaticShape() || !(et.isF32() || et.isInteger(32) || et.isInteger(64))) return fail("placed buffer"), std::nullopt;
+    LocalBuf l;
+    l.vt = et.isF32() ? ::sa::VT_F32 : ::sa::VT_I32;
+    l.n = mt.getNumElements();
+    l.la = ::sa::acc(uint32_t(w.getInt()));
+    locals[v] = l;
+    return l;
+  }
   if (auto pm = alloc->getAttrOfType<StringAttr>("sa.mem"); pm && pm.getValue() == "spad_b") {
     // weight tiles in a SPAD_B bank (sahl-expand-kernels: the bank chosen)
     auto bank = alloc->getAttrOfType<IntegerAttr>("sa.bank");
@@ -398,12 +419,28 @@ bool Lowerer::load(sahl::LoadOp l) {
   if (r->et.isInteger(64)) return fail("i64 load");
   auto dst = bufOf(l.getDst());
   if (!dst) return false;
+  Value adv = advanceOf(l);
   if ((dst->la >> 28) == uint32_t(::sa::MEM_SPAD_B)) {
-    // weight tiles [nc, K, D] into a SPAD_B bank: one row per tile
+    // weight tiles [nc, K, D] into a SPAD_B bank: one row per tile; with
+    // sa.prefix in the template's prefix (it may run during an earlier dispatch)
     auto st = cast<MemRefType>(l.getSrc().getType());
     int64_t rows = st.getDimSize(0), rb = r->n / rows;
     if (r->pitch || r->dyn || r->off % 8 || rb % 8 || rb > 65535) return fail("weight tiles load");
-    sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(dst->la), rows, rb, rb, 0, ValueRange{});
+    OpBuilder *wb = &bb;
+    std::optional<OpBuilder> pb;
+    if (l->hasAttr("sa.prefix")) {
+      auto pre = sahw::PrefixOp::create(regB, loc);
+      pb.emplace(OpBuilder::atBlockEnd(&pre.getRegion().emplaceBlock()));
+      wb = &*pb;
+    }
+    advanced(sahw::LdOp::create(*wb, loc, r->base, r->off, int64_t(dst->la), rows, rb, rb, 0,
+                                adv ? ValueRange{adv} : ValueRange{}), adv);
+    return true;
+  }
+  if (adv) {                                       // a contiguous row moving on with the loop
+    uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
+    if (r->pitch || r->dyn || r->off % 8 || bytes > 65535) return fail("advancing load");
+    advanced(sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(dst->la), 1, bytes, bytes, 0, ValueRange{adv}), adv);
     return true;
   }
   if (r->dyn) return dynamicDma(*r, *dst, true);
@@ -421,6 +458,12 @@ bool Lowerer::store(sahl::StoreOp s) {
   auto it = locals.find(s.getSrc());
   if (it == locals.end()) return fail("stored buffer not computed");
   LocalBuf l = it->second;
+  if (Value adv = advanceOf(s)) {                  // a contiguous row moving on with the loop
+    uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
+    if (r->pitch || r->dyn || r->off % 8 || bytes > 65535) return fail("advancing store");
+    advanced(sahw::StOp::create(bb, loc, r->base, r->off, int64_t(l.la), 1, bytes, bytes, ValueRange{adv}), adv);
+    return true;
+  }
   if (r->dyn) return dynamicDma(*r, l, false);
   if (l.bcast && l.n > 1) l = packBcast(l);
   if (r->pitch) return rowsDma(false, *r, l.la);
@@ -431,15 +474,61 @@ bool Lowerer::store(sahl::StoreOp s) {
 }
 
 bool Lowerer::strip(sahl::StripOp st) {
+  auto dst = bufOf(st.getDst());
+  if (!dst) return false;
+  if (!ddrRoot(st.getSrc())) {
+    // a local vector [K] -> every element over the D rows (a VE copy, DIV mode)
+    auto x = bufOf(st.getSrc());
+    if (!x) return false;
+    ve({x->la, x->vt, ::sa::IDX_DIV, uint32_t(d)}, std::nullopt, dst->la, ::sa::VT_I8, x->n * d, ::sa::VOP_COPY);
+    return true;
+  }
   // D rows of int8 x [D, K] -> the A strip: one LD with INTERLEAVE
   auto r = ddrOf(st.getSrc(), /*allowPitch=*/true);
-  auto dst = bufOf(st.getDst());
-  if (!r || !dst) return false;
+  if (!r) return false;
   auto mt = cast<MemRefType>(st.getSrc().getType());
   if (mt.getRank() != 2 || !mt.getElementType().isInteger(8) || r->dyn) return fail("strip source");
   int64_t rows = mt.getDimSize(0), k = mt.getDimSize(1), pitch = r->pitch ? r->pitch : k;
   if (r->off % 8 || k % 8) return fail("strip source alignment");
   sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(dst->la), rows, k, pitch, /*INTERLEAVE=*/1, ValueRange{});
+  return true;
+}
+
+Value Lowerer::advanceOf(Operation *op) {
+  auto a = op->getAttrOfType<IntegerAttr>("sa.advance");
+  if (!a) return Value();
+  if (size_t(a.getInt()) >= loopParams.size()) return fail("sa.advance outside a sahl.loop"), Value();
+  return loopParams[a.getInt()];
+}
+
+void Lowerer::advanced(Operation *op, Value adv) {
+  if (!adv) return;
+  auto mark = [](auto o) {
+    o.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
+    o.setDynAdd(ArrayRef<bool>{true});
+  };
+  if (auto l = dyn_cast<sahw::LdOp>(op)) mark(l);
+  else if (auto st = dyn_cast<sahw::StOp>(op)) mark(st);
+}
+
+bool Lowerer::loop(sahl::LoopOp lp) {
+  // LOOP_END: a private PARAM per stride (0 first), the body, the loop around it
+  if (!loopParams.empty() || lp.getStrides().size() > 2 || lp.getStrides().empty()) return fail("sahl.loop form");
+  for (size_t j = 0; j < lp.getStrides().size(); ++j) loopParams.push_back(privateParam());
+  SmallVector<int64_t> zeros(loopParams.size(), 0);
+  sahw::SetRegOp::create(bb, loc, ValueRange(loopParams), zeros, 0, ValueRange{});
+  Block *blk = bb.getInsertionBlock();
+  Operation *before = blk->empty() ? nullptr : &blk->back();
+  if (!lowerBlock(lp.getBody().front())) return false;
+  ArrayRef<int64_t> st = lp.getStrides();
+  auto l = sahw::LoopOp::create(bb, loc, lp.getCount(), loopParams[0], st[0],
+                                loopParams.size() > 1 ? loopParams[1] : Value(), st.size() > 1 ? st[1] : 0);
+  Block *lb = &l.getRegion().emplaceBlock();
+  SmallVector<Operation *> moved;
+  for (Operation *o = before ? before->getNextNode() : &blk->front(); o && o != l.getOperation(); o = o->getNextNode())
+    moved.push_back(o);
+  for (Operation *o : moved) o->moveBefore(lb, lb->end());
+  loopParams.clear();
   return true;
 }
 

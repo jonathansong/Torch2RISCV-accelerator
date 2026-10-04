@@ -275,7 +275,11 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     auto mt = dyn_cast<MemRefType>(in.getType());
     if (!mt) return fail("scalar generic input");
     Val v;
-    if (mt.getElementType().isInteger(64)) {
+    auto placedAcc = [&] {                            // an expanded kernel's i64 accumulator (int32 words)
+      auto a = in.getDefiningOp<memref::AllocOp>();
+      return a && a->hasAttr("sa.word");
+    };
+    if (mt.getElementType().isInteger(64) && !placedAcc()) {
       // i64 scalars: positions / indices (masks, gathers), read through LDPARAM
       if (mt.getRank() != 0 || !ddrRoot(in)) return fail("i64 input other than a scalar in DDR");
       v.kind = Val::ScalarArg;

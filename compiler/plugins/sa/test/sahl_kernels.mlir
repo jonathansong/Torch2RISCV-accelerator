@@ -6,6 +6,35 @@
 // RUN: iree-opt --iree-sa-to-sahl="ukernels=none" %s | FileCheck %s --check-prefix=GEN
 // RUN: iree-opt --iree-sa-to-sahl --iree-sahl-to-sahw %s | FileCheck %s --check-prefix=LOW
 // RUN: iree-opt --iree-sa-to-sahl --iree-sahl-schedule %s | FileCheck %s --check-prefix=SCHED
+// RUN: iree-opt --iree-sa-to-sahl --iree-sahl-schedule --iree-sahl-expand-kernels %s | FileCheck %s --check-prefix=EXP
+
+// sahl-expand-kernels (§8.20, E2): decode's linear kernel written out. The
+// strip's words first, x copied over the D rows, the scalar s_x broadcast;
+// each bank's accumulator / s_w / result at fixed ACC words (C3's layout);
+// chunk 0's weights in the prefix; 8 chunks: a LOOP_END loop of 3 pairs
+// (each DMA inside moving on by two chunks), then chunks 6 and 7.
+// EXP-NOT: sahl.kernel
+// EXP: sahl.reserve %[[STRIP:.+]] : memref<8x288xi8>
+// EXP: sahl.load %{{.+}}, %[[X:.+]] : memref<288xi32
+// EXP: sahl.strip %[[X]], %[[STRIP]] : memref<288xi32>, memref<8x288xi8>
+// EXP: sahl.bcast %{{.+}}, %[[SX:.+]] : memref<f32>, memref<f32>
+// EXP: %[[ACC0:.+]] = memref.alloc() {{.*}}sa.word = 0 : i64} : memref<24x8xi64>
+// EXP: sa.bank = 0 : i64, sa.mem = "spad_b"
+// EXP: %[[ACC1:.+]] = memref.alloc() {{.*}}sa.word = 4096 : i64} : memref<24x8xi64>
+// EXP: sa.bank = 1 : i64, sa.mem = "spad_b"
+// EXP: sahl.load %{{.+}}, %{{.+}} {sa.prefix}
+// EXP: sahl.loop attributes {count = 3 : i64, strides = array<i64: 110592, 1536>} {
+// EXP: sahl.mma %[[STRIP]], %{{.+}}, %[[ACC0]]
+// EXP: sahl.load {{.*}} {sa.advance = 0 : i64}
+// EXP: sahl.load {{.*}} {sa.advance = 1 : i64}
+// EXP: linalg.generic {{.*}} ins(%[[ACC0]], {{.*}}, %[[SX]] :
+// EXP-SAME: sa.prefer_bank = 0
+// EXP: sahl.store {{.*}} {sa.advance = 1 : i64}
+// EXP: sahl.mma %[[STRIP]], %{{.+}}, %[[ACC1]]
+// EXP: sa.prefer_bank = 1
+// EXP: }
+// EXP-COUNT-2: sahl.mma
+// EXP-NOT: sahl.mma
 
 // UK-LABEL: func.func @main$async_dispatch_28
 // UK: memref.alloc() : memref<192x8xf32>

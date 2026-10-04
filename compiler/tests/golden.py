@@ -77,6 +77,9 @@ def canonical(data):
     _, _, exps = sadesc.read(data)
     for (name, rows, nb, nc, cyc, setup), ext in zip(exps, sadesc.read_ext(data)):
         names = {s[1]: f"<b{s[2]}+c{s[3]}*{s[4]}/{s[5]}+{s[6]}>" for s in setup if s[0] == 0}
+        ext = dict(ext)
+        if "prefix_reg" in ext:                      # (the BASE register the prefix was generated for)
+            ext["prefix_reg"] = names.get(ext["prefix_reg"], ext["prefix_reg"])
         out.append(f"{name} {rows.shape[0]} {nb} {nc} {ext}")
         out += sorted(f"setup {names[s[1]]}" if s[0] == 0 else f"setup PARAM{s[1]} {s[2:]}" for s in setup)
         for i, w in enumerate(rows):
