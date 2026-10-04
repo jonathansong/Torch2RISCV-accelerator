@@ -28,7 +28,7 @@ from pynq import GPIO, MMIO, Overlay, allocate
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Addresses from scripts/pico_bit.tcl
+# Addresses from scripts/pico_bit.tcl (PYNQ-Z1; the KV260's are read from the overlay)
 BRAM_ARM_BASE = 0x40010000   # psBramController (RISC-V sees it at 0xC0000000)
 BRAM_BYTES    = 0x2000       # RISC-V-visible part of the BRAM
 INTC_BASE     = 0x40020000   # axi_intc, input 0 = PicoRV32 trap
@@ -73,10 +73,16 @@ def main():
     ap.add_argument("--timeout", type=float, default=5.0)
     args = ap.parse_args()
 
-    Overlay(args.bit)
+    ol = Overlay(args.bit)
+    # the ARM-side addresses from the overlay (PYNQ-Z1 0x4001_0000 / 0x4002_0000,
+    # KV260 0xA001_0000 / 0xA002_0000); the constants above if absent
+    ips = ol.ip_dict
+    bram_base = ips.get("pico_processor_0/psBramController", {}).get("phys_addr", BRAM_ARM_BASE)
+    intc_base = ips.get("psInterruptController", {}).get("phys_addr", INTC_BASE)
+    print(f"BRAM at {bram_base:#x}, interrupt controller at {intc_base:#x}")
     reset = GPIO(GPIO.get_gpio_pin(RESET_EMIO), "out")
-    bram = MMIO(BRAM_ARM_BASE, BRAM_BYTES)
-    intc = MMIO(INTC_BASE, 0x1000)
+    bram = MMIO(bram_base, BRAM_BYTES)
+    intc = MMIO(intc_base, 0x1000)
 
     reset.write(1)
     fw_len = load_firmware(bram, args.fw)

@@ -8,14 +8,14 @@
 #   board: python3 board_llm.py
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=pynq-z1 (default) | kv260
 O=${1:-$SA_REPO/build/hfgen/smollm2_p8}
 D=$SA_REPO/build/deploy_hfgen
 rm -rf "$D" && mkdir -p "$D"
 "$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/SmolLM2-135M" --out "$O" \
   --skip-export --quant --rope --attn --prefill 8 --mb 400 --board-bundle "$D"
-"$SA_COMPILER/scripts/build_sa_runtime.sh" armv7 | tail -1
-llvm-strip-18 -o "$D/sa-llm-run" "$SA_REPO/build/iree/build-sa-armv7/runtime/plugins/hal/drivers/sa/sa-llm-run"
+stage_runtime "$D"
 cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/runtime/test/board_launcher.py" \
    "$SA_REPO/driver/pynq_matmul.py" "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"
-cp "$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2/picorv32.bit" "$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2/picorv32.hwh" "$D/"
+stage_overlay "$D"
 ls -la "$D"

@@ -72,16 +72,20 @@ def serve(sim, dev, base, ring_entries, stop, log):
 
 
 def main():
+    global MBOX_PHYS                     # (serve() reads it)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--d", type=int, default=8)
     ap.add_argument("--mb", type=int, default=64)
     ap.add_argument("--base", type=lambda s: int(s, 0), default=0x10000000)
     ap.add_argument("--ring", type=int, default=16)
     ap.add_argument("--file", default=f"/dev/shm/sa_devmem_{os.getpid()}")
+    ap.add_argument("--mbox", type=lambda s: int(s, 0), default=MBOX_PHYS,
+                    help="the mailbox's physical address (KV260: 0xA0011F00)")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args()
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
     size = args.mb << 20
+    MBOX_PHYS = args.mbox
     span = MBOX_PHYS + 0x100
     with open(args.file, "wb") as f:
         f.truncate(span)

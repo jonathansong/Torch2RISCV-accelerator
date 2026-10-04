@@ -42,11 +42,15 @@ except ImportError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Overlay addresses (RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl)
+# Overlay addresses. The board-specific ones come from the overlay's .hwh
+# (overlay_info: the ARM-side program BRAM address and the accelerator clock),
+# so one driver serves both boards; these are the PYNQ-Z1 values
+# (RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl), used when the .hwh does not say.
+# KV260 (KV260/scripts/kv260_bd.tcl): BRAM 0xA001_0000, pl_clk0.
 BRAM_ARM_BASE = 0x40010000
 BRAM_BYTES = 0x2000
-RESET_EMIO = 0                 # PS GPIO EMIO[0] -> RISC-V reset (1 = hold)
-RISCV_HZ = 50e6                # subprocessorClk; matmul_unit shares it
+RESET_EMIO = 0                 # PS GPIO EMIO[0] -> RISC-V reset (1 = hold), both boards
+RISCV_HZ = 50e6                # the accelerator / PicoRV32 clock (Z1: subprocessorClk)
 
 # firmware/include/mailbox.h
 MBOX = 0x1F00
@@ -384,18 +388,46 @@ def build_vector_list(d, op, it, ot, n, ny, x_addr, y_addr, o_addr, relu=False, 
     return dl.end(0x5EC)
 
 
-def overlay_params(bitfile):
-    """D and NPORTS of the sa_unit in the overlay, from the .hwh next to the .bit
-    (module-reference parameters); (SA_D, 1) if not found."""
+@dataclass
+class OverlayInfo:
+    board: str            # "pynq-z1" (processing_system7) or "kv260" (zynq_ultra_ps_e)
+    d: int                # sa_unit D
+    nports: int           # sa_unit NPORTS (DMA ports)
+    bram_base: int        # ARM physical address of the program BRAM (psBramController)
+    riscv_hz: float       # the accelerator / PicoRV32 clock (sa_unit aclk)
+
+
+def overlay_info(bitfile):
+    """The overlay's board, sa_unit parameters, ARM-side BRAM address and clock,
+    from the .hwh next to the .bit; the PYNQ-Z1 defaults for what it does not say."""
+    info = OverlayInfo("pynq-z1", SA_D, 1, BRAM_ARM_BASE, RISCV_HZ)
     try:
         hwh = open(os.path.splitext(bitfile)[0] + ".hwh").read()
     except OSError:
-        return SA_D, 1
+        return info
+    if "zynq_ultra_ps_e" in hwh:
+        info.board = "kv260"
     i = hwh.find('MODTYPE="sa_unit"')
-    if i < 0:
-        return SA_D, 1
-    params = dict(re.findall(r'<PARAMETER NAME="(\w+)" VALUE="([^"]*)"', hwh[i:i + 20000]))
-    return int(params.get("D", SA_D)), int(params.get("NPORTS", 1))
+    if i >= 0:
+        mod = hwh[i:i + 20000]
+        params = dict(re.findall(r'<PARAMETER NAME="(\w+)" VALUE="([^"]*)"', mod))
+        info.d, info.nports = int(params.get("D", SA_D)), int(params.get("NPORTS", 1))
+        m = re.search(r'<PORT CLKFREQUENCY="(\d+)" DIR="I" NAME="aclk"', mod)
+        if m:
+            info.riscv_hz = float(m.group(1))
+    # the BRAM as the PS master sees it (not the PicoRV32's mem_axi view at 0xC000_0000)
+    for m in re.finditer(r'<MEMRANGE [^>]*>', hwh):
+        r = m.group(0)
+        if 'INSTANCE="pico_processor_0_psBramController"' in r and 'MASTERBUSINTERFACE="mem_axi"' not in r:
+            info.bram_base = int(re.search(r'BASEVALUE="(0x[0-9A-Fa-f]+)"', r).group(1), 16)
+            break
+    return info
+
+
+def overlay_params(bitfile):
+    """D and NPORTS of the sa_unit in the overlay (overlay_info)."""
+    info = overlay_info(bitfile)
+    return info.d, info.nports
 
 
 def _describe(first_err):
@@ -412,9 +444,12 @@ class MatmulOverlay:
         bitfile = bitfile or os.path.join(HERE, "picorv32.bit")
         firmware = firmware or os.path.join(HERE, "matmul_fw.bin")
         self.overlay = Overlay(bitfile, download=download)
-        self.d, self.nports = overlay_params(bitfile)     # array size, DMA ports
+        self.info = overlay_info(bitfile)                 # board, D, ports, addresses, clock
+        self.d, self.nports = self.info.d, self.info.nports
+        self.riscv_hz = self.info.riscv_hz
+        self.bram_base = self.info.bram_base
         self.reset = GPIO(GPIO.get_gpio_pin(RESET_EMIO), "out")
-        self.bram = MMIO(BRAM_ARM_BASE, BRAM_BYTES)
+        self.bram = MMIO(self.bram_base, BRAM_BYTES)
         self.reset.write(1)
         self.load_firmware(firmware)
 
@@ -554,7 +589,7 @@ class MatmulOverlay:
             "accel_cycles": accel,
             "riscv_cycles_per_job": total / n if n else 0,
             "accel_cycles_per_job": accel / n if n else 0,
-            "us_per_job": total / n / RISCV_HZ * 1e6 if n else 0,
+            "us_per_job": total / n / self.riscv_hz * 1e6 if n else 0,
             "wall_s": wall,
         }
         return c, stats
@@ -613,7 +648,7 @@ class MatmulOverlay:
         cycles = self._mbox(MBOX_TOTAL_CYCLES)
         return c, {"firmware": self.firmware, "shape": (m, n, k), "tiles": self._mbox(MBOX_JOBS_DONE),
                    "riscv_cycles": cycles, "mac_per_cycle": m * n * k / cycles if cycles else 0,
-                   "us": cycles / RISCV_HZ * 1e6, "wall_s": wall, "perf": self._perf()}
+                   "us": cycles / self.riscv_hz * 1e6, "wall_s": wall, "perf": self._perf()}
 
     def vector(self, op, x, y=None, out_dtype=None, relu=False, requant=None, timeout=5.0):
         """One vector-engine operation with vector_fw.bin (M3):
@@ -667,7 +702,7 @@ class MatmulOverlay:
         cycles = self._mbox(MBOX_TOTAL_CYCLES)
         return out, {"firmware": self.firmware, "len": n, "chunks": self._mbox(MBOX_JOBS_DONE),
                      "riscv_cycles": cycles, "elem_per_cycle": n / cycles if cycles else 0,
-                     "us": cycles / RISCV_HZ * 1e6, "wall_s": wall, "perf": self._perf()}
+                     "us": cycles / self.riscv_hz * 1e6, "wall_s": wall, "perf": self._perf()}
 
     # ------------------------------------------------------ descriptor lists
     def run_list(self, dl, bases=(0, 0, 0, 0), count=0, timeout=5.0):
@@ -689,7 +724,7 @@ class MatmulOverlay:
             raise RuntimeError("this overlay has no descriptor fetch unit (CAPS bit 21)")
         cycles = self._mbox(MBOX_TOTAL_CYCLES)
         return {"firmware": self.firmware, "descriptors": len(dl), "riscv_cycles": cycles,
-                "us": cycles / RISCV_HZ * 1e6, "wall_s": wall, "dl_status": self._mbox(MBOX_DL_STATUS),
+                "us": cycles / self.riscv_hz * 1e6, "wall_s": wall, "dl_status": self._mbox(MBOX_DL_STATUS),
                 "dl_exec": self._mbox(MBOX_DL_EXEC), "perf": self._perf()}
 
     def gemm_list(self, a, b, bias=None, quant=None, relu=False, timeout=5.0):

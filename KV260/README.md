@@ -70,6 +70,27 @@ side only the window moves (Z1: BRAM at `0x4001_0000`, so the driver's
 DDR buffers for the accelerator must be in the low 2 GB
 (docs/kv260_upgrade_plan.md §2.4; the runtime checks it).
 
+## Board tests
+
+The driver (`driver/pynq_matmul.py` `overlay_info`) reads the board, D, the
+ARM-side BRAM address and the accelerator clock from the `.hwh`, so the
+launcher, `bwtest` and the LLM tests need no board switch. The deploy
+scripts take `SA_BOARD=kv260` (`compiler/scripts/board_env.sh`: the aarch64
+runtime, this directory's `build/output` overlay or `SA_BIT_DIR`); the whole
+regression of the Z1 freeze:
+
+```sh
+compiler/scripts/deploy_z1_freeze.sh --board kv260        # -> build/deploy_kv260
+scp -r build/deploy_kv260 <user>@<kv260>:~/kv260
+# on the board (PYNQ venv, root): cd ~/kv260 && python3 board_regress.py
+```
+
+and compare `results/` with `tests/baselines/pynq-z1/` (K1a: the token files
+must match). Checked without the board: the aarch64 `sa-llm-run` of a KV260
+bundle under qemu with the ring emulator at the KV260's addresses
+(`sa_board_emu.py --mbox 0xA0011F00 --base 0x7C000000`): stories15M 22/22
+logits rows bit-exact.
+
 ## To confirm on the board
 
 - The carrier's fan is controlled from the PL in AMD's reference designs;

@@ -30,7 +30,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from pynq_matmul import RISCV_HZ, MatmulOverlay, format_breakdown, perf_breakdown  # noqa: E402
+from pynq_matmul import MatmulOverlay, format_breakdown, perf_breakdown  # noqa: E402
 
 # name: dim, hidden_dim, layers, vocab (llama2.c TinyStories checkpoints; n_kv_heads = n_heads)
 MODELS = {"stories15M": (288, 768, 6, 32000), "stories42M": (512, 1376, 8, 32000),
@@ -73,6 +73,7 @@ def main():
 
     mm = MatmulOverlay(args.bit, os.path.join(HERE, "gemm_fw.bin"))
     d = mm.d
+    RISCV_HZ = mm.riscv_hz
     rng = np.random.default_rng(1)
     ok = True
     print(f"overlay: D = {d}, {mm.nports} DMA port(s), {RISCV_HZ / 1e6:.0f} MHz; "

@@ -27,7 +27,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from pynq_matmul import (BRAM_ARM_BASE, MBOX, MBOX_CPL_BASE, MBOX_FW_STATE, MBOX_HEARTBEAT,  # noqa: E402
+from pynq_matmul import (MBOX, MBOX_CPL_BASE, MBOX_FW_STATE, MBOX_HEARTBEAT,  # noqa: E402
                          MBOX_RING_BASE, MBOX_RING_HEAD, MBOX_RING_SIZE, MBOX_WORDS, RT_READY, MatmulOverlay,
                          allocate)
 
@@ -80,9 +80,9 @@ def start(bit, fw, mb=16, ring=16):
     while mm._mbox(MBOX_FW_STATE) != RT_READY:
         if time.perf_counter() - t0 > 5:
             raise RuntimeError(f"rt_fw not ready (FW_STATE {mm._mbox(MBOX_FW_STATE):#x})")
-    print(f"launcher: overlay D = {mm.d}, rt_fw ready, window {mb} MB at {phys:#x}, ring {ring}", flush=True)
+    print(f"launcher: {mm.info.board} overlay D = {mm.d}, {mm.riscv_hz / 1e6:.1f} MHz, rt_fw ready, window {mb} MB at {phys:#x}, ring {ring}", flush=True)
     env = dict(os.environ, SA_TRANSPORT="board", SA_BOARD_MEM=f"{phys:#x}:{mb << 20:#x}",
-               SA_BOARD_MBOX=f"{BRAM_ARM_BASE + MBOX:#x}", SA_BOARD_RING=str(ring), SA_BOARD_D=str(mm.d))
+               SA_BOARD_MBOX=f"{mm.bram_base + MBOX:#x}", SA_BOARD_RING=str(ring), SA_BOARD_D=str(mm.d))
     return mm, buf, env
 
 

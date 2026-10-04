@@ -7,6 +7,7 @@
 #   scp build/deploy_c6p_<model>_m<M>/* xilinx@<board>:/home/xilinx/c6p/
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=pynq-z1 (default) | kv260
 model=${1:?stories or smollm2}
 M=${2:-8}
 O=$SA_REPO/build/c6p/${model}_m$M
@@ -23,9 +24,8 @@ case $model in
       --model "$SA_REPO/build/llm_cache/SmolLM2-135M" --board-bundle "$D" --board-generate 24 ;;
   *) echo "stories or smollm2"; exit 2 ;;
 esac
-"$SA_COMPILER/scripts/build_sa_runtime.sh" armv7 | tail -1
-llvm-strip-18 -o "$D/sa-llm-run" "$SA_REPO/build/iree/build-sa-armv7/runtime/plugins/hal/drivers/sa/sa-llm-run"
+stage_runtime "$D"
 cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/tests/board_profile.py" "$SA_COMPILER/runtime/test/board_launcher.py" \
    "$SA_REPO/driver/pynq_matmul.py" "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"
-cp "$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2/picorv32.bit" "$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2/picorv32.hwh" "$D/"
+stage_overlay "$D"
 ls -la "$D"
