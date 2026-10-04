@@ -1,6 +1,7 @@
 # Board selection for the deploy scripts (sourced after env.sh):
 #   SA_BOARD=pynq-z1 (default)  armv7 runtime, RISCV-on-PYNQ-Z1/bitstreams/l2
-#   SA_BOARD=kv260              aarch64 runtime, KV260/build/output (KV260/scripts/build_bitstream.sh)
+#   SA_BOARD=kv260              aarch64 runtime, KV260/build/output/$SA_KV260_CONFIG
+#                               (KV260/scripts/build_bitstream.sh; default d8_50mhz = K1a, d8_100mhz = K1b)
 #   SA_BIT_DIR=<dir>            another directory with picorv32.bit / .hwh
 # The driver and the launcher read the board's addresses and clock from the
 # .hwh (driver/pynq_matmul.py overlay_info), so a bundle is the same apart
@@ -11,7 +12,8 @@
 SA_BOARD=${SA_BOARD:-pynq-z1}
 case "$SA_BOARD" in
   pynq-z1) SA_RT_ARCH=armv7;   SA_BIT_DIR=${SA_BIT_DIR:-$SA_REPO/RISCV-on-PYNQ-Z1/bitstreams/l2} ;;
-  kv260)   SA_RT_ARCH=aarch64; SA_BIT_DIR=${SA_BIT_DIR:-$SA_REPO/KV260/build/output} ;;
+  kv260)   SA_RT_ARCH=aarch64; SA_KV260_CONFIG=${SA_KV260_CONFIG:-d8_50mhz}
+           SA_BIT_DIR=${SA_BIT_DIR:-$SA_REPO/KV260/build/output/$SA_KV260_CONFIG} ;;
   *) echo "SA_BOARD must be pynq-z1 or kv260 (got $SA_BOARD)" >&2; exit 2 ;;
 esac
 SA_RT_BUILD=$SA_REPO/build/iree/build-sa-$SA_RT_ARCH

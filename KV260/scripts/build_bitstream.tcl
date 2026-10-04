@@ -20,7 +20,9 @@
 #
 # Flow: fresh project (part xck26-sfvc784-2LV-c, board kv260_som) -> IP
 # repository RISCV-on-PYNQ-Z1/ip (picorv32_axi) -> kv260_bd.tcl -> wrapper ->
-# synth -> impl -> write_bitstream -> KV260/build/output/picorv32.{bit,hwh}
+# synth -> impl -> write_bitstream -> KV260/build/output/d<D>_<MHz>mhz/picorv32.{bit,hwh}
+# (one directory per configuration, e.g. d8_50mhz for K1a, d8_100mhz for K1b;
+# the Vivado project likewise: build/picorv32_kv260_d<D>_<MHz>mhz)
 # (+ timing / utilization reports, the address map). PYNQ needs the .bit and
 # .hwh to share a basename. No PL I/O, so no pin constraints.
 # ----------------------------------------------------------------------
@@ -42,7 +44,7 @@ set sa_d     8
 set sa_mhz   50
 set bd_only  0
 set synth_only 0
-set proj_dir [file join $kv_root build $proj_name]
+set proj_dir ""
 
 proc die {msg} { puts "\nERROR: \[kv260_build\] $msg\n"; exit 1 }
 proc info_msg {msg} { puts "\nINFO: \[kv260_build\] $msg" }
@@ -68,7 +70,10 @@ if {[string first $vivado_ver [version -short]] == -1} {
 }
 info_msg "KV260: D = $sa_d, pl_clk0 = $sa_mhz MHz"
 
-set out_dir [file join $kv_root build output]
+set cfg     d${sa_d}_${sa_mhz}mhz
+set out_dir [file join $kv_root build output $cfg]
+if {$proj_dir eq ""} { set proj_dir [file join $kv_root build ${proj_name}_$cfg] }
+info_msg "configuration $cfg -> $out_dir"
 
 # ------------------------------------------------------------- project
 info_msg "Creating project in $proj_dir"
@@ -154,6 +159,19 @@ check_timing          -file [file join $out_dir check_timing.rpt]
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
 set whs [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -hold]]
 close_design
+
+# what this build is (read by the deploy scripts' VERSION)
+set commit "unknown"
+catch {set commit [string trim [exec git -C $repo_root rev-parse HEAD]]}
+set dirty ""
+catch {exec git -C $repo_root diff --quiet HEAD -- rtl KV260 RISCV-on-PYNQ-Z1/scripts RISCV-on-PYNQ-Z1/ip} err opts
+if {[dict get $opts -code] != 0} { set dirty " (dirty)" }
+set fh [open [file join $out_dir build_info.txt] w]
+puts $fh "config $cfg (D = $sa_d, pl_clk0 = $sa_mhz MHz, part $part)"
+puts $fh "commit $commit$dirty"
+puts $fh "built [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S}] (Vivado [version -short], -jobs $jobs)"
+puts $fh "setup WNS $wns ns, hold WHS $whs ns"
+close $fh
 
 info_msg "Done.\n    [file join $out_dir $out_name.bit]\n    [file join $out_dir $out_name.hwh]\n    setup WNS = $wns ns, hold WHS = $whs ns"
 if {($wns ne "" && $wns < 0) || ($whs ne "" && $whs < 0)} {

@@ -4,7 +4,8 @@
 # (each made by its own deploy script, which runs the host test first: export,
 # compile, per-dispatch check, sim run), plus board_regress.py at the top.
 #   compiler/scripts/deploy_z1_freeze.sh [--board pynq-z1|kv260] [test ...]   (default: all; tests below)
-#   --board kv260: the KV260's aarch64 runtime and overlay (KV260/build/output, or SA_BIT_DIR)
+#   --board kv260: the KV260's aarch64 runtime and overlay (KV260/build/output/$SA_KV260_CONFIG,
+#   default d8_50mhz; or SA_BIT_DIR)
 #   into build/deploy_kv260 (docs/kv260_upgrade_plan.md K1a; compare the results with
 #   tests/baselines/pynq-z1/); the default pynq-z1 stages build/deploy_z1
 #   scp -r build/deploy_z1 xilinx@<board>:/home/xilinx/z1
@@ -67,6 +68,7 @@ cp "$SA_COMPILER/tests/board_regress.py" "$Z/"
   echo "staged $(date -Iseconds)"
   echo "bitstream $(sha256sum "$L2/picorv32.bit" | cut -c1-16) (${L2#$SA_REPO/})"
   echo "board $SA_BOARD (runtime $SA_RT_ARCH)"
+  [ -f "$L2/build_info.txt" ] && sed 's/^/overlay /' "$L2/build_info.txt"
 } > "$Z/VERSION"
 cat "$Z/VERSION"
 du -sh "$Z"/* | sort -k2

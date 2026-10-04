@@ -18,7 +18,17 @@ fi
 
 mkdir -p "$kv_root/build"
 cd "$kv_root/build"
-cmd=(vivado -mode batch -notrace -log vivado.log -journal vivado.jou
+# the configuration's name for the log (build_bitstream.tcl names its outputs the same way)
+sa_d=8; sa_mhz=50
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+        -sa_d)   sa_d=${args[i+1]:-8} ;;
+        -sa_mhz) sa_mhz=${args[i+1]:-50} ;;
+    esac
+done
+cfg=d${sa_d}_${sa_mhz}mhz
+cmd=(vivado -mode batch -notrace -log "vivado_$cfg.log" -journal "vivado_$cfg.jou"
      -source "$kv_root/scripts/build_bitstream.tcl" -tclargs "$@")
 
 # Vivado runs in its own systemd scope with a hard cap (MemoryMax): beyond it
@@ -30,7 +40,7 @@ cmd=(vivado -mode batch -notrace -log vivado.log -journal vivado.jou
 # Vivado directly.
 MEM=${KV260_BUILD_MEM:-12G}
 if [ -z "${KV260_BUILD_NO_SCOPE:-}" ] && command -v systemd-run >/dev/null 2>&1; then
-    echo "vivado in a systemd scope: MemoryMax=$MEM (log: $kv_root/build/vivado.log)"
+    echo "vivado in a systemd scope: MemoryMax=$MEM (log: $kv_root/build/vivado_$cfg.log)"
     exec systemd-run --user --scope -q -p MemoryMax="$MEM" "${cmd[@]}"
 fi
 exec "${cmd[@]}"

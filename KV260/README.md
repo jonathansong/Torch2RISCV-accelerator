@@ -13,9 +13,13 @@ KV260/scripts/build_bitstream.sh -bd_only                # block design + addres
 KV260/scripts/build_bitstream.sh -jobs 2 -synth_only     # stop after synthesis (~9 min)
 ```
 
-Outputs in `KV260/build/output/`: `picorv32.bit` / `picorv32.hwh` (same
-basename for PYNQ), `timing_summary.rpt`, `utilization.rpt`, `clocks.rpt`,
-`check_timing.rpt`, `address_map.txt`.
+Outputs per configuration in `KV260/build/output/d<D>_<MHz>mhz/` (K1a
+`d8_50mhz`, K1b `d8_100mhz`, K1c `d16_100mhz`; the Vivado project in
+`build/picorv32_kv260_<config>`, the log `build/vivado_<config>.log`):
+`picorv32.bit` / `picorv32.hwh` (same basename for PYNQ), `build_info.txt`
+(configuration, commit, date, WNS / WHS), `timing_summary.rpt`,
+`utilization.rpt`, `clocks.rpt`, `check_timing.rpt`, `address_map.txt`,
+`post_synth.dcp`, `post_route.dcp`.
 
 ## Builds
 
@@ -61,7 +65,7 @@ PicoRV32 hierarchy (`pico_processor.tcl`, IP `RISCV-on-PYNQ-Z1/ip`) and
 | interrupts | axi_intc -> `pl_ps_irq0` (In0 PicoRV32 trap, In1 `matmul_0/notify_irq`) | axi_intc -> IRQ_F2P |
 | PL I/O | none | unused LED / button / Arduino / PMOD ports |
 
-## Address map (`build/output/address_map.txt`)
+## Address map (`build/output/<config>/address_map.txt`)
 
 | Master | Slave | Address | Range |
 |---|---|---|---|
@@ -84,11 +88,12 @@ The driver (`driver/pynq_matmul.py` `overlay_info`) reads the board, D, the
 ARM-side BRAM address and the accelerator clock from the `.hwh`, so the
 launcher, `bwtest` and the LLM tests need no board switch. The deploy
 scripts take `SA_BOARD=kv260` (`compiler/scripts/board_env.sh`: the aarch64
-runtime, this directory's `build/output` overlay or `SA_BIT_DIR`); the whole
-regression of the Z1 freeze:
+runtime and the overlay of `build/output/$SA_KV260_CONFIG`, default
+`d8_50mhz`, or `SA_BIT_DIR`); the whole regression of the Z1 freeze:
 
 ```sh
-compiler/scripts/deploy_z1_freeze.sh --board kv260        # -> build/deploy_kv260
+compiler/scripts/deploy_z1_freeze.sh --board kv260        # K1a (d8_50mhz) -> build/deploy_kv260
+SA_KV260_CONFIG=d8_100mhz compiler/scripts/deploy_z1_freeze.sh --board kv260   # K1b
 scp -r build/deploy_kv260 <user>@<kv260>:~/kv260
 # on the board (PYNQ venv, root): cd ~/kv260 && python3 board_regress.py
 ```
