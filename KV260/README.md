@@ -26,7 +26,14 @@ basename for PYNQ), `timing_summary.rpt`, `utilization.rpt`, `clocks.rpt`,
 K1a: the worst setup path (10.5 ns data path, 14 levels including a DSP
 multiplier) runs from the DMA port's read data (`PS8_i/SAXIGP3RCLK`, HP1)
 to the descriptor fetch unit's `fetch/param_reg`, so about 90-95 MHz is the
-limit as built: K1b (100 MHz) needs a register stage on that path. BRAM is
+limit as built: K1b (100 MHz) needs a register stage on that path - done
+(`sa_cmdfetch.v`: the word is registered on the last beat, multiplied the
+cycle after; `tb_sa_unit` passes at D = 8 / 16). The next paths of the K1a
+routing (20 ns target, so not pushed): VE TRANSPOSE address (`tr_word0`, a
+DSP) -> ACC BRAM address / write enable (9.5-10.1 ns, 11 levels), LD
+`q_rp` -> ACC BRAM address (~10.1 ns, 13 levels), the RISC-V reset -> EX
+`bsr_reg` synchronous resets (~10.2 ns, high fanout); K1b's 100 MHz build
+will show whether the tool closes them, K2a's 200-250 MHz needs stages there. BRAM is
 at 90%: SPAD / ACC growth (K3, D = 32's wider words) goes to URAM.
 
 Memory: the build runs in one Vivado process (global IP synthesis, in-process

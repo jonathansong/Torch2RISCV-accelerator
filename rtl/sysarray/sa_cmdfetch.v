@@ -19,7 +19,10 @@
 //   CALL/RET subroutines (return stack of 4)
 //   LDPARAM  PARAM = mem32 * mul + add (the 64-byte block holding the word
 //            is read on the same AXI port; prefetched descriptors are dropped
-//            and fetched again after it)
+//            and fetched again after it). The word is registered on the last
+//            beat and multiplied the cycle after: the AXI read data comes out
+//            of the PS late, and data -> multiply -> add -> PARAM in one cycle
+//            was the overlay's worst path (KV260 K1a: 10.5 ns)
 // Registers: BASE0..15 (relocation; BASESEL = {w0[14:13], w0[10:9]}) and
 // PARAM0..7, written by mat_cfg (keys 11..34) while no list runs, and by
 // SETREG / LOOP_END / LDPARAM. Before decode, the two dynamic slots of w0
@@ -266,6 +269,7 @@ module sa_cmdfetch #(
     reg  [15:0] ldp_mul;
     reg  [2:0]  ldp_k, ldp_beat;
     reg         ldp_pend, ldp_stop, ldp_err;
+    reg         ldp_calc;                  // the word is in ldp_word: PARAM = word * mul + add
     wire [31:0] ldp_data = ldp_beat == ldp_a[5:3] ? (ldp_a[2] ? r_data[63:32] : r_data[31:0]) : ldp_word;
 
     assign busy = state != S_IDLE || pkt_valid;
@@ -291,7 +295,7 @@ module sa_cmdfetch #(
             state <= S_IDLE; ar_valid <= 0; outstanding <= 0; wp <= 0; rp <= 0;
             wi <= 0; dfull <= 0; pdone <= 0; pkt_valid <= 0; fenced <= 0; resume <= 0;
             st_done <= 0; st_status <= 0; st_err_idx <= 0; st_exec <= 0; st_addr <= 0;
-            err_code <= 0; lp_n <= 0; cs_n <= 0; ldp_pend <= 0;
+            err_code <= 0; lp_n <= 0; cs_n <= 0; ldp_pend <= 0; ldp_calc <= 0;
             for (k = 0; k < 16; k = k + 1) base[k] <= 0;
             for (k = 0; k < 8; k = k + 1) param[k] <= 0;
         end else begin
@@ -499,22 +503,25 @@ module sa_cmdfetch #(
                     ar_addr  <= {ldp_a[31:6], 6'd0};
                     ldp_beat <= 0;
                     ldp_err  <= 0;
+                    ldp_calc <= 0;
                     state    <= S_LDPW;
                 end
                 S_LDPW:
-                    if (beat) begin
+                    if (ldp_calc) begin                          // the cycle after the last beat
+                        param[ldp_k] <= ldp_word * {16'd0, ldp_mul} + ldp_add;
+                        ldp_calc     <= 0;
+                        state        <= ldp_stop ? S_IDLE : S_RUN;
+                    end else if (beat) begin
                         ldp_beat <= ldp_beat + 3'd1;
-                        ldp_word <= ldp_data;
+                        ldp_word <= ldp_data;                    // (the addressed word stays here)
                         if (r_resp != 2'b00) ldp_err <= 1;
                         if (r_last) begin
                             ldp_pend <= 0;
                             if (ldp_err || r_resp != 2'b00) begin
                                 st_err_idx <= st_exec - 1;
                                 fail(XERR_RRESP);
-                            end else begin
-                                param[ldp_k] <= ldp_data * {16'd0, ldp_mul} + ldp_add;
-                                state <= ldp_stop ? S_IDLE : S_RUN;
-                            end
+                            end else
+                                ldp_calc <= 1;
                         end
                     end
                 default:                                         // S_ERR
