@@ -75,7 +75,11 @@ def Sahl_ScopeOp : Sahl_Op<"scope", [SingleBlock, NoTerminator]> {
     sahl-tile splits an element-wise dispatch too large for ACC into pieces,
     one sahl.scope each: its operations work on views and local buffers of the
     piece. Buffers shared by the pieces are allocated before them (sahl.reserve).
+    With `keep` (an expanded kernel's step, sahl-expand-kernels) the buffers
+    allocated before the scope stay usable inside it (a piece sees only the
+    reserved ones).
   }];
+  let arguments = (ins UnitAttr:$keep);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = "attr-dict-with-keyword $body";
 }
@@ -84,6 +88,39 @@ def Sahl_ReserveOp : Sahl_Op<"reserve"> {
   let summary = "Allocates a local buffer now (shared by the sahl.scope pieces that follow)";
   let arguments = (ins AnyMemRef:$buffer, UnitAttr:$bcast);
   let assemblyFormat = "$buffer attr-dict `:` type($buffer)";
+}
+
+def Sahl_StripOp : Sahl_Op<"strip"> {
+  let summary = "Rows of int8 x (a DDR view [D, K]) -> an A strip of EX in SPAD_A (the rows interleaved)";
+  let description = [{
+    The A operand of sahl.mma for D rows at once (prefill's rows): element k
+    of row r at word k, lane r. One LD with INTERLEAVE.
+  }];
+  let arguments = (ins Arg<AnyMemRef, "the rows", [MemRead]>:$src, Arg<AnyMemRef, "the strip", [MemWrite]>:$dst);
+  let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
+}
+
+def Sahl_MmaOp : Sahl_Op<"mma"> {
+  let summary = "acc[D, nc, D] = A strip [D, K] x B tiles [nc, K, D] (one EX; + acc with `accumulate`)";
+  let description = [{
+    The systolic array's matrix multiply: `a` an A strip in SPAD_A (sahl.strip),
+    `b` nc weight tiles in a SPAD_B bank (packed [nc, K, D], loaded by
+    sahl.load into a buffer placed "spad_b"), `acc` int32 in ACC.
+  }];
+  let arguments = (ins Arg<AnyMemRef, "the A strip", [MemRead]>:$a, Arg<AnyMemRef, "the B tiles", [MemRead]>:$b,
+                       Arg<AnyMemRef, "the accumulator", [MemRead, MemWrite]>:$acc, UnitAttr:$accumulate);
+  let assemblyFormat = "$a `,` $b `,` $acc attr-dict `:` type($a) `,` type($b) `,` type($acc)";
+}
+
+def Sahl_BcastOp : Sahl_Op<"bcast"> {
+  let summary = "A local vector [n] or scalar -> its broadcast layout (one word per element, every lane the element)";
+  let description = [{
+    The layout a per-row (or scalar) operand of an element-wise operation
+    reads with the DIV index mode. sahl-expand-kernels makes it explicit for
+    the inputs of a kernel's epilogue that every step reads.
+  }];
+  let arguments = (ins Arg<AnyMemRef, "the values", [MemRead]>:$src, Arg<AnyMemRef, "the broadcast words", [MemWrite]>:$dst);
+  let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
 }
 
 def Sahl_KernelOp : Sahl_Op<"kernel", [SingleBlock, NoTerminator]> {

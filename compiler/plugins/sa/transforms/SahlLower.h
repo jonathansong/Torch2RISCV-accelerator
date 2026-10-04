@@ -141,6 +141,9 @@ private:
   LocalBuf newLocal(VType vt, int64_t n, bool bcast = false);
   // the local of a buffer (allocated at its first use)
   std::optional<LocalBuf> bufOf(Value v, bool bcast = false);
+  // an expanded kernel's steps (sahl-expand-kernels)
+  bool strip(sahl::StripOp st);
+  bool mma(sahl::MmaOp m);
 
   // ------------------------------------------------------------ DDR
   struct Ddr {

@@ -28,6 +28,7 @@ iree_cc_library(
     "../transforms/SahlTile.cpp"
     "../transforms/SahlPlanMemory.cpp"
     "../transforms/SahlSchedule.cpp"
+    "../transforms/SahlExpandKernels.cpp"
     "../transforms/SahlToSahw.cpp"
     "../transforms/SahlLowerGeneric.cpp"
     "../transforms/SahlLowerKernels.cpp"

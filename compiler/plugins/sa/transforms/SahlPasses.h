@@ -28,6 +28,9 @@ void registerSahlPlanMemoryPass();
 // The schedule of each linear micro-kernel (chunk_tiles, loop on its sahl.kernel).
 std::unique_ptr<Pass> createSahlSchedulePass(const TargetConfig &config);
 void registerSahlSchedulePass();
+
+std::unique_ptr<Pass> createSahlExpandKernelsPass(const TargetConfig &config);
+void registerSahlExpandKernelsPass();
 // sahl -> one sahw.template per function (the lowering: registers, local
 // memory, one single-stage VE per arith / math operation).
 std::unique_ptr<Pass> createSahlToSahwPass(const TargetConfig &config);

@@ -42,10 +42,37 @@ bool Lowerer::lowerBlock(Block &block) {
     loc = op->getLoc();
     if (auto sc = dyn_cast<sahl::ScopeOp>(op)) {   // a piece (sahl-tile): its local memory released after it
       auto mark = mem.mark();
+      if (sc.getKeep()) {                          // an expanded kernel's step: the outer buffers stay
+        auto savedLocals = locals;
+        auto savedBcast = bcastOf;
+        if (!lowerBlock(sc.getBody().front())) return false;
+        mem.release(mark);
+        locals = std::move(savedLocals);
+        bcastOf = std::move(savedBcast);
+        continue;
+      }
       locals = reserved;
       bcastOf.clear();
       if (!lowerBlock(sc.getBody().front())) return false;
       mem.release(mark);
+      continue;
+    }
+    if (auto st = dyn_cast<sahl::StripOp>(op)) {
+      if (!strip(st)) return false;
+      continue;
+    }
+    if (auto mm = dyn_cast<sahl::MmaOp>(op)) {
+      if (!mma(mm)) return false;
+      continue;
+    }
+    if (auto bc = dyn_cast<sahl::BcastOp>(op)) {
+      auto l = bufOf(bc.getSrc());
+      if (!l) return false;
+      auto b = cast<MemRefType>(bc.getSrc().getType()).getRank() == 0
+                   ? scalarBcast(bc.getSrc(), *l)
+                   : perElementBcast(bc.getSrc(), *l, cast<MemRefType>(bc.getSrc().getType()).getNumElements());
+      if (!b) return false;
+      locals[bc.getDst()] = *b;
       continue;
     }
     if (auto rs = dyn_cast<sahl::ReserveOp>(op)) {  // a buffer shared by the pieces: allocated now
@@ -153,10 +180,41 @@ LocalBuf Lowerer::newLocal(VType vt, int64_t n, bool bcast) {
 
 std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
   if (auto it = locals.find(v); it != locals.end()) return it->second;
+  auto mt = cast<MemRefType>(v.getType());
+  if (auto sv = v.getDefiningOp<memref::SubViewOp>(); sv && !ddrRoot(v)) {
+    // a static view of a local buffer (an expanded kernel's step): its words
+    auto base = bufOf(sv.getSource());
+    if (!base) return std::nullopt;
+    SmallVector<int64_t> ss;
+    int64_t so;
+    if (failed(sv.getSourceType().getStridesAndOffset(ss, so)) || !mt.hasStaticShape())
+      return fail("local view layout"), std::nullopt;
+    int64_t elem = 0;
+    for (auto [o, str] : llvm::zip(sv.getStaticOffsets(), ss)) {
+      if (ShapedType::isDynamic(o)) return fail("dynamic local view"), std::nullopt;
+      elem += o * str;
+    }
+    // one word per element in the broadcast layout, D elements per word packed
+    if (!base->bcast && elem % d) return fail("local view not at a word boundary"), std::nullopt;
+    LocalBuf l = *base;
+    l.la += uint32_t(base->bcast ? elem : elem / d);
+    l.n = mt.getNumElements();
+    return l;
+  }
   auto alloc = v.getDefiningOp<memref::AllocOp>();
   if (!alloc) return fail("operand is not a local buffer"), std::nullopt;
-  auto mt = cast<MemRefType>(v.getType());
   auto vt = vtOf(mt.getElementType());
+  if (auto pm = alloc->getAttrOfType<StringAttr>("sa.mem"); pm && pm.getValue() == "spad_b") {
+    // weight tiles in a SPAD_B bank (sahl-expand-kernels: the bank chosen)
+    auto bank = alloc->getAttrOfType<IntegerAttr>("sa.bank");
+    if (!bank || !mt.hasStaticShape() || !mt.getElementType().isInteger(8)) return fail("SPAD_B buffer"), std::nullopt;
+    LocalBuf l;
+    l.vt = ::sa::VT_I8;
+    l.n = mt.getNumElements();
+    l.la = ::sa::laddr(::sa::MEM_SPAD_B, uint32_t(bank.getInt()) * lay.sbank);
+    locals[v] = l;
+    return l;
+  }
   // the plan (sahl-plan-memory): the layout; the place checked
   if (auto pl = alloc->getAttrOfType<StringAttr>("sa.layout")) bcast |= pl.getValue() == "bcast";
   if (auto pm = alloc->getAttrOfType<StringAttr>("sa.mem");
@@ -340,6 +398,14 @@ bool Lowerer::load(sahl::LoadOp l) {
   if (r->et.isInteger(64)) return fail("i64 load");
   auto dst = bufOf(l.getDst());
   if (!dst) return false;
+  if ((dst->la >> 28) == uint32_t(::sa::MEM_SPAD_B)) {
+    // weight tiles [nc, K, D] into a SPAD_B bank: one row per tile
+    auto st = cast<MemRefType>(l.getSrc().getType());
+    int64_t rows = st.getDimSize(0), rb = r->n / rows;
+    if (r->pitch || r->dyn || r->off % 8 || rb % 8 || rb > 65535) return fail("weight tiles load");
+    sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(dst->la), rows, rb, rb, 0, ValueRange{});
+    return true;
+  }
   if (r->dyn) return dynamicDma(*r, *dst, true);
   if (r->pitch) return rowsDma(true, *r, dst->la);
   if (r->off % 8 && r->n == 1 && r->et.isF32()) return scalarByParam(*r, *dst);
@@ -361,6 +427,31 @@ bool Lowerer::store(sahl::StoreOp s) {
   uint32_t bytes = uint32_t((r->n * esize(r->et) + 7) / 8 * 8);
   if (r->off % 8) return fail("store not 8-byte aligned");
   contiguousDma(false, r->base, r->off, l.la, bytes);
+  return true;
+}
+
+bool Lowerer::strip(sahl::StripOp st) {
+  // D rows of int8 x [D, K] -> the A strip: one LD with INTERLEAVE
+  auto r = ddrOf(st.getSrc(), /*allowPitch=*/true);
+  auto dst = bufOf(st.getDst());
+  if (!r || !dst) return false;
+  auto mt = cast<MemRefType>(st.getSrc().getType());
+  if (mt.getRank() != 2 || !mt.getElementType().isInteger(8) || r->dyn) return fail("strip source");
+  int64_t rows = mt.getDimSize(0), k = mt.getDimSize(1), pitch = r->pitch ? r->pitch : k;
+  if (r->off % 8 || k % 8) return fail("strip source alignment");
+  sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(dst->la), rows, k, pitch, /*INTERLEAVE=*/1, ValueRange{});
+  return true;
+}
+
+bool Lowerer::mma(sahl::MmaOp m) {
+  // acc = A strip x B tiles: one EX (nc tiles of K / D words each)
+  auto a = bufOf(m.getA()), b = bufOf(m.getB()), c = bufOf(m.getAcc());
+  if (!a || !b || !c) return false;
+  auto bt = cast<MemRefType>(m.getB().getType());
+  if (bt.getRank() != 3 || bt.getDimSize(2) != d) return fail("mma: B tiles [nc, K, D]");
+  const int64_t nc = bt.getDimSize(0), k = bt.getDimSize(1);
+  sahw::ExOp::create(bb, loc, int64_t(a->la & 0xFFFFFFF), int64_t(b->la & 0xFFFFFFF), int64_t(c->la & 0xFFFFFFF),
+                     k / d, m.getAccumulate(), nc, k, 1, nc, ValueRange{});
   return true;
 }
 

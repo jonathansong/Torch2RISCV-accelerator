@@ -64,6 +64,29 @@ def sa_only(text):
     return "\n".join(out)
 
 
+def canonical(data):
+    """The disassembly with each BASE register named by its setup (binding and
+    offset) instead of its number: two executables equal here differ only in
+    the numbering of the BASE registers (the order the lowering met the DDR
+    views), not in what they do."""
+    import re
+    sys.path.insert(0, os.path.join(REPO, "compiler", "runtime", "tools"))
+    import sadesc
+    import sadis
+    out = []
+    _, _, exps = sadesc.read(data)
+    for (name, rows, nb, nc, cyc, setup), ext in zip(exps, sadesc.read_ext(data)):
+        names = {s[1]: f"<b{s[2]}+c{s[3]}*{s[4]}/{s[5]}+{s[6]}>" for s in setup if s[0] == 0}
+        out.append(f"{name} {rows.shape[0]} {nb} {nc} {ext}")
+        out += sorted(f"setup {names[s[1]]}" if s[0] == 0 else f"setup PARAM{s[1]} {s[2:]}" for s in setup)
+        for i, w in enumerate(rows):
+            t = sadis.line(i, w)
+            t = re.sub(r"base=(\d+)", lambda m: "base=" + names.get(int(m.group(1)), m.group(1)), t)
+            t = re.sub(r"\bBASE(\d+)\b", lambda m: "BASE" + names.get(int(m.group(1)), m.group(1)), t)
+            out.append(t)
+    return "\n".join(out)
+
+
 def key_of(text, flags):
     return hashlib.sha256((" ".join(flags) + "\n" + text).encode()).hexdigest()[:20]
 
@@ -136,7 +159,7 @@ def compare(args):
     t0 = time.time()
     with tempfile.TemporaryDirectory(prefix="sa_golden_") as tmp:
         res = run_all({k: (os.path.join(GOLDEN, "src", k + ".mlir"), flags[k]) for k in keys}, args.jobs, tmp)
-    bad = {}
+    bad, renamed = {}, set()
     for k in keys:
         data, err = res[k]
         if k in mf["errors"]:
@@ -149,17 +172,23 @@ def compare(args):
         with open(os.path.join(GOLDEN, "exp", k + ".sadesc"), "rb") as f:
             want = f.read()
         if data != want:
+            if canonical(data) == canonical(want):
+                renamed.add(k)
+                continue
             at = next((i for i, (a, b) in enumerate(zip(data, want)) if a != b), min(len(data), len(want)))
             bad[k] = f"differs ({len(data)} vs {len(want)} bytes, first at byte {at})"
     for c, v in cases.items():
         ks = [e for e in v["entries"] if e["key"] in bad]
-        print(f"{c}: {len(v['entries']) - len(ks)}/{len(v['entries'])} identical")
+        nr = sum(e["key"] in renamed for e in v["entries"])
+        print(f"{c}: {len(v['entries']) - len(ks)}/{len(v['entries'])} identical"
+              + (f" ({nr} up to the numbering of BASE registers)" if nr else ""))
         for e in ks[:args.show]:
             print(f"  {e['name']} [{e['key']}]: {bad[e['key']]}")
         if len(ks) > args.show:
             print(f"  ... {len(ks) - args.show} more")
     print(f"{len(keys)} unique dispatches in {time.time() - t0:.0f} s: "
-          + ("golden corpus IDENTICAL" if not bad else f"{len(bad)} DIFFER"))
+          + ("golden corpus IDENTICAL" if not bad else f"{len(bad)} DIFFER")
+          + (f" ({len(renamed)} up to the numbering of BASE registers)" if renamed else ""))
     print("golden PASS" if not bad else "golden FAIL")
     return 1 if bad else 0
 
