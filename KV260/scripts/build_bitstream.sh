@@ -18,6 +18,20 @@ fi
 
 mkdir -p "$kv_root/build"
 cd "$kv_root/build"
-exec vivado -mode batch -notrace \
-    -log vivado.log -journal vivado.jou \
-    -source "$kv_root/scripts/build_bitstream.tcl" -tclargs "$@"
+cmd=(vivado -mode batch -notrace -log vivado.log -journal vivado.jou
+     -source "$kv_root/scripts/build_bitstream.tcl" -tclargs "$@")
+
+# Vivado runs in its own memory-capped systemd scope. The UltraScale+ build
+# fills the page cache on top of ~6 GB of processes (main + synthesis); in the
+# terminal's own cgroup that pushed the session's memory pressure past
+# systemd-oomd's limit, which then killed the whole terminal. MemoryHigh makes
+# the kernel reclaim Vivado's own cache first; beyond MemoryMax only this
+# scope is killed. KV260_BUILD_MEM / KV260_BUILD_MEM_HIGH override the caps,
+# KV260_BUILD_NO_SCOPE=1 runs Vivado directly.
+MEM=${KV260_BUILD_MEM:-11G}
+MEM_HIGH=${KV260_BUILD_MEM_HIGH:-9G}
+if [ -z "${KV260_BUILD_NO_SCOPE:-}" ] && command -v systemd-run >/dev/null 2>&1; then
+    echo "vivado in a systemd scope: MemoryHigh=$MEM_HIGH MemoryMax=$MEM (log: $kv_root/build/vivado.log)"
+    exec systemd-run --user --scope -q -p MemoryHigh="$MEM_HIGH" -p MemoryMax="$MEM" "${cmd[@]}"
+fi
+exec "${cmd[@]}"
