@@ -123,9 +123,13 @@ def perf(results, commit):
                 out.append(f"| {t} | {l.strip()} |")
     out += ["", "## DMA bandwidth (m2_bw_test.py)", "", "```", log("bwtest").split("--- stderr ---")[0].strip(), "```", ""]
     for t in ("c6p_stories", "c6p_smollm2", "hfgen"):
-        p = log(t + "_profile").split("--- stderr ---")[0].strip()
-        if p:
-            out += [f"## Profile: {t} (board_profile.py)", "", "```", p, "```", ""]
+        p = log(t + "_profile").split("--- stderr ---")[0].strip().splitlines()
+        if p:                                       # the header, the 15 largest exports, the total
+            hi = next((i for i, l in enumerate(p) if l.startswith("export")), 0)
+            rows = [l for l in p[hi + 1:] if not l.startswith("total")]
+            tot = [l for l in p if l.startswith("total")]
+            keep = p[:hi + 1] + rows[:15] + ([f"... ({len(rows) - 15} more exports)"] if len(rows) > 15 else []) + tot
+            out += [f"## Profile: {t} (board_profile.py; the full log in the release's results)", "", "```"] + keep + ["```", ""]
     l2 = os.path.join(REPO, "RISCV-on-PYNQ-Z1", "bitstreams", "l2")
     rd = open(os.path.join(l2, "README.md")).read().splitlines()
     res = [l for l in rd if "LUT" in l and "WNS" in l]
