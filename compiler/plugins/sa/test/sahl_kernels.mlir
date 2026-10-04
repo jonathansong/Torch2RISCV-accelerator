@@ -7,6 +7,28 @@
 // RUN: iree-opt --iree-sa-to-sahl --iree-sahl-to-sahw %s | FileCheck %s --check-prefix=LOW
 // RUN: iree-opt --iree-sa-to-sahl --iree-sahl-schedule %s | FileCheck %s --check-prefix=SCHED
 // RUN: iree-opt --iree-sa-to-sahl --iree-sahl-schedule --iree-sahl-expand-kernels %s | FileCheck %s --check-prefix=EXP
+// RUN: iree-opt --iree-sa-to-sahl="ukernels=none" --iree-sahl-schedule --iree-sahl-expand-kernels %s | FileCheck %s --check-prefix=EXPGEN
+
+// sahl-expand-kernels (§8.20, E3): the same layer as a generic contraction
+// (ukernels=none). SPAD_A claimed: the strip at word 0; x (int32) in ACC,
+// copied over the D rows; per chunk its B tiles in a SPAD_B bank (the banks
+// alternating; no prefetch: each chunk's load comes right before its EX),
+// then a scope with the EX, the epilogue over the chunk (1-D), the store.
+// EXPGEN-NOT: sahl.kernel
+// EXPGEN: sahl.claim_spad {words = 16384 : i64}
+// EXPGEN: sahl.bcast %{{.+}}, %[[SX:.+]] : memref<f32>, memref<f32>
+// EXPGEN: sahl.reserve %[[X:.+]] : memref<288xi32>
+// EXPGEN: sahl.strip %{{.+}}, %{{.+}} : memref<288xi32, strided<[1]>>, memref<8x288xi8>
+// EXPGEN: %[[B0:.+]] = memref.alloc() {sa.bank = 0 : i64, sa.mem = "spad_b"} : memref<24x288x8xi8>
+// EXPGEN: sahl.load %{{.+}}, %[[B0]]
+// EXPGEN: sahl.scope attributes {keep} {
+// EXPGEN: sahl.mma %{{.+}}, %[[B0]], %[[ACC:.+]] : memref<8x288xi8>, memref<24x288x8xi8>, memref<192xi64>
+// EXPGEN: linalg.generic {{.*}} iterator_types = ["parallel"]} ins(%[[ACC]], %{{.+}}, %[[SX]] :
+// EXPGEN: sahl.store
+// EXPGEN: %[[B1:.+]] = memref.alloc() {sa.bank = 1 : i64, sa.mem = "spad_b"} : memref<24x288x8xi8>
+// EXPGEN: sahl.load %{{.+}}, %[[B1]]
+// EXPGEN: sahl.scope attributes {keep} {
+// EXPGEN: sahl.mma %{{.+}}, %[[B1]], %{{.+}} :
 
 // sahl-expand-kernels (§8.20, E2): decode's linear kernel written out. The
 // strip's words first, x copied over the D rows, the scalar s_x broadcast;

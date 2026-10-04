@@ -145,6 +145,7 @@ private:
   bool strip(sahl::StripOp st);
   bool mma(sahl::MmaOp m);
   bool loop(sahl::LoopOp lp);
+  int64_t leadingPitch(Value v, int64_t rb);
   // inside a sahl.loop: the PARAM a DMA's sa.advance names (none: Value()), and marking the DMA dynamic
   Value advanceOf(Operation *op);
   void advanced(Operation *op, Value adv);

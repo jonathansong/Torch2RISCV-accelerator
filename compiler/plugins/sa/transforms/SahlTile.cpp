@@ -208,7 +208,7 @@ void flatPieces(func::FuncOp f, int64_t N, int64_t len) {
   };
   for (int64_t off = 0; off < N; off += len) {
     int64_t n = std::min(len, N - off);
-    auto sc = sahl::ScopeOp::create(b, f.getLoc());
+    auto sc = sahl::ScopeOp::create(b, f.getLoc(), /*keep=*/false, /*spad_from=*/IntegerAttr());
     Block *sb = &sc.getBody().emplaceBlock();
     OpBuilder ib = OpBuilder::atBlockEnd(sb);
     IRMapping map;
@@ -268,7 +268,7 @@ void rowPieces(func::FuncOp f, int64_t R, int64_t C, int64_t rn) {
   };
   for (int64_t r0 = 0; r0 < R; r0 += rn) {
     int64_t n = std::min(rn, R - r0);
-    auto sc = sahl::ScopeOp::create(b, f.getLoc());
+    auto sc = sahl::ScopeOp::create(b, f.getLoc(), /*keep=*/false, /*spad_from=*/IntegerAttr());
     Block *sb = &sc.getBody().emplaceBlock();
     OpBuilder ib = OpBuilder::atBlockEnd(sb);
     IRMapping map;

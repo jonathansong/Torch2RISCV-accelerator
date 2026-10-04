@@ -77,9 +77,10 @@ def Sahl_ScopeOp : Sahl_Op<"scope", [SingleBlock, NoTerminator]> {
     piece. Buffers shared by the pieces are allocated before them (sahl.reserve).
     With `keep` (an expanded kernel's step, sahl-expand-kernels) the buffers
     allocated before the scope stay usable inside it (a piece sees only the
-    reserved ones).
+    reserved ones). With `spad_from` the SPAD_A buffers allocated inside it
+    start at that word (the generic contraction's int8 results: after x).
   }];
-  let arguments = (ins UnitAttr:$keep);
+  let arguments = (ins UnitAttr:$keep, OptionalAttr<I64Attr>:$spad_from);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = "attr-dict-with-keyword $body";
 }
@@ -135,6 +136,23 @@ def Sahl_LoopOp : Sahl_Op<"loop", [SingleBlock, NoTerminator]> {
   let arguments = (ins I64Attr:$count, DenseI64ArrayAttr:$strides);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = "attr-dict-with-keyword $body";
+}
+
+def Sahl_ClaimSpadOp : Sahl_Op<"claim_spad"> {
+  let summary = "SPAD_A words [0, words) belong to the placed buffers that follow (SPAD_A unused before)";
+  let description = [{
+    The generic contraction's layout: the A strip at word 0, x or the raw rows
+    of a transposed matrix in bank 1, placed with sa.word. Other SPAD_A
+    buffers are allocated after `words`.
+  }];
+  let arguments = (ins I64Attr:$words);
+  let assemblyFormat = "attr-dict";
+}
+
+def Sahl_TransposeOp : Sahl_Op<"transpose"> {
+  let summary = "Rows [R, C] in SPAD_A -> weight tiles in a SPAD_B bank (TRANSPOSE: B tiles of a row-major matrix)";
+  let arguments = (ins Arg<AnyMemRef, "the rows", [MemRead]>:$src, Arg<AnyMemRef, "the tiles", [MemWrite]>:$dst);
+  let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
 }
 
 def Sahl_KernelOp : Sahl_Op<"kernel", [SingleBlock, NoTerminator]> {

@@ -43,6 +43,7 @@ bool Lowerer::lowerBlock(Block &block) {
     if (auto sc = dyn_cast<sahl::ScopeOp>(op)) {   // a piece (sahl-tile): its local memory released after it
       auto mark = mem.mark();
       if (sc.getKeep()) {                          // an expanded kernel's step: the outer buffers stay
+        if (auto sf = sc.getSpadFrom()) mem.takeSpad(uint32_t(*sf));
         auto savedLocals = locals;
         auto savedBcast = bcastOf;
         if (!lowerBlock(sc.getBody().front())) return false;
@@ -55,6 +56,20 @@ bool Lowerer::lowerBlock(Block &block) {
       bcastOf.clear();
       if (!lowerBlock(sc.getBody().front())) return false;
       mem.release(mark);
+      continue;
+    }
+    if (auto cs = dyn_cast<sahl::ClaimSpadOp>(op)) {
+      if (mem.spadUsed()) return fail("a kernel claiming SPAD_A after other SPAD_A buffers");
+      mem.takeSpad(uint32_t(cs.getWords()));
+      continue;
+    }
+    if (auto tr = dyn_cast<sahl::TransposeOp>(op)) {
+      auto a = bufOf(tr.getSrc()), b = bufOf(tr.getDst());
+      if (!a || !b) return false;
+      auto st = cast<MemRefType>(tr.getSrc().getType());
+      if (st.getRank() != 2 || st.getDimSize(1) % d) return fail("transpose source [R, C]");
+      sahw::TransposeOp::create(bb, loc, int64_t(a->la), int64_t(b->la), st.getNumElements(),
+                                int64_t(::sa::vtypes(::sa::VT_I8, ::sa::VT_I8)), st.getDimSize(1) / d, ValueRange{});
       continue;
     }
     if (auto lp = dyn_cast<sahl::LoopOp>(op)) {
@@ -214,6 +229,16 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
   if (!alloc) return fail("operand is not a local buffer"), std::nullopt;
   auto vt = vtOf(mt.getElementType());
   if (auto w = alloc->getAttrOfType<IntegerAttr>("sa.word")) {
+    auto pm = alloc->getAttrOfType<StringAttr>("sa.mem");
+    if (pm && pm.getValue() == "spad_a") {         // a fixed place in SPAD_A (after sahl.claim_spad)
+      if (!mt.hasStaticShape() || !mt.getElementType().isInteger(8)) return fail("placed SPAD_A buffer"), std::nullopt;
+      LocalBuf l;
+      l.vt = ::sa::VT_I8;
+      l.n = mt.getNumElements();
+      l.la = ::sa::laddr(::sa::MEM_SPAD_A, uint32_t(w.getInt()));
+      locals[v] = l;
+      return l;
+    }
     // a fixed place in ACC (sahl-expand-kernels: decode's linear chunk buffers;
     // an i64 accumulator, as IREE types it, holds int32 words: its epilogue truncates)
     Type et = mt.getElementType();
@@ -233,6 +258,12 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
     l.vt = ::sa::VT_I8;
     l.n = mt.getNumElements();
     l.la = ::sa::laddr(::sa::MEM_SPAD_B, uint32_t(bank.getInt()) * lay.sbank);
+    locals[v] = l;
+    return l;
+  }
+  if (alloc->hasAttr("sa.accumulator") && mt.getElementType().isInteger(64) && mt.hasStaticShape()) {
+    // an expanded kernel's accumulator typed i64 as IREE gives it: int32 words (its epilogue truncates)
+    LocalBuf l = newLocal(::sa::VT_I32, mt.getNumElements());
     locals[v] = l;
     return l;
   }
@@ -413,6 +444,15 @@ bool Lowerer::scalarByParam(const Ddr &r, const LocalBuf &dst) {
   return true;
 }
 
+// The bytes between the rows of a view (its leading stride; `rb` for a 1-D view).
+int64_t Lowerer::leadingPitch(Value v, int64_t rb) {
+  auto mt = cast<MemRefType>(v.getType());
+  SmallVector<int64_t> st;
+  int64_t off;
+  if (mt.getRank() < 2 || failed(mt.getStridesAndOffset(st, off)) || ShapedType::isDynamic(st[0])) return rb;
+  return st[0] * esize(mt.getElementType());
+}
+
 bool Lowerer::load(sahl::LoadOp l) {
   auto r = ddrOf(l.getSrc(), /*allowPitch=*/true);
   if (!r) return false;
@@ -423,9 +463,11 @@ bool Lowerer::load(sahl::LoadOp l) {
   if ((dst->la >> 28) == uint32_t(::sa::MEM_SPAD_B)) {
     // weight tiles [nc, K, D] into a SPAD_B bank: one row per tile; with
     // sa.prefix in the template's prefix (it may run during an earlier dispatch)
+    // (rows of a larger matrix: their pitch; sa.interleave: K-major rows, interleaved)
     auto st = cast<MemRefType>(l.getSrc().getType());
-    int64_t rows = st.getDimSize(0), rb = r->n / rows;
-    if (r->pitch || r->dyn || r->off % 8 || rb % 8 || rb > 65535) return fail("weight tiles load");
+    int64_t rows = st.getDimSize(0), rb = r->n / rows * esize(r->et), pitch = leadingPitch(l.getSrc(), rb);
+    if (r->dyn || r->off % 8 || rb % 8 || rb > 65535 || pitch % 8) return fail("weight tiles load");
+    const int64_t ilv = l->hasAttr("sa.interleave") ? 1 : 0;
     OpBuilder *wb = &bb;
     std::optional<OpBuilder> pb;
     if (l->hasAttr("sa.prefix")) {
@@ -433,8 +475,15 @@ bool Lowerer::load(sahl::LoadOp l) {
       pb.emplace(OpBuilder::atBlockEnd(&pre.getRegion().emplaceBlock()));
       wb = &*pb;
     }
-    advanced(sahw::LdOp::create(*wb, loc, r->base, r->off, int64_t(dst->la), rows, rb, rb, 0,
+    advanced(sahw::LdOp::create(*wb, loc, r->base, r->off, int64_t(dst->la), rows, rb, pitch, ilv,
                                 adv ? ValueRange{adv} : ValueRange{}), adv);
+    return true;
+  }
+  if (l->hasAttr("sa.rows")) {                     // one DMA row per row of the view (rows to transpose)
+    auto st = cast<MemRefType>(l.getSrc().getType());
+    int64_t rows = st.getDimSize(0), rb = r->n / rows * esize(r->et), pitch = leadingPitch(l.getSrc(), rb);
+    if (r->dyn || r->off % 8 || rb > 65535) return fail("rows load");
+    sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(dst->la), rows, rb, pitch, 0, ValueRange{});
     return true;
   }
   if (adv) {                                       // a contiguous row moving on with the loop

@@ -277,7 +277,7 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel, const Chunk *chunk
     Val v;
     auto placedAcc = [&] {                            // an expanded kernel's i64 accumulator (int32 words)
       auto a = in.getDefiningOp<memref::AllocOp>();
-      return a && a->hasAttr("sa.word");
+      return a && (a->hasAttr("sa.word") || a->hasAttr("sa.accumulator"));
     };
     if (mt.getElementType().isInteger(64) && !placedAcc()) {
       // i64 scalars: positions / indices (masks, gathers), read through LDPARAM
