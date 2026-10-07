@@ -149,6 +149,8 @@
 
 **验收**：板子能启动，能用 PYNQ（或 Python + `/dev/mem`）加载一个空 overlay；版本组合已记录。
 
+**进度**（2026-10-07）：板子到手。镜像 Ubuntu 22.04.4（Ubuntu for Kria，内核 5.15.0-1027-xilinx-zynqmp），启动固件 K26-BootFW-01.02 / U-Boot 2023.01（A / B 相同）；DDR 低段 `0x0000_0000`–`0x7FEF_FFFF`，CMA 1000 MiB 在 `0x3780_0000`（整段在低 2 GB）；开机加载 `k26-starter-kits`，加载 overlay 前要 `xmutil unloadapp`（驱动与 `ddr_test.py` 已自动处理）。版本组合记在 `KV260/README.md`。Vivado 2024.1 支持 XCK26（已确认）。待做：安装 Kria-PYNQ、A53 的 CPU 基线、加载 overlay。回归测试包已补上 K1a 验证第 1、3、4 步（`ddr`、`fwdemo`、`c1`）。
+
 ### K1a 平台移植（加速器完全不变）
 
 目标是在 KV260 上**以与 Z1 相同的加速器**完成闭环，把平台问题和时序问题分开：这一步出错，只可能是平台（block design、地址、运行时）的问题。

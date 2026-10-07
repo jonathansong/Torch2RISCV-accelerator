@@ -14,7 +14,10 @@
 #   back:  scp -r xilinx@<board>:/home/xilinx/z1/results build/deploy_z1/
 #          $SA_PY compiler/tests/make_z1_baselines.py          (-> tests/baselines/pynq-z1/)
 #
+#   ddr          RISC-V reads / writes DDR (RISCV-on-PYNQ-Z1/tests/ddr_access)          (K1a step 1)
 #   bwtest       DMA bandwidth (notebooks/m2_bw_test.py, firmware/bwtest) on the board's overlay
+#   fwdemo       gemm / vector / desc_run firmware vs NumPy (notebooks/m1, m3, m5 demos) (step 3)
+#   c1           the sa HAL driver's C1 test (sa_hal_test through board_launcher.py) (step 4)
 #   c3           stories15M decode vs the hand-written L5 path (DeviceModel)        deploy_c3.sh
 #   c55          SmolLM2-135M decode, export_hf.py (qhf), vs the sim                deploy_c55.sh
 #   c6p_stories  stories15M prefill (M = 8) + decode                                deploy_c6p.sh stories 8
@@ -34,7 +37,7 @@ case $SA_BOARD in
   *)       Z=$SA_REPO/build/deploy_$SA_BOARD ;;
 esac
 MEM=${MEM:-12G}
-ALL=(bwtest c3 c55 c6p_stories c6p_smollm2 hfgen)
+ALL=(ddr bwtest fwdemo c1 c3 c55 c6p_stories c6p_smollm2 hfgen)
 TESTS=("$@")
 [ ${#TESTS[@]} -eq 0 ] && TESTS=("${ALL[@]}") && rm -rf "$Z"
 mkdir -p "$Z"
@@ -50,6 +53,18 @@ stage() {                      # <test> <deploy dir> <deploy command...>
 }
 for t in "${TESTS[@]}"; do
   case $t in
+    ddr)
+      rm -rf "$Z/ddr" && mkdir -p "$Z/ddr"
+      cp "$SA_REPO/RISCV-on-PYNQ-Z1/tests/ddr_access/ddr_test.py" "$SA_REPO/RISCV-on-PYNQ-Z1/tests/ddr_access/ddr_test.bin" \
+         "$L2/picorv32.bit" "$L2/picorv32.hwh" "$Z/ddr/" ;;
+    fwdemo)
+      rm -rf "$Z/fwdemo" && mkdir -p "$Z/fwdemo"
+      cp "$SA_REPO/notebooks/m1_gemm_demo.py" "$SA_REPO/notebooks/m3_vector_demo.py" "$SA_REPO/notebooks/m5_desc_demo.py" \
+         "$SA_REPO/firmware/gemm/gemm_fw.bin" "$SA_REPO/firmware/vector/vector_fw.bin" \
+         "$SA_REPO/firmware/desc_run/desc_run_fw.bin" "$SA_REPO/firmware/matmul/matmul_fw.bin" \
+         "$SA_REPO/firmware/matmul_insn/matmul_insn_fw.bin" "$SA_REPO/driver/pynq_matmul.py" \
+         "$L2/picorv32.bit" "$L2/picorv32.hwh" "$Z/fwdemo/" ;;
+    c1)          stage c1 "$SA_REPO/build/deploy_c1" "$SA_COMPILER/scripts/deploy_c1.sh" ;;
     bwtest)
       rm -rf "$Z/bwtest" && mkdir -p "$Z/bwtest"
       cp "$SA_REPO/notebooks/m2_bw_test.py" "$SA_REPO/firmware/bwtest/bwtest_fw.bin" "$SA_REPO/driver/pynq_matmul.py" \

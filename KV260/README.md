@@ -21,6 +21,20 @@ Outputs per configuration in `KV260/build/output/d<D>_<MHz>mhz/` (K1a
 `utilization.rpt`, `clocks.rpt`, `check_timing.rpt`, `address_map.txt`,
 `post_synth.dcp`, `post_route.dcp`.
 
+## Board (K0, 2026-10-07)
+
+| | |
+|---|---|
+| Image | Ubuntu 22.04.4 LTS (Ubuntu for Kria), kernel 5.15.0-1027-xilinx-zynqmp |
+| Boot firmware | K26-BootFW-01.02 (XilinxSom_QspiImage-k26-v2.1), U-Boot 2023.01; image A / B identical |
+| DDR | low `0x0000_0000`-`0x7FEF_FFFF`, high `0x8_0000_0000`-`0x8_7FFF_FFFF` |
+| CMA | 1000 MiB at `0x3780_0000` (`cma=1000M`), entirely in the low 2 GB: the accelerator's windows are allocated there (the runtime checks the window ends at or below 2 GB) |
+| PL at boot | the `k26-starter-kits` app is loaded; it must be unloaded (`xmutil unloadapp`) before an overlay: the driver (`kria_unload_app`) and `ddr_test.py` do it |
+| Network | MAC 00:0a:35:2a:df:b8, 192.168.0.121 (DHCP) |
+
+PYNQ (Kria-PYNQ, which installs the PYNQ venv and XRT setup under
+`/etc/profile.d/`) is needed by the driver; Vivado 2024.1 builds the overlay.
+
 ## Builds
 
 | Build | Date | LUT | FF | DSP | BRAM36 | URAM | Setup WNS / hold WHS | Notes |

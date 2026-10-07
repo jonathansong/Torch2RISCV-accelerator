@@ -23,6 +23,8 @@ import os
 import sys
 import time
 
+import subprocess
+
 import numpy as np
 from pynq import GPIO, MMIO, Overlay, allocate
 
@@ -73,6 +75,9 @@ def main():
     ap.add_argument("--timeout", type=float, default=5.0)
     args = ap.parse_args()
 
+    import shutil
+    if shutil.which("xmutil"):           # Kria: the app loaded at boot owns the PL
+        subprocess.run(["xmutil", "unloadapp"], capture_output=True)
     ol = Overlay(args.bit)
     # the ARM-side addresses from the overlay (PYNQ-Z1 0x4001_0000 / 0x4002_0000,
     # KV260 0xA001_0000 / 0xA002_0000); the constants above if absent

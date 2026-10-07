@@ -7,8 +7,12 @@ results/ (copied back to the host for compiler/tests/make_z1_baselines.py).
     sudo bash -c 'source /etc/profile.d/pynq_venv.sh && source /etc/profile.d/xrt_setup.sh && \\
         cd /home/xilinx/z1 && python3 board_regress.py [test ...] [--no-profile]'
 
-Tests (a directory each; missing ones are skipped):
+Tests (a directory each; missing ones are skipped), in the order of the KV260
+K1a verification (docs/kv260_upgrade_plan.md):
+  ddr          ddr_test.py: the PicoRV32 reads / writes DDR
   bwtest       m2_bw_test.py: DMA bandwidth
+  fwdemo       m1_gemm_demo.py, m3_vector_demo.py, m5_desc_demo.py: firmware vs NumPy
+  c1           board_launcher.py -- ./sa_hal_test test_d8 20: the sa HAL driver (C1)
   c3           board_llm.py: stories15M decode, bit-exact with DeviceModel
   c55          board_llm.py: SmolLM2-135M decode (qhf), bit-exact with the sim
   c6p_stories  board_llm.py: stories15M prefill + decode; board_profile.py (+ event counters: *_perf.csv)
@@ -27,7 +31,12 @@ RES = os.path.join(HERE, "results")
 
 # (test, run name, script, arguments, required: a failure fails the regression)
 RUNS = [
+    ("ddr", "ddr", "ddr_test.py", [], True),
     ("bwtest", "bwtest", "m2_bw_test.py", [], True),
+    ("fwdemo", "gemm", "m1_gemm_demo.py", [], True),
+    ("fwdemo", "vector", "m3_vector_demo.py", [], True),
+    ("fwdemo", "desc", "m5_desc_demo.py", [], True),
+    ("c1", "c1", "board_launcher.py", ["--", "./sa_hal_test", "test_d8", "20"], True),
     ("c3", "c3", "board_llm.py", [], True),
     ("c55", "c55", "board_llm.py", [], True),
     ("c6p_stories", "c6p_stories", "board_llm.py", [], True),

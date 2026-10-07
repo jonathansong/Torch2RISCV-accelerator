@@ -424,6 +424,16 @@ def overlay_info(bitfile):
     return info
 
 
+def kria_unload_app():
+    """Kria (KV260): unload the accelerator app the board loads at boot
+    (k26-starter-kits, through dfx-mgr / xmutil); it owns the PL and PYNQ
+    cannot load an overlay while it is there. No-op without xmutil."""
+    import shutil
+    import subprocess
+    if shutil.which("xmutil"):
+        subprocess.run(["xmutil", "unloadapp"], capture_output=True, text=True)
+
+
 def overlay_params(bitfile):
     """D and NPORTS of the sa_unit in the overlay (overlay_info)."""
     info = overlay_info(bitfile)
@@ -443,8 +453,10 @@ class MatmulOverlay:
     def __init__(self, bitfile=None, firmware=None, download=True):
         bitfile = bitfile or os.path.join(HERE, "picorv32.bit")
         firmware = firmware or os.path.join(HERE, "matmul_fw.bin")
-        self.overlay = Overlay(bitfile, download=download)
         self.info = overlay_info(bitfile)                 # board, D, ports, addresses, clock
+        if download and self.info.board == "kv260":
+            kria_unload_app()
+        self.overlay = Overlay(bitfile, download=download)
         self.d, self.nports = self.info.d, self.info.nports
         self.riscv_hz = self.info.riscv_hz
         self.bram_base = self.info.bram_base
