@@ -319,7 +319,21 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 - `LD_BEATS` / `ST_BEATS` 仍按 8 字节计（`sa_perf` 新增 `ev2`：两 lane 的写 / 拍计两次），`z1_profile.py` 等软件不用改；计数器 19 现在就是"写入 SPAD/ACC 的字节数 ÷ 8"（第 3 项的有效字节计数）。`sa_ld` 文件头的在途 burst 数改正为 8。
 - 验证：`tb_sa_dma` 的 AXI 模型加 128 位与 `WSTRB`，另加 40 个随机形状（8 字节对齐的地址、8 的奇数倍行长、跨 4 KB、INTERLEAVE），故意改错合并条件或 `WSTRB` 都能抓到；`make test` / `test16` / `test128`、`tb_sa_unit`（365 项计数器检查、描述符列表）、固件系统仿真（gemm、vector、desc_run、rt、bwtest；D = 16 的 64 / 128 位）全部 PASS。仿真中 bwtest 连续读写 3.62 → 7.26 B/周期（DDR 模型带随机停顿，不是板上数字），`tb_sa_unit` 的 64×64×128 GEMM 10107 → 6413 周期。`-bd_only` 验证通过。编译器与运行时不变；驱动从 `.hwh` 读 `DMA_W`，`m2_bw_test.py` 按位宽报告占比。
 - 构建（2026-10-08，`094d535`）：setup WNS +0.311 ns（K1c +0.630），WHS +0.010；LUT 75503（64.5%，比 K1c 多 552）、FF 60270（+326）、BRAM 130（90.3%）、DSP 347，后两项不变。最差路径仍是 K1c 那条 EX `drain_active` → PE `sh_out`（1 级，布线 96%），不在 DMA 上。
-- 待办：板上 `bwtest`（目标接近 16 B/周期，1.6 GB/s）与 K1 回归逐位一致。
+- **板上通过**（2026-10-08，`build/deploy_kv260_d16_100mhz_w128`）：REGRESSION PASS，全部测试与 sim 逐位一致，生成的 token 与 K1c 相同（与 Z1 基线的差异同 K1c，来自 D = 16）。`bwtest` 连续 LD / ST 15.6–15.8 B/周期（1.57 GB/s，128 位上限的 98%，K1c 7.9），LD + ST 并发 31.0 B/周期；8 字节小行（1 拍 burst）3.03 B/周期不变（受 burst 开销限制，符合预期）。
+
+| 测试（token/s） | K1c | K2a-1 | 倍数 |
+|---|---|---|---|
+| stories15M decode (c3) | 39.36 | **61.72** | 1.57 |
+| stories15M decode (c6p) | 37.84 | **58.40** | 1.54 |
+| stories15M prefill (c6p) | 191.4 | **227.6** | 1.19 |
+| SmolLM2 qhf decode (c55) | 4.77 | **7.98** | 1.67 |
+| SmolLM2 qhf decode (c6p) | 4.50 | **7.26** | 1.61 |
+| SmolLM2 qhf prefill (M = D) | 22.22 | **27.17** | 1.22 |
+| SmolLM2 通用 decode (hfgen) | 4.38 | **6.89** | 1.57 |
+| SmolLM2 通用 prefill | 10.04 | **11.21** | 1.12 |
+| GEMM 256³（MAC/周期） | 202.6 | **216.0** | 1.07 |
+
+decode 受带宽限制，提升 1.5–1.7 倍（不到 2 倍：VE 尾部、注意力、调度开销与带宽无关）；prefill 与 GEMM 受计算 / VE 限制，提升小。下一步 K2a-2（200 MHz）。
 
 #### K2b 多口接收 + 存储分银行
 
@@ -456,7 +470,8 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 | K1a | 50 MHz | 0.4 GB/s | 实测 0.397 GB/s | 通过；stories15M 18.27 token/s，SmolLM2 2.27（通用 1.88） |
 | K1b | 100 MHz | 0.8 GB/s | 实测 0.794 GB/s | 通过；stories15M 35.44 token/s，SmolLM2 4.43（通用 3.73） |
 | K1c | 100 MHz（D = 16） | 0.8 GB/s | 实测 0.794 GB/s | 通过；stories15M 39.36 token/s，SmolLM2 4.77（通用 4.39），SmolLM2 prefill 22.2 token/s；GEMM 256³ 202.6 MAC/周期 |
-| K2a | 200–250 MHz | 3.2–4.0 GB/s | DMA → SPAD 有效带宽接近上限 | 观测 |
+| K2a-1 | 100 MHz（D = 16，128 位） | 1.6 GB/s | 实测 1.576 GB/s | 通过；stories15M 61.72 token/s，SmolLM2 7.98（通用 6.89），SmolLM2 prefill 27.2 token/s；GEMM 256³ 216.0 MAC/周期 |
+| K2a-2 | 200–250 MHz | 3.2–4.0 GB/s | DMA → SPAD 有效带宽接近上限 | 观测 |
 | K2b | 200–250 MHz | 6.4–12.8 GB/s（按所选配置） | **LINEAR 写入 SPAD 有效带宽**达到所选配置的目标（例如 2 字/周期 × 250 MHz ≥ 6 GB/s）；INTERLEAVE 记录实测值 | SmolLM2 随有效带宽提升（实测比例） |
 | K4a | 同 K2b | 同 K2b | — | Qwen3-0.6B 正确运行，不设速度门槛 |
 | K4b | 同 K2b | 同 K2b | — | 按耗时分解设目标；仅权重读取的上限：6 GB/s 约 10 token/s、10 GB/s 约 16 token/s；10–15 token/s 为冲刺目标 |

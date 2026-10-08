@@ -192,6 +192,23 @@ a multiple of D) and fell back to one GEMV per row (8x the EX steps);
 gate / up matmul's fused SwiGLU epilogue on the fp VE / SFU (30% of the
 prefill), which the qhf path does not have (22.2).
 
+## K2a-1: 128-bit DMA (passed)
+
+`d16_100mhz_w128` (D = 16, 100 MHz, `-dma_w 128`): setup WNS +0.311 ns,
+LUT 64.5% (+552 vs K1c). The regression passes, every LLM test bit-exact with
+the sim and the same tokens as K1c. `bwtest`: contiguous LD / ST 15.6-15.8
+B/cycle (1.57 GB/s, 98% of the 128-bit limit; K1c 7.9), LD + ST concurrently
+31.0.
+
+| Run (tok/s) | K1c | **K2a-1** |
+|---|---|---|
+| stories15M decode (c3) | 39.36 | **61.72** |
+| SmolLM2 qhf decode (c55) | 4.77 | **7.98** |
+| SmolLM2 qhf prefill (M = D) | 22.22 | **27.17** |
+| SmolLM2 generic decode (hfgen) | 4.38 | **6.89** |
+| SmolLM2 generic prefill | 10.04 | **11.21** |
+| GEMM 256³ (MAC/cycle) | 202.6 | **216.0** |
+
 ## To confirm on the board
 
 - The carrier's fan is controlled from the PL in AMD's reference designs;
