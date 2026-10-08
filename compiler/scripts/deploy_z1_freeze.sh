@@ -6,7 +6,7 @@
 # board_regress.py and run_board.sh at the top. The aarch64 runtime and the
 # overlay of boards/kv260/build/output/$SA_KV260_CONFIG (default d8_100mhz; or
 # SA_BIT_DIR) go into build/deploy_kv260_<config>.
-#   compiler/scripts/deploy_z1_freeze.sh [--board kv260] [test ...]   (default: all; tests below)
+#   compiler/scripts/deploy_z1_freeze.sh [--board kv260] [--reuse <config>] [test ...]   (default: all; tests below)
 #   scp -r build/deploy_kv260_<config> ubuntu@<kv260>:~/kv260_<config>
 #   board: sudo ./run_board.sh [test ...]     (sources the board's PYNQ / XRT environment)
 #   back:  scp -r ubuntu@<kv260>:~/kv260_<config>/results build/deploy_kv260_<config>/
@@ -25,15 +25,30 @@
 # D = SA_D (board_env.sh: from the overlay's configuration); at D != 8 the host builds go to
 # build/<test>/<model>_d<D> (the D = 8 ones feed the golden corpus)
 # Each deploy runs in a memory-capped scope (MEM, default 12G).
+# --reuse <config>: the LLM tests (c1 ... hfgen) are not rebuilt: their directories come from
+# build/deploy_kv260_<config> (same D), with this overlay, rt_fw.bin and the board scripts of
+# the tree; minutes instead of hours. Only for a new overlay with the same D (DMA width, clock):
+# its host tests and sim do not depend on those. A change to the compiler, runtime or exports
+# needs the full staging.
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 if [ "${1:-}" = "--board" ]; then
   export SA_BOARD=${2:?--board kv260}
   shift 2
 fi
+REUSE=
+if [ "${1:-}" = "--reuse" ]; then
+  REUSE=${2:?--reuse <config>}
+  shift 2
+fi
 source "$(dirname "$0")/board_env.sh"
 export SA_BOARD SA_BIT_DIR
 Z=$SA_REPO/build/deploy_kv260_$SA_KV260_CONFIG          # (per overlay: results are kept)
+if [ -n "$REUSE" ]; then
+  R=$SA_REPO/build/deploy_kv260_$REUSE
+  [ "$R" != "$Z" ] || { echo "--reuse $REUSE: that is this overlay's own bundle"; exit 2; }
+  grep -q "D = $SA_D\$" "$R/VERSION" 2>/dev/null || { echo "--reuse: $R/VERSION is missing or not D = $SA_D"; exit 2; }
+fi
 MEM=${MEM:-12G}
 ALL=(ddr bwtest fwdemo c1 c3 c55 c6p_stories c6p_smollm2 hfgen)
 TESTS=("$@")
@@ -49,7 +64,24 @@ stage() {                      # <test> <deploy dir> <deploy command...>
   rm -rf "$Z/$t" && mv "$d" "$Z/$t"
   cp "$SA_COMPILER/tests/board_profile.py" "$Z/$t/"
 }
+reuse() {                      # <test>: the test's directory from $R, with this overlay and the tree's scripts
+  local t=$1 f
+  [ -d "$R/$t" ] || { echo "--reuse: $R/$t is missing"; exit 1; }
+  echo "== $t: from ${R#$SA_REPO/}"
+  rm -rf "$Z/$t" && cp -r "$R/$t" "$Z/$t"
+  rm -rf "$Z/$t/results"
+  cp "$L2/picorv32.bit" "$L2/picorv32.hwh" "$Z/$t/"
+  for f in "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/tests/board_profile.py" \
+           "$SA_COMPILER/runtime/test/board_launcher.py" "$SA_REPO/driver/pynq_matmul.py" "$SA_REPO/firmware/rt/rt_fw.bin"; do
+    [ -f "$Z/$t/$(basename "$f")" ] && cp "$f" "$Z/$t/"
+  done
+  [ -f "$R/$t.deploy.log" ] && cp "$R/$t.deploy.log" "$Z/"
+  return 0
+}
 for t in "${TESTS[@]}"; do
+  if [ -n "$REUSE" ]; then
+    case $t in c1|c3|c55|c6p_stories|c6p_smollm2|hfgen) reuse "$t"; continue ;; esac
+  fi
   case $t in
     ddr)
       rm -rf "$Z/ddr" && mkdir -p "$Z/ddr"
@@ -81,6 +113,7 @@ cp "$SA_COMPILER/tests/board_regress.py" "$SA_COMPILER/tests/run_board.sh" "$Z/"
   echo "staged $(date -Iseconds)"
   echo "bitstream $(sha256sum "$L2/picorv32.bit" | cut -c1-16) (${L2#$SA_REPO/})"
   echo "board $SA_BOARD (runtime $SA_RT_ARCH), D = $SA_D"
+  [ -n "$REUSE" ] && echo "LLM tests reused from ${R#$SA_REPO/} ($(head -1 "$R/VERSION"))"
   [ -f "$L2/build_info.txt" ] && sed 's/^/overlay /' "$L2/build_info.txt"
 } > "$Z/VERSION"
 cat "$Z/VERSION"
