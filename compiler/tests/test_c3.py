@@ -26,6 +26,7 @@ import time
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+D = int(os.environ.get("SA_D", "8"))   # the array size (the overlay's; compile_sa.sh passes --iree-sa-d)
 COMPILER = os.path.abspath(os.path.join(HERE, ".."))
 REPO = os.path.abspath(os.path.join(COMPILER, ".."))
 sys.path.insert(0, os.path.join(REPO, "llm"))
@@ -55,9 +56,9 @@ def main():
     out = args.out
     ok = True
     if not args.skip_export:
-        print(sh([PY, os.path.join(COMPILER, "frontend", "export.py"), "--out", out]
+        print(sh([PY, os.path.join(COMPILER, "frontend", "export.py"), "--out", out, "--d", str(D)]
                  + (["--static-len"] if args.static_len else [])).strip().splitlines()[-2])
-    run_args = [] if args.static_len else ["--pad=8"]
+    run_args = [] if args.static_len else [f"--pad={D}"]
     t0 = time.time()
     shutil.rmtree(os.path.join(out, "sa_bin"), ignore_errors=True)
     shutil.rmtree(os.path.join(out, "sa_sources"), ignore_errors=True)
@@ -84,7 +85,7 @@ def main():
     prompt = tok.encode(PROMPT)
     toks = prompt[:args.steps]
     sock = f"/tmp/sa_c3_{os.getpid()}.sock"
-    srv = subprocess.Popen([PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--socket", sock,
+    srv = subprocess.Popen([PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", str(D), "--socket", sock,
                             "--once"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
     logits_path = os.path.join(out, "logits_sim.f32")
@@ -95,7 +96,7 @@ def main():
     srv.wait()
     sim_tokens = [int(t) for t in res.splitlines()[0].split(":")[1].split()]
     got = np.fromfile(logits_path, np.float32).reshape(-1, cfg.vocab)
-    dm = DeviceModel(cfg, w, kv, d=8, sfu=SfuExact)
+    dm = DeviceModel(cfg, w, kv, d=D, sfu=SfuExact)
     exact = 0
     for pos in range(len(got)):
         ref = dm.forward(sim_tokens[pos], pos).astype(np.float32)
@@ -120,7 +121,7 @@ def stage(dst, out, prompt, dm, cfg, w, kv, tok, n_gen):
     os.makedirs(dst, exist_ok=True)
     for f in ("sa.vmfb", "sa_packed.irpa"):
         shutil.copy(os.path.join(out, f), os.path.join(dst, f))
-    ref = DeviceModel(cfg, w, kv, d=8, sfu=SfuExact)
+    ref = DeviceModel(cfg, w, kv, d=D, sfu=SfuExact)
     tokens, logits = generate(ref, prompt, len(prompt) + n_gen, keep_logits=True)
     np.save(os.path.join(dst, "expected_tokens.npy"), np.array(tokens, np.int64))
     np.save(os.path.join(dst, "expected_logits.npy"), np.stack(logits).astype(np.float32))

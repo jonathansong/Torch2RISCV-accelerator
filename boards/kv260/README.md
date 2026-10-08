@@ -44,6 +44,7 @@ PYNQ (Kria-PYNQ, which installs the PYNQ venv and XRT setup under
 | K1a, first build: D = 8, 50 MHz (`-jobs 2`) | 2026-10-04 | 40,351 (34.5%) | 31,576 (13.5%) | 115 (9.2%) | 130 / 144 (90.3%) | 0 / 64 | +9.050 / +0.010 ns | before the LDPARAM register stage; no unclocked or unconstrained endpoints (`check_timing`); one clock `clk_pl_0` (20 ns) |
 | **K1a: D = 8, 50 MHz** (`output/d8_50mhz`, commit `0b9c414`) | 2026-10-04 | 40,257 (34.4%) | | 115 | 130 / 144 | 0 / 64 | +7.800 / +0.010 ns | with the LDPARAM stage; the overlay for K1a's board tests |
 | **K1b: D = 8, 100 MHz** (`output/d8_100mhz`, LDPARAM fix `b4bd8a6`) | 2026-10-04 | 40,275 (34.4%) | 31,550 (13.5%) | 115 | 130 / 144 | 0 / 64 | +1.171 / +0.010 ns | `clk_pl_0` 10 ns; worst path LD `q_lane` -> DSP -> ACC BRAM write enable (7.8 ns, 13 levels): about 113 MHz |
+| **K1c: D = 16, 100 MHz** (`output/d16_100mhz`, commit `4bd8389`) | 2026-10-08 | 74,951 (64.0%) | 59,944 (25.6%) | 347 (27.8%) | 130 / 144 | 0 / 64 | +0.630 / +0.011 ns | every PE column on DSPs (`DSP_COLS = D`: 256 for the array); the fp VE at FL = 8; worst path LD `q_rp` -> DSP -> ACC BRAM write enable (8.4 ns, 12 levels) |
 
 K1a: the worst setup path (10.5 ns data path, 14 levels including a DSP
 multiplier) runs from the DMA port's read data (`PS8_i/SAXIGP3RCLK`, HP1)
@@ -113,6 +114,7 @@ regression of the Z1 freeze:
 ```sh
 compiler/scripts/deploy_z1_freeze.sh                     # K1b (d8_100mhz) -> build/deploy_kv260_d8_100mhz
 SA_KV260_CONFIG=d8_50mhz compiler/scripts/deploy_z1_freeze.sh    # K1a -> build/deploy_kv260_d8_50mhz
+SA_KV260_CONFIG=d16_100mhz compiler/scripts/deploy_z1_freeze.sh  # K1c (D = 16: compiled with --iree-sa-d=16)
 scp -r build/deploy_kv260_d8_100mhz <user>@<kv260>:~/kv260_d8_100mhz
 # on the board: cd ~/kv260_d8_100mhz && sudo ./run_board.sh
 # back: results/ -> build/deploy_kv260_d8_100mhz/results

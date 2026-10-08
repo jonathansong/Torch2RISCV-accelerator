@@ -11,13 +11,14 @@ K1a verification (docs/kv260_upgrade_plan.md):
   ddr          ddr_test.py: the PicoRV32 reads / writes DDR
   bwtest       m2_bw_test.py: DMA bandwidth
   fwdemo       m1_gemm_demo.py, m3_vector_demo.py, m5_desc_demo.py: firmware vs NumPy
-  c1           board_launcher.py -- ./sa_hal_test test_d8 20: the sa HAL driver (C1)
+  c1           board_launcher.py -- ./sa_hal_test test_d<D> 20: the sa HAL driver (C1)
   c3           board_llm.py: stories15M decode, bit-exact with DeviceModel
   c55          board_llm.py: SmolLM2-135M decode (qhf), bit-exact with the sim
   c6p_stories  board_llm.py: stories15M prefill + decode; board_profile.py (+ event counters: *_perf.csv)
   c6p_smollm2  board_llm.py: SmolLM2-135M prefill + decode (qhf); board_profile.py
   hfgen        board_llm.py: SmolLM2-135M prefill + decode (generic HF); board_profile.py
 """
+import glob
 import os
 import platform
 import shutil
@@ -35,7 +36,7 @@ RUNS = [
     ("fwdemo", "gemm", "m1_gemm_demo.py", [], True),
     ("fwdemo", "vector", "m3_vector_demo.py", [], True),
     ("fwdemo", "desc", "m5_desc_demo.py", [], True),
-    ("c1", "c1", "board_launcher.py", ["--", "./sa_hal_test", "test_d8", "20"], True),
+    ("c1", "c1", "board_launcher.py", ["--", "./sa_hal_test", "test_d*", "20"], True),
     ("c3", "c3", "board_llm.py", [], True),
     ("c55", "c55", "board_llm.py", [], True),
     ("c6p_stories", "c6p_stories", "board_llm.py", [], True),
@@ -49,6 +50,9 @@ RUNS = [
 
 def run(test, name, script, args):
     d = os.path.join(HERE, test)
+    # test_d*: the C1 executables made for the overlay's D (deploy_c1.sh)
+    args = [next(iter(sorted(glob.glob(os.path.join(d, a)))), a).replace(d + os.sep, "") if "*" in a else a
+            for a in args]
     t0 = time.time()
     r = subprocess.run([sys.executable, script, *args], cwd=d, capture_output=True, text=True)
     dt = time.time() - t0

@@ -3,6 +3,10 @@
 #                               (boards/kv260/scripts/build_bitstream.sh; default d8_100mhz = K1b, d8_50mhz = K1a)
 #   (the frozen PYNQ-Z1, armv7: the pynq-z1 branch)
 #   SA_BIT_DIR=<dir>            another directory with picorv32.bit / .hwh
+#   SA_D                        the overlay's array size, from the configuration's name (d16_100mhz -> 16;
+#                               default 8): the compiler's --iree-sa-d (compile_sa.sh), the sim's and the
+#                               references' D in the tests; SA_DSUF ("" at D = 8, else _d<D>) keeps the
+#                               build directories of other D apart (the golden corpus reads the D = 8 ones)
 # The driver and the launcher read the board's addresses and clock from the
 # .hwh (driver/pynq_matmul.py overlay_info), so a bundle is the same apart
 # from the runtime binaries and the overlay.
@@ -16,6 +20,26 @@ case "$SA_BOARD" in
   *) echo "SA_BOARD must be kv260 (got $SA_BOARD; the PYNQ-Z1: pynq-z1 branch)" >&2; exit 2 ;;
 esac
 SA_RT_BUILD=$SA_REPO/build/iree/build-sa-$SA_RT_ARCH
+if [ -z "${SA_D:-}" ]; then
+  case "${SA_KV260_CONFIG:-}" in d[0-9]*_*) SA_D=${SA_KV260_CONFIG%%_*}; SA_D=${SA_D#d} ;; *) SA_D=8 ;; esac
+fi
+export SA_D
+SA_DSUF=$( [ "$SA_D" = 8 ] || echo "_d$SA_D" )
+
+# seed_export <d8 export dir> <dir>: the exports do not depend on D (the attention
+# length is dynamic), so another D's build directory starts from a copy of the
+# D = 8 export (qllama.mlir / .irpa, prompt, KV scales); compile output differs
+seed_export() {
+  local src=$1 dst=$2
+  [ "$src" = "$dst" ] && return 0
+  [ -f "$dst/qllama.mlir" ] && return 0
+  [ -f "$src/qllama.mlir" ] || { echo "seed_export: no export in $src" >&2; exit 1; }
+  mkdir -p "$dst"
+  for f in qllama.mlir qllama.irpa prompt.npy kv_scales.npy; do
+    [ -f "$src/$f" ] && cp "$src/$f" "$dst/"
+  done
+  return 0
+}
 
 stage_runtime() {
   local d=$1

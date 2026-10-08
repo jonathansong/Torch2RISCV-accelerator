@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+D = int(os.environ.get("SA_D", "8"))   # the array size (the overlay's; compile_sa.sh passes --iree-sa-d)
 COMPILER = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(COMPILER, "frontend"))
@@ -122,7 +123,7 @@ def main():
                              for p, t in enumerate(tf_toks)]) if args.quant else None
     ref = np.stack(ref)
     sock = f"/tmp/sa_hf_{os.getpid()}.sock"
-    srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb", str(args.mb),
+    srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", str(D), "--mb", str(args.mb),
                             "--socket", sock, "--once"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
     lp = os.path.join(args.out, "logits_hf.f32")
@@ -150,7 +151,7 @@ def main():
         # of the quantization itself is printed (SmolLM2: 34-36 / 40; Qwen3-0.6B
         # 25 / 40, plan C6.2), not judged here.
         toks, fp = tf_toks, tf_ref
-        srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb",
+        srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", str(D), "--mb",
                                 str(args.mb), "--socket", sock, "--once"], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
         time.sleep(3)
@@ -174,7 +175,7 @@ def main():
         M = args.prefill
         pp = prompt if len(prompt) >= 2 * M else [int(v) for v in np.resize(np.array(prompt), 2 * M + M // 2)]
         def run(pre, generate=args.generate):
-            srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb",
+            srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", str(D), "--mb",
                                     str(args.mb), "--socket", sock, "--once"], stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL)
             time.sleep(3)

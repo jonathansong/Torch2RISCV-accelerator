@@ -8,8 +8,8 @@ source "$(dirname "$0")/../env.sh"
 source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (the default; the PYNQ-Z1: pynq-z1 branch)
 D=$SA_REPO/build/deploy_c1
 rm -rf "$D" && mkdir -p "$D"
-"$SA_PY" "$SA_COMPILER/runtime/tools/make_test_exec.py" --d 8 --out "$D/test_d8"
+"$SA_PY" "$SA_COMPILER/runtime/tools/make_test_exec.py" --d "$SA_D" --out "$D/test_d$SA_D"
 stage_runtime "$D" sa_hal_test iree-run-module
 cp "$SA_COMPILER/runtime/test/board_launcher.py" "$SA_REPO/driver/pynq_matmul.py" "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"
 stage_overlay "$D"
-ls -la "$D" "$D/test_d8"
+ls -la "$D" "$D/test_d$SA_D"

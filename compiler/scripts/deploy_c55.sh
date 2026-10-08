@@ -11,8 +11,9 @@ source "$(dirname "$0")/../env.sh"
 source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (the default; the PYNQ-Z1: pynq-z1 branch)
 D=$SA_REPO/build/deploy_c55
 rm -rf "$D" && mkdir -p "$D"
+seed_export "$SA_REPO/build/c55/smollm2" "$SA_REPO/build/c55/smollm2$SA_DSUF"
 "$SA_PY" "$SA_COMPILER/tests/test_c55.py" --model "$SA_REPO/build/llm_cache/SmolLM2-135M" \
-  --out "$SA_REPO/build/c55/smollm2" --board-bundle "$D" "$@"
+  --out "$SA_REPO/build/c55/smollm2$SA_DSUF" --board-bundle "$D" "$@"
 stage_runtime "$D"
 cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/runtime/test/board_launcher.py" "$SA_REPO/driver/pynq_matmul.py" \
    "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"

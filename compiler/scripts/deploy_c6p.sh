@@ -10,16 +10,16 @@ source "$(dirname "$0")/../env.sh"
 source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (the default; the PYNQ-Z1: pynq-z1 branch)
 model=${1:?stories or smollm2}
 M=${2:-8}
-O=$SA_REPO/build/c6p/${model}_m$M
+O=$SA_REPO/build/c6p/${model}_m$M$SA_DSUF
 D=$SA_REPO/build/deploy_c6p_${model}_m$M
 rm -rf "$D" && mkdir -p "$D"
 case $model in
   stories)
-    "$SA_PY" "$SA_COMPILER/frontend/export.py" --out "$O" --prefill "$M" | tail -2
+    "$SA_PY" "$SA_COMPILER/frontend/export.py" --out "$O" --prefill "$M" --d "$SA_D" | tail -2
     "$SA_PY" "$SA_COMPILER/tests/test_c6p.py" --out "$O" --prefill "$M" --check --board-bundle "$D" --board-generate 60 ;;
   smollm2)
     "$SA_PY" "$SA_COMPILER/frontend/export_hf.py" --model "$SA_REPO/build/llm_cache/SmolLM2-135M" --out "$O" \
-      --prefill "$M" | tail -2
+      --prefill "$M" --d "$SA_D" | tail -2
     "$SA_PY" "$SA_COMPILER/tests/test_c6p.py" --out "$O" --prefill "$M" --check --mb 144 \
       --model "$SA_REPO/build/llm_cache/SmolLM2-135M" --board-bundle "$D" --board-generate 24 ;;
   *) echo "stories or smollm2"; exit 2 ;;

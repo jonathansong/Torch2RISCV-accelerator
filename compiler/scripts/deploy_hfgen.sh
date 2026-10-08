@@ -9,7 +9,8 @@
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (the default; the PYNQ-Z1: pynq-z1 branch)
-O=${1:-$SA_REPO/build/hfgen/smollm2_p8}
+O=${1:-$SA_REPO/build/hfgen/smollm2_p8$SA_DSUF}
+seed_export "$SA_REPO/build/hfgen/smollm2_p8" "$O"
 D=$SA_REPO/build/deploy_hfgen
 rm -rf "$D" && mkdir -p "$D"
 "$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/SmolLM2-135M" --out "$O" \

@@ -23,6 +23,7 @@ import time
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+D = int(os.environ.get("SA_D", "8"))   # the array size (the overlay's; compile_sa.sh passes --iree-sa-d)
 COMPILER = os.path.abspath(os.path.join(HERE, ".."))
 REPO = os.path.abspath(os.path.join(COMPILER, ".."))
 PY = sys.executable
@@ -41,14 +42,14 @@ def sh(cmd, env=None):
 def run_sim(out, tokens, generate, mb, prefill=0):
     """sa-llm-run on the functional simulator: (tokens, logits rows, stats lines)."""
     sock = f"/tmp/sa_c6p_{os.getpid()}_{prefill}.sock"
-    srv = subprocess.Popen([PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb", str(mb),
+    srv = subprocess.Popen([PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", str(D), "--mb", str(mb),
                             "--socket", sock, "--once"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
     lp = os.path.join(out, f"logits_sim_p{prefill}.f32")
     try:
         res = sh([RUN, "--device=sa", f"--module={os.path.join(out, 'sa.vmfb')}",
                   f"--parameters=model={os.path.join(out, 'sa_packed.irpa')}", "--tokens=" + ",".join(map(str, tokens)),
-                  f"--generate={generate}", f"--logits_out={lp}", "--pad=8"] +
+                  f"--generate={generate}", f"--logits_out={lp}", f"--pad={D}"] +
                  ([f"--prefill={prefill}"] if prefill else []), env=dict(os.environ, SA_SIM_SOCKET=sock))
     finally:
         srv.wait(timeout=60)
@@ -123,7 +124,7 @@ def stage(args, out, prompt):
     """Board bundle: module, packed parameters, the sim's decode-only run over the
     prompt and --board-generate tokens (board_llm.py compares the prefill run
     with its rows from the prompt's last position on), the tokenizer, model.json,
-    sa_args.txt (--pad=8 --prefill=M), board.txt (reference, window MB)."""
+    sa_args.txt (--pad=D --prefill=M), board.txt (reference, window MB)."""
     import json
     dst = args.board_bundle
     os.makedirs(dst, exist_ok=True)
@@ -146,7 +147,7 @@ def stage(args, out, prompt):
     mj["prefill"] = args.prefill
     json.dump(mj, open(os.path.join(dst, "model.json"), "w"))
     with open(os.path.join(dst, "sa_args.txt"), "w") as f:
-        f.write(f"--pad=8 --prefill={args.prefill}\n")
+        f.write(f"--pad={D} --prefill={args.prefill}\n")
     with open(os.path.join(dst, "board.txt"), "w") as f:
         f.write(f"the functional simulator {args.mb}\n")
     print(f"board bundle: {dst} ({len(tokens)} expected tokens from the sim in {time.time() - t0:.0f} s)")

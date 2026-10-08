@@ -214,6 +214,10 @@ K1a 布线后的前 40 条路径（`post_route.dcp`，在 20 ns 约束下工具�
 
 **验收**：第 5、6 步逐位一致；prefill 的 token/s 记录为观测值（阵列 4 倍乘累加，decode 仍受带宽限制）。之后各阶段以 D = 16 为准（SPAD 一字 128 位，正好一个 128 位 beat，见 K2a）。
 
+**构建通过**（2026-10-08，`-sa_d 16 -sa_mhz 100`，`4bd8389`）：setup WNS +0.630 ns、hold WHS +0.011 ns；LUT 74,951（64.0%）、FF 59,944、DSP 347、BRAM36 130 / 144。所有 PE 列都放在 DSP 上（`kv260_bd.tcl` 设 `DSP_COLS = D`；Z1 的 D = 16 构建因为只有 220 个 DSP，只有 8 列用 DSP）。最差路径与 K1b 同类：LD 的 `q_rp` → DSP → ACC BRAM 写使能（8.4 ns，12 级）。
+
+**软件**：D 跟着 overlay 走。`board_env.sh` 从配置名取 `SA_D`（`d16_100mhz` → 16）；`compile_sa.sh` 传 `--iree-sa-d`；测试里 sim 的 D、参照模型（`DeviceModel(d = D)`、qhf 的 `valid` 长度）、`--pad` 都用 `SA_D`；C1 的测试可执行文件按 D 生成（`test_d16`）。prefill 的块大小 M = D（`c6p_*`；通用路径 `hfgen` 仍是 M = 8，它的导出里固定了 M）。D ≠ 8 的主机构建放在 `build/<test>/<model>_d16`，不覆盖黄金语料读的 D = 8 目录；导出与 D 无关（注意力长度是动态的），`seed_export` 复制 D = 8 的导出。主机端：C1 三项、C3（stories15M 12/12 步与 `DeviceModel(d = 16)` 逐位一致，58 个 dispatch 逐个检查 OK）通过。
+
 ### K2 带宽：DMA 与片上存储接口
 
 decode 受权重读取带宽限制，这一阶段是性能提升的主要来源。**它不只是加宽 DMA，而是 DMA 与片上存储写入接口的一起重构。**

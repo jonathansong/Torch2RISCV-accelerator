@@ -31,6 +31,7 @@ import numpy as np
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+D = int(os.environ.get("SA_D", "8"))   # the array size (the overlay's; compile_sa.sh passes --iree-sa-d)
 COMPILER = os.path.abspath(os.path.join(HERE, ".."))
 REPO = os.path.abspath(os.path.join(COMPILER, ".."))
 sys.path.insert(0, os.path.join(COMPILER, "frontend"))
@@ -45,8 +46,9 @@ def sh(cmd, env=None):
     return r.stdout
 
 
-def reference(model, out, tokens, d=8):
+def reference(model, out, tokens, d=None):
     """Eager QModel logits (device SFU) on the given tokens (teacher forced)."""
+    d = d or D
     import export_hf as X
     import qhf
     kv = np.load(os.path.join(out, "kv_scales.npy"))
@@ -124,14 +126,14 @@ def compile_sa(out, flags):
 def run_sim(out, tokens, generate, mb):
     """sa-llm-run on the functional simulator: (all tokens, logits per step, its stats line)."""
     sock = f"/tmp/sa_c55_{os.getpid()}.sock"
-    srv = subprocess.Popen([PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", "8", "--mb", str(mb),
+    srv = subprocess.Popen([PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", str(D), "--mb", str(mb),
                             "--socket", sock, "--once"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
     logits_path = os.path.join(out, "logits_sim.f32")
     try:
         res = sh([RUN, "--device=sa", f"--module={os.path.join(out, 'sa.vmfb')}",
                   f"--parameters=model={os.path.join(out, 'sa_packed.irpa')}", "--tokens=" + ",".join(map(str, tokens)),
-                  f"--generate={generate}", f"--logits_out={logits_path}", "--pad=8"],
+                  f"--generate={generate}", f"--logits_out={logits_path}", f"--pad={D}"],
                  env=dict(os.environ, SA_SIM_SOCKET=sock))
     finally:
         srv.wait(timeout=60)
@@ -163,7 +165,7 @@ def stage(args, out, prompt, tok):
         json.dump({"tokenizer": "hf", "bos": None, "stop": eos[0] if isinstance(eos, list) else eos,
                    "context": 256}, f)
     with open(os.path.join(dst, "sa_args.txt"), "w") as f:
-        f.write("--pad=8\n")                             # as the sim run: the attention length follows pos
+        f.write(f"--pad={D}\n")                             # as the sim run: the attention length follows pos
     with open(os.path.join(dst, "board.txt"), "w") as f:
         f.write(f"the functional simulator {args.mb}\n")
     print(f"board bundle: {dst} ({len(tokens)} expected tokens from the sim in {time.time() - t0:.0f} s): "

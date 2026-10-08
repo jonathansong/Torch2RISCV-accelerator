@@ -19,9 +19,11 @@
 #   c1           the sa HAL driver's C1 test (sa_hal_test through board_launcher.py) (step 4)
 #   c3           stories15M decode vs the hand-written L5 path (DeviceModel)        deploy_c3.sh
 #   c55          SmolLM2-135M decode, export_hf.py (qhf), vs the sim                deploy_c55.sh
-#   c6p_stories  stories15M prefill (M = 8) + decode                                deploy_c6p.sh stories 8
-#   c6p_smollm2  SmolLM2-135M prefill (M = 8) + decode, qhf                         deploy_c6p.sh smollm2 8
-#   hfgen        SmolLM2-135M prefill (M = 8) + decode, unmodified HF (generic)     deploy_hfgen.sh
+#   c6p_stories  stories15M prefill (M = D, the overlay's array size) + decode       deploy_c6p.sh stories D
+#   c6p_smollm2  SmolLM2-135M prefill (M = D) + decode, qhf                         deploy_c6p.sh smollm2 D
+#   hfgen        SmolLM2-135M prefill (M = 8: its export) + decode, unmodified HF   deploy_hfgen.sh
+# D = SA_D (board_env.sh: from the overlay's configuration); at D != 8 the host builds go to
+# build/<test>/<model>_d<D> (the D = 8 ones feed the golden corpus)
 # Each deploy runs in a memory-capped scope (MEM, default 12G).
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
@@ -67,8 +69,8 @@ for t in "${TESTS[@]}"; do
          "$L2/picorv32.bit" "$L2/picorv32.hwh" "$Z/bwtest/" ;;
     c3)          stage c3 "$SA_REPO/build/deploy_c3" "$SA_COMPILER/scripts/deploy_c3.sh" ;;
     c55)         stage c55 "$SA_REPO/build/deploy_c55" "$SA_COMPILER/scripts/deploy_c55.sh" ;;
-    c6p_stories) stage c6p_stories "$SA_REPO/build/deploy_c6p_stories_m8" "$SA_COMPILER/scripts/deploy_c6p.sh" stories 8 ;;
-    c6p_smollm2) stage c6p_smollm2 "$SA_REPO/build/deploy_c6p_smollm2_m8" "$SA_COMPILER/scripts/deploy_c6p.sh" smollm2 8 ;;
+    c6p_stories) stage c6p_stories "$SA_REPO/build/deploy_c6p_stories_m$SA_D" "$SA_COMPILER/scripts/deploy_c6p.sh" stories "$SA_D" ;;
+    c6p_smollm2) stage c6p_smollm2 "$SA_REPO/build/deploy_c6p_smollm2_m$SA_D" "$SA_COMPILER/scripts/deploy_c6p.sh" smollm2 "$SA_D" ;;
     hfgen)       stage hfgen "$SA_REPO/build/deploy_hfgen" "$SA_COMPILER/scripts/deploy_hfgen.sh" ;;
     *) echo "unknown test $t (${ALL[*]})"; exit 2 ;;
   esac
@@ -78,7 +80,7 @@ cp "$SA_COMPILER/tests/board_regress.py" "$SA_COMPILER/tests/run_board.sh" "$Z/"
   echo "commit $(git -C "$SA_REPO" rev-parse HEAD)$(git -C "$SA_REPO" diff --quiet HEAD -- compiler rtl firmware driver || echo ' (dirty)')"
   echo "staged $(date -Iseconds)"
   echo "bitstream $(sha256sum "$L2/picorv32.bit" | cut -c1-16) (${L2#$SA_REPO/})"
-  echo "board $SA_BOARD (runtime $SA_RT_ARCH)"
+  echo "board $SA_BOARD (runtime $SA_RT_ARCH), D = $SA_D"
   [ -f "$L2/build_info.txt" ] && sed 's/^/overlay /' "$L2/build_info.txt"
 } > "$Z/VERSION"
 cat "$Z/VERSION"

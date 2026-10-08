@@ -5,7 +5,7 @@
 #   compiler/scripts/compile_sa.sh <dir with qllama.mlir / .irpa> [extra iree-compile flags]
 # -> <dir>/sa.vmfb, <dir>/sa_packed.irpa, <dir>/sa_sources/ (dispatch sources)
 # Aggressive dispatch fusion is on (C4: 242 -> 200 dispatches per token).
-# SA_COMPILE_FLAGS: extra iree-compile flags.
+# SA_COMPILE_FLAGS: extra iree-compile flags. SA_D: the array size (--iree-sa-d; default 8).
 # SA_HOST_FALLBACK=0: no host fallback (default 1: every dispatch also gets a
 # VMVX variant; one the sa backend cannot compile runs on the ARM host, plan
 # §8.15; IREE's executable linking is off, it would merge the VMVX variants of
@@ -20,4 +20,5 @@ mkdir -p "$dir/sa_sources"
   --iree-parameter-export=model="$dir/sa_packed.irpa" --iree-parameter-export-minimum-size=256 \
   --iree-dispatch-creation-enable-aggressive-fusion \
   $( [ "${SA_HOST_FALLBACK:-1}" = 1 ] && echo --iree-sa-host-fallback --iree-hal-link-executables=false ) \
+  $( [ -n "${SA_D:-}" ] && [ "$SA_D" != 8 ] && echo --iree-sa-d="$SA_D" ) \
   --iree-hal-dump-executable-sources-to="$dir/sa_sources" ${SA_COMPILE_FLAGS:-} "$@" -o "$dir/sa.vmfb"
