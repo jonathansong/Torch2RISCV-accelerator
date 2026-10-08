@@ -122,6 +122,15 @@ private:
   Value rowAcc;                                  // the row loops' DDR offset
   Value curLen;                                  // row mode: the dynamic LEN of full-length VEs
   int64_t curLenStatic = -1;
+  // A VE of a fixed size inside row mode (the w * D * D block of a per-row
+  // broadcast, a scalar's broadcast word) keeps its static LEN even when that
+  // equals a full row's (w * D * D = maxDynamic at D = 16, w = 1)
+  struct StaticLen {
+    Lowerer &l;
+    Value saved;
+    explicit StaticLen(Lowerer &l) : l(l), saved(l.curLen) { l.curLen = Value(); }
+    ~StaticLen() { l.curLen = saved; }
+  };
   std::map<std::pair<void *, int>, Value> validParams;   // (i64 scalar, predicate) -> VALID count
   // its schedule: as sahl-schedule chose (the attributes), else chosen here
 

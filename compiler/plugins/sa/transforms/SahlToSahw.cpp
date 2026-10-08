@@ -782,6 +782,7 @@ std::optional<LocalBuf> Lowerer::scalarBcast(Value v, const LocalBuf &l) {
   if (auto it = bcastOf.find(v); it != bcastOf.end()) return it->second;
   if (l.vt != ::sa::VT_F32) return fail("broadcast of a non-fp32 scalar"), std::nullopt;
   LocalBuf b = newLocal(::sa::VT_F32, 1, true);
+  StaticLen fixed(*this);
   ve({l.la}, std::nullopt, b.la, ::sa::VT_F32, d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_MAX, 0, 1);
   bcastOf[v] = b;
   return b;
@@ -794,6 +795,7 @@ std::optional<LocalBuf> Lowerer::perElementBcast(Value v, const LocalBuf &l, int
   uint32_t w = uint32_t((n + d - 1) / d);
   LocalBuf rep = newLocal(::sa::VT_F32, int64_t(w) * d * d);
   Opd s{l.la, ::sa::VT_F32, ::sa::IDX_DIV, uint32_t(d)};
+  StaticLen fixed(*this);
   ve(s, std::nullopt, rep.la, ::sa::VT_F32, int64_t(w) * d * d, ::sa::VOP_COPY);
   LocalBuf b = newLocal(::sa::VT_F32, int64_t(w) * d, true);
   sahw::TransposeOp::create(bb, loc, int64_t(rep.la), int64_t(b.la), int64_t(w * d * d),
