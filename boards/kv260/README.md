@@ -164,15 +164,16 @@ concurrently 1574 MB/s. The DDR latency is fixed in ns, so it costs twice
 the cycles at 100 MHz: 1-beat bursts drop from 47.7% to 38.0% of 8 B/cycle,
 and the LLM runs take 0.2-0.4% more cycles than at 50 MHz.
 
-## K1c on the board (2026-10-08): LLM tests pass
+## K1c on the board (2026-10-08): passed
 
 The regression with the `d16_100mhz` overlay (D = 16): every LLM test
 (`c1`, `c3`, `c55`, `c6p_stories`, `c6p_smollm2`, `hfgen`) is bit-exact with
 the D = 16 sim; `ddr`, `bwtest` and `desc` pass. Tokens vs the Z1 baselines:
 `c3` and `hfgen` identical, the others differ from token 16-22 on (the fp32
 reductions group by D lanes; expected). The `gemm` and `vector` demos failed
-on D = 8-only shapes (fixed in `6658deb`; the firmware passes the D = 16 system
-sim); `fwdemo` is still to be rerun on the board.
+on D = 8-only shapes (fixed in `6658deb`, which skips them); rerun on the
+board, `fwdemo` passes. GEMM 256x256x256: 202.6 MAC/cycle (79% of the 256
+peak; K1b 58.9).
 
 | Run | K1b (D = 8) | **K1c (D = 16)** |
 |---|---|---|
