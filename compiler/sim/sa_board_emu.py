@@ -42,22 +42,23 @@ MBOX_PHYS = BRAM_ARM_BASE + MBOX
 CPL_OFFSET = 0x2000
 
 
-def serve(sim, dev, base, ring_entries, stop, log):
+def serve(sim, dev, win, base, ring_entries, stop, log):
+    """win: the device window (physical address base at index 0)."""
     mb = dev[MBOX_PHYS:MBOX_PHYS + 0x100].view("<u4")
     head = 0
     while not stop.is_set():
         if int(mb[MBOX_RING_TAIL // 4]) == head:
             continue
         slot = head & (ring_entries - 1)
-        e = dev[base + 64 * slot:base + 64 * slot + 64].view("<u8")
-        c = dev[base + CPL_OFFSET + 32 * slot:base + CPL_OFFSET + 32 * slot + 32].view("<u4")
+        e = win[64 * slot:64 * slot + 64].view("<u8")
+        c = win[CPL_OFFSET + 32 * slot:CPL_OFFSET + 32 * slot + 32].view("<u4")
         w0 = int(e[0])
         typ, seq = w0 & 0xFF, w0 >> 32
         status = exe = end = 0
         if typ == RT_RUN_LIST:
             bases = [int(e[3 + i]) & 0xFFFFFFFF for i in range(4)]
             pb = int(e[7]) & 0xFFFFFFFF
-            params = [int(v) for v in dev[pb:pb + 32].view("<u4")] if pb else None
+            params = [int(v) for v in win[pb - base:pb - base + 32].view("<u4")] if pb else None
             try:
                 exe = sim.run_list(int(e[1]) & 0xFFFFFFFF, int(e[2]) & 0xFFFFFFFF, bases, params)
                 end = sim.dl_status
@@ -81,6 +82,8 @@ def main():
     ap.add_argument("--file", default=f"/dev/shm/sa_devmem_{os.getpid()}")
     ap.add_argument("--mbox", type=lambda s: int(s, 0), default=MBOX_PHYS,
                     help="the mailbox's physical address (KV260: 0xA0011F00)")
+    ap.add_argument("--mem-file", help="serve the window from this file (offset 0) and pass it as "
+                    "SA_BOARD_MEM_DEV, as the KV260's u-dma-buf device")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args()
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
@@ -91,25 +94,35 @@ def main():
         f.truncate(span)
     dev = np.memmap(args.file, np.uint8, "r+", shape=(span,))
     sim = SaFuncSim(args.d, args.base, size)
-    sim.ddr = dev[args.base:args.base + size]
+    if args.mem_file:
+        with open(args.mem_file, "wb") as f:
+            f.truncate(size)
+        win = np.memmap(args.mem_file, np.uint8, "r+", shape=(size,))
+    else:
+        win = dev[args.base:args.base + size]
+    sim.ddr = win
     mb = dev[MBOX_PHYS:MBOX_PHYS + 0x100].view("<u4")
     mb[MBOX_RING_BASE // 4] = args.base
     mb[MBOX_RING_SIZE // 4] = args.ring
     mb[MBOX_CPL_BASE // 4] = args.base + CPL_OFFSET
     mb[MBOX_FW_STATE // 4] = RT_READY
     stop, log = threading.Event(), []
-    t = threading.Thread(target=serve, args=(sim, dev, args.base, args.ring, stop, log), daemon=True)
+    t = threading.Thread(target=serve, args=(sim, dev, win, args.base, args.ring, stop, log), daemon=True)
     t.start()
     env = dict(os.environ, SA_TRANSPORT="board", SA_BOARD_DEVMEM=args.file,
                SA_BOARD_MEM=f"{args.base:#x}:{size:#x}", SA_BOARD_MBOX=f"{MBOX_PHYS:#x}",
                SA_BOARD_RING=str(args.ring), SA_BOARD_D=str(args.d))
+    if args.mem_file:
+        env["SA_BOARD_MEM_DEV"] = args.mem_file
     try:
         rc = subprocess.call(cmd, env=env)
     finally:
         stop.set()
         t.join()
-        del dev
+        del dev, win
         os.remove(args.file)
+        if args.mem_file:
+            os.remove(args.mem_file)
     print(f"sa board emu: {len(log)} ring entries served, RING_HEAD {len(log)}; statuses "
           f"{sorted(set(s for _, _, s, _, _ in log))}")
     return rc

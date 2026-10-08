@@ -32,9 +32,63 @@ from pynq_matmul import (MBOX, MBOX_CPL_BASE, MBOX_FW_STATE, MBOX_HEARTBEAT,  # 
                          allocate)
 
 CPL_OFFSET = 0x2000                      # sa_transport_board.c
+UDMABUF = os.environ.get("SA_UDMABUF", "/dev/udmabuf0")
+
+
+class UdmabufWindow:
+    """The device window from the u-dma-buf module (KV260: arm64 kernels with
+    CONFIG_STRICT_DEVMEM refuse /dev/mem on RAM, so the program cannot map a
+    PYNQ buffer). The module allocated a contiguous buffer at load
+    (`insmod u-dma-buf.ko udmabuf0=<bytes>`); opened with O_SYNC its mapping is
+    non-cached, as the program's. The first `mb` MB serve as the window; the
+    program maps the same device (SA_BOARD_MEM_DEV)."""
+
+    def __init__(self, dev, mb):
+        import mmap
+        name = os.path.basename(dev)
+        sysfs = next((d for d in (f"/sys/class/u-dma-buf/{name}", f"/sys/class/udmabuf/{name}") if os.path.isdir(d)), None)
+        if sysfs is None:
+            raise RuntimeError(f"{dev}: no sysfs entry (is the u-dma-buf module loaded?)")
+        self.physical_address = int(open(os.path.join(sysfs, "phys_addr")).read().strip(), 0)
+        size = int(open(os.path.join(sysfs, "size")).read().strip(), 0)
+        self.nbytes = mb << 20
+        if self.nbytes > size:
+            raise RuntimeError(f"{dev}: {size >> 20} MB, the window needs {mb} MB (reload u-dma-buf larger)")
+        self.dev = dev
+        # sync_mode 2: an O_SYNC mapping is write-combining (arm64: Normal
+        # non-cacheable). The default 1 maps it pgprot_noncached, which on arm64
+        # is Device memory: memcpy / memset would fault on unaligned accesses.
+        mode = os.path.join(sysfs, "sync_mode")
+        if os.path.exists(mode) and open(mode).read().strip() != "2":
+            with open(mode, "w") as f:
+                f.write("2")
+        fd = os.open(dev, os.O_RDWR | os.O_SYNC)
+        try:
+            self._map = mmap.mmap(fd, self.nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        finally:
+            os.close(fd)
+        self.view = np.frombuffer(self._map, dtype=np.uint8)
+
+    def __setitem__(self, key, value):
+        self.view[key] = value
+
+    def flush(self):                     # (non-cached: nothing to write back)
+        pass
+
+    def freebuffer(self):
+        self.view = None
+        self._map.close()
 
 
 def alloc_window(mb):
+    """The device window: u-dma-buf when its device exists (KV260), else a PYNQ
+    buffer in CMA (PYNQ-Z1)."""
+    if os.path.exists(UDMABUF):
+        return UdmabufWindow(UDMABUF, mb)
+    return alloc_pynq_window(mb)
+
+
+def alloc_pynq_window(mb):
     """The device window (CMA). A large window can fail on free but fragmented
     CMA (loading the overlay leaves page cache in it): then drop the page cache,
     compact memory (root) and retry. SmolLM2 (168 MB) needs cma=320M on the
@@ -80,7 +134,13 @@ def start(bit, fw, mb=16, ring=16):
     while mm._mbox(MBOX_FW_STATE) != RT_READY:
         if time.perf_counter() - t0 > 5:
             raise RuntimeError(f"rt_fw not ready (FW_STATE {mm._mbox(MBOX_FW_STATE):#x})")
-    print(f"launcher: {mm.info.board} overlay D = {mm.d}, {mm.riscv_hz / 1e6:.1f} MHz, rt_fw ready, window {mb} MB at {phys:#x}, ring {ring}", flush=True)
+    kind = f"u-dma-buf {buf.dev}" if isinstance(buf, UdmabufWindow) else "PYNQ buffer"
+    print(f"launcher: {mm.info.board} overlay D = {mm.d}, {mm.riscv_hz / 1e6:.1f} MHz, rt_fw ready, "
+          f"window {mb} MB at {phys:#x} ({kind}), ring {ring}", flush=True)
+    if isinstance(buf, UdmabufWindow):   # the program maps the window from the same device
+        os.environ["SA_BOARD_MEM_DEV"] = buf.dev
+    else:
+        os.environ.pop("SA_BOARD_MEM_DEV", None)
     env = dict(os.environ, SA_TRANSPORT="board", SA_BOARD_MEM=f"{phys:#x}:{mb << 20:#x}",
                SA_BOARD_MBOX=f"{mm.bram_base + MBOX:#x}", SA_BOARD_RING=str(ring), SA_BOARD_D=str(mm.d))
     return mm, buf, env

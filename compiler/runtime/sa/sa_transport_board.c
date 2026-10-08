@@ -21,6 +21,11 @@
 // board_launcher.py, which allocated the window, set up the ring and started
 // rt_fw):
 //   SA_BOARD_MEM=<physical address>:<bytes>   the window (page aligned)
+//   SA_BOARD_MEM_DEV=<device file>            optional: map the window from this
+//       file (offset 0) instead of /dev/mem at its physical address. On the
+//       KV260 (arm64, CONFIG_STRICT_DEVMEM) /dev/mem refuses RAM even to root:
+//       the window comes from the u-dma-buf module (/dev/udmabuf0, opened with
+//       O_SYNC: a non-cached mapping), its physical address from sysfs.
 //   SA_BOARD_MBOX=<physical address>          the mailbox (BRAM + 0x1F00)
 //   SA_BOARD_RING=<entries>  SA_BOARD_D=<array size>
 // O_SYNC makes the DDR mapping non-cacheable (ARM: write-combining normal
@@ -152,6 +157,16 @@ static void* sa_devmem_map(uint64_t phys, uint64_t size) {
   return p == MAP_FAILED ? NULL : (uint8_t*)p + (phys - base);
 }
 
+// Maps [0, size) of a device file (u-dma-buf) with O_SYNC; NULL on failure.
+static void* sa_file_map(const char* path, uint64_t size) {
+  if (size > (uint64_t)SIZE_MAX) return NULL;
+  int fd = open(path, O_RDWR | O_SYNC);
+  if (fd < 0) return NULL;
+  void* p = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  return p == MAP_FAILED ? NULL : p;
+}
+
 // A whole unsigned number (decimal, 0x hex, 0 octal) into 64 bits; *end: the
 // first character after it (NULL: nothing may follow). Returns 0 on failure.
 static int sa_parse_u64(const char* s, uint64_t* out, const char** end) {
@@ -199,14 +214,17 @@ static iree_status_t sa_board_attach_from_env(void) {
                             "SA_BOARD_D %llu (8 or 16)",
                             (unsigned long long)mbox_phys, (unsigned long long)ring, (unsigned long long)d);
   }
-  void* m = sa_devmem_map(phys, size);
+  const char* memdev = getenv("SA_BOARD_MEM_DEV");
+  void* m = memdev && *memdev ? sa_file_map(memdev, size) : sa_devmem_map(phys, size);
   // the mailbox and the perf area below it (SA_PROFILE_PERF)
   void* b = sa_devmem_map(mbox_phys - SA_PERF_AREA_BELOW_MBOX, 0x100 + SA_PERF_AREA_BELOW_MBOX);
   if (b) b = (uint8_t*)b + SA_PERF_AREA_BELOW_MBOX;
   if (!m || !b) {
     return iree_make_status(IREE_STATUS_PERMISSION_DENIED,
-                            "sa board: cannot map /dev/mem (%#llx, %#llx); run as root",
-                            (unsigned long long)phys, (unsigned long long)mbox_phys);
+                            "sa board: cannot map the window %#llx (%s) or the mailbox %#llx (/dev/mem); run as "
+                            "root (arm64 with CONFIG_STRICT_DEVMEM: the window needs SA_BOARD_MEM_DEV, u-dma-buf)",
+                            (unsigned long long)phys, memdev && *memdev ? memdev : "/dev/mem",
+                            (unsigned long long)mbox_phys);
   }
   sa_board_attach(m, (uint32_t)phys, (uint32_t)size, b, (uint32_t)ring, (uint32_t)d);
   return iree_ok_status();
