@@ -107,10 +107,12 @@ runtime and the overlay of `build/output/$SA_KV260_CONFIG`, default
 `d8_50mhz`, or `SA_BIT_DIR`); the whole regression of the Z1 freeze:
 
 ```sh
-compiler/scripts/deploy_z1_freeze.sh --board kv260        # K1a (d8_50mhz) -> build/deploy_kv260
-SA_KV260_CONFIG=d8_100mhz compiler/scripts/deploy_z1_freeze.sh --board kv260   # K1b
-scp -r build/deploy_kv260 <user>@<kv260>:~/kv260
-# on the board (PYNQ venv, root): cd ~/kv260 && python3 board_regress.py
+compiler/scripts/deploy_z1_freeze.sh --board kv260        # K1a (d8_50mhz) -> build/deploy_kv260_d8_50mhz
+SA_KV260_CONFIG=d8_100mhz compiler/scripts/deploy_z1_freeze.sh --board kv260   # K1b -> build/deploy_kv260_d8_100mhz
+scp -r build/deploy_kv260_d8_100mhz <user>@<kv260>:~/kv260_d8_100mhz
+# on the board: cd ~/kv260_d8_100mhz && sudo ./run_board.sh
+# back: results/ -> build/deploy_kv260_d8_100mhz/results
+$SA_PY compiler/tests/compare_z1_baselines.py build/deploy_kv260_d8_100mhz/results
 ```
 
 and compare `results/` with `tests/baselines/pynq-z1/` (K1a: the token files
@@ -136,6 +138,25 @@ Board setup the tests need (each boot):
 sudo insmod ~/udmabuf/u-dma-buf.ko udmabuf0=536870912     # 512 MB in CMA (0x37f00000 here)
 cd ~/kv260 && sudo ./run_board.sh                          # the PYNQ venv; xmutil unloadapp by the driver
 ```
+
+## K1b on the board (2026-10-08): passed
+
+The same regression with the `d8_100mhz` overlay: `REGRESSION PASS`, every
+run's tokens identical to the PYNQ-Z1 baselines. Wall time per decode step
+halves (the device time dominates; the A53 host adds little):
+
+| Run | Z1 (50 MHz) | K1a (50 MHz) | **K1b (100 MHz)** | K1b device cycles / Z1 |
+|---|---|---|---|---|
+| stories15M decode (c3) | 17.62 tok/s | 18.27 | **35.44** | |
+| stories15M prefill + decode | 17.41 | 18.06 | **34.84** | 2,719,808 / 2,709,281 (+0.39%) |
+| SmolLM2 qhf decode (c55) | 2.22 | 2.27 | **4.43** | |
+| SmolLM2 qhf prefill + decode | 2.17 | 2.22 | **4.30** | 22,272,216 / 22,220,320 (+0.23%) |
+| SmolLM2 generic (hfgen) | 1.87 | 1.88 | **3.73** | 26,729,622 / 26,671,269 (+0.22%) |
+
+DMA (`bwtest`): contiguous LD / ST 794 MB/s (99.2% of 8 B/cycle), LD + ST
+concurrently 1574 MB/s. The DDR latency is fixed in ns, so it costs twice
+the cycles at 100 MHz: 1-beat bursts drop from 47.7% to 38.0% of 8 B/cycle,
+and the LLM runs take 0.2-0.4% more cycles than at 50 MHz.
 
 ## To confirm on the board
 

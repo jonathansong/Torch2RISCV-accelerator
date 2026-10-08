@@ -202,6 +202,8 @@ K1a 布线后的前 40 条路径（`post_route.dcp`，在 20 ns 约束下工具�
 
 **100 MHz 构建通过**（2026-10-04，`-sa_mhz 100`）：setup WNS +1.171 ns、hold WHS +0.010 ns，`check_timing` 无未约束路径，资源与 K1a 相同（LUT 34.4%、BRAM36 130）；最差路径变为 LD 的 `q_lane` → DSP → ACC BRAM 写使能（7.8 ns，13 级），按现状约 113 MHz。K1b 剩下板上验证（第 2–6 步）。
 
+**K1b 验收通过**（2026-10-08，板上，`d8_100mhz` overlay，`SA_KV260_CONFIG=d8_100mhz compiler/scripts/deploy_z1_freeze.sh --board kv260` + `run_board.sh`）：第 2–6 步全部 PASS，5 个测试的 token 序列与 Z1 基线完全相同。墙钟几乎减半：stories15M decode 28.2 ms/步 = 35.44 token/s（K1a 18.27，Z1 17.62），SmolLM2 qhf decode 225.5 ms/步 = 4.43 token/s（K1a 2.27），通用路径 268.3 ms/步 = 3.73 token/s（K1a 1.88）。DMA 连续读写 794 MB/s（8 B/周期的 99.2%），读写并发 1574 MB/s。DDR 延迟按纳秒固定，100 MHz 下折合的周期数加倍：单拍突发从 47.7% 降到 38.0%，LLM 的设备周期比 50 MHz 多 0.2–0.4%（stories15M 2,719,808 / 2,708,522，SmolLM2 qhf 22,272,216 / 22,215,268，通用路径 26,729,622 / 26,663,452）。主机开销小，提频的收益几乎全部落到墙钟上。**K1（K1a + K1b）验收完成**，按 7.3 节可以合入 main。
+
 **验收**：时序收敛，第 5、6 步逐位一致。性能为观测项：`bwtest` 的入口上限变为 0.8 GB/s（64 位 × 100 MHz），decode 的 token/s 预计有提升，但主机开销与 DDR 延迟使它不一定是 Z1 的两倍。
 
 ### K1c D = 8 → 16
@@ -420,8 +422,8 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 | 阶段 | 加速器时钟 | LD 入口上限 | 读带宽（实测 / 目标） | 性能 |
 |---|---|---|---|---|
 | PYNQ-Z1（实测） | 50 MHz | 0.4 GB/s | 实测约 0.39 GB/s | SmolLM2-135M 约 2.2 token/s（手写路径；通用路径 1.87）；Qwen3-0.6B 放不下 |
-| K1a | 50 MHz | 0.4 GB/s | 观测 | 正确性验收，token/s 为观测值 |
-| K1b | 100 MHz | 0.8 GB/s | 观测 | 观测 |
+| K1a | 50 MHz | 0.4 GB/s | 实测 0.397 GB/s | 通过；stories15M 18.27 token/s，SmolLM2 2.27（通用 1.88） |
+| K1b | 100 MHz | 0.8 GB/s | 实测 0.794 GB/s | 通过；stories15M 35.44 token/s，SmolLM2 4.43（通用 3.73） |
 | K2a | 200–250 MHz | 3.2–4.0 GB/s | DMA → SPAD 有效带宽接近上限 | 观测 |
 | K2b | 200–250 MHz | 6.4–12.8 GB/s（按所选配置） | **LINEAR 写入 SPAD 有效带宽**达到所选配置的目标（例如 2 字/周期 × 250 MHz ≥ 6 GB/s）；INTERLEAVE 记录实测值 | SmolLM2 随有效带宽提升（实测比例） |
 | K4a | 同 K2b | 同 K2b | — | Qwen3-0.6B 正确运行，不设速度门槛 |
