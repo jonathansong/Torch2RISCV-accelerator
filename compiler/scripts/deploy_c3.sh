@@ -6,7 +6,7 @@
 #   scp build/deploy_c3/* xilinx@<board>:/home/xilinx/c3/
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
-source "$(dirname "$0")/board_env.sh"            # SA_BOARD=pynq-z1 (default) | kv260
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (default) | pynq-z1
 D=$SA_REPO/build/deploy_c3
 rm -rf "$D" && mkdir -p "$D"
 "$SA_PY" "$SA_COMPILER/tests/test_c3.py" --board-bundle "$D" "$@"

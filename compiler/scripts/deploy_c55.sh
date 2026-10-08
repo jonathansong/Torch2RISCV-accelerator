@@ -8,7 +8,7 @@
 #   scp build/deploy_c55/* xilinx@<board>:/home/xilinx/c55/
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
-source "$(dirname "$0")/board_env.sh"            # SA_BOARD=pynq-z1 (default) | kv260
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (default) | pynq-z1
 D=$SA_REPO/build/deploy_c55
 rm -rf "$D" && mkdir -p "$D"
 "$SA_PY" "$SA_COMPILER/tests/test_c55.py" --model "$SA_REPO/build/llm_cache/SmolLM2-135M" \

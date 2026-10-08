@@ -5,7 +5,7 @@
 #   scp -r build/deploy_c1/test_d8 xilinx@<board>:/home/xilinx/c1/
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
-source "$(dirname "$0")/board_env.sh"            # SA_BOARD=pynq-z1 (default) | kv260
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (default) | pynq-z1
 D=$SA_REPO/build/deploy_c1
 rm -rf "$D" && mkdir -p "$D"
 "$SA_PY" "$SA_COMPILER/runtime/tools/make_test_exec.py" --d 8 --out "$D/test_d8"

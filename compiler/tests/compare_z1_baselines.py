@@ -4,7 +4,7 @@
 sequences must be identical) and puts the speeds and device cycles side by
 side.
 
-    $SA_PY compiler/tests/compare_z1_baselines.py [results dir, default build/deploy_kv260_d8_50mhz/results]
+    $SA_PY compiler/tests/compare_z1_baselines.py [results dir, default build/deploy_kv260_d8_100mhz/results]
 
 Exit 0 when every run with a baseline has identical tokens.
 """
@@ -50,7 +50,7 @@ def timing(results, run):
 
 
 def main():
-    results = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "build", "deploy_kv260_d8_50mhz", "results")
+    results = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "build", "deploy_kv260_d8_100mhz", "results")
     base = baseline_tokens()
     ok, rows = True, []
     for run, want in base.items():

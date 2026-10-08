@@ -7,7 +7,7 @@
 #   scp build/deploy_c6p_<model>_m<M>/* xilinx@<board>:/home/xilinx/c6p/
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
-source "$(dirname "$0")/board_env.sh"            # SA_BOARD=pynq-z1 (default) | kv260
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (default) | pynq-z1
 model=${1:?stories or smollm2}
 M=${2:-8}
 O=$SA_REPO/build/c6p/${model}_m$M

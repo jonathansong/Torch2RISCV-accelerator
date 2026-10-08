@@ -8,7 +8,7 @@
 #   board: python3 board_llm.py
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
-source "$(dirname "$0")/board_env.sh"            # SA_BOARD=pynq-z1 (default) | kv260
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (default) | pynq-z1
 O=$SA_REPO/build/fallback/stories_hostlin
 D=$SA_REPO/build/deploy_fallback
 rm -rf "$O" "$D" && mkdir -p "$O" "$D"

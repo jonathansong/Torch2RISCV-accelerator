@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Stages the PYNQ-Z1 freeze regression (docs/kv260_upgrade_plan.md §7.2) in
-# build/deploy_z1: every board test of the current main, one directory each
+# Stages the PYNQ-Z1 freeze regression (docs/kv260_upgrade_plan.md §7.2), now
+# the KV260's regression against the Z1 baselines: every board test of the current main, one directory each
 # (each made by its own deploy script, which runs the host test first: export,
 # compile, per-dispatch check, sim run), plus board_regress.py at the top.
-#   compiler/scripts/deploy_z1_freeze.sh [--board pynq-z1|kv260] [test ...]   (default: all; tests below)
-#   --board kv260: the KV260's aarch64 runtime and overlay (KV260/build/output/$SA_KV260_CONFIG,
-#   default d8_50mhz; or SA_BIT_DIR)
-#   into build/deploy_kv260_<config> (docs/kv260_upgrade_plan.md K1a / K1b; compare the results
-#   with compiler/tests/compare_z1_baselines.py); the default pynq-z1 stages build/deploy_z1
+#   compiler/scripts/deploy_z1_freeze.sh [--board kv260|pynq-z1] [test ...]   (default: all; tests below)
+#   kv260 (default): the KV260's aarch64 runtime and overlay (KV260/build/output/$SA_KV260_CONFIG,
+#   default d8_100mhz; or SA_BIT_DIR) into build/deploy_kv260_<config> (docs/kv260_upgrade_plan.md
+#   K1a / K1b; compare the results with compiler/tests/compare_z1_baselines.py);
+#   --board pynq-z1 stages the frozen Z1's bundle in build/deploy_z1, as below
 #   scp -r build/deploy_z1 xilinx@<board>:/home/xilinx/z1
 #   board: sudo ./run_board.sh [test ...]     (sources the board's PYNQ / XRT environment)
 #   back:  scp -r xilinx@<board>:/home/xilinx/z1/results build/deploy_z1/
