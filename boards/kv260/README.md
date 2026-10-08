@@ -11,6 +11,7 @@ PYNQ-Z1 baselines; results below).
 boards/kv260/scripts/build_bitstream.sh -jobs 2                 # K1a: D = 8, 50 MHz (~25 min)
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_mhz 100     # K1b
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100   # K1c
+boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100 -dma_w 128   # K2a-1: 128-bit DMA (d16_100mhz_w128)
 boards/kv260/scripts/build_bitstream.sh -bd_only                # block design + address map only (minutes)
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -synth_only     # stop after synthesis (~9 min)
 ```

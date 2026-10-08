@@ -310,6 +310,16 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 
 **验收**：`bwtest` 的 DMA → SPAD 有效带宽接近单口 128 位的入口上限（200 MHz 时 3.2 GB/s 以内的实测值，记录实际比例）；stories15M、SmolLM2 逐位一致。
 
+**分两步**（同 K1a / K1b，把位宽与时序分开）：**K2a-1** 在 100 MHz 下把 DMA 加宽到 128 位（`d16_100mhz_w128`，入口上限 1.6 GB/s），**K2a-2** 再提频到 200 MHz（第 1 项）。
+
+**K2a-1 RTL 完成**（2026-10-08，`119a524`）：`sa_ld` / `sa_st` / `sa_cmdfetch` / `sa_unit` 加参数 `DMA_W`（64 | 128，默认 64，旧配置不变），KV260 构建加 `-dma_w 128`（HP1 128 位，配置名后缀 `_w128`）。
+- 8 字节粒度不变：burst 从地址向下取整到 16 字节开始，burst 队列记下"首拍的低 lane 不是本命令的""末拍的高 lane 是不是本命令的"；LD 按此丢弃，ST 按此生成 `WSTRB`。
+- 一拍的两个 lane 落在同一个本地字、且起始 lane 为偶数时一个周期写完（`lw_two`：D = 16 的 SPAD、ACC，DDR 地址 16 字节对齐时）；否则一个周期写一个 lane（R 保持一拍），所以 D = 8 的 SPAD、只 8 字节对齐的地址、INTERLEAVE 跨字的块都正确，只是这部分不加速。ST 的本地读同理。
+- 描述符取指每拍两个 64 位字（4 拍一个描述符），LDPARAM 按 beat 内偏移取字。
+- `LD_BEATS` / `ST_BEATS` 仍按 8 字节计（`sa_perf` 新增 `ev2`：两 lane 的写 / 拍计两次），`z1_profile.py` 等软件不用改；计数器 19 现在就是"写入 SPAD/ACC 的字节数 ÷ 8"（第 3 项的有效字节计数）。`sa_ld` 文件头的在途 burst 数改正为 8。
+- 验证：`tb_sa_dma` 的 AXI 模型加 128 位与 `WSTRB`，另加 40 个随机形状（8 字节对齐的地址、8 的奇数倍行长、跨 4 KB、INTERLEAVE），故意改错合并条件或 `WSTRB` 都能抓到；`make test` / `test16` / `test128`、`tb_sa_unit`（365 项计数器检查、描述符列表）、固件系统仿真（gemm、vector、desc_run、rt、bwtest；D = 16 的 64 / 128 位）全部 PASS。仿真中 bwtest 连续读写 3.62 → 7.26 B/周期（DDR 模型带随机停顿，不是板上数字），`tb_sa_unit` 的 64×64×128 GEMM 10107 → 6413 周期。`-bd_only` 验证通过。编译器与运行时不变；驱动从 `.hwh` 读 `DMA_W`，`m2_bw_test.py` 按位宽报告占比。
+- 待办：`d16_100mhz_w128` 的 Vivado 构建（资源与时序），板上 `bwtest` 与 K1 回归逐位一致。
+
 #### K2b 多口接收 + 存储分银行
 
 1. **先确定架构**。功能仿真器（`sa_funcsim`、`sa_sim_server.py`）**没有时序模型**（返回的周期数为 0），不能用来比较方案，改用两种工具：
