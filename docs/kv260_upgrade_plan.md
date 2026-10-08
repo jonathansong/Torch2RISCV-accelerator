@@ -220,6 +220,20 @@ K1a 布线后的前 40 条路径（`post_route.dcp`，在 20 ns 约束下工具�
 
 **D = 16 端到端发现的编译器错误**（`a1fefb6`）：C5.5（SmolLM2）在 D = 16 的 sim 上第 0 步正确、第 1 步起完全偏离；逐 dispatch 检查（`dispatch_check`）全部 OK，`--dirty`（片上存储从垃圾值开始）下 30 个注意力 softmax（`reduction_3x3xD`，GQA 的 3 × 3 行）失败。原因：行模式（动态长度、每次一行）里，长度等于整行（`maxDynamic` = 256）的 VE 取动态长度 LEN；按行广播（`perElementBcast`）先复制出 w × D × D 的块再转置，D = 16、不超过 16 行时这个块正好 256 个元素，于是也被改成 LEN = T，只写了块的第一个字，广播出的行读到上一步留下的通道（第 0 步片上存储还是 0、且只用通道 0，所以碰巧正确）。D = 8 时块是 128，不会撞上。修正：固定大小的辅助 VE（按行广播的块、标量广播字）在行模式里保持静态长度。黄金语料不变，新增 `smollm2_d16` 一组（共 4232 个 dispatch）。教训：新的目标配置要做端到端 sim，并用 `dispatch_check --dirty`。
 
+**板上结果**（2026-10-08，`d16_100mhz` overlay，`SA_KV260_CONFIG=d16_100mhz compiler/scripts/deploy_z1_freeze.sh` + `run_board.sh`，bundle 来自 `fcc75ee`）：第 5、6 步全部 PASS（`c1`、`c3`、`c55`、`c6p_stories`、`c6p_smollm2`、`hfgen` 与 D = 16 的 sim 逐位一致），`ddr`、`bwtest`（792–794 MB/s，与 K1b 相同）、`desc` PASS。与 Z1 基线相比，`c3` 与 `hfgen` 的 token 相同，`c55`、`c6p_stories`、`c6p_smollm2` 分别从第 18、16、22 个 token 起不同（fp32 归约分组不同，符合预期）。`gemm`、`vector` 两个 demo 失败在脚本：形状写死为 D = 8 的倍数（8×8×8、24×16×40），驱动在 D = 16 时报 ValueError；固件本身在 D = 16 的系统仿真中通过（19 个 GEMM、7 个向量运算）。`6658deb` 让 demo 跳过不是 D 倍数的形状和 8×8×8 的 Phase 4 旧路径，并加了 D = 16 也合法的非方形用例；**`fwdemo` 待在板上重跑**。
+
+| 运行 | K1b（D = 8） | **K1c（D = 16）** | |
+|---|---|---|---|
+| stories15M decode（c3） | 35.44 token/s | **39.36** | +11% |
+| stories15M prefill + decode 的 decode | 34.84 | **37.84** | +9% |
+| SmolLM2 qhf decode（c55） | 4.43 | **4.77** | +8% |
+| SmolLM2 qhf prefill + decode 的 decode | 4.30 | **4.50** | +5% |
+| SmolLM2 qhf prefill（M = D） | 14.04 | **22.22** | +58%（每块 16 个 token） |
+| SmolLM2 通用路径 decode（hfgen） | 3.73 | **4.39** | +18%（设备周期 26.73M → 22.68M） |
+| SmolLM2 通用路径 prefill（M = 8） | 6.84 | **4.17** | −39% |
+
+decode 的提升小于 2 倍：每周期消耗 D 字节权重，但读带宽仍是 8 B/周期（§3.1 H0），D = 16 要和 K2a 的 128 位读通道一起才能发挥。**通用路径的 prefill 变慢**：它的导出固定 M = 8，在 D = 16 的阵列上每块只用一半的行，而 prefill 的 matmul（`8x96x16x576` 等）设备周期反而约为 D = 8 时的 2 倍（30.3M 对 16.6M）。待办：`deploy_hfgen.sh` 按 D 导出 M = D 的 prefill，并查明 M < D 时 matmul 的周期为何翻倍。
+
 ### K2 带宽：DMA 与片上存储接口
 
 decode 受权重读取带宽限制，这一阶段是性能提升的主要来源。**它不只是加宽 DMA，而是 DMA 与片上存储写入接口的一起重构。**
@@ -430,6 +444,7 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 | PYNQ-Z1（实测） | 50 MHz | 0.4 GB/s | 实测约 0.39 GB/s | SmolLM2-135M 约 2.2 token/s（手写路径；通用路径 1.87）；Qwen3-0.6B 放不下 |
 | K1a | 50 MHz | 0.4 GB/s | 实测 0.397 GB/s | 通过；stories15M 18.27 token/s，SmolLM2 2.27（通用 1.88） |
 | K1b | 100 MHz | 0.8 GB/s | 实测 0.794 GB/s | 通过；stories15M 35.44 token/s，SmolLM2 4.43（通用 3.73） |
+| K1c | 100 MHz（D = 16） | 0.8 GB/s | 实测 0.794 GB/s | LLM 测试通过；stories15M 39.36 token/s，SmolLM2 4.77（通用 4.39），SmolLM2 prefill 22.2 token/s；fwdemo 待重跑 |
 | K2a | 200–250 MHz | 3.2–4.0 GB/s | DMA → SPAD 有效带宽接近上限 | 观测 |
 | K2b | 200–250 MHz | 6.4–12.8 GB/s（按所选配置） | **LINEAR 写入 SPAD 有效带宽**达到所选配置的目标（例如 2 字/周期 × 250 MHz ≥ 6 GB/s）；INTERLEAVE 记录实测值 | SmolLM2 随有效带宽提升（实测比例） |
 | K4a | 同 K2b | 同 K2b | — | Qwen3-0.6B 正确运行，不设速度门槛 |

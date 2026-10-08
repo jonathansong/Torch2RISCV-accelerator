@@ -164,6 +164,29 @@ concurrently 1574 MB/s. The DDR latency is fixed in ns, so it costs twice
 the cycles at 100 MHz: 1-beat bursts drop from 47.7% to 38.0% of 8 B/cycle,
 and the LLM runs take 0.2-0.4% more cycles than at 50 MHz.
 
+## K1c on the board (2026-10-08): LLM tests pass
+
+The regression with the `d16_100mhz` overlay (D = 16): every LLM test
+(`c1`, `c3`, `c55`, `c6p_stories`, `c6p_smollm2`, `hfgen`) is bit-exact with
+the D = 16 sim; `ddr`, `bwtest` and `desc` pass. Tokens vs the Z1 baselines:
+`c3` and `hfgen` identical, the others differ from token 16-22 on (the fp32
+reductions group by D lanes; expected). The `gemm` and `vector` demos failed
+on D = 8-only shapes (fixed in `6658deb`; the firmware passes the D = 16 system
+sim); `fwdemo` is still to be rerun on the board.
+
+| Run | K1b (D = 8) | **K1c (D = 16)** |
+|---|---|---|
+| stories15M decode (c3) | 35.44 tok/s | **39.36** |
+| SmolLM2 qhf decode (c55) | 4.43 | **4.77** |
+| SmolLM2 qhf prefill (M = D) | 14.04 | **22.22** |
+| SmolLM2 generic decode (hfgen) | 3.73 | **4.39** |
+| SmolLM2 generic prefill (M = 8 export) | 6.84 | **4.17** |
+
+Decode gains are small: the array consumes D bytes of weights per cycle but
+the read path is still 8 B/cycle (K2a). The generic path's prefill is slower:
+its export fixes M = 8, and its prefill matmuls take about twice the D = 8
+cycles on the D = 16 array (to fix: export M = D).
+
 ## To confirm on the board
 
 - The carrier's fan is controlled from the PL in AMD's reference designs;
