@@ -131,6 +131,8 @@ def main():
                         f"--parameters=model={args.out}/sa_packed.irpa", "--abi=hf", "--tokens=" + args.prompt,
                         f"--generate={args.generate}", f"--logits_out={lp}"],
                        capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock, SA_STATS="1"))
+    if r.returncode:
+        srv.kill()             # (it waits for a connection the run may never have made)
     srv.wait(timeout=120)
     if r.returncode:
         print(r.stderr[-3000:])
