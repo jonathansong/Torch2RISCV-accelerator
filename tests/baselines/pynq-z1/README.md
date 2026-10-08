@@ -20,3 +20,6 @@ Large outputs (logits, full logs) are not in git; they go with the release.
 On the KV260 (K1a: the same accelerator), the token files must match exactly;
 the descriptors of the D = 8 / default-memory target must match
 `golden_manifest.txt` while the compiler is unchanged.
+`compiler/tests/compare_z1_baselines.py <results>` checks a board run.
+K1a (50 MHz, 2026-10-08) and K1b (100 MHz, 2026-10-08): all five runs
+identical (KV260/README.md).

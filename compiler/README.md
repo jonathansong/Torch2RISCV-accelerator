@@ -80,7 +80,13 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   SA_PROFILE_PERF=<file>` (board: each list with `RT_F_PERF`, the counters
   summed per export into a CSV), `tests/z1_profile.py` splits the cycles per
   dispatch type into loads (and their floor), EX, VE / SFU, ST, fixed overhead
-  and overlap. Further work goes on with the KV260 (docs/kv260_upgrade_plan.md).
+  and overlap. Further work goes on with the KV260 (docs/kv260_upgrade_plan.md):
+  `deploy_z1_freeze.sh --board kv260` stages the same regression with the
+  aarch64 runtime and a KV260 overlay (`SA_KV260_CONFIG`, into
+  `build/deploy_kv260_<config>`), `tests/compare_z1_baselines.py` compares
+  the board's tokens with the Z1 baselines. K1a (50 MHz) and K1b (100 MHz)
+  pass with identical tokens; at 100 MHz stories15M runs at 35.4 tok/s and
+  SmolLM2-135M at 4.4 tok/s (KV260/README.md).
 - Setup: the frontend Python environment is checked. A turbine export of a
   small torch model (matmul + softmax), compiled with the pip `iree-compile`,
   matches torch.

@@ -1,16 +1,22 @@
 # Torch2RISCV-accelerator
 
-> **Platform update:** The PYNQ-Z1 version is frozen at tag
+> **Platform update:** Development has moved to the AMD Kria KV260
+> ([`KV260/`](KV260/README.md), [plan](docs/kv260_upgrade_plan.md)). Its first
+> stage (K1: the same accelerator, then 100 MHz) is accepted on the board:
+> every test's tokens are identical to the PYNQ-Z1 baselines, stories15M at
+> 35.4 tok/s and SmolLM2-135M at 4.4 tok/s (generic HuggingFace path 3.7).
+> The PYNQ-Z1 version is frozen at tag
 > [`v1.0-pynq-z1`](../../tree/v1.0-pynq-z1) (branch `pynq-z1`): stories15M at
 > 17.6 tok/s and SmolLM2-135M (prefill + decode, the hand-written and the
 > generic HuggingFace path), all bit-exact on the board; its baselines are in
-> [`tests/baselines/pynq-z1/`](tests/baselines/pynq-z1/). A port to the AMD
-> Kria KV260 is in progress on branch `kv260`
-> ([plan](docs/kv260_upgrade_plan.md)); further optimization happens there.
+> [`tests/baselines/pynq-z1/`](tests/baselines/pynq-z1/). It still works and
+> is the cheapest way to try the full stack, but it only receives critical
+> fixes. The project phases below were done on the PYNQ-Z1.
 
 An end-to-end compiler stack that lowers PyTorch models to a custom RISC-V
 instruction set, running on a heterogeneous **ARM (host) + PicoRV32 (control
-core) + systolic-array accelerator** built on a PYNQ-Z1 board.
+core) + systolic-array accelerator** on an FPGA SoC: the AMD Kria KV260
+(Zynq UltraScale+) now, a PYNQ-Z1 (Zynq-7020) until the freeze.
 
 ```
 PyTorch (ARM / Linux, host)
@@ -210,7 +216,9 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
 - [PYNQ-Z1 → Kria KV260 upgrade plan (中文)](docs/kv260_upgrade_plan.md) - the
   port in stages (platform at the same accelerator, clock, DMA and on-chip
   memory bandwidth, URAM capacity, Qwen3-0.6B), the measured Z1 time breakdown
-  it starts from, and the repository strategy (Z1 frozen at `v1.0-pynq-z1`)
+  it starts from, and the repository strategy (Z1 frozen at `v1.0-pynq-z1`).
+  K1 (K1a 50 MHz, K1b 100 MHz) is accepted on the board; the overlay, its
+  builds, address map and board setup are in [KV260/README.md](KV260/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)
 - [Custom instruction encoding](docs/custom_isa_encoding.md) and

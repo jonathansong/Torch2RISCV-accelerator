@@ -1,6 +1,6 @@
 # PYNQ-Z1 → Kria KV260 升级方案
 
-状态：草案（2026-10-02，按三轮实现前评审修订：K1 拆为 50 / 100 MHz 两步，K2 改为 DMA 与片上存储接口重构，K4 拆为正确性与性能两步验收）。**2026-10-04：Z1 已冻结**（§7.2 完成：tag `v1.0-pynq-z1`、分支 `pynq-z1`、基线文件 `tests/baselines/pynq-z1/`，含实测的耗时分解 `z1_profile.md`）；之后的所有优化都在 KV260 上做，包括编译器的带生存期内存规划（K2b 的编译器工作项）。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
+状态：草案（2026-10-02，按三轮实现前评审修订：K1 拆为 50 / 100 MHz 两步，K2 改为 DMA 与片上存储接口重构，K4 拆为正确性与性能两步验收）。**2026-10-04：Z1 已冻结**（§7.2 完成：tag `v1.0-pynq-z1`、分支 `pynq-z1`、基线文件 `tests/baselines/pynq-z1/`，含实测的耗时分解 `z1_profile.md`）；之后的所有优化都在 KV260 上做，包括编译器的带生存期内存规划（K2b 的编译器工作项）。**2026-10-08：K1 验收完成**（K1a 50 MHz、K1b 100 MHz，板上 token 序列与 Z1 基线完全相同；100 MHz 下 stories15M 35.44 token/s、SmolLM2 4.43 token/s），`kv260` 分支合入 main，main 从此是 KV260 版本（§7.3）。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
 
 相关文档：[`iree_compiler_plan.md`](iree_compiler_plan.md) §8.18（FPGA 规模估计）、[`double_buffer_design.md`](double_buffer_design.md)（加速器架构）、[`memory_model.md`](memory_model.md)（地址与一致性）。
 
@@ -21,7 +21,7 @@
 - **正确性与性能分开验收**：平台移植和大模型上板先以逐位一致验收；性能数字在硬件稳定后按实测设目标。
 - **每一步先 sim、再上板、逐位一致后提交**。逐位一致的参照：功能仿真器（`llm/sa_funcsim.py`）与 PYNQ-Z1 上已验证的结果。
 - **K1 不动编译器**：硬件参数通过目标配置（`--iree-sa-d`、`--iree-sa-spad-kb`、`--iree-sa-acc-kb`）传入，黄金语料（4002 个 dispatch）守护代码生成不变。**K2b 和 K3 有明确的编译器工作**（对齐、子银行冲突、读端口分配、chunk 选择），分别列在这两个阶段里。
-- **PYNQ-Z1 已冻结**（2026-10-04）：tag `v1.0-pynq-z1`、分支 `pynq-z1`，基线在 `tests/baselines/pynq-z1/`。K1 完成前 main 仍是 Z1 版本，新平台在 `kv260` 分支、用新目录和参数，不破坏现有 bitstream 与测试；K1 验收后 main 完全转向 KV260（见 §7）。
+- **PYNQ-Z1 已冻结**（2026-10-04）：tag `v1.0-pynq-z1`、分支 `pynq-z1`，基线在 `tests/baselines/pynq-z1/`。K1 完成前 main 仍是 Z1 版本，新平台在 `kv260` 分支、用新目录和参数，不破坏现有 bitstream 与测试；K1 验收后 main 完全转向 KV260（见 §7；2026-10-08 已合入）。
 
 ---
 
@@ -164,14 +164,14 @@
    - PicoRV32 的 DDR 口（原 HP0，用于读环形队列）接 HP1 或经 SmartConnect 共用。
    - **时钟域**：沿用 Z1 的做法，PicoRV32 与加速器在**同一个时钟**（Z1 的 `pico_bit.tcl` 中 `riscv_clk` 与 `matmul_0/aclk` 都接 `subprocessorClk`），PS 侧 AXI-Lite 经互连跨时钟域。之后提频时两者一起提：PCPI 是紧耦合接口，拆成两个时钟域需要在 PCPI 与命令路径上都做跨时钟域处理。只有当 PicoRV32 或 PCPI（`sa_pcpi.v`）的路径成为完整实现中的关键路径时，才评估拆分。
    **已写好**（2026-10-04，`kv260` 分支）：`KV260/scripts/kv260_bd.tcl` + `build_bitstream.{tcl,sh}`（`-sa_d`、`-sa_mhz`、`-bd_only`），block design 在 Vivado 2024.1 中验证通过（`-bd_only`）；与 Z1 的差别：只有一个 PL 时钟 `pl_clk0`（不用 clk_wiz），加速器 DMA 直接接 `S_AXI_HP1_FPD`（AXI4，不要协议转换），没有 PL 引脚。**完整构建通过**（2026-10-04）：LUT 34.5%、DSP 115、BRAM36 130 / 144（90%）、URAM 0；50 MHz 下 setup WNS +9.05 ns、hold WHS +0.010 ns，`check_timing` 无未约束路径。最差路径从 DMA 口（HP1）的读数据经 DSP 乘法到描述符取指单元的 `fetch/param_reg`（数据路径 10.5 ns），按现状约 90–95 MHz，**K1b 的 100 MHz 需要在这条路径上加一级寄存器**。构建在一个 Vivado 进程里完成（这台 15 GB 的机器上，分 IP 单独综合的子进程会被 systemd-oomd 杀掉）。见 `KV260/README.md`。
-2. 地址映射：记录 ARM 侧的 BRAM、CSR、mailbox 新地址，写进 `docs/memory_model.md` 的 KV260 一节。ARM 侧：BRAM `0xA001_0000`（mailbox `0xA001_1F00`，perf 区 `0xA001_1E00`）、中断控制器 `0xA002_0000`；RISC-V 与加速器侧与 Z1 相同，DDR 为低 2 GB。
+2. 地址映射：记录 ARM 侧的 BRAM、CSR、mailbox 新地址，写进 `docs/memory_model.md` 的 KV260 一节（**已写**，含 `STRICT_DEVMEM` 与 u-dma-buf 窗口）。ARM 侧：BRAM `0xA001_0000`（mailbox `0xA001_1F00`，perf 区 `0xA001_1E00`）、中断控制器 `0xA002_0000`；RISC-V 与加速器侧与 Z1 相同，DDR 为低 2 GB。
 3. `synth_ooc.tcl` 加 K26 器件选项，先做脱离上下文的综合，确认资源。
 
 **软件**
 
 4. aarch64 交叉编译：`toolchain-aarch64.cmake`、`build_sa_runtime.sh aarch64`，构建 `sa-llm-run`、`sa_hal_test`、L0 的 `iree-run-module`。**已完成**（2026-10-04，`kv260` 分支）：`compiler/runtime/toolchains/aarch64-linux-gnu.cmake`，三个程序静态链接；不用板子的检查 `compiler/scripts/test_aarch64_runtime.sh`（qemu-aarch64 用户态 + 环形队列仿真器 `sa_board_emu.py`）：C1 HAL 测试 PASS，stories15M decode 与 prefill + decode 的 logits 与参照逐位一致。
 5. **地址与 ABI**（细节见 §2.4）：`sa_transport_board.c` 改为用 64 位类型解析物理地址，检查整个窗口在保留区内之后再转成 32 位；明确保留区的分配、映射属性和同步边界；审计主机与固件共享的结构体。运行时部分**已完成**：`SA_BOARD_*` 按 64 位解析，窗口整段检查（非空、末端 ≤ 2 GB）后才形成 32 位设备地址，mailbox 可在任意物理地址；与固件共享的只有环形队列项（64 位字）与完成记录（32 位字），按偏移写，不含结构体、指针或 `long`。保留区的分配方式与映射属性等板子到手再定。
-6. 驱动与部署：`pynq_matmul.py` 和 `deploy_*.sh` 增加 `--board kv260`，读入新的基地址。**已完成**（2026-10-04，`kv260` 分支）：驱动从 `.hwh` 读板子、D、ARM 侧 BRAM 地址与加速器时钟（`overlay_info`），launcher、bwtest、`ddr_test.py`（从 overlay 的 `ip_dict` 取地址）不再写死 Z1 的地址；部署脚本用 `SA_BOARD=kv260`（`compiler/scripts/board_env.sh`：aarch64 运行时、`KV260/build/output/<配置>` 的 overlay，`SA_KV260_CONFIG` 选配置，默认 `d8_50mhz`；构建输出按配置分目录，如 K1b 的 `d8_100mhz`），整套回归 `deploy_z1_freeze.sh --board kv260` → `build/deploy_kv260`；不用板子的检查：KV260 测试包里的 aarch64 `sa-llm-run` 在 qemu 下、按 KV260 的地址（mailbox `0xA001_1F00`，窗口在 2 GB 以下）运行，stories15M 22/22 行逐位一致。
+6. 驱动与部署：`pynq_matmul.py` 和 `deploy_*.sh` 增加 `--board kv260`，读入新的基地址。**已完成**（2026-10-04，`kv260` 分支）：驱动从 `.hwh` 读板子、D、ARM 侧 BRAM 地址与加速器时钟（`overlay_info`），launcher、bwtest、`ddr_test.py`（从 overlay 的 `ip_dict` 取地址）不再写死 Z1 的地址；部署脚本用 `SA_BOARD=kv260`（`compiler/scripts/board_env.sh`：aarch64 运行时、`KV260/build/output/<配置>` 的 overlay，`SA_KV260_CONFIG` 选配置，默认 `d8_50mhz`，K1 验收后改为 `d8_100mhz`，`SA_BOARD` 默认也改为 `kv260`；构建输出按配置分目录，如 K1b 的 `d8_100mhz`），整套回归 `deploy_z1_freeze.sh --board kv260` → `build/deploy_kv260`；不用板子的检查：KV260 测试包里的 aarch64 `sa-llm-run` 在 qemu 下、按 KV260 的地址（mailbox `0xA001_1F00`，窗口在 2 GB 以下）运行，stories15M 22/22 行逐位一致。
 7. 编译器：不改；生成与 Z1 基线相同的模块（D = 8、默认 SPAD/ACC），描述符应与 `tests/baselines/pynq-z1/golden_manifest.txt` 逐字节相同。
 
 **验证顺序**（每项都与 sim 逐位一致，并与 §7.2 的 Z1 基线文件对比；测试包与板上脚本沿用 `compiler/scripts/deploy_z1_freeze.sh` 和 `compiler/tests/board_regress.py`，加 `--board kv260`）
@@ -502,6 +502,7 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 - 在 `kv260` 分支上开发，main 在这期间仍然是可用的 Z1 版本。
 - K1（K1a 与 K1b）验收通过后，把 `kv260` 合入 main。从这一刻起，main 是 KV260 版本。
 - 合入的同一个 PR 里更新 README（7.5）。
+- **已完成**（2026-10-08）：K1a、K1b 板上验收通过后快进合入 main，README 顶部换成 7.5 的说明，部署脚本的默认板子改为 `kv260`（`SA_BOARD=pynq-z1` 仍可用）。7.4 的目录整理另行提交。
 
 ### 7.4 合入之后整理 main
 
@@ -549,5 +550,5 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 | 现在 → Z1 完善完成 | Z1 版本 | — |
 | Z1 冻结（**2026-10-04 完成**） | Z1 版本 | tag `v1.0-pynq-z1`、分支 `pynq-z1`、Release、基线文件 |
 | K0–K1 | Z1 版本（README 预告 KV260） | `kv260` 分支开发 |
-| K1 验收 | **合入 KV260**，README 更新，目录整理 | `pynq-z1` 只修严重问题 |
+| K1 验收（**2026-10-08 完成**） | **合入 KV260**，README 更新，目录整理（之后另行提交） | `pynq-z1` 只修严重问题 |
 | K2 及以后 | KV260 版本 | — |

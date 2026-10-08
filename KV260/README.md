@@ -4,6 +4,8 @@ The PicoRV32 + systolic-array overlay on the Kria KV260 (K26 SOM,
 `xck26-sfvc784-2LV-c`, Vivado 2024.1). K1a: the PYNQ-Z1 L2 accelerator
 unchanged (D = 8, 128 KB per SPAD, 256 KB ACC, one 64-bit DMA port, 50 MHz);
 the plan's later stages change one thing at a time (K1b 100 MHz, K1c D = 16).
+K1a and K1b are accepted on the board (2026-10-08, tokens identical to the
+PYNQ-Z1 baselines; results below).
 
 ```sh
 KV260/scripts/build_bitstream.sh -jobs 2                 # K1a: D = 8, 50 MHz (~25 min)
@@ -102,13 +104,14 @@ DDR buffers for the accelerator must be in the low 2 GB
 The driver (`driver/pynq_matmul.py` `overlay_info`) reads the board, D, the
 ARM-side BRAM address and the accelerator clock from the `.hwh`, so the
 launcher, `bwtest` and the LLM tests need no board switch. The deploy
-scripts take `SA_BOARD=kv260` (`compiler/scripts/board_env.sh`: the aarch64
+scripts default to `SA_BOARD=kv260` (`compiler/scripts/board_env.sh`: the aarch64
 runtime and the overlay of `build/output/$SA_KV260_CONFIG`, default
-`d8_50mhz`, or `SA_BIT_DIR`); the whole regression of the Z1 freeze:
+`d8_100mhz`, or `SA_BIT_DIR`; `SA_BOARD=pynq-z1` for the frozen Z1); the whole
+regression of the Z1 freeze:
 
 ```sh
-compiler/scripts/deploy_z1_freeze.sh --board kv260        # K1a (d8_50mhz) -> build/deploy_kv260_d8_50mhz
-SA_KV260_CONFIG=d8_100mhz compiler/scripts/deploy_z1_freeze.sh --board kv260   # K1b -> build/deploy_kv260_d8_100mhz
+compiler/scripts/deploy_z1_freeze.sh                     # K1b (d8_100mhz) -> build/deploy_kv260_d8_100mhz
+SA_KV260_CONFIG=d8_50mhz compiler/scripts/deploy_z1_freeze.sh    # K1a -> build/deploy_kv260_d8_50mhz
 scp -r build/deploy_kv260_d8_100mhz <user>@<kv260>:~/kv260_d8_100mhz
 # on the board: cd ~/kv260_d8_100mhz && sudo ./run_board.sh
 # back: results/ -> build/deploy_kv260_d8_100mhz/results
@@ -163,5 +166,7 @@ and the LLM runs take 0.2-0.4% more cycles than at 50 MHz.
 - The carrier's fan is controlled from the PL in AMD's reference designs;
   this design drives no PL pin. Check the fan's behaviour (speed, noise,
   temperature) with this overlay loaded before long runs.
-- The EMIO GPIO numbering seen by PYNQ (`GPIO.get_gpio_pin(0)`) on the ZynqMP.
-- Overlay loading on the chosen image (Kria-PYNQ vs Ubuntu for Kria) with this `.bit` / `.hwh`.
+
+Confirmed by K1a / K1b: the overlay loads on Ubuntu 22.04 for Kria with
+Kria-PYNQ (after `xmutil unloadapp`, done by the driver), and the RISC-V
+reset through EMIO GPIO[0] (`GPIO.get_gpio_pin(0)`) works.

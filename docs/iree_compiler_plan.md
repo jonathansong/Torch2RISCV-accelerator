@@ -1364,6 +1364,8 @@ C5.5 的模型（§8.9 的第一步）：
 
 §8.17 的第 1、2 项完成后，PYNQ-Z1 版本冻结在 tag `v1.0-pynq-z1`（分支 `pynq-z1`，GitHub Release 附 bitstream、固件、运行时和板上的完整结果）；之后的优化全部在 KV260 上做（`kv260_upgrade_plan.md`，第 3 项移到那里的 K2b）。
 
+**KV260 K1**（2026-10-08）：编译器不变，同一套回归换成 aarch64 运行时与 KV260 overlay（`deploy_z1_freeze.sh --board kv260`），K1a（50 MHz）与 K1b（100 MHz）板上 5 个测试的 token 序列都与 Z1 基线完全相同（`compiler/tests/compare_z1_baselines.py`）；100 MHz 下 stories15M 35.44 token/s、SmolLM2 qhf 4.43、通用路径 3.73，约为 Z1 的两倍。main 从此是 KV260 版本。
+
 **冻结前的板上回归**（`compiler/scripts/deploy_z1_freeze.sh` 生成测试包，`compiler/tests/board_regress.py` 在板上跑，L2 bitstream，D = 8，50 MHz）：全部逐位一致。
 
 | 测试 | 板上 |

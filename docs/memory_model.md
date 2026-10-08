@@ -38,6 +38,27 @@ notify interrupt, and the runtime's buffers.
   is why the host notification is an edge interrupt (`mat_notify`) and not a
   status bit the ARM clears.
 
+### Kria KV260 (`kv260` overlay, KV260/README.md)
+
+The RISC-V / accelerator side is unchanged (firmware unchanged). The ARM
+reaches the PL through `M_AXI_HPM0_FPD`: program BRAM at `0xA001_0000`
+(performance counter area `0xA001_1E00`, mailbox `0xA001_1F00`), interrupt
+controller at `0xA002_0000`; PicoRV32 uses `S_AXI_HP0_FPD`, the accelerator
+DMA `S_AXI_HP1_FPD` (both 64-bit AXI4, not coherent, like the Z1's HP ports).
+The PicoRV32 and the accelerator address 32 bits, so every buffer they touch
+must be in the **low 2 GB of DDR** (`0x0000_0000`–`0x7FFF_FFFF`; the upper
+2 GB is at `0x8_0000_0000`); the runtime checks the window. One PL clock
+(`pl_clk0`, 50 or 100 MHz) drives PicoRV32, the accelerator and both HP
+ports. The driver reads the BRAM address and the clock from the `.hwh`
+(`overlay_info`).
+
+The kernel of Ubuntu for Kria has `CONFIG_STRICT_DEVMEM=y`: `/dev/mem` maps
+the PL (BRAM, mailbox) but refuses RAM, even for root. The C runtime's DDR
+window therefore comes from the u-dma-buf module (`/dev/udmabuf0`, in CMA,
+`sync_mode` 2 = write-combined, uncached on the ARM side, so no cache
+maintenance; `SA_BOARD_MEM_DEV`); the Python tests keep `pynq.allocate` with
+the flush / invalidate protocol below.
+
 ## Coherency
 
 HP0/HP2 are not coherent with the ARM L1/L2 caches. The driver
