@@ -21,7 +21,7 @@
 #   c55          SmolLM2-135M decode, export_hf.py (qhf), vs the sim                deploy_c55.sh
 #   c6p_stories  stories15M prefill (M = D, the overlay's array size) + decode       deploy_c6p.sh stories D
 #   c6p_smollm2  SmolLM2-135M prefill (M = D) + decode, qhf                         deploy_c6p.sh smollm2 D
-#   hfgen        SmolLM2-135M prefill (M = 8: its export) + decode, unmodified HF   deploy_hfgen.sh
+#   hfgen        SmolLM2-135M prefill (M = D) + decode, unmodified HF                deploy_hfgen.sh
 # D = SA_D (board_env.sh: from the overlay's configuration); at D != 8 the host builds go to
 # build/<test>/<model>_d<D> (the D = 8 ones feed the golden corpus)
 # Each deploy runs in a memory-capped scope (MEM, default 12G).
