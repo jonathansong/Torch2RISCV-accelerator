@@ -218,6 +218,8 @@ K1a 布线后的前 40 条路径（`post_route.dcp`，在 20 ns 约束下工具�
 
 **软件**：D 跟着 overlay 走。`board_env.sh` 从配置名取 `SA_D`（`d16_100mhz` → 16）；`compile_sa.sh` 传 `--iree-sa-d`；测试里 sim 的 D、参照模型（`DeviceModel(d = D)`、qhf 的 `valid` 长度）、`--pad` 都用 `SA_D`；C1 的测试可执行文件按 D 生成（`test_d16`）。prefill 的块大小 M = D（`c6p_*`；通用路径 `hfgen` 仍是 M = 8，它的导出里固定了 M）。D ≠ 8 的主机构建放在 `build/<test>/<model>_d16`，不覆盖黄金语料读的 D = 8 目录；导出与 D 无关（注意力长度是动态的），`seed_export` 复制 D = 8 的导出。主机端：C1 三项、C3（stories15M 12/12 步与 `DeviceModel(d = 16)` 逐位一致，58 个 dispatch 逐个检查 OK）通过。
 
+**D = 16 端到端发现的编译器错误**（`a1fefb6`）：C5.5（SmolLM2）在 D = 16 的 sim 上第 0 步正确、第 1 步起完全偏离；逐 dispatch 检查（`dispatch_check`）全部 OK，`--dirty`（片上存储从垃圾值开始）下 30 个注意力 softmax（`reduction_3x3xD`，GQA 的 3 × 3 行）失败。原因：行模式（动态长度、每次一行）里，长度等于整行（`maxDynamic` = 256）的 VE 取动态长度 LEN；按行广播（`perElementBcast`）先复制出 w × D × D 的块再转置，D = 16、不超过 16 行时这个块正好 256 个元素，于是也被改成 LEN = T，只写了块的第一个字，广播出的行读到上一步留下的通道（第 0 步片上存储还是 0、且只用通道 0，所以碰巧正确）。D = 8 时块是 128，不会撞上。修正：固定大小的辅助 VE（按行广播的块、标量广播字）在行模式里保持静态长度。黄金语料不变，新增 `smollm2_d16` 一组（共 4232 个 dispatch）。教训：新的目标配置要做端到端 sim，并用 `dispatch_check --dirty`。
+
 ### K2 带宽：DMA 与片上存储接口
 
 decode 受权重读取带宽限制，这一阶段是性能提升的主要来源。**它不只是加宽 DMA，而是 DMA 与片上存储写入接口的一起重构。**
