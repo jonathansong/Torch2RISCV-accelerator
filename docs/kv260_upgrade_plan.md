@@ -187,6 +187,10 @@
 
 **验收**：第 5、6 步通过。**只以正确性验收**；token/s 记录为观测值（ARM 主机、DDR 延迟、驱动开销都变了，不能预设与 Z1 的比例）。
 
+**K1a 验收通过**（2026-10-08，板上，`d8_50mhz` overlay，`compiler/scripts/deploy_z1_freeze.sh --board kv260` + `run_board.sh`）：第 1–6 步全部 PASS（`ddr`、`bwtest`、gemm / vector / desc_run、C1、C3、SmolLM2 与两条 prefill + decode 路径），`compiler/tests/compare_z1_baselines.py`：5 个测试的 token 序列与 Z1 基线完全相同。设备周期与 Z1 相差不到 0.03%（decode 每步：stories15M 2,708,522 / Z1 2,709,281，SmolLM2 qhf 22,215,268 / 22,220,320，通用路径 26,663,452 / 26,671,269），DMA 397 MB/s（99.3%）；墙钟快 1–4%（A53 主机：stories15M 54.7 ms/步 = 18.27 token/s，Z1 56.8；SmolLM2 qhf 440.9 ms/步 = 2.27 token/s，Z1 449.6）。
+
+上板时解决的平台问题：Kria-PYNQ 没有 `/etc/profile.d/xrt_setup.sh`（测试包带 `run_board.sh`，自动找环境脚本）；开机加载的 `k26-starter-kits` 占着 PL（驱动先 `xmutil unloadapp`）；PYNQ 把 BRAM 控制器列在 `mem_dict`（`ddr_test.py` 曾退回 Z1 的地址，写到了 CMA 里的 DDR）；**内核 `CONFIG_STRICT_DEVMEM=y`，`/dev/mem` 对 root 也拒绝映射内存**：运行时的窗口改由 u-dma-buf 模块提供（`/dev/udmabuf0`，`sync_mode` 2 = 写合并；`SA_BOARD_MEM_DEV`），PL 地址照旧经 `/dev/mem`。
+
 ### K1b 提频到 100 MHz
 
 1. 只改 `pl_clk0` 为 100 MHz，其他不变；记录 WNS / TNS、关键路径。

@@ -119,6 +119,24 @@ bundle under qemu with the ring emulator at the KV260's addresses
 (`sa_board_emu.py --mbox 0xA0011F00 --base 0x7C000000`): stories15M 22/22
 logits rows bit-exact.
 
+## K1a on the board (2026-10-08): passed
+
+All K1a steps pass on the board with the `d8_50mhz` overlay (`REGRESSION
+PASS`), and `compiler/tests/compare_z1_baselines.py` finds every run's tokens
+identical to the PYNQ-Z1 baselines. Device cycles within 0.03% of the Z1
+(same accelerator, clock and DMA width); wall time 1-4% faster (the A53
+host): stories15M 18.27 tok/s (Z1 17.62), SmolLM2 qhf 2.27 tok/s (Z1 2.22),
+generic 1.88 tok/s (Z1 1.87); DMA 397 MB/s.
+
+Board setup the tests need (each boot):
+
+```sh
+# u-dma-buf (https://github.com/ikwzm/udmabuf, built on the board with the kernel headers):
+# the runtime's window, since /dev/mem refuses RAM (CONFIG_STRICT_DEVMEM=y)
+sudo insmod ~/udmabuf/u-dma-buf.ko udmabuf0=536870912     # 512 MB in CMA (0x37f00000 here)
+cd ~/kv260 && sudo ./run_board.sh                          # the PYNQ venv; xmutil unloadapp by the driver
+```
+
 ## To confirm on the board
 
 - The carrier's fan is controlled from the PL in AMD's reference designs;
