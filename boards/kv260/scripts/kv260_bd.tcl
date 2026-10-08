@@ -14,7 +14,7 @@
 #     pl_ps_irq0[0]     the interrupt controller (PicoRV32 trap, matmul_0/notify_irq)
 #     emio_gpio_o[0]    RISC-V reset (1 = hold), as EMIO[0] on the Z1 (2 EMIO pins: xlslice needs >= 2)
 #   pico_processor_0    the Z1 hierarchy as is (pico_processor.tcl)
-#   matmul_0            sa_unit (rtl/sysarray), D = ::sa_d, 128 KB per SPAD, 256 KB ACC
+#   matmul_0            sa_unit (rtl/sysarray), D = ::sa_d (all PE columns on DSPs), 128 KB per SPAD, 256 KB ACC
 #
 # Differences from the Z1 design: one clock domain (the Z1's clk_wiz with
 # its AXI reconfiguration port is not used by the driver); no PL I/O (the
@@ -88,8 +88,11 @@ if {[get_files -quiet sa_unit.v] eq ""} {
 }
 set matmul_0 [create_bd_cell -type module -reference sa_unit matmul_0]
 # (the module reference freezes the defaults at D = 8: the depths that derive
-# from D are set explicitly, as on the Z1)
+# from D are set explicitly, as on the Z1). Every PE column on DSPs
+# (DSP_COLS = D): the K26 has 1248 DSP48E2; the Z1's D = 16 builds put only 8
+# columns on DSPs to fit its 220.
 set_property -dict [list CONFIG.D $::sa_d \
+                         CONFIG.DSP_COLS $::sa_d \
                          CONFIG.SPAD_WORDS [expr {131072 / $::sa_d}] \
                          CONFIG.ACC_WORDS [expr {262144 / (4 * $::sa_d)}]] $matmul_0
 
