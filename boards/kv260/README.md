@@ -181,13 +181,15 @@ peak; K1b 58.9).
 | SmolLM2 qhf decode (c55) | 4.43 | **4.77** |
 | SmolLM2 qhf prefill (M = D) | 14.04 | **22.22** |
 | SmolLM2 generic decode (hfgen) | 3.73 | **4.39** |
-| SmolLM2 generic prefill (M = 8 export) | 6.84 | **4.17** |
+| SmolLM2 generic prefill | 6.84 (M = 8) | **10.04** (M = 16; 4.17 with M = 8) |
 
 Decode gains are small: the array consumes D bytes of weights per cycle but
-the read path is still 8 B/cycle (K2a). The generic path's prefill is slower:
-its M = 8 export missed the prefill micro-kernel (rows must be a multiple of
-D) and fell back to one GEMV per row (8x the EX steps). `564a0de` exports
-M = D; to rerun on the board.
+the read path is still 8 B/cycle (K2a). The generic path's prefill first ran
+slower (4.17): its M = 8 export missed the prefill micro-kernel (rows must be
+a multiple of D) and fell back to one GEMV per row (8x the EX steps);
+`564a0de` exports M = D (10.04 on the board, bit-exact). The rest is its
+gate / up matmul's fused SwiGLU epilogue on the fp VE / SFU (30% of the
+prefill), which the qhf path does not have (22.2).
 
 ## To confirm on the board
 

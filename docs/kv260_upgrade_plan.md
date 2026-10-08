@@ -230,9 +230,9 @@ K1a 布线后的前 40 条路径（`post_route.dcp`，在 20 ns 约束下工具�
 | SmolLM2 qhf prefill + decode 的 decode | 4.30 | **4.50** | +5% |
 | SmolLM2 qhf prefill（M = D） | 14.04 | **22.22** | +58%（每块 16 个 token） |
 | SmolLM2 通用路径 decode（hfgen） | 3.73 | **4.39** | +18%（设备周期 26.73M → 22.68M） |
-| SmolLM2 通用路径 prefill（M = 8） | 6.84 | **4.17** | −39% |
+| SmolLM2 通用路径 prefill | 6.84（M = 8） | **10.04**（M = 16；M = 8 时 4.17） | +47% |
 
-decode 的提升小于 2 倍：每周期消耗 D 字节权重，但读带宽仍是 8 B/周期（§3.1 H0），D = 16 要和 K2a 的 128 位读通道一起才能发挥。**通用路径的 prefill 变慢**：它的导出固定 M = 8，在 D = 16 的阵列上每块只用一半的行，而 prefill 的 matmul（`8x96x16x576` 等）设备周期反而约为 D = 8 时的 2 倍（30.3M 对 16.6M）。原因（板上计数器）：down 投影的 `LD_BEATS` 与 D = 8 相近（权重只读一次），`EX_USEFUL` 却是 26.5M（按 D = 16 应为 3.3M，8 倍），`VE_ACTIVE` 27.5M。prefill 的 linear 微内核要求行数是 D 的倍数（`SahlKernels.cpp` `matchLinear` 的 `p.rows % d`），M = 8 < 16 时回退到通用 contraction，它对 x 的每一行单独做 decode 式的 GEMV（x 复制到 D 行，阵列利用率 1/D），8 行就是 8 遍。修正（`564a0de`）：`deploy_hfgen.sh` 按 D 导出 M = D（`build/hfgen/smollm2_p<D>`，导出固定 M，不再复制 D = 8 的）；D = 16 的 sim PASS（prefill + decode 与只 decode 5/5 行逐位一致），`dispatch_check --dirty` 1306 个 OK（另 2 个是 host 上的）。**待板上重跑 `hfgen`**。让微内核直接支持 M < D（只装入 / 存回 M 行）留作以后的编译器工作：只有固定 M 的导出会遇到。
+decode 的提升小于 2 倍：每周期消耗 D 字节权重，但读带宽仍是 8 B/周期（§3.1 H0），D = 16 要和 K2a 的 128 位读通道一起才能发挥。**通用路径的 prefill 变慢**：它的导出固定 M = 8，在 D = 16 的阵列上每块只用一半的行，而 prefill 的 matmul（`8x96x16x576` 等）设备周期反而约为 D = 8 时的 2 倍（30.3M 对 16.6M）。原因（板上计数器）：down 投影的 `LD_BEATS` 与 D = 8 相近（权重只读一次），`EX_USEFUL` 却是 26.5M（按 D = 16 应为 3.3M，8 倍），`VE_ACTIVE` 27.5M。prefill 的 linear 微内核要求行数是 D 的倍数（`SahlKernels.cpp` `matchLinear` 的 `p.rows % d`），M = 8 < 16 时回退到通用 contraction，它对 x 的每一行单独做 decode 式的 GEMV（x 复制到 D 行，阵列利用率 1/D），8 行就是 8 遍。修正（`564a0de`）：`deploy_hfgen.sh` 按 D 导出 M = D（`build/hfgen/smollm2_p<D>`，导出固定 M，不再复制 D = 8 的）；D = 16 的 sim PASS（prefill + decode 与只 decode 5/5 行逐位一致），`dispatch_check --dirty` 1306 个 OK（另 2 个是 host 上的）。板上重跑 `hfgen` PASS（与 sim 逐位一致）：prefill 40 个 token 分 3 块，10.04 token/s（M = 8 时 4.17，D = 8 时 6.84），decode 4.38 token/s；down 投影的 `EX_USEFUL` 回到 3.3M。剩下的大头是 gate / up 投影（`matmul_like_16x96x16x576`，30 次 35.0M 周期，占 prefill 的 30%）：`VE_ACTIVE` 26.4M、`VE_CREDIT` 20.6M，受融合在里面的 SwiGLU 尾部（fp VE / SFU）限制，与 D 无关（D = 8 时 33.1M）。qhf 路径同样位置的 matmul 不带这个尾部（`VE_ACTIVE` 1.2M），所以 prefill 快一倍多（22.2 token/s）。这属于 P6（SFU 多槽交错）/ KC 的范围。让微内核直接支持 M < D（只装入 / 存回 M 行）留作以后的编译器工作：只有固定 M 的导出会遇到。
 
 ### K2 带宽：DMA 与片上存储接口
 
