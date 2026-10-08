@@ -1,6 +1,6 @@
 # PYNQ-Z1 → Kria KV260 升级方案
 
-状态：草案（2026-10-02，按三轮实现前评审修订：K1 拆为 50 / 100 MHz 两步，K2 改为 DMA 与片上存储接口重构，K4 拆为正确性与性能两步验收）。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
+状态：草案（2026-10-02，按三轮实现前评审修订：K1 拆为 50 / 100 MHz 两步，K2 改为 DMA 与片上存储接口重构，K4 拆为正确性与性能两步验收）。**2026-10-04：Z1 已冻结**（§7.2 完成：tag `v1.0-pynq-z1`、分支 `pynq-z1`、基线文件 `tests/baselines/pynq-z1/`，含实测的耗时分解 `z1_profile.md`）；之后的所有优化都在 KV260 上做，包括编译器的带生存期内存规划（K2b 的编译器工作项）。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
 
 相关文档：[`iree_compiler_plan.md`](iree_compiler_plan.md) §8.18（FPGA 规模估计）、[`double_buffer_design.md`](double_buffer_design.md)（加速器架构）、[`memory_model.md`](memory_model.md)（地址与一致性）。
 
@@ -21,7 +21,7 @@
 - **正确性与性能分开验收**：平台移植和大模型上板先以逐位一致验收；性能数字在硬件稳定后按实测设目标。
 - **每一步先 sim、再上板、逐位一致后提交**。逐位一致的参照：功能仿真器（`llm/sa_funcsim.py`）与 PYNQ-Z1 上已验证的结果。
 - **K1 不动编译器**：硬件参数通过目标配置（`--iree-sa-d`、`--iree-sa-spad-kb`、`--iree-sa-acc-kb`）传入，黄金语料（4002 个 dispatch）守护代码生成不变。**K2b 和 K3 有明确的编译器工作**（对齐、子银行冲突、读端口分配、chunk 选择），分别列在这两个阶段里。
-- **PYNQ-Z1 先保留、后冻结**：K1 完成前，新平台用新目录和参数，不破坏现有 bitstream 与测试；K1 验收后，Z1 冻结在 tag `v1.0-pynq-z1` 和分支 `pynq-z1`，main 完全转向 KV260（见 §7）。
+- **PYNQ-Z1 已冻结**（2026-10-04）：tag `v1.0-pynq-z1`、分支 `pynq-z1`，基线在 `tests/baselines/pynq-z1/`。K1 完成前 main 仍是 Z1 版本，新平台在 `kv260` 分支、用新目录和参数，不破坏现有 bitstream 与测试；K1 验收后 main 完全转向 KV260（见 §7）。
 
 ---
 
@@ -107,15 +107,49 @@
 | 阶段 | 内容 | 主要风险 | 工作量 |
 |---|---|---|---|
 | **K0** | 准备：固定系统镜像、启动固件、Vivado / Kria-PYNQ 版本；保存 Z1 可复现基线 | 版本组合 | 小 |
-| **K1a** | 平台移植，加速器**完全不变**：D = 16、1 个 64 位 HP 口、**50 MHz**、原存储容量 | block design、地址映射、aarch64 运行时 | 中 |
+| **K1a** | 平台移植，加速器**完全不变**：D = 8（Z1 的 L2 bitstream）、1 个 64 位 HP 口、**50 MHz**、原存储容量 | block design、地址映射、aarch64 运行时 | 中 |
 | **K1b** | 只提频到 100 MHz，重新记录时序与性能 | 时序 | 小 |
+| **K1c** | 只把 D 从 8 改为 16（Z1 因 LUT 只能放 D = 8 的 LLM 加速器） | 资源、时序；VE 的 fp 通道折叠（FL）随 D 变化 | 小 |
+| **KC** | 计算侧（§3.1 的 H1、H2）：VE 定序模式多组交错（P6）、调度器乱序发射 / 细粒度冲突检查；K1c 之后，可与 K2 并行 | 与功能仿真器逐位一致；记分板的正确性 | 中 |
 | **K2a** | 单口 128 位：LD 入口、DMA 与 SPAD 写入加宽；测 DMA → SPAD 的端到端有效带宽 | DMA 与存储写入接口改动 | 中 |
-| **K2b** | 多口接收 + 存储分银行，逐步追求 6–10 GB/s | **DMA + 片上存储接口重构**、时序收敛、内存规划 | 大 |
-| **K3** | URAM 扩展 SPAD/ACC 容量；优先保持 D = 16 | URAM 的端口语义、初值、读延迟 | 中 |
+| **K2b** | 多口接收 + 存储分银行，逐步追求 6–10 GB/s；**同时解决 decode 时阵列每周期只消耗 D 字节权重的限制**：H4 流式点积（默认候选）或 D = 16 → 32，K2b 前比较（§3.1、§3.2） | **DMA + 片上存储接口重构**、D = 32 的资源与时序、内存规划 | 大 |
+| **K3** | URAM 扩展 SPAD/ACC 容量（若 K2b 选了 D = 32：SPAD 字 256 位、ACC 字 1024 位；选 H4 则保持 D = 16） | URAM 的端口语义、初值、读延迟 | 中 |
 | **K4a** | Qwen3-0.6B 全模型板上正确运行 | 地址与容量、长上下文 | 中 |
 | **K4b** | 长上下文分块（C6.5）与性能调优，按实测耗时分解定目标 | 注意力 T 分块、调度 | 中 |
 | **K5** | 可选扩展：int4、64 位地址、RVV 核、MoE，各自单独评估 | 各自独立 | 大 |
 | **Q（并行）** | Qwen3 量化质量（C6.2），在 CPU / sim 上进行，不等 K4 | 量化方法的数学等价与 scale 语义 | 中 |
+
+### 3.1 硬件改进项（Z1 实测 + RTL 确认，2026-10-04）
+
+依据：`tests/baselines/pynq-z1/z1_profile.md` 的事件计数器（SmolLM2，decode 每步 / prefill 每块，手写路径 / 通用路径），并在 RTL 中逐项确认。
+
+| 编号 | 改进 | 证据（计数器 + RTL） | 代价 | 阶段 |
+|---|---|---|---|---|
+| **H0** | **D 随带宽加大**（D = 16 → 32） | decode 的 `EX_STEP` 几乎等于读入字节 ÷ 8（SmolLM2 手写 17.36M 对 17.30M，stories 2.00M 对 1.98M）。`sa_ex.v`：每步读一个 SPAD_B 字（`sb_addr = b_base + c`，D 字节 = 一个 k 行的 D 个输出列）；decode 的 A 条带是 x 复制到 D 行（VE 的 DIV 复制），D 行算同一个结果，阵列利用率 1/D。所以每周期消耗的权重 = D 字节：D = 8 / 16 / 32 在 250 MHz 时上限 2 / 4 / 8 GB/s。每个 tile 另有 2(D−1) 周期的填充 / 排空（K = 576 时 D = 8 约 2.4%，D = 32 约 11%） | 见 K3 第 6 项 | D = 16：K1c；D = 32：K2b |
+| **H1** | **VE 定序模式多组交错**（P6） | `sa_vefp.v`：EXP / RECIP / RSQRT 与 REDUCE 走定序模式，**一次只有一个组在途**（`cap = seqmode ? 1 : OQ - 4`），微程序逐步等 M2 / A2 的流水延迟；流模式已允许 28 个组在途，不是瓶颈。计数器 24..27 中的第 26 位在 fp VE 上是 `sq_act`（定序器在工作，与整数 VE 的"输出 FIFO 满"相或，名为 `VE_CREDIT`）：decode 1.56M / 2.65M、prefill 12.2M / 19.4M，占 VE 忙碌的 **51–58%**。端口冲突 `VE_RDBLOCK` ≈ 0 | 小到中：定序器同时推进多个组（每个组的微程序状态），复用现有 fp 单元的空闲流水级 | KC |
+| **H2** | **调度器：乱序发射 + 细粒度冲突检查** | `sa_sched.v`：严格按程序顺序派发，记分板只有 6 个 bank（SPAD_A、SPAD_B、ACC 各两半）的粒度，队首受阻则后面全部受阻。prefill 每块（手写）队首受阻：LD 13.2M、ST 11.3M，引擎队列满 9.3M——下一块的权重不能在 VE 尾部期间提前读入；通用路径 decode 的线性层尾部与 EX 串行（约 4.0M）也源于此。前端饥饿 `STARVE` 与全空闲很低，发射本身不是问题 | 中：按地址区间的冲突检查（代替 6 个 bank），允许不冲突的后续命令越过受阻的队首（各引擎独立的发射窗口）；正确性逐条命令与功能仿真器对比 | KC |
+| **H3** | **VE 宽度**（物理 fp 通道 FL） | `sa_vefp.v`：`FL = D / 2`（只支持 D / 2 或 D），**随 D 增长**；L2（D = 8，FL = 4）的 `sa_vefp` 约 17.2k LUT，大致与 FL 成正比，D = 32 时 FL = 16 约 69k LUT（估计）。流模式的吞吐随 FL 增长，定序模式受 H1 限制 | D = 32 时若 LUT 不够，需支持 FL = D / 4（每组 4 个半拍，RTL 改动） | 与 H0 一起评估 |
+| **H4** | **decode 专用的矩阵乘向量通路，权重流式直通**（H0 中 D = 32 的替代；**优先评估**，见 3.2） | H0：decode 时阵列只有 1/D 的乘累加有用，D = 32 用 1024 个乘累加换每周期 32 字节；一个每周期 32–64 字节的 int8 点积单元只要几十个乘累加。decode 的权重只用一次，可以从 LD 的接收 FIFO 直接流进点积单元，**不写 SPAD**：K2b 的多字写入与子银行问题对权重不再存在，带宽也不受 D 限制。同类设计的实测：openTPU 的矩阵单元从 DRAM 流式读入权重，decode 时用到 DRAM 峰值的 85–94%（3.2）。批量 decode / 投机解码填满阵列其余的行是另一条（软件）路 | 中：一个点积单元、一条新命令（opcode）、功能仿真器与编译器路径（decode 的线性层选这条路）。逐位一致的风险低：int8 × int8 累加到 int32 是精确的整数运算，与累加顺序无关，结果与阵列相同 | **K2b 前比较，作为默认候选** |
+| **H5** | **int4 权重，在 LD 通路上解包** | decode 受读入限制：字节减半，上限加倍 | 中到大，并有量化质量问题（GPTQ / AWQ 一类） | K5 |
+| **H6** | **片上保留中间结果**（URAM） | dispatch 之间的激活不经 DDR；固定开销只有 1–2%，收益中等 | 中 | K3 |
+
+不需要改的：发射前端（`STARVE` 0.4M、全空闲 0.3M）、VE 存储端口（`VE_RDBLOCK` ≈ 0）、AXI 读反压（`LD_ARSTALL` ≈ 0，Z1 上）。
+
+**顺序**：H1、H2 便宜且直接针对没被读入掩盖的部分，K1c 之后就做（KC 阶段，100 MHz 下就能测出收益）；K2b 之前用解析模型与小规模 RTL 比较两条路——"D = 16 + H4 流式点积"（默认候选，理由见 3.2）与"D = 32 + 每口拼字"——再定 K2b 的架构；H3 随 H0 评估；H5 在 K5（Qwen3 量化质量解决之后）。每一步重做耗时分解（`board_profile.py` + `SA_PROFILE_PERF`，`compiler/tests/z1_profile.py`）。
+
+**计数器命名的注意**：`PC_VE_CREDIT`（第 26 位）在 fp VE 上统计的是定序器在工作（`sq_act`），不是输出 FIFO 满；`PC_VE_GROUPS`（第 27 位）在 fp VE 上统计的是写入的字（含 TRANSPOSE）。分析 LLM 负载时按这个解释。
+
+### 3.2 参照：openTPU（同类开源项目，2026-10-08 阅读）
+
+[openTPU](https://github.com/FeSens/openTPU)（Apache-2.0）同样是 AI 参与开发、ISA 仿真器 / RTL / 板卡逐位一致、int8 权重 + fp32 向量单元的 LLM 加速器，运行在 Kintex-7 xc7k480t PCIe 卡上（133 MHz，2 路 DDR3，峰值 17.1 GB/s）。以下数字来自其 README，作者自报，未经我们复现。两点与本方案直接相关：
+
+1. **权重流式直通（支持 H4）**：它的矩阵单元从 DRAM 流式读入权重（深度 D = 128，等于量化块大小），不经片上缓冲；decode 时 DRAM 带宽用到峰值的 85–94%，Qwen3-0.6B int8 decode 21.6 token/s。它的 DRAM 峰值（17.1 GB/s）与 KV260 的 DDR4 理论带宽（约 19 GB/s）同一量级，说明 decode 的上限主要是带宽能否被持续拉满，而不是乘累加数量。对本方案的含义：
+   - K2b 的默认候选改为"D = 16 + H4 流式点积"：权重从 LD 接收 FIFO 直接进点积单元，SPAD 只放激活、KV 与中间结果；
+   - prefill 受 VE / SFU 限制（z1_profile：52–54%），D = 32 对它帮助有限，留作 prefill 成为瓶颈后的选项；
+   - KV260 上的瓶颈会是 PS–PL 的 HP 口能给多少带宽，由 K2a / K2b 的 `bwtest` 实测决定。
+2. **激活按块量化（Q 线的候选）**：它的激活 int8 每 128 个元素一组、每组一个 fp32 scale（比我们的按 token 更细），权重 int8 或 FP4（4.25 位，两级块 scale），并用 `tools/validate.py` 与 Hugging Face 的 CPU 结果对比 token 与 logits。Qwen3-0.6B 也在它的已验证模型之列。见 Q 线第 3 项。
+
+其他可参考的：常驻 decode 程序（位置等运行时值放在寄存器里，logits 边算边传回，主机每 token 开销 0.2–1.3 ms；我们的固定开销已只有 1–2%，优先级低），以及可视化的性能分析器 Lens（时间线、roofline）。我们的不同点：IREE/MLIR 通用编译路径（不为每个模型手写代码）、片上 ARM 主机的低成本开发板、RISC-V 控制核。
 
 ### K0 准备
 
@@ -127,6 +161,8 @@
 
 **验收**：板子能启动，能用 PYNQ（或 Python + `/dev/mem`）加载一个空 overlay；版本组合已记录。
 
+**进度**（2026-10-07）：板子到手。镜像 Ubuntu 22.04.4（Ubuntu for Kria，内核 5.15.0-1027-xilinx-zynqmp），启动固件 K26-BootFW-01.02 / U-Boot 2023.01（A / B 相同）；DDR 低段 `0x0000_0000`–`0x7FEF_FFFF`，CMA 1000 MiB 在 `0x3780_0000`（整段在低 2 GB）；开机加载 `k26-starter-kits`，加载 overlay 前要 `xmutil unloadapp`（驱动与 `ddr_test.py` 已自动处理）。版本组合记在 `KV260/README.md`。Vivado 2024.1 支持 XCK26（已确认）。待做：安装 Kria-PYNQ、A53 的 CPU 基线、加载 overlay。回归测试包已补上 K1a 验证第 1、3、4 步（`ddr`、`fwdemo`、`c1`）。
+
 ### K1a 平台移植（加速器完全不变）
 
 目标是在 KV260 上**以与 Z1 相同的加速器**完成闭环，把平台问题和时序问题分开：这一步出错，只可能是平台（block design、地址、运行时）的问题。
@@ -135,21 +171,22 @@
 
 1. 新 block design（`KV260/scripts/kv260_bd.tcl`）：
    - `zynq_ultra_ps_e`，打开 HPM0_FPD（ARM → BRAM、CSR）、S_AXI_HP0_FPD（加速器 DMA）、`pl_clk0`（**50 MHz**，与 Z1 相同）、`pl_ps_irq0`、EMIO GPIO（RISC-V 复位）；
-   - PicoRV32（`picorv32_axi`）、程序 BRAM（8 KB，ARM 侧和 RISC-V 侧双口）、`sa_unit`（D = 16，`NPORTS = 1`，SPAD/ACC 与 Z1 相同）；
+   - PicoRV32（`picorv32_axi`）、程序 BRAM（8 KB，ARM 侧和 RISC-V 侧双口）、`sa_unit`（**D = 8**，`NPORTS = 1`，SPAD/ACC 与 Z1 的 L2 bitstream 相同；Z1 上跑 LLM 的 L2 是 D = 8，`board_llm.py` 的 launcher 打印 `overlay D = 8`）；
    - **HP0 直接配置为 64 位**（ZynqMP 的 HP 口支持 32 / 64 / 128 位），加速器的 64 位 AXI master 直接连接，不需要位宽转换器，也不需要 Z1 上的 AXI4→AXI3 转换；
    - PicoRV32 的 DDR 口（原 HP0，用于读环形队列）接 HP1 或经 SmartConnect 共用。
    - **时钟域**：沿用 Z1 的做法，PicoRV32 与加速器在**同一个时钟**（Z1 的 `pico_bit.tcl` 中 `riscv_clk` 与 `matmul_0/aclk` 都接 `subprocessorClk`），PS 侧 AXI-Lite 经互连跨时钟域。之后提频时两者一起提：PCPI 是紧耦合接口，拆成两个时钟域需要在 PCPI 与命令路径上都做跨时钟域处理。只有当 PicoRV32 或 PCPI（`sa_pcpi.v`）的路径成为完整实现中的关键路径时，才评估拆分。
-2. 地址映射：记录 ARM 侧的 BRAM、CSR、mailbox 新地址，写进 `docs/memory_model.md` 的 KV260 一节。
+   **已写好**（2026-10-04，`kv260` 分支）：`KV260/scripts/kv260_bd.tcl` + `build_bitstream.{tcl,sh}`（`-sa_d`、`-sa_mhz`、`-bd_only`），block design 在 Vivado 2024.1 中验证通过（`-bd_only`）；与 Z1 的差别：只有一个 PL 时钟 `pl_clk0`（不用 clk_wiz），加速器 DMA 直接接 `S_AXI_HP1_FPD`（AXI4，不要协议转换），没有 PL 引脚。**完整构建通过**（2026-10-04）：LUT 34.5%、DSP 115、BRAM36 130 / 144（90%）、URAM 0；50 MHz 下 setup WNS +9.05 ns、hold WHS +0.010 ns，`check_timing` 无未约束路径。最差路径从 DMA 口（HP1）的读数据经 DSP 乘法到描述符取指单元的 `fetch/param_reg`（数据路径 10.5 ns），按现状约 90–95 MHz，**K1b 的 100 MHz 需要在这条路径上加一级寄存器**。构建在一个 Vivado 进程里完成（这台 15 GB 的机器上，分 IP 单独综合的子进程会被 systemd-oomd 杀掉）。见 `KV260/README.md`。
+2. 地址映射：记录 ARM 侧的 BRAM、CSR、mailbox 新地址，写进 `docs/memory_model.md` 的 KV260 一节。ARM 侧：BRAM `0xA001_0000`（mailbox `0xA001_1F00`，perf 区 `0xA001_1E00`）、中断控制器 `0xA002_0000`；RISC-V 与加速器侧与 Z1 相同，DDR 为低 2 GB。
 3. `synth_ooc.tcl` 加 K26 器件选项，先做脱离上下文的综合，确认资源。
 
 **软件**
 
-4. aarch64 交叉编译：`toolchain-aarch64.cmake`、`build_sa_runtime.sh aarch64`，构建 `sa-llm-run`、`sa_hal_test`、L0 的 `iree-run-module`。
-5. **地址与 ABI**（细节见 §2.4）：`sa_transport_board.c` 改为用 64 位类型解析物理地址，检查整个窗口在保留区内之后再转成 32 位；明确保留区的分配、映射属性和同步边界；审计主机与固件共享的结构体。
-6. 驱动与部署：`pynq_matmul.py` 和 `deploy_*.sh` 增加 `--board kv260`，读入新的基地址。
-7. 编译器：生成 D = 16、默认 SPAD/ACC 的模块，与 PYNQ-Z1 的 D = 16 bitstream（M4 起）相同。
+4. aarch64 交叉编译：`toolchain-aarch64.cmake`、`build_sa_runtime.sh aarch64`，构建 `sa-llm-run`、`sa_hal_test`、L0 的 `iree-run-module`。**已完成**（2026-10-04，`kv260` 分支）：`compiler/runtime/toolchains/aarch64-linux-gnu.cmake`，三个程序静态链接；不用板子的检查 `compiler/scripts/test_aarch64_runtime.sh`（qemu-aarch64 用户态 + 环形队列仿真器 `sa_board_emu.py`）：C1 HAL 测试 PASS，stories15M decode 与 prefill + decode 的 logits 与参照逐位一致。
+5. **地址与 ABI**（细节见 §2.4）：`sa_transport_board.c` 改为用 64 位类型解析物理地址，检查整个窗口在保留区内之后再转成 32 位；明确保留区的分配、映射属性和同步边界；审计主机与固件共享的结构体。运行时部分**已完成**：`SA_BOARD_*` 按 64 位解析，窗口整段检查（非空、末端 ≤ 2 GB）后才形成 32 位设备地址，mailbox 可在任意物理地址；与固件共享的只有环形队列项（64 位字）与完成记录（32 位字），按偏移写，不含结构体、指针或 `long`。保留区的分配方式与映射属性等板子到手再定。
+6. 驱动与部署：`pynq_matmul.py` 和 `deploy_*.sh` 增加 `--board kv260`，读入新的基地址。**已完成**（2026-10-04，`kv260` 分支）：驱动从 `.hwh` 读板子、D、ARM 侧 BRAM 地址与加速器时钟（`overlay_info`），launcher、bwtest、`ddr_test.py`（从 overlay 的 `ip_dict` 取地址）不再写死 Z1 的地址；部署脚本用 `SA_BOARD=kv260`（`compiler/scripts/board_env.sh`：aarch64 运行时、`KV260/build/output/<配置>` 的 overlay，`SA_KV260_CONFIG` 选配置，默认 `d8_50mhz`；构建输出按配置分目录，如 K1b 的 `d8_100mhz`），整套回归 `deploy_z1_freeze.sh --board kv260` → `build/deploy_kv260`；不用板子的检查：KV260 测试包里的 aarch64 `sa-llm-run` 在 qemu 下、按 KV260 的地址（mailbox `0xA001_1F00`，窗口在 2 GB 以下）运行，stories15M 22/22 行逐位一致。
+7. 编译器：不改；生成与 Z1 基线相同的模块（D = 8、默认 SPAD/ACC），描述符应与 `tests/baselines/pynq-z1/golden_manifest.txt` 逐字节相同。
 
-**验证顺序**（每项都与 sim 逐位一致，并与 §7.2 的 Z1 基线文件对比）
+**验证顺序**（每项都与 sim 逐位一致，并与 §7.2 的 Z1 基线文件对比；测试包与板上脚本沿用 `compiler/scripts/deploy_z1_freeze.sh` 和 `compiler/tests/board_regress.py`，加 `--board kv260`）
 
 | 步骤 | 测试 | 预期 |
 |---|---|---|
@@ -162,12 +199,30 @@
 
 **验收**：第 5、6 步通过。**只以正确性验收**；token/s 记录为观测值（ARM 主机、DDR 延迟、驱动开销都变了，不能预设与 Z1 的比例）。
 
+**K1a 验收通过**（2026-10-08，板上，`d8_50mhz` overlay，`compiler/scripts/deploy_z1_freeze.sh --board kv260` + `run_board.sh`）：第 1–6 步全部 PASS（`ddr`、`bwtest`、gemm / vector / desc_run、C1、C3、SmolLM2 与两条 prefill + decode 路径），`compiler/tests/compare_z1_baselines.py`：5 个测试的 token 序列与 Z1 基线完全相同。设备周期与 Z1 相差不到 0.03%（decode 每步：stories15M 2,708,522 / Z1 2,709,281，SmolLM2 qhf 22,215,268 / 22,220,320，通用路径 26,663,452 / 26,671,269），DMA 397 MB/s（99.3%）；墙钟快 1–4%（A53 主机：stories15M 54.7 ms/步 = 18.27 token/s，Z1 56.8；SmolLM2 qhf 440.9 ms/步 = 2.27 token/s，Z1 449.6）。
+
+上板时解决的平台问题：Kria-PYNQ 没有 `/etc/profile.d/xrt_setup.sh`（测试包带 `run_board.sh`，自动找环境脚本）；开机加载的 `k26-starter-kits` 占着 PL（驱动先 `xmutil unloadapp`）；PYNQ 把 BRAM 控制器列在 `mem_dict`（`ddr_test.py` 曾退回 Z1 的地址，写到了 CMA 里的 DDR）；**内核 `CONFIG_STRICT_DEVMEM=y`，`/dev/mem` 对 root 也拒绝映射内存**：运行时的窗口改由 u-dma-buf 模块提供（`/dev/udmabuf0`，`sync_mode` 2 = 写合并；`SA_BOARD_MEM_DEV`），PL 地址照旧经 `/dev/mem`。
+
 ### K1b 提频到 100 MHz
 
 1. 只改 `pl_clk0` 为 100 MHz，其他不变；记录 WNS / TNS、关键路径。
 2. 重跑 K1a 的验证顺序第 2–6 步。
 
+K1a 的构建显示最差路径（DMA 读数据 → DSP 乘法 → 描述符取指单元的 `fetch/param_reg`，数据路径 10.5 ns）只能到约 90–95 MHz：100 MHz 前先在这条路径上加一级寄存器（`sa_cmdfetch.v`），以功能仿真与板上逐位一致验收。**已改**（2026-10-04，`kv260` 分支）：LDPARAM 在最后一拍只锁存取出的字，下一周期再做乘加（LDPARAM 多一个周期，语义不变）；`tb_sa_unit` 在 D = 8 / 16 下全部通过（含 LDPARAM 的检查）。
+
+K1a 布线后的前 40 条路径（`post_route.dcp`，在 20 ns 约束下工具没有对它们用力）中，修掉这条后接下来是：VE TRANSPOSE 的地址（`tr_word0`，DSP）→ ACC BRAM 地址 / 写使能（数据路径 9.5–10.1 ns，11 级）；LD 的 `q_rp` → ACC BRAM 地址（约 10.1 ns，13 级）；RISC-V 复位 → EX `bsr_reg` 的同步复位（约 10.2 ns，4 级，高扇出、以布线为主）。10 ns 约束下工具会优化（复制复位网络、就近布局），多数应能收敛，以 100 MHz 的实际构建为准；**K2a 的 200–250 MHz 需要在这几处都加流水级**。
+
+**100 MHz 构建通过**（2026-10-04，`-sa_mhz 100`）：setup WNS +1.171 ns、hold WHS +0.010 ns，`check_timing` 无未约束路径，资源与 K1a 相同（LUT 34.4%、BRAM36 130）；最差路径变为 LD 的 `q_lane` → DSP → ACC BRAM 写使能（7.8 ns，13 级），按现状约 113 MHz。K1b 剩下板上验证（第 2–6 步）。
+
 **验收**：时序收敛，第 5、6 步逐位一致。性能为观测项：`bwtest` 的入口上限变为 0.8 GB/s（64 位 × 100 MHz），decode 的 token/s 预计有提升，但主机开销与 DDR 延迟使它不一定是 Z1 的两倍。
+
+### K1c D = 8 → 16
+
+1. 只改 `sa_unit` 的 `D`（`build_bitstream.sh -sa_d 16`），其他不变；记录资源与时序（Z1 上 D = 8 的 L2 已用 83% LUT，`sa_vefp` 单独 17.2k LUT）。
+2. 编译器：`--iree-sa-d=16`；黄金语料已有 D = 16 的用例（`cfg_d16`），功能仿真器与 `dispatch_check.py` 支持任意 D。D = 16 的模块与 Z1 基线的描述符不同，以 sim 逐位一致验收，并建立 D = 16 配置自己的基线（§5）。
+3. 重跑 K1a 的验证顺序第 2–6 步，参照换成 D = 16 的 sim（fp32 归约按 D 个 lane 分组，结果可能与 D = 8 差最低位，所以不要求 token 序列与 Z1 基线相同；记录是否相同）。
+
+**验收**：第 5、6 步逐位一致；prefill 的 token/s 记录为观测值（阵列 4 倍乘累加，decode 仍受带宽限制）。之后各阶段以 D = 16 为准（SPAD 一字 128 位，正好一个 128 位 beat，见 K2a）。
 
 ### K2 带宽：DMA 与片上存储接口
 
@@ -205,16 +260,21 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 
 **带宽之后：读权重以外的部分**
 
-带宽提高后，读权重以外的周期（VE 尾部、SFU、EX、每个 DMA 与 dispatch 的固定开销）不会跟着减少；DDR 延迟按纳秒计不变，提频后折算成周期反而更多。用 Z1 上 SmolLM2-135M decode 的实测数字估算（读权重下限：每层约 3.54 MB，按 7.8 B/周期约 453k 周期 × 30 层 = 13.6M，加分类层 28.3 MB 约 3.6M，合计约 17.2M 周期）：
+带宽提高后，读权重以外的周期（VE 尾部、SFU、EX、每个 DMA 与 dispatch 的固定开销）不会跟着减少；DDR 延迟按纳秒计不变，提频后折算成周期反而更多。Z1 冻结时在板上用加速器的事件计数器做了耗时分解（`tests/baselines/pynq-z1/z1_profile.md`，`compiler/tests/z1_profile.py`；decode 每步，一个 dispatch 一个列表）：
 
-| 路径 | Z1 每步周期 | 读权重下限 | 其余部分 | K2b（24 B/周期）读权重 | K2b 后其余部分的占比 |
-|---|---|---|---|---|---|
-| 手写路径（2.23 token/s） | 约 22.4M | 17.2M | 约 5.2M（23%） | 约 5.6M | 约 48% |
-| 编译器通用路径（1.87 token/s，`iree_compiler_plan.md` §8） | 26.7M | 17.2M | 约 9.5M（36%） | 约 5.6M | 约 63% |
+| 路径 | Z1 每步周期 | 读入字节 | 读入下限（7.94 B/周期） | 没被读入掩盖的部分 | 全部引擎空闲（固定开销） | K2b（24 B/周期）读入下限 | K2b 后其余部分的占比 |
+|---|---|---|---|---|---|---|---|
+| stories15M 手写路径 | 2.71M | 15.8 MB | 1.99M | 0.72M（26%） | 0.06M（2%） | 0.66M | 约 52% |
+| SmolLM2 手写 qhf 路径（2.22 token/s） | 22.22M | 138.4 MB | 17.44M | 4.78M（22%） | 0.28M（1%） | 5.77M | 约 45% |
+| SmolLM2 编译器通用路径（1.87 token/s） | 26.67M | 140.9 MB | 17.75M | 8.92M（33%） | 0.30M（1%） | 5.87M | 约 60% |
 
-（其余部分按周期数不变估计，实际可能更多。）所以 K2b 以后，**性能主要取决于计算侧与调度侧的效率**：引擎之间的重叠、子银行冲突、每个 DMA 与 dispatch 的固定开销，而不只是带宽。Qwen3-0.6B 的粗略外推见 K4b。
+（其余部分按周期数不变估计，实际可能更多。）实测说明：
+- **固定开销很小**（全部引擎空闲 1–2%）：描述符列表与 rt_fw 的设计已经把发射开销压住了，K2 之后它也不是主要问题。
+- **线性层贴着读入下限**：SmolLM2 的 `matvec` 类 dispatch 读入 135.8 MB，LD 忙 17.2M 周期，EX 17.2M 与 LD 几乎完全重叠（重叠 16.4M 周期）。
+- **没被掩盖的部分**：手写路径 4.78M 里，线性层的尾部约 1.6M（`matvec` 总周期减去读入下限）、RMSNorm / softmax 的归约约 1.7M、逐元素 0.9M、注意力 0.46M；通用路径 8.92M 里，线性层的尾部约 4.0M（通用 contraction 的尾部与 EX 串行）、注意力 2.4M、归约 2.6M。这些都是 VE / SFU 的工作，K2 不会让它们变快。
+- **prefill** 每块（8 个 token）VE / SFU 占 52–54%，读入下限只占 28–42%：prefill 受 VE / SFU 限制，不是带宽（K1c 的 D = 16 只加快 EX）。
 
-为此，Z1 冻结前先做一份**耗时分解基线**（§7.2 的 `z1_profile.md`）：用 `board_profile.py` 与 `SA_PROFILE`，对 stories15M 与 SmolLM2 的手写路径和通用路径，按 dispatch 类型给出读权重、EX、VE / SFU、固定开销和重叠的周期。K 各阶段的性能预期以它为依据。
+所以 K2b 以后，**性能主要取决于 VE / SFU 侧与调度的效率**：尾部与 EX 的重叠、归约与 SFU 的吞吐（P6 SFU 多槽交错）、注意力，而不只是带宽。另外，**decode 时阵列每周期只消耗 D 字节权重**（§3.1 H0），D = 8 时无论 DMA 多宽都卡在每周期 8 字节；带宽升级必须与 D 一起做（K1c 的 D = 16 对应 K2a，D = 32 对应 K2b）。K 各阶段的性能预期以 `z1_profile.md` 为依据。Qwen3-0.6B 的粗略外推见 K4b。
 
 #### K2a 单口 128 位
 
@@ -268,6 +328,7 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 5. **RTL**：`sa_ld` 返回端改为多口同时接收（每口独立 `m_rready`）；汇聚与写回；`sa_bankmem` 增加子银行维度。先做独立的存储与 DMA 测试平台，再接 EX / VE。
 6. **多口**：`NPORTS` = 2，再试 3–4，接 HP0–HP3；逐口测量，并对比 HP 与 HPC 口。
 7. **编译器工作项**（方案 A）：
+   - **带生存期的内存规划**（`iree_compiler_plan.md` §8.17 第 3 项，Z1 冻结时决定放到这里）分两步。**3a 框架**：在 `sahl-expand-kernels` 展开后的 IR 上做生存期分析，由规划器给出 `sa.word` / `sa.bank` / `sahl.scope`；第一版完全复现现有分配（黄金语料不变），bank 数、对齐、容量、读端口都从 `TargetConfig` 读，约束做成可替换的一层；去掉 `expandContraction` 重放分配器的耦合。不改输出，可以在 K1 期间就在 `kv260` 分支上做。**3b 优化**：按生存期复用、避开子银行冲突、放不下时分片，下面三项约束就是它的规则；改变输出，K2b / K3 的银行组织定下来之后做，以逐 dispatch 检查和板上周期验收；
    - **对齐**：多字写入要求的 DMA 块对齐（2 / 4 字）进入 `TargetConfig` 与内存规划；不满足对齐的块退回单字写入（正确但慢），而不是拒绝编译；
    - **子银行冲突**：记分板按子银行检查冲突；内存规划尽量把同时访问的 LD 写入与 EX / VE 读放在不同子银行，调度在冲突时串行化；
    - **读端口分配**：EX / VE / ST 的读端口与子银行的对应关系作为目标配置的一部分，调度器据此避免同周期争用；
@@ -279,7 +340,7 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 - `bwtest` 同时报告 DDR 侧带宽与**写入 SPAD 的有效带宽**，分 LINEAR 与 INTERLEAVE 两种模式、分 burst 长度，并报告队列已满的周期；LINEAR 的有效带宽达到按上表选定的配置目标（例如 2 字/周期 × 250 MHz，实测 ≥ 6 GB/s），按"DDR 能给多少"和"片上存储能收多少"分别记录，找出实际瓶颈。INTERLEAVE 记录实测值。
 - stories15M、SmolLM2 逐位一致；SmolLM2 decode 的 token/s 随有效带宽提升，记录实测比例（不预设线性）。
 
-### K3 URAM 容量扩展（优先保持 D = 16）
+### K3 URAM 容量扩展
 
 1. **存储接口先抽象**：`sa_tdpram.v` 是 UG901 的 BRAM 模板（read-first、1 周期读延迟、byte-write），不能只改 `ram_style` 就认为行为不变。存储接口改为：
    - 可配置读延迟（URAM 通常需要额外的流水寄存器才能跑到高频）；
@@ -296,7 +357,7 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
    - 现有本地地址是 **16 位字地址**（`TargetConfig::invalid()` 要求每块存储不超过 2^16 字）。D = 16 时 SPAD 一字 16 字节，2^16 字 = 1 MB；ACC 一字 64 字节，上限更大，所以上述配置不需要改地址位宽。超过时需同步改描述符编码、RTL 和编译器检查。
    - 编译器：`--iree-sa-spad-kb`、`--iree-sa-acc-kb` 传入新大小；C6 已在 sim 上验证过 SPAD 256 KB / ACC 512 KB 和更大的配置（D = 16）。
 5. **编译器工作项**：SPAD/ACC 变大后重新确定 chunk 的选择（每个线性层、注意力的块大小）、跨 dispatch 预取可用的空间、双缓冲的划分；新配置建立自己的黄金语料基线。
-6. **D = 32 暂不做**：decode 受带宽限制，D = 32 只提升 prefill 的算力；需要 RTL（阵列、VE 宽度、存储字宽）、描述符编码、`TargetConfig`（目前只允许 8、16）、功能仿真器同时支持。放到 K4b 之后，确认 prefill 是瓶颈再评估。
+6. **D = 32 只在 K2b 的比较选中它时与 K2b 一起做**（默认候选是 H4 流式点积，§3.2；原计划放到 K4b 之后，Z1 实测与 RTL 确认后改，见 §3.1 H0）：decode 时阵列每周期只消耗 D 字节权重，K2b 每周期 24–40 字节的带宽只有 D = 32 才用得上。需要 RTL（阵列 1024 个 int8 乘累加：DSP48E2 每个装两个约 512 个 DSP，或部分用 LUT；SPAD 字 256 位、ACC 字 1024 位；VE 的 FL）、描述符编码、`TargetConfig`（目前只允许 8、16）、功能仿真器同时支持，并建立 D = 32 配置自己的黄金语料基线。
 
 **验收**：独立存储测试通过；新配置先通过语义验证（逐 dispatch 检查与功能仿真器一致），再建立**该配置自己的**黄金语料描述符基线，不覆盖 Z1 和其他配置的基线（见 §5）；上板逐位一致。
 
@@ -314,7 +375,7 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 2. **编译器随硬件复查**：如果 K2 / K3 改变了银行组织、读延迟或 DMA 并行度，目标配置、内存规划、预取与调度都要复查，确认能用上新硬件的带宽；这不只是 T 分块一项。
 3. **耗时分解**：用 `SA_PROFILE` 和性能计数器，把每个 token 的耗时分成**权重读取、KV 读取、计算（EX / VE / SFU）、调度（描述符处理、dispatch 固定开销、主机）**四部分，分别在上下文长度 **128、512、2048** 下测量。各引擎（LD、EX、VE、ST）的 busy 周期互相重叠，**不能直接相加**：按时间轴标出重叠区间，报告每个 token 的墙钟时间中各部分独占的时间与重叠的时间，以及关键路径上的引擎。
 4. **性能目标按分解设定**：仅权重读取的上限是 有效带宽 ÷ 每 token 读取的权重字节数。Qwen3-0.6B 的嵌入与分类层共享一份权重（151936 × 1024，约 155 MB），分类层每个 token 读一遍，每 token 读取的权重合计约 0.6 GB：6 GB/s 时上限约 10 token/s，10 GB/s 时约 16 token/s。实际还要加上 KV 读取、计算与调度中不能重叠的部分，所以 **10–15 token/s 是冲刺目标，不是推算结果**。
-   **粗略外推**（只用于说明量级）：按 24 B/周期，读 0.6 GB 权重约 25M 周期；读权重以外的部分如果按层宽与 hidden 维度从 SmolLM2 的约 9.5M 周期（通用路径）放大约 2 倍，约 19M 周期，合计约 44M 周期，250 MHz 时约 5.7 token/s。要达到 10 token/s（25M 周期以内），读权重以外的部分必须基本被读权重掩盖。所以 K4b 的主要工作是**压缩和重叠读权重以外的部分**（线性层合并、SFU 多槽交错、固定开销、跨 dispatch 预取），以 `z1_profile.md` 和 K2b 后的分解为依据排序。
+   **粗略外推**（只用于说明量级）：按 24 B/周期，读 0.6 GB 权重约 25M 周期；读权重以外的部分如果按层宽与 hidden 维度从 SmolLM2 的约 9.5M 周期（通用路径）放大约 2 倍，约 19M 周期，合计约 44M 周期，250 MHz 时约 5.7 token/s。要达到 10 token/s（25M 周期以内），读权重以外的部分必须基本被读权重掩盖。所以 K4b 的主要工作是**压缩和重叠读权重以外的部分**（线性层合并、SFU 多槽交错、固定开销、跨 dispatch 预取），以 `z1_profile.md`（Z1 实测：通用路径 decode 没被读入掩盖的 8.92M 周期里，线性层尾部约 4.0M、注意力 2.4M、归约 2.6M）和 K2b 后的分解为依据排序。
 5. **调优**：通用 contraction 路径的线性层改走微内核（§8.19 的做法）；按分解结果决定优先优化哪一部分。
 
 **验收**：T = 2048 时逐 dispatch 一致、板上逐位一致；在三种上下文长度下给出耗时分解；性能目标以分解结果为依据设定并达到。
@@ -330,7 +391,11 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
    - **GQA 约束**：`Wv` 只有 8 × 128 个输出通道，而 `wo` 的输入有 16 × 128 个通道；共享同一个 KV head 的 Q head 必须用同一组 s，`wo` 处的平滑效果因此受限；
    - **SwiGLU**：`down_proj` 的输入是 `silu(gate_proj·x) ⊙ (up_proj·x)`。把 `up_proj` 的输出行除以 s，乘积的对应通道也除以 s，由 `down_proj` 的对应输入列乘以 s 补偿；缩放**不能穿过 SiLU 的 gate 分支**（非线性）。（llama2.c 的命名：`w1` = gate_proj、`w2` = down_proj、`w3` = up_proj；文档与代码统一用 HF 的名字。）
    - 分类层与嵌入共享权重，不做变换。
-3. 其他候选：更细的 KV scale、个别层保留更高精度（如需硬件或编译器改动，单独评估）。
+3. **激活按块量化**（参照 openTPU，3.2）：激活沿 K 维每 B 个元素（B = 64 或 128）一组，每组一个 fp32 scale，取代按 token 的单一 scale。离群通道只影响它所在的块，误差更小。步骤：
+   - **先只做软件评估**：在 CPU / sim 的参照模型里模拟按块量化（fake-quant），测 top-1 与困惑度，并和 SmoothQuant 比较；也可以只用在误差最大的层（例如 `down_proj` 的输入）。
+   - **数值契约要改**：y = Σ_b s_b · s_w · (Σ_{k∈b} a_k w_k)。块内仍是精确的 int32 累加，但**跨块不能在 int32 里累加**：每个块的部分和要先乘自己的 scale。对硬件的含义：EX 按块输出 int32 部分和（每块一次 ACC 写入），VE 做 fp32 的缩放与累加。块数 = K / B，每个 token 的 VE 工作量增加约 N × K / B 次乘加（例如 K = 1024、B = 128 时每个输出 8 次），而 VE / SFU 已经是没被掩盖的主要部分（3.1 的 H1）。openTPU 用 D = 块大小 = 128 让每次矩阵单元调用正好是一个块；我们的阵列在一个 tile 里沿 K 方向一直累加（一次跨多个块），要改成在每个块的边界把部分和写出（K 分块的粒度对齐到 B），这是微内核和描述符层面的改动。
+   - **只有软件评估表明 SmoothQuant 不够时才进硬件**，并与 H4 一起设计：点积单元按块输出部分和，代价最小。
+4. 其他候选：更细的 KV scale、个别层保留更高精度（如需硬件或编译器改动，单独评估）。
 
 **验收**：与 fp32 的 top-1 一致率与困惑度达到 C6.2 定义的可接受范围；所选方法在 sim 上逐位一致。
 
@@ -382,7 +447,7 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 
 1. **带宽目标与配置成对**：每个带宽目标都写明对应的配置（字/周期 × 频率）和所需利用率（§3 K2 的对应表）；所需利用率超过约 85% 的组合不作为计划目标。
 2. **时序以完整实现为准**：`synth_ooc.tcl` 的 OOC 综合只用来定位关键路径。验收看完整设计布局布线后的报告：setup 与 hold 都收敛（WNS、WHS ≥ 0）、所有时钟都有约束（`report_clocks`、`check_timing` 无未约束路径）、跨时钟域检查（`report_cdc`）没有未处理的路径。
-3. **黄金语料按目标配置分别保留**：每个目标配置（Z1 的 D = 16、KV260 的 K2 / K3 配置……）各有一份描述符基线。新配置先通过语义验证（逐 dispatch 与功能仿真器一致、端到端与 sim 逐位一致），再建立自己的基线；**不覆盖** Z1 基线（§7.2）和其他配置的基线。
+3. **黄金语料按目标配置分别保留**：每个目标配置（Z1 的 D = 8、KV260 的 D = 16 与 K2 / K3 配置……）各有一份描述符基线。新配置先通过语义验证（逐 dispatch 与功能仿真器一致、端到端与 sim 逐位一致），再建立自己的基线；**不覆盖** Z1 基线（§7.2）和其他配置的基线。
 4. **耗时分解标注重叠**：各引擎的 busy 周期有重叠，不能直接相加；报告墙钟时间中的独占与重叠部分（K4b 第 3 步）。
 
 估算方法：decode 每 token 读一遍全部权重，**仅权重读取的上限** ≈ 有效带宽 ÷ 每 token 读取的权重字节数。实际还包括 KV 读取、量化、SFU、描述符处理以及不能完全重叠的计算，需按 K4b 的耗时分解实测。
@@ -399,6 +464,8 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 - 固件和驱动中是否还有其他写死的 ARM 侧地址（逐个 grep `0x4001`、`0x4000` 等）。
 - UltraScale+ 上 `sa_tdpram.v`、`sa_bankmem.v` 的 BRAM 推断结果；URAM 的读延迟配置与碰撞行为。
 - K2b 的子银行数与内部总线宽度（2 / 3 / 4 字每周期），按目标带宽与配置对应表和解析性能模型选定。
+- D = 32 的资源与时序：DSP48E2 每个装两个 int8 乘法的可行性、FL = 16 的 LUT（或改为 FL = D / 4）、阵列 PE 链在 250 MHz 下的时序；与 H4（专用矩阵乘向量通路）比较。
+- H4 流式点积单元的宽度（32 或 64 字节/周期）、与 LD 接收 FIFO 的接口、编译器选择该路径的条件（decode 形式的线性层）；按块激活量化若要支持，块大小 B 与点积单元宽度的关系。
 - KV260 上 DDR 读延迟（随负载变化）的实测值，用于解析性能模型和 QD 的选择。
 - PicoRV32 与 PCPI 在 200–250 MHz 下的时序余量。
 - K2b 架构 A 中，EX / VE 读端与子银行的端口分配是否会降低现有的计算吞吐。
@@ -429,7 +496,9 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
    | `stories15m_tokens.txt` | stories15M 76 步的 token 序列（固定 prompt 和种子） |
    | `smollm2_tokens.txt` | SmolLM2-135M prefill + decode 的 token 序列 |
    | `perf.md` | 实测 token/s、`bwtest` 带宽、资源占用和时序（每个 bitstream 一行） |
-   | `z1_profile.md` | 耗时分解：stories15M 与 SmolLM2 的手写路径和通用路径，按 dispatch 类型给出读权重、EX、VE / SFU、固定开销和重叠的周期（`board_profile.py`、`SA_PROFILE`）；K 各阶段性能预期的依据 |
+   | `z1_profile.md` | 耗时分解：stories15M 与 SmolLM2 的手写路径和通用路径，按 dispatch 类型给出读入（及下限）、EX、VE / SFU、ST、固定开销和重叠的周期（`board_profile.py` + `SA_PROFILE_PERF`：运行时读加速器的事件计数器）；K 各阶段性能预期的依据 |
+
+   **已完成**（2026-10-04）：`compiler/scripts/deploy_z1_freeze.sh` 生成全部测试包（bwtest、C3、C5.5、两个 C6.P、通用路径），`compiler/tests/board_regress.py` 在板上全部逐位一致（`REGRESSION PASS`），`compiler/tests/make_z1_baselines.py` 写出上表的文件（另有 `README.md`）。
 
    大的二进制输出（logits、中间张量）不进 git，放到 Release 附件里。
 3. **打 tag 和分支**：
@@ -493,7 +562,7 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 | 时间点 | main | 其他 |
 |---|---|---|
 | 现在 → Z1 完善完成 | Z1 版本 | — |
-| Z1 冻结 | Z1 版本 | tag `v1.0-pynq-z1`、分支 `pynq-z1`、Release、基线文件 |
+| Z1 冻结（**2026-10-04 完成**） | Z1 版本 | tag `v1.0-pynq-z1`、分支 `pynq-z1`、Release、基线文件 |
 | K0–K1 | Z1 版本（README 预告 KV260） | `kv260` 分支开发 |
 | K1 验收 | **合入 KV260**，README 更新，目录整理 | `pynq-z1` 只修严重问题 |
 | K2 及以后 | KV260 版本 | — |
