@@ -23,6 +23,9 @@
 `ifndef SIM_D
 `define SIM_D 8          // array size: make sim SIM_D=16
 `endif
+`ifndef SIM_DMA_W
+`define SIM_DMA_W 64     // DMA data width: make sim SIM_DMA_W=128 (K2a)
+`endif
 module tb_system;
     `include "n_cases.vh"
 
@@ -151,18 +154,20 @@ module tb_system;
 
     // ------------------------------------------------------ matmul_unit
     wire [31:0] m_araddr, m_awaddr;
-    wire [7:0]  m_arlen, m_awlen, m_wstrb;
+    localparam integer DW = `SIM_DMA_W, BB = DW / 8;
+    wire [7:0]  m_arlen, m_awlen;
+    wire [BB-1:0] m_wstrb;
     wire [2:0]  m_arsize, m_awsize, m_arprot, m_awprot;
     wire [1:0]  m_arburst, m_awburst;
     wire [3:0]  m_arcache, m_awcache;
     wire        m_arvalid, m_rready, m_awvalid, m_wvalid, m_wlast, m_bready;
-    wire [63:0] m_wdata;
+    wire [DW-1:0] m_wdata;
     reg         m_arready = 0, m_rvalid = 0, m_rlast = 0, m_awready = 0, m_wready = 0, m_bvalid = 0;
-    reg  [63:0] m_rdata = 0;
+    reg  [DW-1:0] m_rdata = 0;
     wire        mm_irq, mm_nirq;
 
     localparam integer D = `SIM_D;
-    sa_unit #(.D(D), .NPORTS(1)) mm (
+    sa_unit #(.D(D), .NPORTS(1), .DMA_W(DW)) mm (
         .aclk(clk), .aresetn(resetn),
         .s_axi_awaddr(c_awaddr[7:0]), .s_axi_awvalid(c_awvalid & aw_csr), .s_axi_awready(mm_awready),
         .s_axi_wdata(c_wdata), .s_axi_wstrb(c_wstrb), .s_axi_wvalid(c_wvalid & aw_csr), .s_axi_wready(mm_wready),
@@ -180,10 +185,10 @@ module tb_system;
         .m0_axi_wdata(m_wdata), .m0_axi_wstrb(m_wstrb), .m0_axi_wlast(m_wlast),
         .m0_axi_wvalid(m_wvalid), .m0_axi_wready(m_wready),
         .m0_axi_bresp(2'b00), .m0_axi_bvalid(m_bvalid), .m0_axi_bready(m_bready),
-        .m1_axi_arready(1'b0), .m1_axi_rdata(64'd0), .m1_axi_rresp(2'd0), .m1_axi_rlast(1'b0),
+        .m1_axi_arready(1'b0), .m1_axi_rdata({DW{1'b0}}), .m1_axi_rresp(2'd0), .m1_axi_rlast(1'b0),
         .m1_axi_rvalid(1'b0), .m1_axi_awready(1'b0), .m1_axi_wready(1'b0), .m1_axi_bresp(2'd0),
         .m1_axi_bvalid(1'b0),
-        .m2_axi_arready(1'b0), .m2_axi_rdata(64'd0), .m2_axi_rresp(2'd0), .m2_axi_rlast(1'b0),
+        .m2_axi_arready(1'b0), .m2_axi_rdata({DW{1'b0}}), .m2_axi_rresp(2'd0), .m2_axi_rlast(1'b0),
         .m2_axi_rvalid(1'b0), .m2_axi_awready(1'b0), .m2_axi_wready(1'b0), .m2_axi_bresp(2'd0),
         .m2_axi_bvalid(1'b0),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
@@ -207,12 +212,12 @@ module tb_system;
             @(posedge clk);
             if (m_arvalid && m_arready) begin
                 r_addr = m_araddr; r_len = m_arlen;
-                ddr_check(r_addr, (r_len + 1) * 8);
+                ddr_check(r_addr, (r_len + 1) * BB);
                 #1 m_arready = 0;
                 for (rb = 0; rb <= r_len; rb = rb + 1) begin
                     repeat (rnd(6)) @(posedge clk);
                     #1;
-                    for (k = 0; k < 8; k = k + 1) m_rdata[8*k +: 8] = ddr[r_addr - DDR_BASE + 8*rb + k];
+                    for (k = 0; k < BB; k = k + 1) m_rdata[8*k +: 8] = ddr[r_addr - DDR_BASE + BB*rb + k];
                     m_rlast = rb == r_len; m_rvalid = 1;
                     @(posedge clk);
                     while (!m_rready) @(posedge clk);
@@ -227,14 +232,14 @@ module tb_system;
             @(posedge clk);
             if (m_awvalid && m_awready) begin
                 w_addr = m_awaddr; w_len = m_awlen;
-                ddr_check(w_addr, (w_len + 1) * 8);
+                ddr_check(w_addr, (w_len + 1) * BB);
                 #1 m_awready = 0;
                 for (wb = 0; wb <= w_len; wb = wb + 1) begin
                     repeat (rnd(6)) @(posedge clk);
                     #1 m_wready = 1;
                     @(posedge clk);
                     while (!m_wvalid) @(posedge clk);
-                    for (k = 0; k < 8; k = k + 1) ddr[w_addr - DDR_BASE + 8*wb + k] = m_wdata[8*k +: 8];
+                    for (k = 0; k < BB; k = k + 1) if (m_wstrb[k]) ddr[w_addr - DDR_BASE + BB*wb + k] = m_wdata[8*k +: 8];
                     #1 m_wready = 0;
                 end
                 repeat (rnd(6)) @(posedge clk);

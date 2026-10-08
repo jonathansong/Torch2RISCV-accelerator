@@ -3,7 +3,7 @@
 // docs/llm_inference_plan.md §5.3).
 //
 // mat_submit(list, count) starts it: 64-byte descriptors are read from DDR
-// (one 8-beat burst each, up to 4 in flight, into a 32 x 64-bit LUTRAM FIFO),
+// (one burst each: 8 beats, 4 at DMA_W = 128; up to 4 in flight, into a 32 x 64-bit LUTRAM FIFO),
 // assembled, patched, decoded and fed to the scheduler input in list order,
 // exactly like the commands the PCPI decoder builds (the pkt_* functions of
 // sa_defs.vh). Control descriptors are handled here:
@@ -43,7 +43,8 @@
 `include "sa_macros.vh"
 
 module sa_cmdfetch #(
-    parameter integer D = 8                    // VE LEN (elements) -> groups
+    parameter integer D     = 8,               // VE LEN (elements) -> groups
+    parameter integer DMA_W = 64               // AXI read data width: 64 or 128 (2 words per beat)
 ) (
     input  wire                  clk,
     input  wire                  resetn,
@@ -76,11 +77,11 @@ module sa_cmdfetch #(
     output reg  [31:0]           st_err_idx,   // index (in its list) of a failing descriptor
     output reg  [31:0]           st_exec,      // descriptors decoded in the current list
 
-    // AXI read (shares a DMA port through the arbiter in sa_unit; 8-beat bursts)
+    // AXI read (shares a DMA port through the arbiter in sa_unit; one burst per descriptor)
     output reg  [31:0]           ar_addr,
     output reg                   ar_valid,
     input  wire                  ar_ready,
-    input  wire [63:0]           r_data,
+    input  wire [DMA_W-1:0]      r_data,
     input  wire [1:0]            r_resp,
     input  wire                  r_last,
     input  wire                  r_valid,
@@ -105,7 +106,8 @@ module sa_cmdfetch #(
     // ------------------------------------------------------------ fetch
     reg  [31:0] fetch_addr;
     reg  [2:0]  outstanding;            // bursts in flight (<= 4)
-    reg  [63:0] fifo [0:31];
+    localparam integer LB = DMA_W == 128 ? 1 : 0;   // log2(64-bit words per beat)
+    reg  [DMA_W-1:0] fifo [0:(32 >> LB) - 1];        // 32 x 64 bits; pointers count 64-bit words
     reg  [5:0]  wp, rp;
     wire [5:0]  used = wp - rp;         // 6-bit difference: modulo-64 pointers
     wire        fetching = state == S_RUN || state == S_FENCE || state == S_SETREG;
@@ -270,7 +272,7 @@ module sa_cmdfetch #(
     reg  [2:0]  ldp_k, ldp_beat;
     reg         ldp_pend, ldp_stop, ldp_err;
     reg         ldp_calc;                  // the word is in ldp_word: PARAM = word * mul + add
-    wire [31:0] ldp_data = ldp_beat == ldp_a[5:3] ? (ldp_a[2] ? r_data[63:32] : r_data[31:0]) : ldp_word;
+    wire [31:0] ldp_data = ldp_beat == (ldp_a[5:3] >> LB) ? r_data[32 * (ldp_a[3:2] & (LB ? 2'd3 : 2'd1)) +: 32] : ldp_word;
 
     assign busy = state != S_IDLE || pkt_valid;
 
@@ -313,14 +315,14 @@ module sa_cmdfetch #(
             end
             outstanding <= outstanding + (ar_valid && ar_ready) - (beat && r_last);
             if (beat && keep) begin
-                fifo[wp[4:0]] <= r_data;
-                wp <= wp + 1;
+                fifo[wp[4:0] >> LB] <= r_data;
+                wp <= wp + (6'd1 << LB);
             end
             if (pkt_valid && out_ready && out_valid) pkt_valid <= 0;
 
             // ---- assemble
             if (pop) begin
-                w[wi] <= fifo[rp[4:0]];
+                w[wi] <= fifo[rp[4:0] >> LB] >> (64 * (rp[0] & LB));
                 rp    <= rp + 1;
                 wi    <= wi + 1;
                 if (wi == 3'd7) dfull <= 1;

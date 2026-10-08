@@ -1,7 +1,8 @@
 # Double-buffered accelerator (docs/double_buffer_design.md).
 #   make sim TB=tb_sa_ex      run one testbench from sim/ in Vivado xsim
 #   make sim TB=tb_sa_dma GEN="NP=3 D=16"   ... with top-level generics
-#   make test                 run all unit testbenches (D = 8); make test16: D = 16
+#   make test                 run all unit testbenches (D = 8); make test16: D = 16;
+#                             make test128: the 128-bit DMA (K2a, DMA_W=128)
 #   make synth                out-of-context synth/place/route (CLOCK_NS, SYNTH_GEN)
 #   make clean
 
@@ -53,7 +54,14 @@ test16:                   # the same at D = 16 (M4)
 	@$(MAKE) -s sim TB=tb_sa_unit GEN=D=16
 	@$(MAKE) -s sim TB=tb_sa_ve GEN=D=16
 
+test128:                  # the 128-bit DMA (K2a): the DMA engines and the unit
+	@$(MAKE) -s sim TB=tb_sa_dma GEN="NP=1 D=16 DMA_W=128"
+	@$(MAKE) -s sim TB=tb_sa_dma GEN="NP=3 D=16 DMA_W=128"
+	@$(MAKE) -s sim TB=tb_sa_dma GEN="NP=1 D=8 DMA_W=128"
+	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=16 DMA_W=128"
+	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=8 DMA_W=128"
+
 clean:
 	rm -rf build
 
-.PHONY: sim test test16 clean
+.PHONY: sim test test16 test128 clean

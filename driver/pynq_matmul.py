@@ -395,6 +395,7 @@ class OverlayInfo:
     nports: int           # sa_unit NPORTS (DMA ports)
     bram_base: int        # ARM physical address of the program BRAM (psBramController)
     riscv_hz: float       # the accelerator / PicoRV32 clock (sa_unit aclk)
+    dma_w: int = 64       # sa_unit DMA_W (bits per DMA beat; K2a: 128)
 
 
 def overlay_info(bitfile):
@@ -412,6 +413,7 @@ def overlay_info(bitfile):
         mod = hwh[i:i + 20000]
         params = dict(re.findall(r'<PARAMETER NAME="(\w+)" VALUE="([^"]*)"', mod))
         info.d, info.nports = int(params.get("D", SA_D)), int(params.get("NPORTS", 1))
+        info.dma_w = int(params.get("DMA_W", 64))
         m = re.search(r'<PORT CLKFREQUENCY="(\d+)" DIR="I" NAME="aclk"', mod)
         if m:
             info.riscv_hz = float(m.group(1))

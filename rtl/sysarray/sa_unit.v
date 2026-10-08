@@ -18,7 +18,8 @@ module sa_unit #(
     parameter integer NPORTS     = 1,
     parameter integer SPAD_WORDS = 131072 / D,        // 128 KB per SPAD
     parameter integer ACC_WORDS  = 262144 / (4 * D),  // 256 KB
-    parameter integer PERF       = 1                  // performance counters (0: removed)
+    parameter integer PERF       = 1,                 // performance counters (0: removed)
+    parameter integer DMA_W      = 64                 // DMA masters' data width: 64 or 128 (K2a)
 ) (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 aclk CLK", X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m0_axi:m1_axi:m2_axi, ASSOCIATED_RESET aresetn" *)
     input  wire        aclk,
@@ -61,8 +62,8 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 s_axi RREADY" *)
     input  wire         s_axi_rready,
 
-    // AXI4 master 0 (64-bit) -> S_AXI_HP1 via protocol converter; unused when NPORTS <= 0
-    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, DATA_WIDTH 64, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
+    // AXI4 master 0 (DMA_W bits) -> S_AXI_HP1 via protocol converter; unused when NPORTS <= 0
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
     output wire [31:0]  m0_axi_araddr,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi ARLEN" *)
     output wire [7:0]   m0_axi_arlen,
@@ -79,7 +80,7 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi ARREADY" *)
     input  wire         m0_axi_arready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi RDATA" *)
-    input  wire [63:0]  m0_axi_rdata,
+    input  wire [DMA_W-1:0] m0_axi_rdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi RRESP" *)
     input  wire [1:0]   m0_axi_rresp,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi RLAST" *)
@@ -105,9 +106,9 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi AWREADY" *)
     input  wire         m0_axi_awready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi WDATA" *)
-    output wire [63:0]  m0_axi_wdata,
+    output wire [DMA_W-1:0] m0_axi_wdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi WSTRB" *)
-    output wire [7:0]   m0_axi_wstrb,
+    output wire [DMA_W/8-1:0] m0_axi_wstrb,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi WLAST" *)
     output wire         m0_axi_wlast,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi WVALID" *)
@@ -121,8 +122,8 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi BREADY" *)
     output wire         m0_axi_bready,
 
-    // AXI4 master 1 (64-bit) -> S_AXI_HP2 via protocol converter; unused when NPORTS <= 1
-    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, DATA_WIDTH 64, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
+    // AXI4 master 1 (DMA_W bits) -> S_AXI_HP2 via protocol converter; unused when NPORTS <= 1
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
     output wire [31:0]  m1_axi_araddr,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi ARLEN" *)
     output wire [7:0]   m1_axi_arlen,
@@ -139,7 +140,7 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi ARREADY" *)
     input  wire         m1_axi_arready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi RDATA" *)
-    input  wire [63:0]  m1_axi_rdata,
+    input  wire [DMA_W-1:0] m1_axi_rdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi RRESP" *)
     input  wire [1:0]   m1_axi_rresp,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi RLAST" *)
@@ -165,9 +166,9 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi AWREADY" *)
     input  wire         m1_axi_awready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi WDATA" *)
-    output wire [63:0]  m1_axi_wdata,
+    output wire [DMA_W-1:0] m1_axi_wdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi WSTRB" *)
-    output wire [7:0]   m1_axi_wstrb,
+    output wire [DMA_W/8-1:0] m1_axi_wstrb,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi WLAST" *)
     output wire         m1_axi_wlast,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi WVALID" *)
@@ -181,8 +182,8 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi BREADY" *)
     output wire         m1_axi_bready,
 
-    // AXI4 master 2 (64-bit) -> S_AXI_HP3 via protocol converter; unused when NPORTS <= 2
-    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, DATA_WIDTH 64, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
+    // AXI4 master 2 (DMA_W bits) -> S_AXI_HP3 via protocol converter; unused when NPORTS <= 2
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
     output wire [31:0]  m2_axi_araddr,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi ARLEN" *)
     output wire [7:0]   m2_axi_arlen,
@@ -199,7 +200,7 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi ARREADY" *)
     input  wire         m2_axi_arready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi RDATA" *)
-    input  wire [63:0]  m2_axi_rdata,
+    input  wire [DMA_W-1:0] m2_axi_rdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi RRESP" *)
     input  wire [1:0]   m2_axi_rresp,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi RLAST" *)
@@ -225,9 +226,9 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi AWREADY" *)
     input  wire         m2_axi_awready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi WDATA" *)
-    output wire [63:0]  m2_axi_wdata,
+    output wire [DMA_W-1:0] m2_axi_wdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi WSTRB" *)
-    output wire [7:0]   m2_axi_wstrb,
+    output wire [DMA_W/8-1:0] m2_axi_wstrb,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi WLAST" *)
     output wire         m2_axi_wlast,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi WVALID" *)
@@ -300,6 +301,7 @@ module sa_unit #(
     wire [1:0]  pcpi_ev;
     wire [3:0]  ex_ev, ve_ev;
     wire [2:0]  ld_ev, st_ev;
+    wire        ld_two, st_two;                // 128-bit DMA: two 8-byte lanes at once
     wire        perf_pctl_we, perf_cctl_we, perf_en;
     wire [1:0]  perf_pctl, perf_cctl;
     wire [4:0]  perf_prsel, perf_crsel;
@@ -346,7 +348,7 @@ module sa_unit #(
         .reg_val(fetch_reg_val), .notify(notify));
 
     // ------------------------------------------------ descriptor fetch unit
-    sa_cmdfetch #(.D(D)) fetch (
+    sa_cmdfetch #(.D(D), .DMA_W(DMA_W)) fetch (
         .clk(aclk), .resetn(resetn),
         .submit(fetch_submit), .submit_addr(fetch_addr), .submit_count(fetch_count),
         .busy(fetch_busy), .reg_we(fetch_reg_we), .reg_idx(fetch_reg_idx), .reg_val(fetch_reg_val),
@@ -366,7 +368,8 @@ module sa_unit #(
     wire [3:0]  lw_mem;
     wire [15:0] lw_word;
     wire [7:0]  lw_lane;
-    wire [63:0] lw_data;
+    wire        lw_two;
+    wire [DMA_W-1:0] lw_data;
 
     sa_legacy #(.D(D), .NPORTS(NPORTS), .VL(D), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS),
                 .PERF(PERF)) legacy (
@@ -379,7 +382,7 @@ module sa_unit #(
         .s_axi_rready(s_axi_rready),
         .q_valid(l_valid), .q_ready(in_ready), .q_pkt(l_pkt),
         .sched_idle(sched_idle), .ext_status(ext_status), .clear_error(clear_error),
-        .desc_we(lw_en && lw_mem == MEM_DESC), .desc_word(lw_word), .desc_data(lw_data),
+        .desc_we(lw_en && lw_mem == MEM_DESC), .desc_word(lw_word), .desc_data(lw_data[63:0]),
         .leg_trigger(leg_trigger), .leg_desc(leg_desc), .leg_dst(leg_dst), .leg_accept(leg_accept),
         .leg_busy(leg_busy), .leg_status(leg_status), .leg_cycles(leg_cycles),
         .leg_reset(leg_reset), .leg_reset_done(leg_reset_done), .irq(irq),
@@ -398,6 +401,8 @@ module sa_unit #(
              pcpi_ev,                            // 6 PCPI_FENCE, 5 PCPI_QFULL
              sched_ev[3:0],                      // 1..4 CMD_LD/ST/EX/VE
              1'b1}),                             // 0 CYCLES
+        // LD_BEATS (19) / ST_BEATS (22) count 8-byte lanes (two per 128-bit write / beat)
+        .ev2({{PERF_NCNT-23{1'b0}}, st_two, 2'b00, ld_two, {19{1'b0}}}),
         .ctl_we_a(perf_pctl_we), .ctl_a(perf_pctl), .ctl_we_b(perf_cctl_we), .ctl_b(perf_cctl),
         .en(perf_en),
         .rsel_a(perf_prsel), .rdata_a(perf_prdata), .rsel_b(perf_crsel), .rdata_b(perf_crdata));
@@ -407,18 +412,19 @@ module sa_unit #(
     wire [NPORTS*8-1:0]  arlen, awlen;
     wire [NPORTS-1:0]    arvalid, arready, rlast, rvalid, rready;
     wire [NPORTS-1:0]    awvalid, awready, wlast, wvalid, wready, bvalid, bready;
-    wire [NPORTS*64-1:0] rdata, wdata;
+    wire [NPORTS*DMA_W-1:0] rdata, wdata;
+    wire [NPORTS*DMA_W/8-1:0] wstrb;
     wire [NPORTS*2-1:0]  rresp, bresp;
 
-    sa_ld #(.D(D), .NPORTS(NPORTS)) ld (
+    sa_ld #(.D(D), .NPORTS(NPORTS), .DMA_W(DMA_W)) ld (
         .clk(aclk), .resetn(resetn), .cmd_valid(ld_v), .cmd_ready(ld_r),
         .cmd_ddr(ld_pkt[33:2]), .cmd_mem(ld_pkt[65:62]), .cmd_word(ld_pkt[49:34]),
         .cmd_rows(ld_pkt[81:66]), .cmd_row_bytes(ld_pkt[97:82]), .cmd_pitch(ld_pkt[129:98]),
         .cmd_mode(ld_pkt[131:130]), .done(ld_done), .err(ld_err), .busy(),
-        .lw_en(lw_en), .lw_mem(lw_mem), .lw_word(lw_word), .lw_lane(lw_lane), .lw_data(lw_data),
+        .lw_en(lw_en), .lw_mem(lw_mem), .lw_word(lw_word), .lw_lane(lw_lane), .lw_two(lw_two), .lw_data(lw_data),
         .m_araddr(araddr), .m_arlen(arlen), .m_arvalid(arvalid), .m_arready(arready),
         .m_rdata(rdata), .m_rresp(rresp), .m_rlast(rlast), .m_rvalid(rvalid), .m_rready(rready),
-        .perf_ev(ld_ev));
+        .perf_ev(ld_ev), .perf_two(ld_two));
 
     wire        lr_en;
     wire [3:0]  lr_mem;
@@ -426,7 +432,7 @@ module sa_unit #(
     wire [8*D-1:0]  lr_a, lr_b;
     wire [32*D-1:0] lr_c;
 
-    sa_st #(.D(D), .NPORTS(NPORTS)) st (
+    sa_st #(.D(D), .NPORTS(NPORTS), .DMA_W(DMA_W)) st (
         .clk(aclk), .resetn(resetn), .cmd_valid(st_v), .cmd_ready(st_r),
         .cmd_ddr(st_pkt[33:2]), .cmd_mem(st_pkt[65:62]), .cmd_word(st_pkt[49:34]),
         .cmd_rows(st_pkt[81:66]), .cmd_row_bytes(st_pkt[97:82]), .cmd_pitch(st_pkt[129:98]),
@@ -434,9 +440,9 @@ module sa_unit #(
         .lr_en(lr_en), .lr_mem(lr_mem), .lr_word(lr_word),
         .lr_spad_a(lr_a), .lr_spad_b(lr_b), .lr_acc(lr_c),
         .m_awaddr(awaddr), .m_awlen(awlen), .m_awvalid(awvalid), .m_awready(awready),
-        .m_wdata(wdata), .m_wlast(wlast), .m_wvalid(wvalid), .m_wready(wready),
+        .m_wdata(wdata), .m_wstrb(wstrb), .m_wlast(wlast), .m_wvalid(wvalid), .m_wready(wready),
         .m_bresp(bresp), .m_bvalid(bvalid), .m_bready(bready),
-        .perf_ev(st_ev));
+        .perf_ev(st_ev), .perf_two(st_two));
 
     wire               sa_en, sb_en, acc_en;
     wire [SAW-1:0]     sa_addr, sb_addr;
@@ -519,8 +525,17 @@ module sa_unit #(
     // ---------------------------------------------------------- memories
     // SPAD side A: [0] LD write, [1] ST read; side B: [0] EX read, [1] VE.
     // ACC  side A: [0] EX drain / accumulate, [1] VE;  side B: [0] LD write, [1] ST read.
-    wire [D-1:0]   spad_we = {D{1'b0}} | ({8'hFF} << (8 * lw_lane));
-    wire [4*D-1:0] acc_lwe = {4*D{1'b0}} | ({8'hFF} << (8 * lw_lane));
+    // LD writes one lane (its data in every 64-bit piece of lw_data) or two (lw_two)
+    wire [15:0]    lw_bytes = lw_two ? 16'hFFFF : 16'h00FF;
+    wire [D-1:0]   spad_we = {D{1'b0}} | (lw_bytes << (8 * lw_lane));
+    wire [4*D-1:0] acc_lwe = {4*D{1'b0}} | (lw_bytes << (8 * lw_lane));
+    wire [8*D-1:0]  spad_lwd;
+    wire [32*D-1:0] acc_lwd = {(32*D/DMA_W){lw_data}};
+    generate if (8*D >= DMA_W) begin : spadw
+        assign spad_lwd = {(8*D/DMA_W){lw_data}};
+    end else begin : spadn                                  // D = 8, 128-bit DMA: one lane per word
+        assign spad_lwd = lw_data[8*D-1:0];
+    end endgenerate
     wire ld_a = lw_en && lw_mem == MEM_SPAD_A, ld_b = lw_en && lw_mem == MEM_SPAD_B, ld_c = lw_en && lw_mem == MEM_ACC;
     wire st_a = lr_en && lr_mem == MEM_SPAD_A, st_b = lr_en && lr_mem == MEM_SPAD_B, st_c = lr_en && lr_mem == MEM_ACC;
     wire [8*D-1:0]  unused_a, unused_b;
@@ -529,14 +544,14 @@ module sa_unit #(
     sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(2)) spad_a (
         .clk(aclk),
         .a_en({st_a, ld_a}), .a_we({{D{1'b0}}, spad_we}),
-        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, {D/8{lw_data}}}),
+        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_lwd}),
         .a_dout({lr_a, unused_a}),
         .b_en({vsa_en, sa_en}), .b_we({vsa_we, {D{1'b0}}}), .b_addr({vsa_addr, sa_addr}),
         .b_din({vsa_din, {8*D{1'b0}}}), .b_dout({vsa_dout, sa_dout}));
     sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(2)) spad_b (
         .clk(aclk),
         .a_en({st_b, ld_b}), .a_we({{D{1'b0}}, spad_we}),
-        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, {D/8{lw_data}}}),
+        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_lwd}),
         .a_dout({lr_b, unused_b}),
         .b_en({vsb_en, sb_en}), .b_we({vsb_we, {D{1'b0}}}), .b_addr({vsb_addr, sb_addr}),
         .b_din({vsb_din, {8*D{1'b0}}}), .b_dout({vsb_dout, sb_dout}));
@@ -545,7 +560,7 @@ module sa_unit #(
         .a_en({vac_en, acc_en}), .a_we({vac_we, acc_we}), .a_addr({vac_addr, acc_addr}),
         .a_din({vac_din, acc_din}), .a_dout({vac_dout, acc_dout}),
         .b_en({st_c, ld_c}), .b_we({{4*D{1'b0}}, acc_lwe}),
-        .b_addr({lr_word[CAW-1:0], lw_word[CAW-1:0]}), .b_din({{32*D{1'b0}}, {D/2{lw_data}}}),
+        .b_addr({lr_word[CAW-1:0], lw_word[CAW-1:0]}), .b_din({{32*D{1'b0}}, acc_lwd}),
         .b_dout({lr_c, unused_c}));
 
     // ------------------------------------------------------ AXI masters
@@ -577,10 +592,10 @@ module sa_unit #(
 
     generate if (NPORTS > 0) begin : port0
         assign m0_axi_araddr  = ar_f ? f_araddr : araddr[32*0 +: 32];
-        assign m0_axi_arlen   = ar_f ? 8'd7     : arlen[8*0 +: 8];
+        assign m0_axi_arlen   = ar_f ? 512 / DMA_W - 1 : arlen[8*0 +: 8];   // a descriptor: 64 bytes
         assign m0_axi_arvalid = ar_f ? f_arvalid : arvalid[0];
         assign arready[0]     = !ar_f && m0_axi_arready;
-        assign rdata[64*0 +: 64] = m0_axi_rdata;
+        assign rdata[DMA_W*0 +: DMA_W] = m0_axi_rdata;
         assign rresp[2*0 +: 2]   = m0_axi_rresp;
         assign rlast[0]       = m0_axi_rlast;
         assign rvalid[0]      = m0_axi_rvalid && !own_f;
@@ -589,7 +604,8 @@ module sa_unit #(
         assign m0_axi_awlen   = awlen[8*0 +: 8];
         assign m0_axi_awvalid = awvalid[0];
         assign awready[0]     = m0_axi_awready;
-        assign m0_axi_wdata   = wdata[64*0 +: 64];
+        assign m0_axi_wdata   = wdata[DMA_W*0 +: DMA_W];
+        assign m0_axi_wstrb   = wstrb[DMA_W/8*0 +: DMA_W/8];
         assign m0_axi_wlast   = wlast[0];
         assign m0_axi_wvalid  = wvalid[0];
         assign wready[0]      = m0_axi_wready;
@@ -599,21 +615,21 @@ module sa_unit #(
     end else begin : tie0
         assign m0_axi_araddr = 0; assign m0_axi_arlen = 0; assign m0_axi_arvalid = 0;
         assign m0_axi_rready = 0; assign m0_axi_awaddr = 0; assign m0_axi_awlen = 0;
-        assign m0_axi_awvalid = 0; assign m0_axi_wdata = 0; assign m0_axi_wlast = 0;
+        assign m0_axi_awvalid = 0; assign m0_axi_wdata = 0; assign m0_axi_wlast = 0; assign m0_axi_wstrb = 0;
         assign m0_axi_wvalid = 0; assign m0_axi_bready = 0;
     end endgenerate
-    assign m0_axi_arsize  = 3'd3;    assign m0_axi_awsize  = 3'd3;      // 8-byte beats
+    assign m0_axi_arsize  = DMA_W == 128 ? 3'd4 : 3'd3;                  // DMA_W-bit beats
+    assign m0_axi_awsize  = DMA_W == 128 ? 3'd4 : 3'd3;
     assign m0_axi_arburst = 2'b01;   assign m0_axi_awburst = 2'b01;     // INCR
     assign m0_axi_arcache = 4'b0011; assign m0_axi_awcache = 4'b0011;
     assign m0_axi_arprot  = 3'b000;  assign m0_axi_awprot  = 3'b000;
-    assign m0_axi_wstrb   = 8'hFF;
 
     generate if (NPORTS > 1) begin : port1
         assign m1_axi_araddr  = araddr[32*1 +: 32];
         assign m1_axi_arlen   = arlen[8*1 +: 8];
         assign m1_axi_arvalid = arvalid[1];
         assign arready[1]     = m1_axi_arready;
-        assign rdata[64*1 +: 64] = m1_axi_rdata;
+        assign rdata[DMA_W*1 +: DMA_W] = m1_axi_rdata;
         assign rresp[2*1 +: 2]   = m1_axi_rresp;
         assign rlast[1]       = m1_axi_rlast;
         assign rvalid[1]      = m1_axi_rvalid;
@@ -622,7 +638,8 @@ module sa_unit #(
         assign m1_axi_awlen   = awlen[8*1 +: 8];
         assign m1_axi_awvalid = awvalid[1];
         assign awready[1]     = m1_axi_awready;
-        assign m1_axi_wdata   = wdata[64*1 +: 64];
+        assign m1_axi_wdata   = wdata[DMA_W*1 +: DMA_W];
+        assign m1_axi_wstrb   = wstrb[DMA_W/8*1 +: DMA_W/8];
         assign m1_axi_wlast   = wlast[1];
         assign m1_axi_wvalid  = wvalid[1];
         assign wready[1]      = m1_axi_wready;
@@ -632,21 +649,21 @@ module sa_unit #(
     end else begin : tie1
         assign m1_axi_araddr = 0; assign m1_axi_arlen = 0; assign m1_axi_arvalid = 0;
         assign m1_axi_rready = 0; assign m1_axi_awaddr = 0; assign m1_axi_awlen = 0;
-        assign m1_axi_awvalid = 0; assign m1_axi_wdata = 0; assign m1_axi_wlast = 0;
+        assign m1_axi_awvalid = 0; assign m1_axi_wdata = 0; assign m1_axi_wlast = 0; assign m1_axi_wstrb = 0;
         assign m1_axi_wvalid = 0; assign m1_axi_bready = 0;
     end endgenerate
-    assign m1_axi_arsize  = 3'd3;    assign m1_axi_awsize  = 3'd3;      // 8-byte beats
+    assign m1_axi_arsize  = DMA_W == 128 ? 3'd4 : 3'd3;                  // DMA_W-bit beats
+    assign m1_axi_awsize  = DMA_W == 128 ? 3'd4 : 3'd3;
     assign m1_axi_arburst = 2'b01;   assign m1_axi_awburst = 2'b01;     // INCR
     assign m1_axi_arcache = 4'b0011; assign m1_axi_awcache = 4'b0011;
     assign m1_axi_arprot  = 3'b000;  assign m1_axi_awprot  = 3'b000;
-    assign m1_axi_wstrb   = 8'hFF;
 
     generate if (NPORTS > 2) begin : port2
         assign m2_axi_araddr  = araddr[32*2 +: 32];
         assign m2_axi_arlen   = arlen[8*2 +: 8];
         assign m2_axi_arvalid = arvalid[2];
         assign arready[2]     = m2_axi_arready;
-        assign rdata[64*2 +: 64] = m2_axi_rdata;
+        assign rdata[DMA_W*2 +: DMA_W] = m2_axi_rdata;
         assign rresp[2*2 +: 2]   = m2_axi_rresp;
         assign rlast[2]       = m2_axi_rlast;
         assign rvalid[2]      = m2_axi_rvalid;
@@ -655,7 +672,8 @@ module sa_unit #(
         assign m2_axi_awlen   = awlen[8*2 +: 8];
         assign m2_axi_awvalid = awvalid[2];
         assign awready[2]     = m2_axi_awready;
-        assign m2_axi_wdata   = wdata[64*2 +: 64];
+        assign m2_axi_wdata   = wdata[DMA_W*2 +: DMA_W];
+        assign m2_axi_wstrb   = wstrb[DMA_W/8*2 +: DMA_W/8];
         assign m2_axi_wlast   = wlast[2];
         assign m2_axi_wvalid  = wvalid[2];
         assign wready[2]      = m2_axi_wready;
@@ -665,12 +683,12 @@ module sa_unit #(
     end else begin : tie2
         assign m2_axi_araddr = 0; assign m2_axi_arlen = 0; assign m2_axi_arvalid = 0;
         assign m2_axi_rready = 0; assign m2_axi_awaddr = 0; assign m2_axi_awlen = 0;
-        assign m2_axi_awvalid = 0; assign m2_axi_wdata = 0; assign m2_axi_wlast = 0;
+        assign m2_axi_awvalid = 0; assign m2_axi_wdata = 0; assign m2_axi_wlast = 0; assign m2_axi_wstrb = 0;
         assign m2_axi_wvalid = 0; assign m2_axi_bready = 0;
     end endgenerate
-    assign m2_axi_arsize  = 3'd3;    assign m2_axi_awsize  = 3'd3;      // 8-byte beats
+    assign m2_axi_arsize  = DMA_W == 128 ? 3'd4 : 3'd3;                  // DMA_W-bit beats
+    assign m2_axi_awsize  = DMA_W == 128 ? 3'd4 : 3'd3;
     assign m2_axi_arburst = 2'b01;   assign m2_axi_awburst = 2'b01;     // INCR
     assign m2_axi_arcache = 4'b0011; assign m2_axi_awcache = 4'b0011;
     assign m2_axi_arprot  = 3'b000;  assign m2_axi_awprot  = 3'b000;
-    assign m2_axi_wstrb   = 8'hFF;
 endmodule

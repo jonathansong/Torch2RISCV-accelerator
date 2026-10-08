@@ -2,10 +2,11 @@
 # One-shot, non-interactive build of the PicoRV32 + accelerator overlay for
 # the Kria KV260 (docs/kv260_upgrade_plan.md K1a / K1b / K1c).
 #
-#   ./boards/kv260/scripts/build_bitstream.sh [-jobs N] [-sa_d 8|16] [-sa_mhz MHZ] [-proj_dir DIR] [-bd_only] [-synth_only]
+#   ./boards/kv260/scripts/build_bitstream.sh [-jobs N] [-sa_d 8|16] [-sa_mhz MHZ] [-dma_w 64|128] [-proj_dir DIR] [-bd_only] [-synth_only]
 #
 #   -sa_d    array size D (sa_unit parameter); default 8: K1a, the Z1 L2 accelerator
 #   -sa_mhz  pl_clk0, the one PL clock; default 50 (K1a; K1b: 100)
+#   -dma_w   the accelerator's DMA data width (S_AXI_HP1_FPD); default 64, K2a: 128 (config suffix _w128)
 #   -bd_only build and validate the block design and write the address map,
 #            no synthesis (a quick check of kv260_bd.tcl)
 #   -synth_only  stop after synthesis (utilization of the synthesized design)
@@ -42,6 +43,7 @@ set out_name      picorv32
 set jobs     4
 set sa_d     8
 set sa_mhz   50
+set dma_w    64
 set bd_only  0
 set synth_only 0
 set proj_dir ""
@@ -55,22 +57,24 @@ for {set i 0} {$i < [llength $argv]} {incr i} {
         -jobs     { set jobs [lindex $argv [incr i]] }
         -sa_d     { set sa_d [lindex $argv [incr i]] }
         -sa_mhz   { set sa_mhz [lindex $argv [incr i]] }
+        -dma_w    { set dma_w [lindex $argv [incr i]] }
         -proj_dir { set proj_dir [file normalize [lindex $argv [incr i]]] }
         -bd_only  { set bd_only 1 }
         -synth_only { set synth_only 1 }
-        default   { die "Unknown argument '$arg'. Valid: -jobs N, -sa_d 8|16, -sa_mhz MHZ, -proj_dir DIR, -bd_only, -synth_only" }
+        default   { die "Unknown argument '$arg'. Valid: -jobs N, -sa_d 8|16, -sa_mhz MHZ, -dma_w 64|128, -proj_dir DIR, -bd_only, -synth_only" }
     }
 }
 if {![string is integer -strict $jobs] || $jobs < 1} { die "-jobs expects a positive integer, got '$jobs'" }
 if {$sa_d != 8 && $sa_d != 16} { die "-sa_d expects 8 or 16, got '$sa_d'" }
+if {$dma_w != 64 && $dma_w != 128} { die "-dma_w expects 64 or 128, got '$dma_w'" }
 if {![string is integer -strict $sa_mhz] || $sa_mhz < 10 || $sa_mhz > 300} { die "-sa_mhz expects 10..300, got '$sa_mhz'" }
 set_param general.maxThreads [expr {$jobs > 8 ? 8 : $jobs}]
 if {[string first $vivado_ver [version -short]] == -1} {
     die "the scripts are written for Vivado $vivado_ver, this is Vivado [version -short]"
 }
-info_msg "KV260: D = $sa_d, pl_clk0 = $sa_mhz MHz"
+info_msg "KV260: D = $sa_d, pl_clk0 = $sa_mhz MHz, DMA $dma_w bits"
 
-set cfg     d${sa_d}_${sa_mhz}mhz
+set cfg     d${sa_d}_${sa_mhz}mhz[expr {$dma_w == 128 ? "_w128" : ""}]
 set out_dir [file join $kv_root build output $cfg]
 if {$proj_dir eq ""} { set proj_dir [file join $kv_root build ${proj_name}_$cfg] }
 info_msg "configuration $cfg -> $out_dir"
@@ -167,7 +171,7 @@ set dirty ""
 catch {exec git -C $repo_root diff --quiet HEAD -- rtl boards/kv260} err opts
 if {[dict get $opts -code] != 0} { set dirty " (dirty)" }
 set fh [open [file join $out_dir build_info.txt] w]
-puts $fh "config $cfg (D = $sa_d, pl_clk0 = $sa_mhz MHz, part $part)"
+puts $fh "config $cfg (D = $sa_d, pl_clk0 = $sa_mhz MHz, DMA $dma_w bits, part $part)"
 puts $fh "commit $commit$dirty"
 puts $fh "built [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S}] (Vivado [version -short], -jobs $jobs)"
 puts $fh "setup WNS $wns ns, hold WHS $whs ns"

@@ -4,12 +4,12 @@
 # on the K26 SOM's Zynq UltraScale+ PS, with the accelerator unchanged.
 #
 # Sourced by build_bitstream.tcl (project already created, IP repository
-# registered; variables ::sa_d, ::sa_mhz).
+# registered; variables ::sa_d, ::sa_mhz, ::dma_w).
 #
 #   zynq_ultra_ps_e_0   board preset (DDR4, MIO), then:
 #     M_AXI_HPM0_FPD    32-bit, ARM -> psAxiInterconnect -> program BRAM, interrupt controller
 #     S_AXI_HP0_FPD     64-bit, PicoRV32's DDR port (the rings in DDR)   [Z1: HP0]
-#     S_AXI_HP1_FPD     64-bit, the accelerator's DMA (m0_axi)            [Z1: HP2 + AXI4->AXI3]
+#     S_AXI_HP1_FPD     ::dma_w bits (64; K2a 128), the accelerator's DMA (m0_axi)  [Z1: HP2 + AXI4->AXI3]
 #     pl_clk0           ::sa_mhz MHz, the only PL clock (PicoRV32, accelerator, AXI)
 #     pl_ps_irq0[0]     the interrupt controller (PicoRV32 trap, matmul_0/notify_irq)
 #     emio_gpio_o[0]    RISC-V reset (1 = hold), as EMIO[0] on the Z1 (2 EMIO pins: xlslice needs >= 2)
@@ -51,7 +51,7 @@ set_property -dict [list \
     CONFIG.PSU__USE__S_AXI_GP2 {1} \
     CONFIG.PSU__SAXIGP2__DATA_WIDTH {64} \
     CONFIG.PSU__USE__S_AXI_GP3 {1} \
-    CONFIG.PSU__SAXIGP3__DATA_WIDTH {64} \
+    CONFIG.PSU__SAXIGP3__DATA_WIDTH $::dma_w \
     CONFIG.PSU__FPGA_PL0_ENABLE {1} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__SRCSEL {IOPLL} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $::sa_mhz \
@@ -93,6 +93,7 @@ set matmul_0 [create_bd_cell -type module -reference sa_unit matmul_0]
 # columns on DSPs to fit its 220.
 set_property -dict [list CONFIG.D $::sa_d \
                          CONFIG.DSP_COLS $::sa_d \
+                         CONFIG.DMA_W $::dma_w \
                          CONFIG.SPAD_WORDS [expr {131072 / $::sa_d}] \
                          CONFIG.ACC_WORDS [expr {262144 / (4 * $::sa_d)}]] $matmul_0
 

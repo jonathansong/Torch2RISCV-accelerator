@@ -9,6 +9,8 @@
 module tb_sa_dma;
     parameter integer NP = 1;
     parameter integer D  = 8;                    // GEN="NP=3 D=16"
+    parameter integer DMA_W = 64;                // GEN="D=16 DMA_W=128"
+    localparam integer BB = DMA_W / 8;           // bytes per beat
 
     `include "sa_defs.vh"
     localparam integer SPAD_WORDS = 131072 / D;
@@ -44,7 +46,8 @@ module tb_sa_dma;
     wire [3:0]  lw_mem;
     wire [15:0] lw_word;
     wire [7:0]  lw_lane;
-    wire [63:0] lw_data;
+    wire        lw_two;
+    wire [DMA_W-1:0] lw_data;
     wire        lr_en;
     wire [3:0]  lr_mem;
     wire [15:0] lr_word;
@@ -55,19 +58,20 @@ module tb_sa_dma;
     wire [NP*8-1:0]  arlen, awlen;
     wire [NP-1:0]    arvalid, rready, awvalid, wvalid, wlast, bready;
     reg  [NP-1:0]    arready = 0, rvalid = 0, rlast = 0, awready = 0, wready = 0, bvalid = 0;
-    reg  [NP*64-1:0] rdata = 0;
+    reg  [NP*DMA_W-1:0] rdata = 0;
     reg  [NP*2-1:0]  rresp = 0, bresp = 0;
-    wire [NP*64-1:0] wdata;
+    wire [NP*DMA_W-1:0] wdata;
+    wire [NP*BB-1:0]    wstrb;
 
-    sa_ld #(.D(D), .NPORTS(NP)) ld (
+    sa_ld #(.D(D), .NPORTS(NP), .DMA_W(DMA_W)) ld (
         .clk(clk), .resetn(resetn), .cmd_valid(ld_valid), .cmd_ready(ld_ready),
         .cmd_ddr(c_ddr), .cmd_mem(c_mem), .cmd_word(c_word), .cmd_rows(c_rows),
         .cmd_row_bytes(c_rb), .cmd_pitch(c_pitch), .cmd_mode(c_mode),
         .done(ld_done), .err(ld_err), .busy(ld_busy),
-        .lw_en(lw_en), .lw_mem(lw_mem), .lw_word(lw_word), .lw_lane(lw_lane), .lw_data(lw_data),
+        .lw_en(lw_en), .lw_mem(lw_mem), .lw_word(lw_word), .lw_lane(lw_lane), .lw_two(lw_two), .lw_data(lw_data),
         .m_araddr(araddr), .m_arlen(arlen), .m_arvalid(arvalid), .m_arready(arready),
         .m_rdata(rdata), .m_rresp(rresp), .m_rlast(rlast), .m_rvalid(rvalid), .m_rready(rready));
-    sa_st #(.D(D), .NPORTS(NP)) st (
+    sa_st #(.D(D), .NPORTS(NP), .DMA_W(DMA_W)) st (
         .clk(clk), .resetn(resetn), .cmd_valid(st_valid), .cmd_ready(st_ready),
         .cmd_ddr(c_ddr), .cmd_mem(c_mem), .cmd_word(c_word), .cmd_rows(c_rows),
         .cmd_row_bytes(c_rb), .cmd_pitch(c_pitch),
@@ -75,7 +79,7 @@ module tb_sa_dma;
         .lr_en(lr_en), .lr_mem(lr_mem), .lr_word(lr_word),
         .lr_spad_a(lr_a), .lr_spad_b(lr_b), .lr_acc(lr_c),
         .m_awaddr(awaddr), .m_awlen(awlen), .m_awvalid(awvalid), .m_awready(awready),
-        .m_wdata(wdata), .m_wlast(wlast), .m_wvalid(wvalid), .m_wready(wready),
+        .m_wdata(wdata), .m_wstrb(wstrb), .m_wlast(wlast), .m_wvalid(wvalid), .m_wready(wready),
         .m_bresp(bresp), .m_bvalid(bvalid), .m_bready(bready));
 
     // ------------------------------------------------ local memories
@@ -92,24 +96,32 @@ module tb_sa_dma;
     wire [8*D-1:0]  ta_unused_a, ta_unused_b;
     wire [32*D-1:0] tc_unused;
 
-    function [8*D-1:0] spad_din(input [63:0] d); spad_din = {D/8{d}}; endfunction
-    function [D-1:0]   spad_we(input [7:0] lane); spad_we = {8'hFF} << (8 * lane); endfunction
-    function [4*D-1:0] acc_we(input [7:0] lane);  acc_we  = {{4*D-8{1'b0}}, 8'hFF} << (8 * lane); endfunction
+    // as sa_unit: one lane (its data in every 64-bit piece) or two (lw_two)
+    wire [15:0] lw_bytes = lw_two ? 16'hFFFF : 16'h00FF;
+    wire [8*D-1:0]  spad_din;
+    wire [32*D-1:0] acc_din = {(32*D/DMA_W){lw_data}};
+    generate if (8*D >= DMA_W) begin : spadw
+        assign spad_din = {(8*D/DMA_W){lw_data}};
+    end else begin : spadn
+        assign spad_din = lw_data[8*D-1:0];
+    end endgenerate
+    wire [D-1:0]   spad_we = {D{1'b0}} | (lw_bytes << (8 * lw_lane));
+    wire [4*D-1:0] acc_we  = {4*D{1'b0}} | (lw_bytes << (8 * lw_lane));
 
     wire ld_a = lw_en && lw_mem == MEM_SPAD_A, ld_b = lw_en && lw_mem == MEM_SPAD_B, ld_c = lw_en && lw_mem == MEM_ACC;
     wire st_a = lr_en && lr_mem == MEM_SPAD_A, st_b = lr_en && lr_mem == MEM_SPAD_B, st_c = lr_en && lr_mem == MEM_ACC;
 
     sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(1)) spad_a (
         .clk(clk),
-        .a_en({st_a, ld_a}), .a_we({{D{1'b0}}, spad_we(lw_lane)}),
-        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_din(lw_data)}),
+        .a_en({st_a, ld_a}), .a_we({{D{1'b0}}, spad_we}),
+        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_din}),
         .a_dout({lr_a, ta_unused_a}),
         .b_en(t_en && t_mem == MEM_SPAD_A), .b_we({D{t_we}}), .b_addr(t_word[SAW-1:0]),
         .b_din(t_din[8*D-1:0]), .b_dout(ta_dout));
     sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(1)) spad_b (
         .clk(clk),
-        .a_en({st_b, ld_b}), .a_we({{D{1'b0}}, spad_we(lw_lane)}),
-        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_din(lw_data)}),
+        .a_en({st_b, ld_b}), .a_we({{D{1'b0}}, spad_we}),
+        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_din}),
         .a_dout({lr_b, ta_unused_b}),
         .b_en(t_en && t_mem == MEM_SPAD_B), .b_we({D{t_we}}), .b_addr(t_word[SAW-1:0]),
         .b_din(t_din[8*D-1:0]), .b_dout(tb_dout));
@@ -117,8 +129,8 @@ module tb_sa_dma;
         .clk(clk),
         .a_en(t_en && t_mem == MEM_ACC), .a_we({4*D{t_we}}), .a_addr(t_word[CAW-1:0]),
         .a_din(t_din), .a_dout(tc_dout),
-        .b_en({st_c, ld_c}), .b_we({{4*D{1'b0}}, acc_we(lw_lane)}),
-        .b_addr({lr_word[CAW-1:0], lw_word[CAW-1:0]}), .b_din({{32*D{1'b0}}, {D/2{lw_data}}}),
+        .b_en({st_c, ld_c}), .b_we({{4*D{1'b0}}, acc_we}),
+        .b_addr({lr_word[CAW-1:0], lw_word[CAW-1:0]}), .b_din({{32*D{1'b0}}, acc_din}),
         .b_dout({lr_c, tc_unused}));
 
     // shadows of the local memories (expected contents)
@@ -175,9 +187,9 @@ module tb_sa_dma;
     task chk_burst(input [31:0] a, input [7:0] len);
         begin
             if (len > 15) fail("burst longer than 16 beats");
-            if (a[2:0] != 0) fail("unaligned burst");
-            if ((a & 32'hFFF) + (len + 1) * 8 > 32'h1000) fail("burst crosses 4 KB");
-            if (a < DDR_BASE || a + (len + 1) * 8 > DDR_BASE + DDR_BYTES) fail("burst outside DDR model");
+            if (a % BB != 0) fail("unaligned burst");
+            if ((a & 32'hFFF) + (len + 1) * BB > 32'h1000) fail("burst crosses 4 KB");
+            if (a < DDR_BASE || a + (len + 1) * BB > DDR_BASE + DDR_BYTES) fail("burst outside DDR model");
         end
     endtask
 
@@ -203,8 +215,8 @@ module tb_sa_dma;
                     for (rb = 0; rb <= rq_l[rq_r % 16]; rb = rb + 1) begin
                         repeat (rnd(3)) @(posedge clk);
                         #1;
-                        for (k = 0; k < 8; k = k + 1)
-                            rdata[64*gp + 8*k +: 8] = ddr[rq_a[rq_r % 16] - DDR_BASE + 8*rb + k];
+                        for (k = 0; k < BB; k = k + 1)
+                            rdata[DMA_W*gp + 8*k +: 8] = ddr[rq_a[rq_r % 16] - DDR_BASE + BB*rb + k];
                         rresp[2*gp +: 2] = inj_rresp && rb == 1 ? 2'b10 : 2'b00;
                         rlast[gp] = rb == rq_l[rq_r % 16];
                         rvalid[gp] = 1;
@@ -238,8 +250,9 @@ module tb_sa_dma;
                         @(posedge clk);
                         while (!wvalid[gp]) @(posedge clk);
                         if (wlast[gp] != (wb == wq_l[wq_r % 16])) fail("WLAST on wrong beat");
-                        for (j = 0; j < 8; j = j + 1)
-                            ddr[wq_a[wq_r % 16] - DDR_BASE + 8*wb + j] = wdata[64*gp + 8*j +: 8];
+                        for (j = 0; j < BB; j = j + 1)
+                            if (wstrb[BB*gp + j])
+                                ddr[wq_a[wq_r % 16] - DDR_BASE + BB*wb + j] = wdata[DMA_W*gp + 8*j +: 8];
                         #1 wready[gp] = 0;
                     end
                     repeat (rnd(4)) @(posedge clk);
@@ -378,6 +391,23 @@ module tb_sa_dma;
         do_st(DDR_BASE + 32'hB008, MEM_SPAD_B, SB - 2, 1, 2056, 2056);   // long row across the bank boundary
         do_st(DDR_BASE + 32'hC000, MEM_ACC, CB - 96, 3, 40, 48);             // partial words
 
+        // ---- random shapes: 8-byte aligned addresses, odd multiples of 8 bytes
+        // (half beats at DMA_W = 128), INTERLEAVE chunks across beats
+        for (q = 0; q < 40; q = q + 1) begin : rnd_cmds
+            integer m, rws, rbb, pt, md, wd, sp, base;
+            m   = rnd(2);                                     // 0 SPAD_A, 1 SPAD_B, 2 ACC
+            md  = m < 2 ? rnd(1) : 0;
+            rws = 1 + rnd(9);
+            rbb = 8 * (1 + rnd(40));
+            pt  = rbb + 8 * rnd(3);
+            base = DDR_BASE + 32'h0F00 + 8 * rnd(1500);       // around 4 KB boundaries too
+            if (base + rws * pt > DDR_BASE + DDR_BYTES) base = DDR_BASE + 8 * rnd(64);
+            sp  = ((rbb + wbytes(m == 2 ? MEM_ACC : MEM_SPAD_A) - 1) / wbytes(m == 2 ? MEM_ACC : MEM_SPAD_A)) * rws;
+            wd  = 4 + rnd((m == 2 ? ACC_WORDS : SPAD_WORDS) - sp - 8);
+            if (rnd(1)) do_ld(base, m == 0 ? MEM_SPAD_A : m == 1 ? MEM_SPAD_B : MEM_ACC, wd, rws, rbb, pt, md);
+            else        do_st(base, m == 0 ? MEM_SPAD_A : m == 1 ? MEM_SPAD_B : MEM_ACC, wd, rws, rbb, pt);
+        end
+
         // ---- errors, then recovery
         inj_rresp = 1;
         run_ld(DDR_BASE + 32'hD000, MEM_SPAD_A, 700, 2, 64, 64, 0);
@@ -393,8 +423,8 @@ module tb_sa_dma;
         do_st(DDR_BASE + 32'hE800, MEM_SPAD_A, 900, 4, 32, 32);
 
         repeat (20) @(posedge clk);
-        $display("TB %s: NP=%0d D=%0d, %0d errors (%0d read / %0d write bursts)",
-                 errors ? "FAIL" : "PASS", NP, D, errors, ar_bursts, aw_bursts);
+        $display("TB %s: NP=%0d D=%0d DMA_W=%0d, %0d errors (%0d read / %0d write bursts)",
+                 errors ? "FAIL" : "PASS", NP, D, DMA_W, errors, ar_bursts, aw_bursts);
         $finish;
     end
 

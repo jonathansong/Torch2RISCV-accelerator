@@ -14,6 +14,8 @@ module tb_sa_unit;
     `include "n_cases.vh"
     parameter  integer D  = 8;                    // make sim TB=tb_sa_unit GEN=D=16
     parameter  integer PERF = 1;                  // GEN="PERF=0": build without counters
+    parameter  integer DMA_W = 64;                // GEN="D=16 DMA_W=128" (K2a)
+    localparam integer BB = DMA_W / 8;            // bytes per beat
     localparam integer AW = 32 * D;               // widest local word (ACC)
 
     localparam [31:0] MEM_BASE  = 32'h1000_0000;
@@ -36,14 +38,15 @@ module tb_sa_unit;
     wire [31:0] s_rdata;
 
     wire [31:0] m_araddr, m_awaddr;
-    wire [7:0]  m_arlen, m_awlen, m_wstrb;
+    wire [7:0]  m_arlen, m_awlen;
+    wire [BB-1:0] m_wstrb;
     wire [2:0]  m_arsize, m_awsize, m_arprot, m_awprot;
     wire [1:0]  m_arburst, m_awburst;
     wire [3:0]  m_arcache, m_awcache;
     wire        m_arvalid, m_rready, m_awvalid, m_wvalid, m_wlast, m_bready;
-    wire [63:0] m_wdata;
+    wire [DMA_W-1:0] m_wdata;
     reg         m_arready = 0, m_rvalid = 0, m_rlast = 0, m_awready = 0, m_wready = 0, m_bvalid = 0;
-    reg  [63:0] m_rdata = 0;
+    reg  [DMA_W-1:0] m_rdata = 0;
     reg  [1:0]  m_rresp = 0, m_bresp = 0;
     wire        irq, nirq;
     integer     nirq_edges = 0, nirq_high = 0;
@@ -59,7 +62,7 @@ module tb_sa_unit;
     wire        pcpi_wr, pcpi_wait, pcpi_ready;
     wire [31:0] pcpi_rd;
 
-    sa_unit #(.D(D), .NPORTS(1), .PERF(PERF)) dut (
+    sa_unit #(.D(D), .NPORTS(1), .PERF(PERF), .DMA_W(DMA_W)) dut (
         .aclk(aclk), .aresetn(aresetn),
         .s_axi_awaddr(s_awaddr), .s_axi_awvalid(s_awvalid), .s_axi_awready(s_awready),
         .s_axi_wdata(s_wdata), .s_axi_wstrb(4'hF), .s_axi_wvalid(s_wvalid), .s_axi_wready(s_wready),
@@ -79,10 +82,10 @@ module tb_sa_unit;
         .m0_axi_bresp(m_bresp), .m0_axi_bvalid(m_bvalid), .m0_axi_bready(m_bready),
 
         // ports 1 and 2 unused in M1
-        .m1_axi_arready(1'b0), .m1_axi_rdata(64'd0), .m1_axi_rresp(2'd0), .m1_axi_rlast(1'b0),
+        .m1_axi_arready(1'b0), .m1_axi_rdata({DMA_W{1'b0}}), .m1_axi_rresp(2'd0), .m1_axi_rlast(1'b0),
         .m1_axi_rvalid(1'b0), .m1_axi_awready(1'b0), .m1_axi_wready(1'b0), .m1_axi_bresp(2'd0),
         .m1_axi_bvalid(1'b0),
-        .m2_axi_arready(1'b0), .m2_axi_rdata(64'd0), .m2_axi_rresp(2'd0), .m2_axi_rlast(1'b0),
+        .m2_axi_arready(1'b0), .m2_axi_rdata({DMA_W{1'b0}}), .m2_axi_rresp(2'd0), .m2_axi_rlast(1'b0),
         .m2_axi_rvalid(1'b0), .m2_axi_awready(1'b0), .m2_axi_wready(1'b0), .m2_axi_bresp(2'd0),
         .m2_axi_bvalid(1'b0),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
@@ -119,12 +122,12 @@ module tb_sa_unit;
     task check_burst(input [31:0] addr, input [7:0] len, input [2:0] size, input [1:0] burst,
                      input is_write);
         begin
-            if (size != 3'd3)  fail("burst size is not 8 bytes");
+            if (size != $clog2(BB)) fail("burst size is not the bus width");
             if (burst != 2'b01) fail("burst type is not INCR");
             if (len > 8'd15)   fail("burst longer than 16 beats (not AXI3-safe)");
-            if (addr[2:0] != 0) fail("unaligned burst address");
-            if ((addr & 32'hFFF) + (len + 1) * 8 > 32'h1000) fail("burst crosses 4 KB boundary");
-            if (!in_mem(addr, (len + 1) * 8)) fail("burst outside memory model");
+            if (addr % BB != 0) fail("unaligned burst address");
+            if ((addr & 32'hFFF) + (len + 1) * BB > 32'h1000) fail("burst crosses 4 KB boundary");
+            if (!in_mem(addr, (len + 1) * BB)) fail("burst outside memory model");
         end
     endtask
 
@@ -145,8 +148,8 @@ module tb_sa_unit;
                 for (rb = 0; rb <= r_len; rb = rb + 1) begin
                     repeat (rnd(3)) @(posedge aclk);
                     #1;
-                    for (k = 0; k < 8; k = k + 1)
-                        m_rdata[8*k +: 8] = in_mem(r_addr + 8*rb + k, 1) ? mem[r_addr + 8*rb + k - MEM_BASE] : 8'hXX;
+                    for (k = 0; k < BB; k = k + 1)
+                        m_rdata[8*k +: 8] = in_mem(r_addr + BB*rb + k, 1) ? mem[r_addr + BB*rb + k - MEM_BASE] : 8'hXX;
                     // beat 3, or the last beat of a shorter burst (D = 16: 1-beat rows)
                     m_rresp  = (inject_rresp && rb == (r_len < 3 ? r_len : 3)) ? 2'b10 : 2'b00;
                     m_rlast  = rb == r_len;
@@ -182,10 +185,11 @@ module tb_sa_unit;
                     #1 m_wready = 1;
                     @(posedge aclk);
                     while (!m_wvalid) @(posedge aclk);
-                    if (m_wstrb != 8'hFF)            fail("partial WSTRB");
+                    // 64-bit bus: every beat full; 128-bit: a first / last beat may be half
+                    if (DMA_W == 64 ? m_wstrb != 8'hFF : m_wstrb == 0) fail("bad WSTRB");
                     if (m_wlast != (wb == w_len))    fail("WLAST on wrong beat");
-                    for (k = 0; k < 8; k = k + 1)
-                        mem[w_addr + 8*wb + k - MEM_BASE] = m_wdata[8*k +: 8];
+                    for (k = 0; k < BB; k = k + 1)
+                        if (m_wstrb[k]) mem[w_addr + BB*wb + k - MEM_BASE] = m_wdata[8*k +: 8];
                     #1 m_wready = 0;
                 end
                 repeat (rnd(4)) @(posedge aclk);

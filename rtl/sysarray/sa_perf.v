@@ -4,6 +4,8 @@
 // the scheduler or the PCPI front end (numbering: PC_* in sa_defs.vh;
 // ev[0] = 1 counts cycles). Events are registered once before counting so
 // no engine logic lands on a new long path; counts lag by one cycle.
+// ev2[i] with ev[i]: the event counts twice (a 128-bit DMA beat or local
+// write of two 8-byte lanes: LD_BEATS / ST_BEATS stay in 8-byte units).
 //
 // Counting only while `en`; control comes from the PCPI instruction mat_perf
 // (port a) or the PERF_CTRL CSR (port b): ctl[0] = clear, ctl[1] = enable.
@@ -18,6 +20,7 @@ module sa_perf #(
     input  wire              clk,
     input  wire              resetn,
     input  wire [NCNT-1:0]   ev,
+    input  wire [NCNT-1:0]   ev2,
 
     input  wire              ctl_we_a,      // PCPI mat_perf control
     input  wire [1:0]        ctl_a,
@@ -33,7 +36,7 @@ module sa_perf #(
     generate
         if (PERF != 0) begin : on
             reg              en_r;
-            reg  [NCNT-1:0]  ev_q;
+            reg  [NCNT-1:0]  ev_q, ev2_q;
             reg  [31:0]      cnt [0:NCNT-1];
             wire             clear = (ctl_we_a && ctl_a[0]) || (ctl_we_b && ctl_b[0]);
 
@@ -42,14 +45,16 @@ module sa_perf #(
                 if (!resetn) begin
                     en_r <= 0;
                     ev_q <= 0;
+                    ev2_q <= 0;
                     for (i = 0; i < NCNT; i = i + 1) cnt[i] <= 0;
                 end else begin
                     ev_q <= ev;
+                    ev2_q <= ev2;
                     if (ctl_we_a)      en_r <= ctl_a[1];      // PCPI wins a same-cycle write
                     else if (ctl_we_b) en_r <= ctl_b[1];
                     for (i = 0; i < NCNT; i = i + 1)
                         if (clear)                 cnt[i] <= 0;
-                        else if (en_r && ev_q[i])  cnt[i] <= cnt[i] + 1;
+                        else if (en_r && ev_q[i])  cnt[i] <= cnt[i] + 1 + ev2_q[i];
                 end
             end
 

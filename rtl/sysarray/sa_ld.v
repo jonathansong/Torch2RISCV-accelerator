@@ -7,17 +7,26 @@
 //   INTERLEAVE local word = word + chunk*rows + row, chunk = word-sized piece
 //              of a row (A strips for the array; SPAD only)
 // It is split into INCR bursts of <= 16 beats that never cross 4 KB, dealt
-// round-robin to NPORTS AXI read ports (up to 4 outstanding per port). Each
-// burst remembers its local start position, so returning beats are written
-// by address in any port order. Commands run one at a time; `done` pulses
-// after the last beat of the command is written, with `err` set if any beat
-// came back with SLVERR/DECERR.
+// round-robin to NPORTS AXI read ports (up to QD = 8 outstanding per port).
+// Each burst remembers its local start position, so returning beats are
+// written by address in any port order. Commands run one at a time; `done`
+// pulses after the last beat of the command is written, with `err` set if any
+// beat came back with SLVERR/DECERR.
+//
+// DMA_W = 128 (docs/kv260_upgrade_plan.md K2a): a beat holds two lanes. The
+// addresses and lengths keep their 8-byte granularity: a burst starts at its
+// address rounded down to 16 bytes, so its first beat may hold only its upper
+// lane and its last beat only its lower one (the burst queue keeps both
+// facts). A beat whose two lanes fall into one local word at an even lane is
+// written in one cycle (lw_two; e.g. SPAD at D = 16 from a 16-byte aligned
+// address); otherwise its lanes are written one per cycle (R held one cycle).
 `timescale 1ns / 1ps
 `include "sa_macros.vh"
 
 module sa_ld #(
     parameter integer D      = 8,
-    parameter integer NPORTS = 1
+    parameter integer NPORTS = 1,
+    parameter integer DMA_W  = 64                    // AXI data width: 64 or 128
 ) (
     input  wire                 clk,
     input  wire                 resetn,
@@ -35,30 +44,37 @@ module sa_ld #(
     output reg                  err,
     output wire                 busy,
 
-    // local write: one 64-bit lane of a word per cycle
+    // local write: one 64-bit lane of a word per cycle, or two (lw_two: lanes
+    // lw_lane, lw_lane + 1 of one word, lw_lane even, data {lane + 1, lane});
+    // one lane: its data in every 64-bit piece of lw_data
     output wire                 lw_en,
     output reg  [3:0]           lw_mem,
     output wire [15:0]          lw_word,
     output wire [7:0]           lw_lane,
-    output wire [63:0]          lw_data,
+    output wire                 lw_two,
+    output wire [DMA_W-1:0]     lw_data,
 
     output reg  [NPORTS*32-1:0] m_araddr,
     output reg  [NPORTS*8-1:0]  m_arlen,
     output reg  [NPORTS-1:0]    m_arvalid,
     input  wire [NPORTS-1:0]    m_arready,
-    input  wire [NPORTS*64-1:0] m_rdata,
+    input  wire [NPORTS*DMA_W-1:0] m_rdata,
     input  wire [NPORTS*2-1:0]  m_rresp,
     input  wire [NPORTS-1:0]    m_rlast,
     input  wire [NPORTS-1:0]    m_rvalid,
     output wire [NPORTS-1:0]    m_rready,
 
-    // performance events: {AR stalled by the port, beat written, command active}
-    output wire [2:0]           perf_ev
+    // performance events: {AR stalled by the port, local write, command active};
+    // perf_two: the local write is two lanes (counts twice: 8-byte units)
+    output wire [2:0]           perf_ev,
+    output wire                 perf_two
 );
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
     localparam integer PB   = NPORTS > 1 ? $clog2(NPORTS) : 1;
     localparam integer QD   = 8;                      // outstanding bursts per port
+    localparam integer BL   = DMA_W / 64;             // lanes per beat (1 or 2)
+    localparam integer W2   = BL == 2;
 
     // lanes per word (log2) of a memory
     function [3:0] lpw_log2(input [3:0] mem);
@@ -91,19 +107,25 @@ module sa_ld #(
                         (cmd_row_bytes & ((16'd8 << c_lpwl) - 16'd1)) == 0;
     assign busy      = active;
 
-    // next burst
+    // next burst, in lanes: <= 16 beats, not past the row or the 4 KB boundary
     wire [31:0] addr      = row_ddr + off;
-    wire [31:0] beats_row = (row_bytes - off) >> 3;
-    wire [12:0] beats_4k  = (13'h1000 - {1'b0, addr[11:0]}) >> 3;
-    wire [4:0]  beats     = beats_row < 16 && beats_row <= beats_4k ? beats_row[4:0] :
-                            beats_4k < 16 ? beats_4k[4:0] : 5'd16;
-    wire [8:0]  lane_sum  = cur_lane + beats;
+    wire        s0        = W2 ? addr[3] : 1'b0;        // first beat: lower lane not ours
+    wire [31:0] lanes_row = (row_bytes - off) >> 3;
+    wire [12:0] lanes_4k  = (13'h1000 - {1'b0, addr[11:0]}) >> 3;
+    wire [5:0]  lanes_max = 6'd16 * BL - s0;
+    wire [5:0]  nl        = lanes_row < lanes_max && lanes_row <= lanes_4k ? lanes_row[5:0] :
+                            lanes_4k < lanes_max ? lanes_4k[5:0] : lanes_max;
+    wire [6:0]  nbeat     = W2 ? (s0 + nl + 7'd1) >> 1 : nl;
+    wire        tfull     = W2 ? !(s0 ^ nl[0]) : 1'b1;  // last beat: upper lane ours too
+    wire [8:0]  lane_sum  = cur_lane + nl;
     wire [15:0] words_adv = lane_sum >> lpwl;
     wire [7:0]  lane_mask = (8'd1 << lpwl) - 8'd1;
 
-    // per-port burst queues: {word, lane, beats}
+    // per-port burst queues: {word, lane, first-beat skip, last beat full}
     reg  [15:0] q_word  [0:NPORTS-1][0:QD-1];
     reg  [7:0]  q_lane  [0:NPORTS-1][0:QD-1];
+    reg         q_s0    [0:NPORTS-1][0:QD-1];
+    reg         q_tf    [0:NPORTS-1][0:QD-1];
     reg  [3:0]  q_wp    [0:NPORTS-1];
     reg  [3:0]  q_rp    [0:NPORTS-1];
     wire [NPORTS-1:0] q_full, q_empty;
@@ -112,6 +134,7 @@ module sa_ld #(
     reg  [PB-1:0] r_rr;           // R side: round-robin start
     reg  [PB-1:0] r_sel;          // R side: port granted this cycle
     reg           r_any;
+    wire          r_take;         // R side: the granted beat is consumed this cycle
 
     genvar gp;
     generate
@@ -165,14 +188,16 @@ module sa_ld #(
                 rerr      <= 0;
             end else if (issue_ok) begin
                 m_arvalid[ar_rr]            <= 1;
-                m_araddr[32*ar_rr +: 32]    <= addr;
-                m_arlen[8*ar_rr +: 8]       <= beats - 1;
+                m_araddr[32*ar_rr +: 32]    <= W2 ? {addr[31:4], 4'd0} : addr;
+                m_arlen[8*ar_rr +: 8]       <= nbeat - 1;
                 q_word[ar_rr][q_wp[ar_rr][2:0]] <= cur_word;
                 q_lane[ar_rr][q_wp[ar_rr][2:0]] <= cur_lane;
+                q_s0[ar_rr][q_wp[ar_rr][2:0]]   <= s0;
+                q_tf[ar_rr][q_wp[ar_rr][2:0]]   <= tfull;
                 q_wp[ar_rr]                 <= q_wp[ar_rr] + 1;
                 issued                      <= issued + 1;
                 ar_rr <= ar_rr == NPORTS - 1 ? 0 : ar_rr + 1;
-                if (off + {beats, 3'b000} == row_bytes) begin      // next row
+                if (off + {nl, 3'b000} == row_bytes) begin         // next row
                     off     <= 0;
                     r       <= r + 1;
                     row_ddr <= row_ddr + pitch;
@@ -186,7 +211,7 @@ module sa_ld #(
                     end
                     if (r + 1 == rows) gen <= 0;
                 end else begin
-                    off      <= off + {beats, 3'b000};
+                    off      <= off + {nl, 3'b000};
                     cur_word <= cur_word + words_adv * step;
                     cur_lane <= lane_sum[7:0] & lane_mask;
                 end
@@ -199,44 +224,67 @@ module sa_ld #(
                 done   <= 1;
                 err    <= rerr;
             end
-            if (lw_en && m_rresp[2*r_sel +: 2] != 2'b00) rerr <= 1;
+            if (r_take && m_rresp[2*r_sel +: 2] != 2'b00) rerr <= 1;
         end
     end
 
     // ------------------------------------------------------------ R side
-    // one beat per cycle, round-robin over ports that have data
+    // one local write per cycle, round-robin over ports that have data; a beat
+    // written in two cycles keeps its port (r_hold)
+    reg           r_hold;         // the selected port's beat: its upper lane next
+    reg  [PB-1:0] r_hport;
     integer s, cand;
     always @* begin
         r_any = 0;
         r_sel = 0;
-        for (s = NPORTS - 1; s >= 0; s = s - 1) begin
-            cand = (r_rr + s) % NPORTS;
-            if (m_rvalid[cand] && !q_empty[cand]) begin
-                r_any = 1;
-                r_sel = cand;
+        if (r_hold) begin
+            r_any = 1;
+            r_sel = r_hport;
+        end else
+            for (s = NPORTS - 1; s >= 0; s = s - 1) begin
+                cand = (r_rr + s) % NPORTS;
+                if (m_rvalid[cand] && !q_empty[cand]) begin
+                    r_any = 1;
+                    r_sel = cand;
+                end
             end
-        end
     end
 
     reg  [4:0] beat_idx [0:NPORTS-1];     // beats already taken from the head burst
     wire [15:0] h_word = q_word[r_sel][q_rp[r_sel][2:0]];
     wire [7:0]  h_lane = q_lane[r_sel][q_rp[r_sel][2:0]];
-    wire [8:0]  h_sum  = h_lane + beat_idx[r_sel];
+    wire        h_s0   = q_s0[r_sel][q_rp[r_sel][2:0]];
+    wire        h_tf   = q_tf[r_sel][q_rp[r_sel][2:0]];
+    wire        h_first = beat_idx[r_sel] == 0;
+    wire        v0     = !(h_first && h_s0);                       // lower lane ours
+    wire        v1     = W2 && !(m_rlast[r_sel] && !h_tf);         // upper lane ours
+    // lane of this beat's lower lane in the burst's sequence (it is ours when v0)
+    wire [8:0]  h_sum0 = h_lane + ({4'd0, beat_idx[r_sel]} << W2) - h_s0;
+    wire        two    = v0 && v1;
+    wire        merge  = two && lpwl != 0 && !h_sum0[0];          // both lanes, one word, even lane
+    wire        upper  = r_hold || !v0;                            // writing the upper lane
+    wire [8:0]  w_sum  = h_sum0 + upper;
+    assign      r_take = r_any && !(two && !merge && !r_hold);     // the beat is consumed
+
+    wire [DMA_W-1:0] r_beat = m_rdata[DMA_W*r_sel +: DMA_W];
+    wire [63:0]      r_lane = upper ? r_beat[DMA_W-1 -: 64] : r_beat[63:0];
 
     assign lw_en   = r_any;
-    assign lw_word = h_word + (h_sum >> lpwl) * step;
-    assign lw_lane = h_sum[7:0] & lane_mask;
-    assign lw_data = m_rdata[64*r_sel +: 64];
+    assign lw_word = h_word + (w_sum >> lpwl) * step;
+    assign lw_lane = w_sum[7:0] & lane_mask;
+    assign lw_two  = merge;
+    assign lw_data = merge ? r_beat : {BL{r_lane}};
 
     generate
         for (gp = 0; gp < NPORTS; gp = gp + 1) begin : rr
-            assign m_rready[gp] = r_any && r_sel == gp;
+            assign m_rready[gp] = r_take && r_sel == gp;
         end
     endgenerate
 
     always @(posedge clk) begin
         if (!resetn) begin
             r_rr      <= 0;
+            r_hold    <= 0;
             completed <= 0;
             for (p = 0; p < NPORTS; p = p + 1) begin
                 q_rp[p]     <= 0;
@@ -244,8 +292,13 @@ module sa_ld #(
             end
         end else begin
             if (cmd_valid && cmd_ready) completed <= 0;
-            if (r_any) begin
-                r_rr <= r_sel == NPORTS - 1 ? 0 : r_sel + 1;
+            if (r_any && !r_take) begin
+                r_hold  <= 1;
+                r_hport <= r_sel;
+            end
+            if (r_take) begin
+                r_hold <= 0;
+                r_rr   <= r_sel == NPORTS - 1 ? 0 : r_sel + 1;
                 if (m_rlast[r_sel]) begin
                     beat_idx[r_sel] <= 0;
                     q_rp[r_sel]     <= q_rp[r_sel] + 1;
@@ -256,5 +309,6 @@ module sa_ld #(
         end
     end
 
-    assign perf_ev = {|(m_arvalid & ~m_arready), lw_en, active};
+    assign perf_ev  = {|(m_arvalid & ~m_arready), lw_en, active};
+    assign perf_two = lw_en && lw_two;
 endmodule

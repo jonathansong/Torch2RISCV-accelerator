@@ -23,9 +23,10 @@ PYTHON          ?= python3
 SA  := $(ROOT)/rtl/sysarray
 RTL := $(ROOT)/rtl/picorv32/picorv32.v $(wildcard $(SA)/*.v)
 SIM_DEFINES ?=
-# array size of the simulated unit (8 or 16)
+# array size of the simulated unit (8 or 16), its DMA data width (64 or 128)
 SIM_D       ?= 8
-SIM := build/sim$(SIM_D)
+SIM_DMA_W   ?= 64
+SIM := build/sim$(SIM_D)$(if $(filter 128,$(SIM_DMA_W)),_w128)
 
 all: $(FW).bin
 
@@ -48,7 +49,7 @@ $(SIM)/n_cases.vh: $(ROOT)/rtl/matmul/sim/gen_vectors.py
 sim: $(SIM)/fw.hex $(SIM)/n_cases.vh
 	$(SIM_PREP)
 	cd $(SIM) && bash -c 'source $(VIVADO_SETTINGS) >/dev/null && \
-	  xvlog -i . -i $(SA) $(addprefix -d ,$(SIM_DEFINES)) -d SIM_D=$(strip $(SIM_D)) $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { grep ERROR xvlog.out; exit 1; }; \
+	  xvlog -i . -i $(SA) $(addprefix -d ,$(SIM_DEFINES)) -d SIM_D=$(strip $(SIM_D)) -d SIM_DMA_W=$(strip $(SIM_DMA_W)) $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { grep ERROR xvlog.out; exit 1; }; \
 	  xelab -debug off tb_system -s tb >xelab.out 2>&1 || { cat xelab.out; exit 1; }; \
 	  xsim tb -R' | grep -E "^(TB|ERROR|FATAL)"
 

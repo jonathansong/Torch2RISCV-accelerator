@@ -6,12 +6,19 @@
 // follows its AW. One local read per cycle (1-cycle latency) feeds small
 // per-port skid FIFOs that drive the W channels. A command completes when
 // all of its B responses are back; `err` reports any SLVERR/DECERR.
+//
+// DMA_W = 128 (see sa_ld): bursts start at the address rounded down to 16
+// bytes; WSTRB leaves out the lower lane of a first beat or the upper lane of
+// a last beat that are not the command's. A beat's two lanes come from one
+// local read when they fall into one word at an even lane, else from two
+// consecutive reads of the same port.
 `timescale 1ns / 1ps
 `include "sa_macros.vh"
 
 module sa_st #(
     parameter integer D      = 8,
-    parameter integer NPORTS = 1
+    parameter integer NPORTS = 1,
+    parameter integer DMA_W  = 64                    // AXI data width: 64 or 128
 ) (
     input  wire                 clk,
     input  wire                 resetn,
@@ -40,7 +47,8 @@ module sa_st #(
     output reg  [NPORTS*8-1:0]  m_awlen,
     output reg  [NPORTS-1:0]    m_awvalid,
     input  wire [NPORTS-1:0]    m_awready,
-    output wire [NPORTS*64-1:0] m_wdata,
+    output wire [NPORTS*DMA_W-1:0]   m_wdata,
+    output wire [NPORTS*DMA_W/8-1:0] m_wstrb,
     output wire [NPORTS-1:0]    m_wlast,
     output wire [NPORTS-1:0]    m_wvalid,
     input  wire [NPORTS-1:0]    m_wready,
@@ -48,14 +56,18 @@ module sa_st #(
     input  wire [NPORTS-1:0]    m_bvalid,
     output wire [NPORTS-1:0]    m_bready,
 
-    // performance events: {W stalled by the port, beat accepted, command active}
-    output wire [2:0]           perf_ev
+    // performance events: {W stalled by the port, beat accepted, command active};
+    // perf_two: the accepted beat carries two lanes (counts twice: 8-byte units)
+    output wire [2:0]           perf_ev,
+    output wire                 perf_two
 );
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
     localparam integer PB   = NPORTS > 1 ? $clog2(NPORTS) : 1;
     localparam integer QD   = 8;          // queued bursts per port
     localparam integer SD   = 4;          // skid entries per port
+    localparam integer BL   = DMA_W / 64; // lanes per beat (1 or 2)
+    localparam integer W2   = BL == 2;
 
     function [3:0] lpw_log2(input [3:0] mem);
         lpw_log2 = mem == MEM_ACC ? LOGD - 1 : LOGD - 3;
@@ -83,21 +95,30 @@ module sa_st #(
                         (cmd_row_bytes & ((16'd8 << c_lpwl) - 16'd1)) == 0;
     assign busy      = active;
 
+    // next burst, in lanes (as sa_ld)
     wire [31:0] addr      = row_ddr + off;
-    wire [31:0] beats_row = (row_bytes - off) >> 3;
-    wire [12:0] beats_4k  = (13'h1000 - {1'b0, addr[11:0]}) >> 3;
-    wire [4:0]  beats     = beats_row < 16 && beats_row <= beats_4k ? beats_row[4:0] :
-                            beats_4k < 16 ? beats_4k[4:0] : 5'd16;
-    wire [8:0]  lane_sum  = cur_lane + beats;
+    wire        s0        = W2 ? addr[3] : 1'b0;
+    wire [31:0] lanes_row = (row_bytes - off) >> 3;
+    wire [12:0] lanes_4k  = (13'h1000 - {1'b0, addr[11:0]}) >> 3;
+    wire [5:0]  lanes_max = 6'd16 * BL - s0;
+    wire [5:0]  nl        = lanes_row < lanes_max && lanes_row <= lanes_4k ? lanes_row[5:0] :
+                            lanes_4k < lanes_max ? lanes_4k[5:0] : lanes_max;
+    wire [6:0]  nbeat     = W2 ? (s0 + nl + 7'd1) >> 1 : nl;
+    wire        tfull     = W2 ? !(s0 ^ nl[0]) : 1'b1;
+    wire [8:0]  lane_sum  = cur_lane + nl;
     wire [7:0]  lane_mask = (8'd1 << lpwl) - 8'd1;
 
     // burst waiting for its AW handshake (per port), then queued for W
     reg  [15:0] aw_word [0:NPORTS-1];
     reg  [7:0]  aw_lane [0:NPORTS-1];
     reg  [4:0]  aw_beats[0:NPORTS-1];
+    reg         aw_s0   [0:NPORTS-1];
+    reg         aw_tf   [0:NPORTS-1];
     reg  [15:0] q_word  [0:NPORTS-1][0:QD-1];
     reg  [7:0]  q_lane  [0:NPORTS-1][0:QD-1];
     reg  [4:0]  q_beats [0:NPORTS-1][0:QD-1];
+    reg         q_s0    [0:NPORTS-1][0:QD-1];
+    reg         q_tf    [0:NPORTS-1][0:QD-1];
     reg  [3:0]  q_wp    [0:NPORTS-1];
     reg  [3:0]  q_rp    [0:NPORTS-1];
     reg  [PB-1:0] aw_rr;
@@ -120,11 +141,14 @@ module sa_st #(
     reg  [PB-1:0] w_rr, w_sel;
     reg           w_any;
     reg  [4:0]    beat_idx [0:NPORTS-1];
-    reg  [2:0]    sk_cnt   [0:NPORTS-1];      // entries + read in flight
-    reg  [63:0]   sk_data  [0:NPORTS-1][0:SD-1];
+    reg  [2:0]    sk_cnt   [0:NPORTS-1];      // entries + beats being read
+    reg  [DMA_W-1:0]   sk_data [0:NPORTS-1][0:SD-1];
+    reg  [DMA_W/8-1:0] sk_strb [0:NPORTS-1][0:SD-1];
     reg           sk_last  [0:NPORTS-1][0:SD-1];
     reg  [2:0]    sk_wp    [0:NPORTS-1];
     reg  [2:0]    sk_rp    [0:NPORTS-1];
+    reg           w_hold;                     // the selected port's beat: its upper lane next
+    reg  [PB-1:0] w_hport;
 
     integer p;
     always @(posedge clk) begin
@@ -142,6 +166,8 @@ module sa_st #(
                     q_word[p][q_wp[p][2:0]]      <= aw_word[p];
                     q_lane[p][q_wp[p][2:0]]      <= aw_lane[p];
                     q_beats[p][q_wp[p][2:0]]     <= aw_beats[p];
+                    q_s0[p][q_wp[p][2:0]]        <= aw_s0[p];
+                    q_tf[p][q_wp[p][2:0]]        <= aw_tf[p];
                     q_wp[p]                      <= q_wp[p] + 1;
                 end
 
@@ -170,14 +196,16 @@ module sa_st #(
                 berr      <= 0;
             end else if (issue_ok) begin
                 m_awvalid[aw_rr]          <= 1;
-                m_awaddr[32*aw_rr +: 32]  <= addr;
-                m_awlen[8*aw_rr +: 8]     <= beats - 1;
+                m_awaddr[32*aw_rr +: 32]  <= W2 ? {addr[31:4], 4'd0} : addr;
+                m_awlen[8*aw_rr +: 8]     <= nbeat - 1;
                 aw_word[aw_rr]            <= cur_word;
                 aw_lane[aw_rr]            <= cur_lane;
-                aw_beats[aw_rr]           <= beats;
+                aw_beats[aw_rr]           <= nbeat[4:0];
+                aw_s0[aw_rr]              <= s0;
+                aw_tf[aw_rr]              <= tfull;
                 issued                    <= issued + 1;
                 aw_rr <= aw_rr == NPORTS - 1 ? 0 : aw_rr + 1;
-                if (off + {beats, 3'b000} == row_bytes) begin
+                if (off + {nl, 3'b000} == row_bytes) begin
                     off      <= 0;
                     r        <= r + 1;
                     row_ddr  <= row_ddr + pitch;
@@ -186,7 +214,7 @@ module sa_st #(
                     cur_lane <= 0;
                     if (r + 1 == rows) gen <= 0;
                 end else begin
-                    off      <= off + {beats, 3'b000};
+                    off      <= off + {nl, 3'b000};
                     cur_word <= cur_word + (lane_sum >> lpwl);
                     cur_lane <= lane_sum[7:0] & lane_mask;
                 end
@@ -205,27 +233,42 @@ module sa_st #(
     end
 
     // ----------------------------------------------- local read -> skid
+    // a beat starts when its port's skid has room (counted from its first
+    // read); a beat read in two cycles keeps its port (w_hold)
     integer s, cand;
     always @* begin
         w_any = 0;
         w_sel = 0;
-        for (s = NPORTS - 1; s >= 0; s = s - 1) begin
-            cand = (w_rr + s) % NPORTS;
-            if (!q_empty[cand] && sk_cnt[cand] < SD) begin
-                w_any = 1;
-                w_sel = cand;
+        if (w_hold) begin
+            w_any = 1;
+            w_sel = w_hport;
+        end else
+            for (s = NPORTS - 1; s >= 0; s = s - 1) begin
+                cand = (w_rr + s) % NPORTS;
+                if (!q_empty[cand] && sk_cnt[cand] < SD) begin
+                    w_any = 1;
+                    w_sel = cand;
+                end
             end
-        end
     end
 
     wire [15:0] h_word  = q_word[w_sel][q_rp[w_sel][2:0]];
     wire [7:0]  h_lane  = q_lane[w_sel][q_rp[w_sel][2:0]];
     wire [4:0]  h_beats = q_beats[w_sel][q_rp[w_sel][2:0]];
-    wire [8:0]  h_sum   = h_lane + beat_idx[w_sel];
+    wire        h_s0    = q_s0[w_sel][q_rp[w_sel][2:0]];
+    wire        h_tf    = q_tf[w_sel][q_rp[w_sel][2:0]];
     wire        h_last  = beat_idx[w_sel] == h_beats - 1;
+    wire        v0      = !(beat_idx[w_sel] == 0 && h_s0);
+    wire        v1      = W2 && !(h_last && !h_tf);
+    wire [8:0]  h_sum0  = h_lane + ({4'd0, beat_idx[w_sel]} << W2) - h_s0;
+    wire        two     = v0 && v1;
+    wire        merge   = two && lpwl != 0 && !h_sum0[0];
+    wire        upper   = w_hold || !v0;
+    wire [8:0]  r_sum   = h_sum0 + upper;
+    wire        w_done  = !(two && !merge && !w_hold);    // this read completes the beat
 
     assign lr_en   = w_any;
-    assign lr_word = h_word + (h_sum >> lpwl);
+    assign lr_word = h_word + (r_sum >> lpwl);
 
     // B responses this cycle (several ports can answer together)
     reg [3:0] b_count;
@@ -235,27 +278,43 @@ module sa_st #(
         for (bc = 0; bc < NPORTS; bc = bc + 1) b_count = b_count + m_bvalid[bc];
     end
 
-    // read in flight: which port / lane / last
+    // read in flight: which port / lane / beat position
     reg          rd_v;
     reg [PB-1:0] rd_port;
     reg [7:0]    rd_lane;
-    reg          rd_last;
-    wire [63:0]  rd_data = lr_mem == MEM_ACC ? lr_acc[64*rd_lane +: 64] :
-                           lr_mem == MEM_SPAD_B ? lr_spad_b[64*rd_lane +: 64] :
-                                                  lr_spad_a[64*rd_lane +: 64];
+    reg          rd_last, rd_merge, rd_upper, rd_done;
+    reg [1:0]    rd_strb;               // the beat's lanes that are the command's
+    reg [63:0]   asm_lo;                // a two-read beat: its lower lane
+    wire [63:0]  rd_lo = lr_mem == MEM_ACC ? lr_acc[64*rd_lane +: 64] :
+                         lr_mem == MEM_SPAD_B ? lr_spad_b[64*rd_lane +: 64] :
+                                                lr_spad_a[64*rd_lane +: 64];
+    wire [7:0]   rd_lane1 = (rd_lane + 8'd1) & lane_mask;
+    wire [63:0]  rd_hi = lr_mem == MEM_ACC ? lr_acc[64*rd_lane1 +: 64] :
+                         lr_mem == MEM_SPAD_B ? lr_spad_b[64*rd_lane1 +: 64] :
+                                                lr_spad_a[64*rd_lane1 +: 64];
+    wire [DMA_W-1:0] rd_beat;
+    generate
+        if (W2) begin : beat2
+            assign rd_beat = rd_merge ? {rd_hi, rd_lo} : rd_upper ? {rd_lo, asm_lo} : {rd_lo, rd_lo};
+        end else begin : beat1
+            assign rd_beat = rd_lo;
+        end
+    endgenerate
 
     generate
         for (gp = 0; gp < NPORTS; gp = gp + 1) begin : wch
-            assign m_wvalid[gp]         = sk_wp[gp] != sk_rp[gp];
-            assign m_wdata[64*gp +: 64] = sk_data[gp][sk_rp[gp][1:0]];
-            assign m_wlast[gp]          = sk_last[gp][sk_rp[gp][1:0]];
-            assign m_bready[gp]         = 1'b1;
+            assign m_wvalid[gp]                 = sk_wp[gp] != sk_rp[gp];
+            assign m_wdata[DMA_W*gp +: DMA_W]   = sk_data[gp][sk_rp[gp][1:0]];
+            assign m_wstrb[DMA_W/8*gp +: DMA_W/8] = sk_strb[gp][sk_rp[gp][1:0]];
+            assign m_wlast[gp]                  = sk_last[gp][sk_rp[gp][1:0]];
+            assign m_bready[gp]                 = 1'b1;
         end
     endgenerate
 
     always @(posedge clk) begin
         if (!resetn) begin
             w_rr      <= 0;
+            w_hold    <= 0;
             rd_v      <= 0;
             completed <= 0;
             for (p = 0; p < NPORTS; p = p + 1) begin
@@ -268,29 +327,48 @@ module sa_st #(
             // issue a local read
             rd_v <= w_any;
             if (w_any) begin
-                rd_port <= w_sel;
-                rd_lane <= h_sum[7:0] & lane_mask;
-                rd_last <= h_last;
-                w_rr    <= w_sel == NPORTS - 1 ? 0 : w_sel + 1;
-                if (h_last) begin
-                    beat_idx[w_sel] <= 0;
-                    q_rp[w_sel]     <= q_rp[w_sel] + 1;
-                end else
-                    beat_idx[w_sel] <= beat_idx[w_sel] + 1;
+                rd_port  <= w_sel;
+                rd_lane  <= r_sum[7:0] & lane_mask;
+                rd_last  <= h_last;
+                rd_merge <= merge;
+                rd_upper <= upper;
+                rd_done  <= w_done;
+                rd_strb  <= {v1, v0};
+                w_hold   <= !w_done;
+                w_hport  <= w_sel;
+                if (w_done) begin
+                    w_rr <= w_sel == NPORTS - 1 ? 0 : w_sel + 1;
+                    if (h_last) begin
+                        beat_idx[w_sel] <= 0;
+                        q_rp[w_sel]     <= q_rp[w_sel] + 1;
+                    end else
+                        beat_idx[w_sel] <= beat_idx[w_sel] + 1;
+                end
             end
-            // data returns: push into the skid of its port
-            if (rd_v) begin
-                sk_data[rd_port][sk_wp[rd_port][1:0]] <= rd_data;
+            // data returns: complete beats go into the skid of their port
+            if (rd_v && !rd_done) asm_lo <= rd_lo;
+            if (rd_v && rd_done) begin
+                sk_data[rd_port][sk_wp[rd_port][1:0]] <= rd_beat;
+                sk_strb[rd_port][sk_wp[rd_port][1:0]] <= W2 ? {{8{rd_strb[1]}}, {8{rd_strb[0]}}} : {DMA_W/8{1'b1}};
                 sk_last[rd_port][sk_wp[rd_port][1:0]] <= rd_last;
                 sk_wp[rd_port] <= sk_wp[rd_port] + 1;
             end
-            // occupancy: +1 at read issue, -1 when W beat leaves
+            // occupancy: +1 at a beat's first read, -1 when its W beat leaves
             for (p = 0; p < NPORTS; p = p + 1) begin
-                sk_cnt[p] <= sk_cnt[p] + (w_any && w_sel == p) - (m_wvalid[p] && m_wready[p]);
+                sk_cnt[p] <= sk_cnt[p] + (w_any && !w_hold && w_sel == p) - (m_wvalid[p] && m_wready[p]);
                 if (m_wvalid[p] && m_wready[p]) sk_rp[p] <= sk_rp[p] + 1;
             end
         end
     end
 
     assign perf_ev = {|(m_wvalid & ~m_wready), |(m_wvalid & m_wready), active};
+    // the accepted beat's strobes cover both lanes (one port at a time accepts: NPORTS = 1 exact)
+    reg two_acc;
+    integer t;
+    always @* begin
+        two_acc = 0;
+        for (t = 0; t < NPORTS; t = t + 1)
+            if (m_wvalid[t] && m_wready[t] && W2 && m_wstrb[DMA_W/8*t] && m_wstrb[DMA_W/8*t + 8]) two_acc = 1;
+    end
+    assign perf_two = two_acc;
 endmodule
