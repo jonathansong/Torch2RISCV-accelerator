@@ -318,7 +318,8 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 - 描述符取指每拍两个 64 位字（4 拍一个描述符），LDPARAM 按 beat 内偏移取字。
 - `LD_BEATS` / `ST_BEATS` 仍按 8 字节计（`sa_perf` 新增 `ev2`：两 lane 的写 / 拍计两次），`z1_profile.py` 等软件不用改；计数器 19 现在就是"写入 SPAD/ACC 的字节数 ÷ 8"（第 3 项的有效字节计数）。`sa_ld` 文件头的在途 burst 数改正为 8。
 - 验证：`tb_sa_dma` 的 AXI 模型加 128 位与 `WSTRB`，另加 40 个随机形状（8 字节对齐的地址、8 的奇数倍行长、跨 4 KB、INTERLEAVE），故意改错合并条件或 `WSTRB` 都能抓到；`make test` / `test16` / `test128`、`tb_sa_unit`（365 项计数器检查、描述符列表）、固件系统仿真（gemm、vector、desc_run、rt、bwtest；D = 16 的 64 / 128 位）全部 PASS。仿真中 bwtest 连续读写 3.62 → 7.26 B/周期（DDR 模型带随机停顿，不是板上数字），`tb_sa_unit` 的 64×64×128 GEMM 10107 → 6413 周期。`-bd_only` 验证通过。编译器与运行时不变；驱动从 `.hwh` 读 `DMA_W`，`m2_bw_test.py` 按位宽报告占比。
-- 待办：`d16_100mhz_w128` 的 Vivado 构建（资源与时序），板上 `bwtest` 与 K1 回归逐位一致。
+- 构建（2026-10-08，`094d535`）：setup WNS +0.311 ns（K1c +0.630），WHS +0.010；LUT 75503（64.5%，比 K1c 多 552）、FF 60270（+326）、BRAM 130（90.3%）、DSP 347，后两项不变。最差路径仍是 K1c 那条 EX `drain_active` → PE `sh_out`（1 级，布线 96%），不在 DMA 上。
+- 待办：板上 `bwtest`（目标接近 16 B/周期，1.6 GB/s）与 K1 回归逐位一致。
 
 #### K2b 多口接收 + 存储分银行
 
