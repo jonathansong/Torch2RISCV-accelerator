@@ -4,8 +4,7 @@ runs every test directory staged by compiler/scripts/deploy_z1_freeze.sh in
 turn and collects the logs, the generated tokens and the profiles into
 results/ (copied back to the host for compiler/tests/make_z1_baselines.py).
 
-    sudo bash -c 'source /etc/profile.d/pynq_venv.sh && source /etc/profile.d/xrt_setup.sh && \\
-        cd /home/xilinx/z1 && python3 board_regress.py [test ...] [--no-profile]'
+    sudo ./run_board.sh [test ...] [--no-profile]      (the PYNQ environment of either board)
 
 Tests (a directory each; missing ones are skipped), in the order of the KV260
 K1a verification (docs/kv260_upgrade_plan.md):

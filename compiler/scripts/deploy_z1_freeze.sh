@@ -9,8 +9,7 @@
 #   into build/deploy_kv260 (docs/kv260_upgrade_plan.md K1a; compare the results with
 #   tests/baselines/pynq-z1/); the default pynq-z1 stages build/deploy_z1
 #   scp -r build/deploy_z1 xilinx@<board>:/home/xilinx/z1
-#   board: sudo bash -c 'source /etc/profile.d/pynq_venv.sh && source /etc/profile.d/xrt_setup.sh && \
-#            cd /home/xilinx/z1 && python3 board_regress.py'
+#   board: sudo ./run_board.sh [test ...]     (sources the board's PYNQ / XRT environment)
 #   back:  scp -r xilinx@<board>:/home/xilinx/z1/results build/deploy_z1/
 #          $SA_PY compiler/tests/make_z1_baselines.py          (-> tests/baselines/pynq-z1/)
 #
@@ -77,7 +76,7 @@ for t in "${TESTS[@]}"; do
     *) echo "unknown test $t (${ALL[*]})"; exit 2 ;;
   esac
 done
-cp "$SA_COMPILER/tests/board_regress.py" "$Z/"
+cp "$SA_COMPILER/tests/board_regress.py" "$SA_COMPILER/tests/run_board.sh" "$Z/"
 {
   echo "commit $(git -C "$SA_REPO" rev-parse HEAD)$(git -C "$SA_REPO" diff --quiet HEAD -- compiler rtl firmware driver || echo ' (dirty)')"
   echo "staged $(date -Iseconds)"
