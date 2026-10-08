@@ -23,6 +23,7 @@ import os
 import sys
 import time
 
+import re
 import subprocess
 
 import numpy as np
@@ -55,6 +56,25 @@ POISON      = 0xDEADBEEF
 RISCV_HZ    = 50e6           # subprocessorClk default output
 
 
+def overlay_addr(ol, name, bitfile, default):
+    """The ARM physical address of the overlay's IP whose name ends in `name`."""
+    for d in (getattr(ol, "mem_dict", {}), getattr(ol, "ip_dict", {})):
+        for key, v in d.items():
+            if key.split("/")[-1] == name and "phys_addr" in v:
+                return int(v["phys_addr"])
+    try:                                 # the .hwh: the PS master's view (not mem_axi's)
+        hwh = open(os.path.splitext(bitfile)[0] + ".hwh").read()
+        for m in re.finditer(r"<MEMRANGE [^>]*>", hwh):
+            r = m.group(0)
+            if f'INSTANCE="{name}"' in r or f'_{name}"' in r:
+                if 'MASTERBUSINTERFACE="mem_axi"' not in r:
+                    return int(re.search(r'BASEVALUE="(0x[0-9A-Fa-f]+)"', r).group(1), 16)
+    except OSError:
+        pass
+    print(f"warning: {name} not found in the overlay, using {default:#x}")
+    return default
+
+
 def load_firmware(bram, path):
     fw = open(path, "rb").read()
     if len(fw) > MBOX_OFFSET:
@@ -80,10 +100,11 @@ def main():
         subprocess.run(["xmutil", "unloadapp"], capture_output=True)
     ol = Overlay(args.bit)
     # the ARM-side addresses from the overlay (PYNQ-Z1 0x4001_0000 / 0x4002_0000,
-    # KV260 0xA001_0000 / 0xA002_0000); the constants above if absent
-    ips = ol.ip_dict
-    bram_base = ips.get("pico_processor_0/psBramController", {}).get("phys_addr", BRAM_ARM_BASE)
-    intc_base = ips.get("psInterruptController", {}).get("phys_addr", INTC_BASE)
+    # KV260 0xA001_0000 / 0xA002_0000). PYNQ lists the BRAM controller in
+    # mem_dict (memory controllers), other IP in ip_dict; then the .hwh
+    # (as driver/pynq_matmul.py overlay_info does); the Z1 constants last.
+    bram_base = overlay_addr(ol, "psBramController", args.bit, BRAM_ARM_BASE)
+    intc_base = overlay_addr(ol, "psInterruptController", args.bit, INTC_BASE)
     print(f"BRAM at {bram_base:#x}, interrupt controller at {intc_base:#x}")
     reset = GPIO(GPIO.get_gpio_pin(RESET_EMIO), "out")
     bram = MMIO(bram_base, BRAM_BYTES)
