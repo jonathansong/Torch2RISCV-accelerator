@@ -6,8 +6,8 @@
 #   compiler/scripts/deploy_z1_freeze.sh [--board pynq-z1|kv260] [test ...]   (default: all; tests below)
 #   --board kv260: the KV260's aarch64 runtime and overlay (KV260/build/output/$SA_KV260_CONFIG,
 #   default d8_50mhz; or SA_BIT_DIR)
-#   into build/deploy_kv260 (docs/kv260_upgrade_plan.md K1a; compare the results with
-#   tests/baselines/pynq-z1/); the default pynq-z1 stages build/deploy_z1
+#   into build/deploy_kv260_<config> (docs/kv260_upgrade_plan.md K1a / K1b; compare the results
+#   with compiler/tests/compare_z1_baselines.py); the default pynq-z1 stages build/deploy_z1
 #   scp -r build/deploy_z1 xilinx@<board>:/home/xilinx/z1
 #   board: sudo ./run_board.sh [test ...]     (sources the board's PYNQ / XRT environment)
 #   back:  scp -r xilinx@<board>:/home/xilinx/z1/results build/deploy_z1/
@@ -33,6 +33,7 @@ source "$(dirname "$0")/board_env.sh"
 export SA_BOARD SA_BIT_DIR
 case $SA_BOARD in
   pynq-z1) Z=$SA_REPO/build/deploy_z1 ;;
+  kv260)   Z=$SA_REPO/build/deploy_kv260_$SA_KV260_CONFIG ;;   # (per overlay: results are kept)
   *)       Z=$SA_REPO/build/deploy_$SA_BOARD ;;
 esac
 MEM=${MEM:-12G}

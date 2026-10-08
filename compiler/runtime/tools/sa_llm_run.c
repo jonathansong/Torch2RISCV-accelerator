@@ -40,6 +40,14 @@ IREE_FLAG(int32_t, prefill, 0,
           "Prefill chunk M: a prompt of >= M tokens through the module's prefill(tokens[M], positions[M], valid) "
           "in chunks at 0, M, 2M, ... and P - M, then decode (plan §8.13).");
 
+// The device clock for cycles -> ms: SA_DEVICE_HZ (the launcher passes the
+// overlay's, e.g. 100 MHz on the KV260's K1b), else the PYNQ-Z1's 50 MHz.
+static double sa_device_hz(void) {
+  const char* e = getenv("SA_DEVICE_HZ");
+  double hz = e ? atof(e) : 0.0;
+  return hz > 0.0 ? hz : 50e6;
+}
+
 static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* allocator, const void* data,
                                iree_host_size_t n, iree_hal_element_type_t type, iree_hal_buffer_view_t** out) {
   iree_hal_dim_t shape[2] = {n, 1};
@@ -189,10 +197,11 @@ static iree_status_t run(iree_allocator_t host) {
     if (iree_status_is_ok(status) && chunks > 1 && getenv("SA_PROFILE")) {
       uint64_t nd, cyc, ns;
       sa_context_profile_totals(&nd, &cyc, &ns);
-      printf("prefill per chunk (after the first, %d chunks of %d): %.1f %s, device %.2f ms (%.0f cycles at 50 MHz), "
+      printf("prefill per chunk (after the first, %d chunks of %d): %.1f %s, device %.2f ms (%.0f cycles at %.1f MHz), "
              "submissions %.2f ms\n",
              chunks - 1, M, nd / (double)(chunks - 1), strcmp(getenv("SA_PROFILE"), "batch") ? "dispatches" : "lists",
-             cyc / (chunks - 1) / 50e3, cyc / (double)(chunks - 1), ns / 1e6 / (chunks - 1));
+             cyc / (chunks - 1) / (sa_device_hz() / 1e3), cyc / (double)(chunks - 1), sa_device_hz() / 1e6,
+             ns / 1e6 / (chunks - 1));
       sa_context_profile_report(stdout, chunks - 1);
     }
     if (iree_status_is_ok(status)) {
@@ -290,10 +299,10 @@ static iree_status_t run(iree_allocator_t host) {
   if (iree_status_is_ok(status) && np > 0 && getenv("SA_PROFILE")) {
     uint64_t nd, cyc, ns;
     sa_context_profile_totals(&nd, &cyc, &ns);
-    printf("per step (%s): %.1f %s, device %.2f ms (%.0f cycles at 50 MHz), "
+    printf("per step (%s): %.1f %s, device %.2f ms (%.0f cycles at %.1f MHz), "
            "submissions %.2f ms, rest of the runtime %.2f ms\n",
            pos0 > 0 ? "decode after the prefill" : "after the first", nd / (double)np,
-           strcmp(getenv("SA_PROFILE"), "batch") ? "dispatches" : "lists", cyc / np / 50e3, cyc / (double)np,
+           strcmp(getenv("SA_PROFILE"), "batch") ? "dispatches" : "lists", cyc / np / (sa_device_hz() / 1e3), cyc / (double)np, sa_device_hz() / 1e6,
            ns / 1e6 / np, 1e3 * total / np - ns / 1e6 / np);
     sa_context_t* sc = NULL;
     if (iree_status_is_ok(sa_context_get(&sc)))

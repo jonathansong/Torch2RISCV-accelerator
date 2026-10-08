@@ -141,7 +141,7 @@ def start(bit, fw, mb=16, ring=16):
         os.environ["SA_BOARD_MEM_DEV"] = buf.dev
     else:
         os.environ.pop("SA_BOARD_MEM_DEV", None)
-    env = dict(os.environ, SA_TRANSPORT="board", SA_BOARD_MEM=f"{phys:#x}:{mb << 20:#x}",
+    env = dict(os.environ, SA_TRANSPORT="board", SA_DEVICE_HZ=f"{mm.riscv_hz:.0f}", SA_BOARD_MEM=f"{phys:#x}:{mb << 20:#x}",
                SA_BOARD_MBOX=f"{mm.bram_base + MBOX:#x}", SA_BOARD_RING=str(ring), SA_BOARD_D=str(mm.d))
     return mm, buf, env
 
