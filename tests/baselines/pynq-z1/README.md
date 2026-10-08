@@ -1,11 +1,17 @@
 # PYNQ-Z1 baselines (frozen at `v1.0-pynq-z1`)
 
+> **PYNQ-Z1 paths.** This document records work done on the PYNQ-Z1. Paths
+> `RISCV-on-PYNQ-Z1/...` (block design, constraints) and `bitstreams/...`
+> (the board-verified builds) refer to the `pynq-z1` branch (tag
+> `v1.0-pynq-z1`); on main, PicoRV32 and its IP are in `rtl/picorv32/` and
+> `rtl/ip/`, the current overlay in `boards/kv260/`.
+
 The reference the KV260 port is checked against without the Z1 board
 (docs/kv260_upgrade_plan.md §7.2). Made on 2026-10-04 (bundles from commit 9e1f5cf's compiler, the runtime of ce3cf11):
 `compiler/scripts/deploy_z1_freeze.sh` staged every board test,
 `compiler/tests/board_regress.py` ran them on the PYNQ-Z1 (L2 bitstream,
 D = 8, 50 MHz; all bit-exact, `REGRESSION PASS`), and
-`compiler/tests/make_z1_baselines.py` wrote these files.
+`compiler/tests/make_z1_baselines.py` (on the `pynq-z1` branch) wrote these files.
 
 | File | Content |
 |---|---|
@@ -22,4 +28,4 @@ the descriptors of the D = 8 / default-memory target must match
 `golden_manifest.txt` while the compiler is unchanged.
 `compiler/tests/compare_z1_baselines.py <results>` checks a board run.
 K1a (50 MHz, 2026-10-08) and K1b (100 MHz, 2026-10-08): all five runs
-identical (KV260/README.md).
+identical (boards/kv260/README.md).

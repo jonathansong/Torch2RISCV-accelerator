@@ -200,7 +200,7 @@ def main():
 
 def stage(work, dst):
     """Board bundle: per case model.vmfb, packed.irpa, x / s_x / y_ref .npy, plus
-    run_c2.sh (armv7 iree-run-module through the C1 launcher)."""
+    run_c2.sh (the board's iree-run-module through the C1 launcher)."""
     os.makedirs(dst, exist_ok=True)
     for name, *_ in CASES:
         os.makedirs(os.path.join(dst, name), exist_ok=True)

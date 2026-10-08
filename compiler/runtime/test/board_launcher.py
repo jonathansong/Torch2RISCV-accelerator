@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""C1 on the PYNQ-Z1 (docs/iree_compiler_plan.md §5.6): start the accelerator
+"""C1 on the board (docs/iree_compiler_plan.md §5.6): start the accelerator
 for the sa HAL driver's board transport and run a program against it.
 
 The PYNQ side does what the IREE runtime cannot do by itself: load the
 overlay, allocate a physically contiguous window (CMA) for all device memory,
 put rt_fw's submission ring at its start (completion records at +0x2000;
 compiler/runtime/sa/sa_transport_board.c) and release the RISC-V running
-rt_fw. The program (the static armv7 sa_hal_test, or iree-run-module with
+rt_fw. The program (the static aarch64 sa_hal_test, or iree-run-module with
 --device=sa) then maps the window and the mailbox through /dev/mem and talks
 to rt_fw directly; this script only waits for it.
 

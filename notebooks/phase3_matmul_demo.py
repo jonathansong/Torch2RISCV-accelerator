@@ -2,7 +2,7 @@
 """Phase 3 demo: ARM -> PicoRV32 -> matmul unit.
 
 Put these files in one directory on the board:
-    picorv32.bit, picorv32.hwh   RISCV-on-PYNQ-Z1/build/output/ (scripts/build_bitstream.sh)
+    picorv32.bit, picorv32.hwh   boards/kv260/build/output/<config>/ (boards/kv260/scripts/build_bitstream.sh)
     matmul_fw.bin                firmware/matmul/ (make)
     pynq_matmul.py               driver/
     phase3_matmul_demo.py        this file

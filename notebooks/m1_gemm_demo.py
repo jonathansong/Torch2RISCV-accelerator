@@ -2,7 +2,7 @@
 """M1 demo: tiled GEMM on the double-buffered accelerator, vs the Phase 3/4 paths.
 
 Put these files in one directory on the board:
-    picorv32.bit, picorv32.hwh   RISCV-on-PYNQ-Z1/build/output/ (scripts/build_bitstream.sh)
+    picorv32.bit, picorv32.hwh   boards/kv260/build/output/<config>/ (boards/kv260/scripts/build_bitstream.sh)
     gemm_fw.bin                  firmware/gemm/ (make)         - funct7 = 1 ISA
     matmul_insn_fw.bin           firmware/matmul_insn/ (make)  - Phase 4 path (legacy)
     matmul_fw.bin                firmware/matmul/ (make)       - Phase 3 path (legacy)

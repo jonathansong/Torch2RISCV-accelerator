@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Stages the PYNQ-Z1 freeze regression (docs/kv260_upgrade_plan.md §7.2), now
-# the KV260's regression against the Z1 baselines: every board test of the current main, one directory each
-# (each made by its own deploy script, which runs the host test first: export,
-# compile, per-dispatch check, sim run), plus board_regress.py at the top.
-#   compiler/scripts/deploy_z1_freeze.sh [--board kv260|pynq-z1] [test ...]   (default: all; tests below)
-#   kv260 (default): the KV260's aarch64 runtime and overlay (KV260/build/output/$SA_KV260_CONFIG,
-#   default d8_100mhz; or SA_BIT_DIR) into build/deploy_kv260_<config> (docs/kv260_upgrade_plan.md
-#   K1a / K1b; compare the results with compiler/tests/compare_z1_baselines.py);
-#   --board pynq-z1 stages the frozen Z1's bundle in build/deploy_z1, as below
-#   scp -r build/deploy_z1 xilinx@<board>:/home/xilinx/z1
+# Stages the board regression against the PYNQ-Z1 freeze baselines
+# (docs/kv260_upgrade_plan.md §7.2, K1a / K1b) for the KV260: every board test,
+# one directory each (each made by its own deploy script, which runs the host
+# test first: export, compile, per-dispatch check, sim run), plus
+# board_regress.py and run_board.sh at the top. The aarch64 runtime and the
+# overlay of boards/kv260/build/output/$SA_KV260_CONFIG (default d8_100mhz; or
+# SA_BIT_DIR) go into build/deploy_kv260_<config>.
+#   compiler/scripts/deploy_z1_freeze.sh [--board kv260] [test ...]   (default: all; tests below)
+#   scp -r build/deploy_kv260_<config> ubuntu@<kv260>:~/kv260_<config>
 #   board: sudo ./run_board.sh [test ...]     (sources the board's PYNQ / XRT environment)
-#   back:  scp -r xilinx@<board>:/home/xilinx/z1/results build/deploy_z1/
-#          $SA_PY compiler/tests/make_z1_baselines.py          (-> tests/baselines/pynq-z1/)
+#   back:  scp -r ubuntu@<kv260>:~/kv260_<config>/results build/deploy_kv260_<config>/
+#          $SA_PY compiler/tests/compare_z1_baselines.py build/deploy_kv260_<config>/results
+# (The Z1's own bundle and make_z1_baselines.py: the pynq-z1 branch.)
 #
-#   ddr          RISC-V reads / writes DDR (RISCV-on-PYNQ-Z1/tests/ddr_access)          (K1a step 1)
+#   ddr          RISC-V reads / writes DDR (tests/ddr_access)                            (K1a step 1)
 #   bwtest       DMA bandwidth (notebooks/m2_bw_test.py, firmware/bwtest) on the board's overlay
 #   fwdemo       gemm / vector / desc_run firmware vs NumPy (notebooks/m1, m3, m5 demos) (step 3)
 #   c1           the sa HAL driver's C1 test (sa_hal_test through board_launcher.py) (step 4)
@@ -26,16 +26,12 @@
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 if [ "${1:-}" = "--board" ]; then
-  export SA_BOARD=${2:?--board pynq-z1 or kv260}
+  export SA_BOARD=${2:?--board kv260}
   shift 2
 fi
 source "$(dirname "$0")/board_env.sh"
 export SA_BOARD SA_BIT_DIR
-case $SA_BOARD in
-  pynq-z1) Z=$SA_REPO/build/deploy_z1 ;;
-  kv260)   Z=$SA_REPO/build/deploy_kv260_$SA_KV260_CONFIG ;;   # (per overlay: results are kept)
-  *)       Z=$SA_REPO/build/deploy_$SA_BOARD ;;
-esac
+Z=$SA_REPO/build/deploy_kv260_$SA_KV260_CONFIG          # (per overlay: results are kept)
 MEM=${MEM:-12G}
 ALL=(ddr bwtest fwdemo c1 c3 c55 c6p_stories c6p_smollm2 hfgen)
 TESTS=("$@")
@@ -55,7 +51,7 @@ for t in "${TESTS[@]}"; do
   case $t in
     ddr)
       rm -rf "$Z/ddr" && mkdir -p "$Z/ddr"
-      cp "$SA_REPO/RISCV-on-PYNQ-Z1/tests/ddr_access/ddr_test.py" "$SA_REPO/RISCV-on-PYNQ-Z1/tests/ddr_access/ddr_test.bin" \
+      cp "$SA_REPO/tests/ddr_access/ddr_test.py" "$SA_REPO/tests/ddr_access/ddr_test.bin" \
          "$L2/picorv32.bit" "$L2/picorv32.hwh" "$Z/ddr/" ;;
     fwdemo)
       rm -rf "$Z/fwdemo" && mkdir -p "$Z/fwdemo"

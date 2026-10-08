@@ -1,5 +1,7 @@
 # 执行过程详解：从 `m4_demo.py` 到 RTL
 
+> **PYNQ-Z1 的路径**：本文记录的是在 PYNQ-Z1 上完成的工作。文中的 `RISCV-on-PYNQ-Z1/...`（block design、约束）、`bitstreams/...`（板上验证过的构建）和 `iree-sa/l0` 都在 `pynq-z1` 分支（tag `v1.0-pynq-z1`）上；main 上 PicoRV32 与它的 IP 在 `rtl/picorv32/`、`rtl/ip/`，当前的 overlay 在 `boards/kv260/`。
+
 本文以 `notebooks/m4_demo.py` 里的一次 **int32 GEMM `mm.gemm(a, b)`**
 (256×256×256，M4 板卡构建，D = 16) 为例，逐层跟踪一次运行：Python
 驱动 → PicoRV32 固件 → PCPI 自定义指令 → 调度器 → 各引擎 → BRAM / DDR，

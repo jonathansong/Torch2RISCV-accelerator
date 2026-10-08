@@ -2,7 +2,7 @@
 """M4 demo: the D = 16 array (8 DSP columns + 8 LUT columns, VL = 16) on one HP port.
 
 Put these files in one directory on the board:
-    picorv32.bit, picorv32.hwh   RISCV-on-PYNQ-Z1/build/output/ (scripts/build_bitstream.sh)
+    picorv32.bit, picorv32.hwh   boards/kv260/build/output/<config>/ (boards/kv260/scripts/build_bitstream.sh)
     gemm_fw.bin                  firmware/gemm/ (make)         - GEMM (+ VE epilogue)
     vector_fw.bin                firmware/vector/ (make)       - standalone vector ops
     bwtest_fw.bin                firmware/bwtest/ (make)       - DMA bandwidth

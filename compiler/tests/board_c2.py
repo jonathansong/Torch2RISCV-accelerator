@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""C2 on the PYNQ-Z1: the IREE-compiled int8 linear layers (compiler/tests/test_c2.py
---board-bundle) run by the armv7 iree-run-module on the sa device, each
+"""C2 on the board: the IREE-compiled int8 linear layers (compiler/tests/test_c2.py
+--board-bundle) run by the aarch64 iree-run-module on the sa device, each
 result compared bit for bit with DeviceModel.linear (y_ref.npy).
 
 Files in one directory on the board: this script, board_launcher.py,
-pynq_matmul.py, picorv32.bit / .hwh (L2), rt_fw.bin, iree-run-module (armv7,
+pynq_matmul.py, picorv32.bit / .hwh (the overlay), rt_fw.bin, iree-run-module (aarch64,
 with the sa driver), and one directory per case (model.vmfb, packed.irpa,
 x.npy, s_x.npy, y_ref.npy).
 

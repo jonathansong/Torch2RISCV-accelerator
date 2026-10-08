@@ -1,5 +1,11 @@
 # Custom matrix instructions (Phase 4)
 
+> **PYNQ-Z1 paths.** This document records work done on the PYNQ-Z1. Paths
+> `RISCV-on-PYNQ-Z1/...` (block design, constraints) and `bitstreams/...`
+> (the board-verified builds) refer to the `pynq-z1` branch (tag
+> `v1.0-pynq-z1`); on main, PicoRV32 and its IP are in `rtl/picorv32/` and
+> `rtl/ip/`, the current overlay in `boards/kv260/`.
+
 The PicoRV32 hands every instruction it does not implement to its
 co-processor port (PCPI). `rtl/matmul/matmul_pcpi.v` claims a small set of
 R-type instructions in the RISC-V **custom-0** opcode space and drives the

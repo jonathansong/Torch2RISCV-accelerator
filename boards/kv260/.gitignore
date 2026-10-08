@@ -1,0 +1,5 @@
+# Vivado build output (scripts/build_bitstream.sh)
+/build/
+.Xil/
+vivado*.log
+vivado*.jou

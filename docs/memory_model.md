@@ -38,7 +38,7 @@ notify interrupt, and the runtime's buffers.
   is why the host notification is an edge interrupt (`mat_notify`) and not a
   status bit the ARM clears.
 
-### Kria KV260 (`kv260` overlay, KV260/README.md)
+### Kria KV260 (`kv260` overlay, boards/kv260/README.md)
 
 The RISC-V / accelerator side is unchanged (firmware unchanged). The ARM
 reaches the PL through `M_AXI_HPM0_FPD`: program BRAM at `0xA001_0000`

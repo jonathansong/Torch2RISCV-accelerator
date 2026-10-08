@@ -21,7 +21,7 @@ VIVADO_SETTINGS ?= /home/jon/Projects/Vivado/Vivado/2024.1/settings64.sh
 PYTHON          ?= python3
 
 SA  := $(ROOT)/rtl/sysarray
-RTL := $(ROOT)/RISCV-on-PYNQ-Z1/picorv32/picorv32.v $(wildcard $(SA)/*.v)
+RTL := $(ROOT)/rtl/picorv32/picorv32.v $(wildcard $(SA)/*.v)
 SIM_DEFINES ?=
 # array size of the simulated unit (8 or 16)
 SIM_D       ?= 8

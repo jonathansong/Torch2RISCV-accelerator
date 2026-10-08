@@ -2,8 +2,9 @@
 # Source it:  source compiler/env.sh
 #
 # Everything large lives under build/ (git-ignored). By default the IREE
-# source tree and the Python venv of level L0 (iree-sa/l0) are reused: the
-# same IREE revision, so the runtime of L0 and the compiler built here match.
+# source tree and the Python venv first set up for level L0 (llvm-cpu on the
+# PYNQ-Z1's ARM; iree-sa/l0 on the pynq-z1 branch) are reused: the same IREE
+# revision, so the runtime and the compiler built here match.
 
 _SA_COMPILER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SA_REPO="$(cd "$_SA_COMPILER_DIR/.." && pwd)"

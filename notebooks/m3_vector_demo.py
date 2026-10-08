@@ -2,7 +2,7 @@
 """M3 demo: the vector engine, fused after matmul (int8 GEMM) and standalone.
 
 Put these files in one directory on the board:
-    picorv32.bit, picorv32.hwh   RISCV-on-PYNQ-Z1/build/output/ (scripts/build_bitstream.sh)
+    picorv32.bit, picorv32.hwh   boards/kv260/build/output/<config>/ (boards/kv260/scripts/build_bitstream.sh)
     gemm_fw.bin                  firmware/gemm/ (make)         - GEMM + VE epilogue
     vector_fw.bin                firmware/vector/ (make)       - standalone vector ops
     matmul_insn_fw.bin           firmware/matmul_insn/ (make)  - Phase 4 path (legacy)

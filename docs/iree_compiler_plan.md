@@ -1,5 +1,7 @@
 # LLM 编译器：基于 MLIR / IREE 的端到端方案（PyTorch → 描述符列表）
 
+> **PYNQ-Z1 的路径**：本文记录的是在 PYNQ-Z1 上完成的工作。文中的 `RISCV-on-PYNQ-Z1/...`（block design、约束）、`bitstreams/...`（板上验证过的构建）和 `iree-sa/l0` 都在 `pynq-z1` 分支（tag `v1.0-pynq-z1`）上；main 上 PicoRV32 与它的 IP 在 `rtl/picorv32/`、`rtl/ip/`，当前的 overlay 在 `boards/kv260/`。
+
 状态：**C0–C3 完成**（§3.5、§5.7、§6.7、§6.9）；**C4 部分完成、暂缓**（§7.1：板上 2.591M 周期 / token，17.7 tok/s，与手写路径差 13%，目标 ≤ 10%；剩下的融合留到 C5 之后）；**C5 完成**（§8.7：两层方言 sahl / sahw 的完整代码生成，模板成为微内核；stories15M 板上 2.589M 周期 / token；SmolLM2-135M 板上 2.23 tok/s，Qwen3 结构 sim；两者都可在板上交互式生成）；**C6 进行中**（§8.12：目标配置交叉验证、K 分块、C6.0 嵌入只存一份、C6.1 Qwen3-0.6B 全 28 层在 sim 上逐位一致、C6.P prefill + decode 板上逐位一致已完成，下一步 C6.2 量化质量或 prefill 的优化）。这是 [`llm_inference_plan.md`](llm_inference_plan.md) 的 L6-IREE 一级的详细设计，
 取代那里 §10.4、§10.5 的概要。
 

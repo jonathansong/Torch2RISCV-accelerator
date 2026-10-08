@@ -4,7 +4,7 @@
 Needs an overlay with performance counters (CAPS bit 20; rtl/sysarray/sa_perf.v,
 docs/perf_counters_and_desc_dma_plan.md P1-P3). Put these files in one
 directory on the board:
-    picorv32.bit, picorv32.hwh   RISCV-on-PYNQ-Z1/build/output/ (scripts/build_bitstream.sh)
+    picorv32.bit, picorv32.hwh   boards/kv260/build/output/<config>/ (boards/kv260/scripts/build_bitstream.sh)
     gemm_fw.bin, vector_fw.bin   firmware/gemm, firmware/vector (make)
     pynq_matmul.py               driver/
     m4_perf.py                   this file

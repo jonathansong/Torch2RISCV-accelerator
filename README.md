@@ -1,7 +1,7 @@
 # Torch2RISCV-accelerator
 
 > **Platform update:** Development has moved to the AMD Kria KV260
-> ([`KV260/`](KV260/README.md), [plan](docs/kv260_upgrade_plan.md)). Its first
+> ([`boards/kv260/`](boards/kv260/README.md), [plan](docs/kv260_upgrade_plan.md)). Its first
 > stage (K1: the same accelerator, then 100 MHz) is accepted on the board:
 > every test's tokens are identical to the PYNQ-Z1 baselines, stories15M at
 > 35.4 tok/s and SmolLM2-135M at 4.4 tok/s (generic HuggingFace path 3.7).
@@ -11,7 +11,8 @@
 > generic HuggingFace path), all bit-exact on the board; its baselines are in
 > [`tests/baselines/pynq-z1/`](tests/baselines/pynq-z1/). It still works and
 > is the cheapest way to try the full stack, but it only receives critical
-> fixes. The project phases below were done on the PYNQ-Z1.
+> fixes. The project phases below were done on the PYNQ-Z1; their bitstreams are on
+> that branch.
 
 An end-to-end compiler stack that lowers PyTorch models to a custom RISC-V
 instruction set, running on a heterogeneous **ARM (host) + PicoRV32 (control
@@ -140,36 +141,40 @@ MLIR lowering pass (as an LLVM `InlineAsm` node).
 
 ```
 ├── rtl/
-│   ├── sysarray/            # current accelerator (M1-M4): double-buffered D x D systolic
-│   │   │                    #   array, LD/ST DMA, vector engine, bank scoreboard, PCPI + CSRs
+│   ├── sysarray/            # the accelerator: double-buffered D x D systolic array, LD/ST DMA,
+│   │   │                    #   descriptor fetch, int8 + fp32 vector engines, scheduler, PCPI + CSRs
 │   │   ├── sa_*.v, *.vh     #   RTL (file table in rtl/sysarray/README.md)
 │   │   ├── sim/             #   unit testbenches (make test / make test16)
 │   │   └── synth_ooc.tcl    #   out-of-context synth + timing (make synth)
+│   ├── picorv32/            # picorv32.v from upstream PicoRV32 (+ license)
+│   ├── ip/                  # Vivado IP repository: picorv32_axi, the PCPI interface
 │   └── matmul/              # Phase 2-4 8x8x8 unit (reference; CSR + PCPI, NumPy vectors)
+├── boards/kv260/            # the Kria KV260 overlay (README: builds, address map, board setup)
+│   └── scripts/             #   build_bitstream.sh/.tcl (-sa_d, -sa_mhz, -bd_only), kv260_bd.tcl,
+│                            #   pico_processor.tcl (block design); outputs in build/output/<config>
 ├── firmware/                # bare-metal PicoRV32 firmware (clang, rv32imc)
 │   ├── include/             #   sysarray_intrinsics.h (.insn wrappers), mailbox.h, matmul_csr.h
 │   ├── common/, common.mk   #   start.S, link.ld, build + system-simulation rules
-│   ├── gemm/                #   tiled GEMM, int32 or int8 output (VE epilogue)
-│   ├── vector/              #   standalone vector-engine operations
-│   ├── bwtest/              #   DMA bandwidth self-test
+│   ├── rt/                  #   the resident runtime firmware (command ring)
+│   ├── gemm/, vector/       #   tiled GEMM (VE epilogue), standalone vector-engine operations
+│   ├── bwtest/, desc_run/   #   DMA bandwidth self-test, descriptor lists
 │   ├── matmul/, matmul_insn/#   Phase 3 (CSR) / Phase 4 (custom-instruction) job firmware
 │   └── sim/tb_system.v      #   firmware on PicoRV32 + the accelerator RTL (make sim)
-├── driver/pynq_matmul.py    # PYNQ driver: MatmulOverlay (gemm, vector, bandwidth, matmul)
-├── notebooks/               # board scripts per milestone (phase3/4, m1-m4, m4_sched_tune)
+├── compiler/                # the IREE compiler (sa backend), the sa HAL runtime, tests, deploy scripts
+├── llm/                     # the hand-written LLM path (export, compile_model, runtime, funcsim)
+├── driver/pynq_matmul.py    # PYNQ driver: MatmulOverlay (reads board, D, addresses, clock from the .hwh)
+├── notebooks/               # board scripts per milestone (phase3/4, m1-m5, llm/)
+├── tests/                   # ddr_access (RISC-V -> DDR test), baselines/pynq-z1 (freeze baselines)
 ├── docs/                    # design docs and the hardware learning path (see below)
-└── RISCV-on-PYNQ-Z1/        # the PYNQ-Z1 overlay (PicoRV32 + PS7 + accelerator)
-    ├── scripts/             #   build_bitstream.sh/.tcl (one-shot build, -jobs, -sa_d),
-    │                        #   pico_bit.tcl / pico_processor.tcl (block design)
-    ├── bitstreams/          #   board-verified bit/hwh + results: phase3, phase4, m1-m4
-    ├── ip/                  #   IP repository used by the build (picorv32_axi, pcpi interface)
-    ├── picorv32/            #   picorv32.v from upstream PicoRV32 (+ license)
-    ├── constrs/             #   PYNQ-Z1 XDC constraints
-    └── tests/ddr_access/    #   RISC-V -> DDR access test (firmware, sim, board script)
+└── LICENSES/                # licenses of third-party parts (see NOTICE)
 ```
 
-The MLIR lowering (Phase 5) is not in the repository yet. Build output
-(`build/`) is not tracked; tested bitstreams are copied to
-`RISCV-on-PYNQ-Z1/bitstreams/`.
+Build output (`build/`, `boards/kv260/build/`) is not tracked; KV260
+bitstreams are published with the GitHub releases. The PYNQ-Z1 overlay
+(block design, constraints, the board-verified bitstreams of every
+milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
+`v1.0-pynq-z1`), as `RISCV-on-PYNQ-Z1/`; paths `RISCV-on-PYNQ-Z1/...` and
+`bitstreams/...` in the documents refer to it.
 
 ---
 
@@ -218,7 +223,7 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
   memory bandwidth, URAM capacity, Qwen3-0.6B), the measured Z1 time breakdown
   it starts from, and the repository strategy (Z1 frozen at `v1.0-pynq-z1`).
   K1 (K1a 50 MHz, K1b 100 MHz) is accepted on the board; the overlay, its
-  builds, address map and board setup are in [KV260/README.md](KV260/README.md)
+  builds, address map and board setup are in [boards/kv260/README.md](boards/kv260/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)
 - [Custom instruction encoding](docs/custom_isa_encoding.md) and
@@ -232,8 +237,8 @@ The MLIR lowering (Phase 5) is not in the repository yet. Build output
 
 | Phase | Scope | Status | Result / where |
 |---|---|---|---|
-| 0 | Environment, one-shot Vivado build | ✅ done | `RISCV-on-PYNQ-Z1/scripts/build_bitstream.sh` |
-| 1 | PicoRV32 bring-up on PYNQ-Z1, RISC-V → DDR access | ✅ board-verified | `RISCV-on-PYNQ-Z1/tests/ddr_access` |
+| 0 | Environment, one-shot Vivado build | ✅ done | `RISCV-on-PYNQ-Z1/scripts/build_bitstream.sh` (pynq-z1 branch; KV260: `boards/kv260/scripts/build_bitstream.sh`) |
+| 1 | PicoRV32 bring-up on PYNQ-Z1, RISC-V → DDR access | ✅ board-verified | `tests/ddr_access` |
 | 2 | 8×8×8 matrix unit (CSR + AXI master, loose coupling) | ✅ simulation-verified vs NumPy | `rtl/matmul` |
 | 3 | End-to-end closed loop, CSR path, hand-written firmware | ✅ board-verified | 522.6 cycles/job; `bitstreams/phase3` |
 | 4 | Custom instructions (PCPI, `.insn`) | ✅ board-verified | 311.9 cycles/job; `bitstreams/phase4` |

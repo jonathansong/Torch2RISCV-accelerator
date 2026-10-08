@@ -1,5 +1,11 @@
 # Double-buffered accelerator design (v2 of the matmul unit)
 
+> **PYNQ-Z1 paths.** This document records work done on the PYNQ-Z1. Paths
+> `RISCV-on-PYNQ-Z1/...` (block design, constraints) and `bitstreams/...`
+> (the board-verified builds) refer to the `pynq-z1` branch (tag
+> `v1.0-pynq-z1`); on main, PicoRV32 and its IP are in `rtl/picorv32/` and
+> `rtl/ip/`, the current overlay in `boards/kv260/`.
+
 Status: **M1 done and verified on the board** (`rtl/sysarray`, D = 8, one
 DMA port; bitstream and results in `RISCV-on-PYNQ-Z1/bitstreams/m1/`:
 256×256×256 at 54.5 MAC/cycle, 85 % of the array peak, 35× Phase 4).

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Interactive text generation on the PYNQ-Z1: a decoder compiled by IREE for the
-sa device (the C3 / C5.5 board bundles), run by the armv7 sa-llm-run.
+"""Interactive text generation on the board: a decoder compiled by IREE for the
+sa device (the C3 / C5.5 board bundles), run by the aarch64 sa-llm-run.
 
 The overlay and rt_fw are started once; then each prompt is tokenized on the
 ARM, fed to sa-llm-run (a fresh KV cache per prompt), and the generated text is

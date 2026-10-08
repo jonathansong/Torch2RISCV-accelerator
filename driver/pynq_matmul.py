@@ -45,8 +45,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Overlay addresses. The board-specific ones come from the overlay's .hwh
 # (overlay_info: the ARM-side program BRAM address and the accelerator clock),
 # so one driver serves both boards; these are the PYNQ-Z1 values
-# (RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl), used when the .hwh does not say.
-# KV260 (KV260/scripts/kv260_bd.tcl): BRAM 0xA001_0000, pl_clk0.
+# (pico_bit.tcl on the pynq-z1 branch), used when the .hwh does not say.
+# KV260 (boards/kv260/scripts/kv260_bd.tcl): BRAM 0xA001_0000, pl_clk0.
 BRAM_ARM_BASE = 0x40010000
 BRAM_BYTES = 0x2000
 RESET_EMIO = 0                 # PS GPIO EMIO[0] -> RISC-V reset (1 = hold), both boards

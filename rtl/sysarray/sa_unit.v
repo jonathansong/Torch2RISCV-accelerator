@@ -241,7 +241,7 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi BREADY" *)
     output wire         m2_axi_bready,
 
-    // PicoRV32 co-processor interface (bus definition in RISCV-on-PYNQ-Z1/ip/pcpi_v1_0)
+    // PicoRV32 co-processor interface (bus definition in rtl/ip/pcpi_v1_0)
     (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_valid", X_INTERFACE_MODE = "slave" *)
     input  wire         pcpi_valid,
     (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_insn" *)

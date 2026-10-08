@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C4 measurement on the PYNQ-Z1: where the time of one token goes for the
+"""C4 measurement on the board: where the time of one token goes for the
 IREE-compiled model (device cycles per export from rt_fw's completion records,
 host time of the submissions, the rest of the IREE runtime). Same files as
 board_llm.py. One list per dispatch (so each export is timed); --batch keeps the

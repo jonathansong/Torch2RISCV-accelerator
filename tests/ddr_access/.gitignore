@@ -1,0 +1,7 @@
+# build + xsim artifacts (ddr_test.bin is kept)
+/ddr_test.elf
+/sim/ddr_test.hex
+/sim/xsim.dir/
+/sim/*.log
+/sim/*.jou
+/sim/*.pb

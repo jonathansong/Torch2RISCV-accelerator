@@ -1,5 +1,7 @@
 # 性能计数器与描述符 DMA：方案、实现与结果
 
+> **PYNQ-Z1 的路径**：本文记录的是在 PYNQ-Z1 上完成的工作。文中的 `RISCV-on-PYNQ-Z1/...`（block design、约束）、`bitstreams/...`（板上验证过的构建）和 `iree-sa/l0` 都在 `pynq-z1` 分支（tag `v1.0-pynq-z1`）上；main 上 PicoRV32 与它的 IP 在 `rtl/picorv32/`、`rtl/ip/`，当前的 overlay 在 `boards/kv260/`。
+
 状态：**两部分都已完成并上板验证**。下文先是各步骤的完成记录（与原计划的差别都写在其中），
 然后是原始方案，保留作为设计依据。
 

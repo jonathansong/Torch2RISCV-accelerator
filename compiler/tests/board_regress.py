@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The PYNQ-Z1 freeze regression on the board (docs/kv260_upgrade_plan.md §7.2):
+"""The board regression against the PYNQ-Z1 freeze baselines (docs/kv260_upgrade_plan.md §7.2):
 runs every test directory staged by compiler/scripts/deploy_z1_freeze.sh in
 turn and collects the logs, the generated tokens and the profiles into
 results/ (copied back to the host for compiler/tests/make_z1_baselines.py).

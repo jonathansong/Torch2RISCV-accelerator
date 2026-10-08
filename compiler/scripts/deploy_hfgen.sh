@@ -8,7 +8,7 @@
 #   board: python3 board_llm.py
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
-source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (default) | pynq-z1
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (the default; the PYNQ-Z1: pynq-z1 branch)
 O=${1:-$SA_REPO/build/hfgen/smollm2_p8}
 D=$SA_REPO/build/deploy_hfgen
 rm -rf "$D" && mkdir -p "$D"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# LLM step 1: llama2.c on the PYNQ-Z1's ARM Cortex-A9 (650 MHz, NEON), no accelerator.
+# LLM step 1: llama2.c on the board's ARM (measured on the PYNQ-Z1's Cortex-A9,
+# 650 MHz, NEON; the KV260's Cortex-A53 with aarch64 flags), no accelerator.
 #
 #   cd /home/xilinx/llm && bash arm_baseline.sh [tokens]      (no sudo needed)
 #
@@ -16,7 +17,11 @@ set -uo pipefail
 
 N=${1:-256}
 PROMPT="Once upon a time"
-CFLAGS=${CFLAGS:-"-Ofast -march=armv7-a -mfpu=neon -mfloat-abi=hard -mtune=cortex-a9"}
+case $(uname -m) in
+    aarch64) DEF_CFLAGS="-Ofast -mcpu=cortex-a53" ;;
+    *)       DEF_CFLAGS="-Ofast -march=armv7-a -mfpu=neon -mfloat-abi=hard -mtune=cortex-a9" ;;
+esac
+CFLAGS=${CFLAGS:-$DEF_CFLAGS}
 OUT=arm_baseline.txt
 cd "$(dirname "$0")"
 mkdir -p bin

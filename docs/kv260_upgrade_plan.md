@@ -522,6 +522,16 @@ K2b 的目标必须和配置一起写：例如"2 字/周期 × 250 MHz，实测 
 4. **bitstream 不再进 git**：KV260 的 bitstream 和 `.xsa` 比 Z1 的大得多，统一放 GitHub Releases（或 Git LFS）。
 5. **文档**：`memory_model.md`、`hardware_learning_path.md` 等文档中 Z1 专用的内容，改成"历史：PYNQ-Z1"小节，或注明"见 `pynq-z1` 分支"。
 
+**已完成**（2026-10-08）：
+
+- `KV260/` → `boards/kv260/`（block design、构建脚本、README；构建输出仍在 `boards/kv260/build/`，不进 git）；`RISCV-on-PYNQ-Z1/picorv32/` → `rtl/picorv32/`，`RISCV-on-PYNQ-Z1/ip/` → `rtl/ip/`（IP 打包里 `../../picorv32/picorv32.v` 的相对路径不变），`pico_processor.tcl` → `boards/kv260/scripts/`，`RISCV-on-PYNQ-Z1/tests/ddr_access/` → `tests/ddr_access/`。
+- 删除：`RISCV-on-PYNQ-Z1/` 的其余部分（Z1 block design `pico_bit.tcl`、Z1 构建脚本、约束、`bitstreams/` 下 phase3–l2 的全部结果、原始计划）、`iree-sa/l0`（armv7 的 L0）、`build_sa_runtime.sh armv7`、`board_env.sh` 的 `SA_BOARD=pynq-z1`、`export.py --armv7`、`make_z1_baselines.py`。都在 `pynq-z1` 分支上。
+- 许可证：`rtl/ip/` 和 `pico_processor.tcl` 仍源自 RISCV-on-PYNQ-Z2（Jinzzj，MIT），许可证移到 `LICENSES/RISCV-on-PYNQ-Z1-MIT.txt`，NOTICE 更新路径。
+- 编译器的目标配置默认值不用改：K1 的加速器与 Z1 相同（D = 8、128 KB SPAD、256 KB ACC）；K1c 起按新配置改。
+- bitstream：main 上不再有 bitstream；KV260 的 overlay 放 GitHub Release。
+- 文档：记录 Z1 工作的文档开头注明 `RISCV-on-PYNQ-Z1/...`、`bitstreams/...` 指 `pynq-z1` 分支；README 的目录说明、`hardware_learning_path.md` 的构建步骤改为 KV260。
+- 验证：`-bd_only` 用新路径通过（地址映射与 K1 相同），`tests/ddr_access` 和 `firmware/gemm` 的系统仿真 PASS，aarch64 运行时构建通过。
+
 ### 7.5 README 说明
 
 放在 README 最上方：

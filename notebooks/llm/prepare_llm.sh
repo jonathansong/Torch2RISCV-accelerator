@@ -6,7 +6,7 @@
 #
 # Downloads llama2.c (pinned commit) and the TinyStories checkpoints into
 # build/llm_cache/, converts them to Q8_0 (quantize_q80.py, for runq.c), and
-# group size 32 for all models (arm_baseline.sh's runq_gs32 build), copies the m5 overlay, the firmware and the board scripts. stories110M is
+# group size 32 for all models (arm_baseline.sh's runq_gs32 build), copies the overlay (SA_BIT_DIR, default the KV260's d8_100mhz; the Z1's m5 overlay on the pynq-z1 branch), the firmware and the board scripts. stories110M is
 # staged in Q8_0 only: its fp32 file (438 MB) does not fit the board's RAM.
 set -euo pipefail
 
@@ -36,7 +36,8 @@ for m in stories15M stories42M stories110M; do
 done
 cp "$CACHE/stories15M.bin" "$CACHE/stories42M.bin" "$DEST/"
 
-cp "$ROOT/RISCV-on-PYNQ-Z1/bitstreams/m5/picorv32.bit" "$ROOT/RISCV-on-PYNQ-Z1/bitstreams/m5/picorv32.hwh" "$DEST/"
+BIT=${SA_BIT_DIR:-$ROOT/boards/kv260/build/output/d8_100mhz}
+cp "$BIT/picorv32.bit" "$BIT/picorv32.hwh" "$DEST/"
 cp "$ROOT/firmware/gemm/gemm_fw.bin" "$ROOT/firmware/desc_run/desc_run_fw.bin" "$DEST/"
 cp "$ROOT/driver/pynq_matmul.py" "$ROOT/notebooks/llm/arm_baseline.sh" "$ROOT/notebooks/llm/llm_gemv_bench.py" "$DEST/"
 du -sh "$DEST"

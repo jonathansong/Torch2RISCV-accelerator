@@ -2,13 +2,13 @@
 # Stages the C5.5 board test (docs/iree_compiler_plan.md §8.7) in build/deploy_c55:
 # a HuggingFace decoder exported by compiler/frontend/export_hf.py (default
 # SmolLM2-135M in build/c55/smollm2); the host test (compile, sim run) writes the
-# module and the expected run (the sim's); plus the board's sa-llm-run (armv7 / aarch64, SA_BOARD), the C1
+# module and the expected run (the sim's); plus the board's sa-llm-run (aarch64), the C1
 # launcher, the board's overlay.
 #   compiler/scripts/deploy_c55.sh [test_c55.py arguments]
 #   scp build/deploy_c55/* xilinx@<board>:/home/xilinx/c55/
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
-source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (default) | pynq-z1
+source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (the default; the PYNQ-Z1: pynq-z1 branch)
 D=$SA_REPO/build/deploy_c55
 rm -rf "$D" && mkdir -p "$D"
 "$SA_PY" "$SA_COMPILER/tests/test_c55.py" --model "$SA_REPO/build/llm_cache/SmolLM2-135M" \

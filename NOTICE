@@ -7,15 +7,18 @@ SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 This repository includes or is derived from the following third-party work,
 which remains under its own license:
 
-* RISCV-on-PYNQ-Z1/ (base project)
+* rtl/ip/ (the PicoRV32 AXI and PCPI IP packaging) and
+  boards/kv260/scripts/pico_processor.tcl (the PicoRV32 subsystem), derived
+  from RISCV-on-PYNQ-Z2 (https://github.com/JacoboJin/RISCV-on-PYNQ-Z2, the
+  base project; the whole PYNQ-Z1 port is on the pynq-z1 branch)
   Copyright (c) 2023 Jinzzj
-  MIT License, see RISCV-on-PYNQ-Z1/LICENSE
+  MIT License, see LICENSES/RISCV-on-PYNQ-Z1-MIT.txt
 
-* RISCV-on-PYNQ-Z1/picorv32/ (PicoRV32 RISC-V CPU core)
+* rtl/picorv32/ (PicoRV32 RISC-V CPU core)
   Copyright (C) 2015-2021 Claire Xenia Wolf <claire@yosyshq.com>
-  ISC License, see RISCV-on-PYNQ-Z1/picorv32/COPYING
+  ISC License, see rtl/picorv32/COPYING
 
-* RISCV-on-PYNQ-Z1/ip/nobuild.mk
+* rtl/ip/nobuild.mk
   Copyright (c) 2017, Xilinx, Inc.
   BSD 3-Clause License, see the header of that file
 

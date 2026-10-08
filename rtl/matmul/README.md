@@ -1,5 +1,11 @@
 # matmul_unit — 8×8×8 int8 matrix multiply (Phase 2 + Phase 4)
 
+> **PYNQ-Z1 paths.** This document records work done on the PYNQ-Z1. Paths
+> `RISCV-on-PYNQ-Z1/...` (block design, constraints) and `bitstreams/...`
+> (the board-verified builds) refer to the `pynq-z1` branch (tag
+> `v1.0-pynq-z1`); on main, PicoRV32 and its IP are in `rtl/picorv32/` and
+> `rtl/ip/`, the current overlay in `boards/kv260/`.
+
 The unit fetches A and B from DDR through its own AXI4 master, computes
 `C = A · B` on an 8×8 output-stationary systolic array (int8 × int8 → int32),
 and writes C back to DDR. A job is started either
@@ -98,7 +104,7 @@ multipliers from LUTs: 7178 LUTs, 0 DSPs, and 100 MHz fails by 0.15 ns.
 
 ## Integration
 
-In the overlay (`RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl`) the unit is
+In the Z1 overlay (`RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl`) the unit was
 `matmul_0`: CSRs at 0x80000000 on the PicoRV32 bus, `m_axi` on S_AXI_HP2,
 `pcpi` on the PicoRV32 co-processor port, all on `riscv_clk`. Firmware:
 `firmware/matmul` (CSR) and `firmware/matmul_insn` (custom instructions);

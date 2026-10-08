@@ -12,7 +12,7 @@ an `sa` HAL driver through the command ring.
 | `env.sh` | Paths and settings; `source compiler/env.sh` | setup |
 | `scripts/fetch_iree_sources.sh` | Adds the compiler's submodules (llvm-project, torch-mlir) to the IREE source tree | setup |
 | `scripts/build_iree_compiler.sh` | Builds iree-compile from source with our plugins | setup |
-| `scripts/build_sa_runtime.sh` | Builds the IREE runtime with the `sa` HAL driver, `host` or `armv7` (about a minute) | C1 |
+| `scripts/build_sa_runtime.sh` | Builds the IREE runtime with the `sa` HAL driver, `host` or `aarch64` (the KV260; about a minute) | C1 |
 | `scripts/deploy_c1.sh` | Stages the C1 board test in `build/deploy_c1` | C1 |
 | `scripts/deploy_c2.sh` | Runs the C2 host test and stages the board test in `build/deploy_c2` | C2 |
 | `scripts/compile_sa.sh` | Compiles an exported model for the sa device (parameters imported, weights packed, packed parameters exported, dispatch sources dumped) | C3 |
@@ -27,7 +27,7 @@ an `sa` HAL driver through the command ring.
 ## Environment
 
 The IREE revision is fixed: **e4a3b0405d (IREE 3.11.0)**, the same as the pip
-compiler and the board runtime of level L0 (`iree-sa/l0`). By default,
+compiler and the board runtime of level L0 (`iree-sa/l0`, `pynq-z1` branch). By default,
 everything reuses what L0 set up under `build/iree/` (git-ignored):
 
 | What | Where (default) | Used for |
@@ -74,7 +74,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   §8.21): `scripts/deploy_z1_freeze.sh` stages every board test in
   `build/deploy_z1` (bwtest, c3, c55, c6p stories / smollm2, the generic
   hfgen), `tests/board_regress.py` runs them on the board (all bit-exact),
-  `tests/make_z1_baselines.py` writes `tests/baselines/pynq-z1/` (golden
+  `tests/make_z1_baselines.py` (`pynq-z1` branch) wrote `tests/baselines/pynq-z1/` (golden
   manifest, dispatch checks, token sequences, `perf.md`, `z1_profile.md`).
   Profiling with the unit's event counters: `SA_PROFILE=1
   SA_PROFILE_PERF=<file>` (board: each list with `RT_F_PERF`, the counters
@@ -86,7 +86,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   `build/deploy_kv260_<config>`), `tests/compare_z1_baselines.py` compares
   the board's tokens with the Z1 baselines. K1a (50 MHz) and K1b (100 MHz)
   pass with identical tokens; at 100 MHz stories15M runs at 35.4 tok/s and
-  SmolLM2-135M at 4.4 tok/s (KV260/README.md).
+  SmolLM2-135M at 4.4 tok/s (boards/kv260/README.md).
 - Setup: the frontend Python environment is checked. A turbine export of a
   small torch model (matmul + softmax), compiled with the pip `iree-compile`,
   matches torch.
@@ -116,7 +116,7 @@ directory about 10–15 GB. ccache is capped at 8 GB.
     executables per token.
 
   ```sh
-  python3 compiler/frontend/export.py --out build/c0/stories15M --armv7   # then on the board: bash run_c0.sh
+  python3 compiler/frontend/export.py --out build/c0/stories15M          # (the PYNQ-Z1 board bundle, --armv7: pynq-z1 branch)
   ```
 - **C1 done** (docs/iree_compiler_plan.md §5.7): the `sa` HAL driver runs
   hand-built sa-desc-v1 executables through the plain IREE HAL API,

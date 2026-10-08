@@ -1,5 +1,11 @@
 # Hardware learning path
 
+> **PYNQ-Z1 paths.** This document records work done on the PYNQ-Z1. Paths
+> `RISCV-on-PYNQ-Z1/...` (block design, constraints) and `bitstreams/...`
+> (the board-verified builds) refer to the `pynq-z1` branch (tag
+> `v1.0-pynq-z1`); on main, PicoRV32 and its IP are in `rtl/picorv32/` and
+> `rtl/ip/`, the current overlay in `boards/kv260/`.
+
 A guided route through the hardware side of this repository: from digital
 design fundamentals to the double-buffered systolic-array accelerator
 (`rtl/sysarray`) running next to a PicoRV32 on the PYNQ-Z1. Every stage
@@ -139,18 +145,21 @@ run it with `xvlog`/`xelab`/`xsim` (see the `sim` rule in
 **In this repo.**
 1. `docs/memory_model.md` - the three address maps (ARM, RISC-V, DMA) and
    the coherency rules (`flush()` / `invalidate()`).
-2. `RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl` - the block design: PS7, the
-   PicoRV32 hierarchy, `matmul_0` (a module reference to `sa_unit`), the
-   HP0/HP2 connections, `assign_bd_address`.
-3. `RISCV-on-PYNQ-Z1/scripts/build_bitstream.tcl` - project creation,
-   synthesis/implementation runs, bitstream + `.hwh` export.
-4. `RISCV-on-PYNQ-Z1/constrs/PYNQ-Z1.xdc` - pin constraints.
-5. `RISCV-on-PYNQ-Z1/bitstreams/m4/utilization.rpt` and
-   `timing_summary.rpt` - what a finished design costs and how fast it is.
+2. `boards/kv260/scripts/kv260_bd.tcl` (with `pico_processor.tcl`) - the
+   block design: the Zynq UltraScale+ PS, the PicoRV32 hierarchy, `matmul_0`
+   (a module reference to `sa_unit`), the HP0/HP1 connections,
+   `assign_bd_address` (the Z1's `pico_bit.tcl`: `pynq-z1` branch).
+3. `boards/kv260/scripts/build_bitstream.tcl` - project creation, synthesis
+   and implementation in one process, bitstream + `.hwh` export.
+4. No pin constraints on the KV260 (no PL I/O); the Z1's
+   `RISCV-on-PYNQ-Z1/constrs/PYNQ-Z1.xdc` is on the `pynq-z1` branch.
+5. `boards/kv260/build/output/<config>/utilization.rpt` and
+   `timing_summary.rpt` - what a finished design costs and how fast it is
+   (the build tables in `boards/kv260/README.md`).
 
 **Lab.**
-1. Build the overlay: `cd RISCV-on-PYNQ-Z1 && ./scripts/build_bitstream.sh -jobs 4 -sa_d 16`.
-2. Open `build/picorv32_z1/picorv32_z1.xpr` in the Vivado GUI; open the
+1. Build the overlay: `boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100`.
+2. Open `boards/kv260/build/picorv32_kv260_d16_100mhz/picorv32_kv260.xpr` in the Vivado GUI; open the
    block design and the implemented design; find the accelerator's BRAMs
    and DSPs on the device view.
 3. In `build/output/picorv32.hwh`, find the `sa_unit` module and its
@@ -734,5 +743,6 @@ In this repository
 - `docs/execution_walkthrough.md` - one GEMM through every layer (Chinese).
 - `docs/custom_isa_encoding.md`, `docs/memory_model.md` - Phase 4 ISA and address maps.
 - `rtl/matmul/README.md`, `rtl/sysarray/README.md` - the two RTL units.
-- `RISCV-on-PYNQ-Z1/bitstreams/*/README.md` - board results per milestone.
-- `RISCV-on-PYNQ-Z1/pynq-z1-riscv-accelerator-plan-v2.md` - the original project plan (Chinese).
+- `RISCV-on-PYNQ-Z1/bitstreams/*/README.md` (`pynq-z1` branch) - board results per milestone.
+- `RISCV-on-PYNQ-Z1/pynq-z1-riscv-accelerator-plan-v2.md` (`pynq-z1` branch) - the original project plan (Chinese).
+- `boards/kv260/README.md` - the KV260 overlay: builds, address map, board setup and results.

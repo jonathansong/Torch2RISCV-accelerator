@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""C3 / C5.5 on the PYNQ-Z1: a decoder compiled by IREE for the sa device, run by
-the armv7 sa-llm-run (the IREE runtime with the sa HAL driver) through the C1
+"""C3 / C5.5 on the board: a decoder compiled by IREE for the sa device, run by
+the aarch64 sa-llm-run (the IREE runtime with the sa HAL driver) through the C1
 launcher; the logits of every step compared bit for bit with the host reference
 (expected_logits.npy: C3 DeviceModel(SfuExact) = the hand-written L5 path, C5.5
 the functional simulator), and the generated text printed.
 
 Files in one directory on the board: this script, board_launcher.py,
-pynq_matmul.py, picorv32.bit / .hwh (L2), rt_fw.bin, sa-llm-run (armv7),
+pynq_matmul.py, picorv32.bit / .hwh (the overlay), rt_fw.bin, sa-llm-run (aarch64),
 sa.vmfb, sa_packed.irpa, expected_tokens.npy, expected_logits.npy, prompt.npy,
 the tokenizer (tokenizer.bin + tokenizer.py, or tokenizer.json + hf_tokenizer.py),
 optional board.txt (the reference's name, the window size in MB) and

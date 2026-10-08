@@ -1,5 +1,11 @@
 # sysarray — double-buffered matrix accelerator
 
+> **PYNQ-Z1 paths.** This document records work done on the PYNQ-Z1. Paths
+> `RISCV-on-PYNQ-Z1/...` (block design, constraints) and `bitstreams/...`
+> (the board-verified builds) refer to the `pynq-z1` branch (tag
+> `v1.0-pynq-z1`); on main, PicoRV32 and its IP are in `rtl/picorv32/` and
+> `rtl/ip/`, the current overlay in `boards/kv260/`.
+
 Implementation of [`docs/double_buffer_design.md`](../../docs/double_buffer_design.md).
 Replaces `rtl/matmul` (Phase 2–4) in the overlay from M1 on; the old unit's
 behavior (CSRs, funct7 = 0 instructions) is kept by `sa_legacy`.

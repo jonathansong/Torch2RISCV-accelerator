@@ -20,7 +20,7 @@
 // (PS7 S_AXI_HP*).
 `timescale 1ns / 1ps
 
-// Explicit interface tags: with <RISCV-on-PYNQ-Z1>/ip in the IP repo path,
+// Explicit interface tags: with rtl/ip in the IP repo path,
 // Vivado's name-based inference picks the custom PicoBram bus for s_axi_*.
 module matmul_unit (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 aclk CLK", X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m_axi, ASSOCIATED_RESET aresetn" *)
@@ -124,7 +124,7 @@ module matmul_unit (
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m_axi BREADY" *)
     output reg         m_axi_bready,
 
-    // PicoRV32 co-processor interface (bus definition in RISCV-on-PYNQ-Z1/ip/pcpi_v1_0)
+    // PicoRV32 co-processor interface (bus definition in rtl/ip/pcpi_v1_0)
     (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_valid", X_INTERFACE_MODE = "slave" *)
     input  wire        pcpi_valid,
     (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_insn" *)

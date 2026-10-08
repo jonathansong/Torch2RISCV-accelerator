@@ -21,14 +21,9 @@ Steps (docs/iree_compiler_plan.md §3):
 
     python3 compiler/frontend/export.py --out build/c0/stories15M            # stories15M
     python3 compiler/frontend/export.py --tiny --out build/c0/tiny           # random tiny model
-    python3 compiler/frontend/export.py --out build/c0/stories15M --armv7    # + the board bundle
 
---armv7 also compiles for the board's Cortex-A9 (the llvm-cpu flags, libm
-shim and import check of iree-sa/l0) and stages build/deploy_c0: the
-module, the parameter archive, the L0 iree-run-module and two single-step
-cases (pos 0, and pos 5 with T = 8, each starting from an empty KV cache
-since iree-run-module makes one call per process) with the host's outputs
-as the expected values.
+(The board bundle of C0, --armv7: llvm-cpu on the PYNQ-Z1's Cortex-A9, is on
+the pynq-z1 branch.)
 """
 import argparse
 import collections
@@ -273,47 +268,6 @@ def inventory(disp, out):
     return rows
 
 
-def board_bundle(mlir_path, irpa_path, host_vmfb, cfg, d, out, deploy):
-    import shutil
-    import subprocess
-    sys.path.insert(0, os.path.join(REPO, "iree-sa", "l0"))
-    import export_and_compile as L0
-    import iree.compiler as ic
-    L0.build_shim()
-    # embedded_ld.sh finds IREE's lld next to iree-compile on PATH unless IREE_LLD says where it is
-    os.environ.setdefault("IREE_LLD", os.path.join(os.path.dirname(ic.__file__), "_mlir_libs", "iree-lld"))
-    dump = os.path.join(out, "armv7_binaries")
-    os.makedirs(dump, exist_ok=True)
-    t0 = time.time()
-    vmfb = ic.compile_file(mlir_path, input_type="torch",
-                           extra_args=L0.ARMV7_FLAGS + COMPILE_FLAGS + [f"--iree-hal-dump-executable-binaries-to={dump}"])
-    L0.check_no_imports(dump)
-    os.makedirs(deploy, exist_ok=True)
-    with open(os.path.join(deploy, "qllama_armv7.vmfb"), "wb") as f:
-        f.write(vmfb)
-    print(f"compiled (llvm-cpu, armv7 Cortex-A9) in {time.time() - t0:.1f} s ({len(vmfb) / 1e6:.1f} MB)")
-    shutil.copy(irpa_path, os.path.join(deploy, "qllama.irpa"))
-    shutil.copy(os.path.join(REPO, "build", "deploy_iree_l0", "iree-run-module"), deploy)
-    lines = ["#!/usr/bin/env bash", "# On the board (no sudo): the C0 module on the ARM (llvm-cpu), two single-step cases.",
-             'cd "$(dirname "$0")"', "ok=1"]
-    for pos, token in ((0, 1), (5, 400)):
-        args = Q.step_inputs(token, pos, d)
-        want = IreeModel(host_vmfb, irpa_path)(*args)          # fresh module: empty KV cache
-        tag = f"pos{pos}"
-        np.save(os.path.join(deploy, f"{tag}_token.npy"), args[0].numpy())
-        np.save(os.path.join(deploy, f"{tag}_pos.npy"), args[1].numpy())
-        np.save(os.path.join(deploy, f"{tag}_valid.npy"), args[2].numpy())
-        np.save(os.path.join(deploy, f"{tag}_expected.npy"), want)
-        lines += [f'echo "== pos {pos}, token {token}, T = {args[2].shape[0]}"',
-                  "./iree-run-module --device=local-task --module=qllama_armv7.vmfb --parameters=model=qllama.irpa "
-                  f"--function=main --input=@{tag}_token.npy --input=@{tag}_pos.npy --input=@{tag}_valid.npy "
-                  f"--expected_output=@{tag}_expected.npy --expected_f32_threshold=1e-3 || ok=0"]
-    lines += ['[ $ok = 1 ] && echo "C0 board PASS" || echo "C0 board FAIL"']
-    with open(os.path.join(deploy, "run_c0.sh"), "w") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"board bundle: {deploy} ({subprocess.run(['du', '-sh', deploy], capture_output=True, text=True).stdout.split()[0]})")
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--checkpoint", default=os.path.join(CACHE, "stories15M.bin"))
@@ -324,7 +278,6 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--static-len", action="store_true",
                     help="attention over seq_len positions masked by pos (static shapes; the sa backend's form)")
-    ap.add_argument("--armv7", action="store_true", help="also compile for the board and stage build/deploy_c0")
     ap.add_argument("--prefill", type=int, default=0, help="also export prefill with chunks of this many tokens")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -345,8 +298,6 @@ def main():
         ok &= check_prefill(vmfb_path, irpa_path, Q.QLlama(cfg, w, kv, args.d).eval(), tokens, args.prefill,
                             args.d, Q.step_inputs)
     inventory(disp, args.out)
-    if args.armv7:
-        board_bundle(mlir_path, irpa_path, vmfb_path, cfg, args.d, args.out, os.path.join(REPO, "build", "deploy_c0"))
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

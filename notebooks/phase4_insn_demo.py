@@ -2,7 +2,7 @@
 """Phase 4 demo: matmul through the custom instructions (PCPI), vs the CSR path.
 
 Put these files in one directory on the board:
-    picorv32.bit, picorv32.hwh   RISCV-on-PYNQ-Z1/build/output/ (scripts/build_bitstream.sh)
+    picorv32.bit, picorv32.hwh   boards/kv260/build/output/<config>/ (boards/kv260/scripts/build_bitstream.sh)
     matmul_insn_fw.bin           firmware/matmul_insn/ (make)  - mat_trigger / mat_wait
     matmul_fw.bin                firmware/matmul/ (make)       - CSR path, for comparison
     pynq_matmul.py               driver/

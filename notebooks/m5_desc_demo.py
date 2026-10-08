@@ -4,7 +4,7 @@
 Needs an overlay with the descriptor fetch unit (CAPS bit 21; rtl/sysarray/
 sa_cmdfetch.v) and the performance counters. Put these files in one directory
 on the board:
-    picorv32.bit, picorv32.hwh   RISCV-on-PYNQ-Z1/build/output/ (scripts/build_bitstream.sh)
+    picorv32.bit, picorv32.hwh   boards/kv260/build/output/<config>/ (boards/kv260/scripts/build_bitstream.sh)
     gemm_fw.bin, vector_fw.bin   firmware/gemm, firmware/vector (PCPI path)
     desc_run_fw.bin              firmware/desc_run (list path: one mat_submit)
     pynq_matmul.py               driver/
