@@ -31,6 +31,7 @@ from pynq_matmul import (MatmulOverlay, Requant, golden, qgemm_golden, regressio
 QSHAPES = [  # M, N, K, bias, relu, Requant
     (8, 8, 8, True, True, Requant(181, 15, -3)),
     (24, 48, 40, False, False, Requant(-97, 12, 7)),
+    (48, 96, 80, False, False, Requant(-97, 12, 7)),   # (non-square at D = 16 too)
     (64, 64, 64, True, True, Requant(300, 16, 0)),
     (128, 128, 128, True, False, Requant(51, 16, 10, -100, 100)),
     (256, 256, 256, True, True, Requant(9, 16, -128)),
@@ -76,6 +77,9 @@ def main():
     print(f"{'M x N x K':>14} {'bias':>5} {'relu':>5} {'result':>7} {'cycles':>9} {'MAC/cycle':>10}"
           f" {'int32 GEMM':>11} {'MAC/cycle':>10}")
     for m, n, k, use_bias, relu, rq in QSHAPES:
+        if m % mm.d or n % mm.d or k % mm.d:          # (the shapes of D = 8 only)
+            print(f"{f'{m}x{n}x{k}':>14} skipped (not multiples of D = {mm.d})")
+            continue
         a = rng.integers(-128, 128, (m, k), dtype=np.int8)
         b = rng.integers(-128, 128, (k, n), dtype=np.int8)
         bias = rng.integers(-2**16, 2**16, n, dtype=np.int32) if use_bias else None
@@ -92,6 +96,10 @@ def main():
     print(f"{'op':>5} {'in->out':>10} {'n':>6} {'y':>6} {'post':>13} {'result':>7} {'cycles':>8}"
           f" {'elem/cycle':>11} {'B/cycle':>8}")
     for op, it, ot, n, ny, relu, rq in VCASES:
+        if n % mm.d or (ny or n) % mm.d:              # (the lengths of D = 8 only)
+            print(f"{op:>5} {f'{np.dtype(it).name[3:]}->{np.dtype(ot).name[3:]}':>10} {n:6d} {ny or n:6d}"
+                  f" skipped (not multiples of D = {mm.d})")
+            continue
         x = rand(rng, it, n)
         y = rand(rng, it, ny or n)
         out, st = mm.vector(op, x, y, out_dtype=ot, relu=relu, requant=rq)
@@ -104,10 +112,13 @@ def main():
               f" {st['elem_per_cycle']:11.2f} {moved / st['riscv_cycles']:8.2f}")
 
     print("\n== legacy firmware on the new hardware")
-    mm.load_firmware(fw("matmul_insn_fw.bin"))
-    passed, total, st = regression(mm, batches=4, batch_size=256, seed=3)
-    ok &= passed == total
-    print(f"matmul_insn_fw.bin   {passed}/{total} match NumPy, {st['riscv_cycles_per_job']:.1f} cycles/job")
+    if mm.d != 8:      # fixed 8x8x8 jobs, D = 8 only
+        print(f"matmul_insn_fw.bin   skipped at D = {mm.d}")
+    else:
+        mm.load_firmware(fw("matmul_insn_fw.bin"))
+        passed, total, st = regression(mm, batches=4, batch_size=256, seed=3)
+        ok &= passed == total
+        print(f"matmul_insn_fw.bin   {passed}/{total} match NumPy, {st['riscv_cycles_per_job']:.1f} cycles/job")
 
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

@@ -32,6 +32,7 @@ SHAPES = [  # M, N, K, bias
     (64, 64, 64, False),
     (128, 128, 128, False),
     (32, 256, 64, True),
+    (48, 32, 80, True),       # (non-square at D = 16 too)
     (256, 256, 256, False),
 ]
 
@@ -66,6 +67,9 @@ def main():
     print("== new ISA: tiled GEMM (resident B, double-buffered A strips and C tiles)")
     print(f"{'M x N x K':>16} {'bias':>5} {'result':>7} {'cycles':>9} {'us':>9} {'MAC/cycle':>10}")
     for m, n, k, use_bias in SHAPES:
+        if m % mm.d or n % mm.d or k % mm.d:          # (the shapes of D = 8 only)
+            print(f"{f'{m}x{n}x{k}':>16} skipped (not multiples of D = {mm.d})")
+            continue
         a = rng.integers(-128, 128, (m, k), dtype=np.int8)
         b = rng.integers(-128, 128, (k, n), dtype=np.int8)
         bias = rng.integers(-2**20, 2**20, (m, n), dtype=np.int32) if use_bias else None
@@ -76,25 +80,28 @@ def main():
         print(f"{f'{m}x{n}x{k}':>16} {'yes' if use_bias else '-':>5} {'PASS' if good else 'FAIL':>7} "
               f"{st['riscv_cycles']:9d} {st['us']:9.1f} {st['mac_per_cycle']:10.1f}")
 
-    print("\n== the same 64x64x64 GEMM as 512 independent 8x8x8 jobs (Phase 4 path)")
-    a = rng.integers(-128, 128, (64, 64), dtype=np.int8)
-    b = rng.integers(-128, 128, (64, 64), dtype=np.int8)
-    c_new, st_new = mm.gemm(a, b)
-    mm.load_firmware(fw("matmul_insn_fw.bin"))
-    c_old, st_old = legacy_gemm(mm, a, b)
-    good = np.array_equal(c_new, golden(a, b)) and np.array_equal(c_old, golden(a, b))
-    ok &= good
-    print(f"new ISA:     {st_new['riscv_cycles']:8d} cycles ({st_new['mac_per_cycle']:.1f} MAC/cycle)")
-    print(f"Phase 4 path:{st_old['riscv_cycles']:8d} cycles ({64**3 / st_old['riscv_cycles']:.1f} MAC/cycle), "
-          f"plus the partial sums on the ARM")
-    print(f"speedup {st_old['riscv_cycles'] / st_new['riscv_cycles']:.1f}x  {'PASS' if good else 'FAIL'}")
+    if mm.d != 8:      # the Phase 4 path and its firmware: fixed 8x8x8 jobs, D = 8 only
+        print(f"\n== the Phase 4 path (8x8x8 jobs) and the legacy firmware: skipped at D = {mm.d}")
+    else:
+        print("\n== the same 64x64x64 GEMM as 512 independent 8x8x8 jobs (Phase 4 path)")
+        a = rng.integers(-128, 128, (64, 64), dtype=np.int8)
+        b = rng.integers(-128, 128, (64, 64), dtype=np.int8)
+        c_new, st_new = mm.gemm(a, b)
+        mm.load_firmware(fw("matmul_insn_fw.bin"))
+        c_old, st_old = legacy_gemm(mm, a, b)
+        good = np.array_equal(c_new, golden(a, b)) and np.array_equal(c_old, golden(a, b))
+        ok &= good
+        print(f"new ISA:     {st_new['riscv_cycles']:8d} cycles ({st_new['mac_per_cycle']:.1f} MAC/cycle)")
+        print(f"Phase 4 path:{st_old['riscv_cycles']:8d} cycles ({64**3 / st_old['riscv_cycles']:.1f} MAC/cycle), "
+              f"plus the partial sums on the ARM")
+        print(f"speedup {st_old['riscv_cycles'] / st_new['riscv_cycles']:.1f}x  {'PASS' if good else 'FAIL'}")
 
-    print("\n== legacy firmware on the new hardware")
-    for name in ("matmul_insn_fw.bin", "matmul_fw.bin"):
-        mm.load_firmware(fw(name))
-        passed, total, st = regression(mm, batches=4, batch_size=256, seed=3)
-        ok &= passed == total
-        print(f"{name:20} {passed}/{total} match NumPy, {st['riscv_cycles_per_job']:.1f} cycles/job")
+        print("\n== legacy firmware on the new hardware")
+        for name in ("matmul_insn_fw.bin", "matmul_fw.bin"):
+            mm.load_firmware(fw(name))
+            passed, total, st = regression(mm, batches=4, batch_size=256, seed=3)
+            ok &= passed == total
+            print(f"{name:20} {passed}/{total} match NumPy, {st['riscv_cycles_per_job']:.1f} cycles/job")
 
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
