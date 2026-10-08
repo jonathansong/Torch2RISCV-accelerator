@@ -232,7 +232,7 @@ K1a 布线后的前 40 条路径（`post_route.dcp`，在 20 ns 约束下工具�
 | SmolLM2 通用路径 decode（hfgen） | 3.73 | **4.39** | +18%（设备周期 26.73M → 22.68M） |
 | SmolLM2 通用路径 prefill（M = 8） | 6.84 | **4.17** | −39% |
 
-decode 的提升小于 2 倍：每周期消耗 D 字节权重，但读带宽仍是 8 B/周期（§3.1 H0），D = 16 要和 K2a 的 128 位读通道一起才能发挥。**通用路径的 prefill 变慢**：它的导出固定 M = 8，在 D = 16 的阵列上每块只用一半的行，而 prefill 的 matmul（`8x96x16x576` 等）设备周期反而约为 D = 8 时的 2 倍（30.3M 对 16.6M）。待办：`deploy_hfgen.sh` 按 D 导出 M = D 的 prefill，并查明 M < D 时 matmul 的周期为何翻倍。
+decode 的提升小于 2 倍：每周期消耗 D 字节权重，但读带宽仍是 8 B/周期（§3.1 H0），D = 16 要和 K2a 的 128 位读通道一起才能发挥。**通用路径的 prefill 变慢**：它的导出固定 M = 8，在 D = 16 的阵列上每块只用一半的行，而 prefill 的 matmul（`8x96x16x576` 等）设备周期反而约为 D = 8 时的 2 倍（30.3M 对 16.6M）。原因（板上计数器）：down 投影的 `LD_BEATS` 与 D = 8 相近（权重只读一次），`EX_USEFUL` 却是 26.5M（按 D = 16 应为 3.3M，8 倍），`VE_ACTIVE` 27.5M。prefill 的 linear 微内核要求行数是 D 的倍数（`SahlKernels.cpp` `matchLinear` 的 `p.rows % d`），M = 8 < 16 时回退到通用 contraction，它对 x 的每一行单独做 decode 式的 GEMV（x 复制到 D 行，阵列利用率 1/D），8 行就是 8 遍。修正（`564a0de`）：`deploy_hfgen.sh` 按 D 导出 M = D（`build/hfgen/smollm2_p<D>`，导出固定 M，不再复制 D = 8 的）；D = 16 的 sim PASS（prefill + decode 与只 decode 5/5 行逐位一致），`dispatch_check --dirty` 1306 个 OK（另 2 个是 host 上的）。**待板上重跑 `hfgen`**。让微内核直接支持 M < D（只装入 / 存回 M 行）留作以后的编译器工作：只有固定 M 的导出会遇到。
 
 ### K2 带宽：DMA 与片上存储接口
 

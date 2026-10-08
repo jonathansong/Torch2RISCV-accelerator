@@ -185,8 +185,9 @@ peak; K1b 58.9).
 
 Decode gains are small: the array consumes D bytes of weights per cycle but
 the read path is still 8 B/cycle (K2a). The generic path's prefill is slower:
-its export fixes M = 8, and its prefill matmuls take about twice the D = 8
-cycles on the D = 16 array (to fix: export M = D).
+its M = 8 export missed the prefill micro-kernel (rows must be a multiple of
+D) and fell back to one GEMV per row (8x the EX steps). `564a0de` exports
+M = D; to rerun on the board.
 
 ## To confirm on the board
 
