@@ -10,6 +10,7 @@ module tb_sa_vefp;
     `include "vefp_cases.vh"
     parameter  integer D  = 8;
     parameter  integer FL = D / 2;              // physical fp lanes (D / 2 or D)
+    parameter  integer NB = 8;                  // batched special functions (0: off)
     localparam integer SW = 131072 / D, CW = 262144 / (4 * D);
     localparam integer SAW = $clog2(SW), CAW = $clog2(CW);
 
@@ -32,7 +33,7 @@ module tb_sa_vefp;
     wire [8*D-1:0] sa_din, sb_din, sa_dout, sb_dout;
     wire [32*D-1:0] ac_din, ac_dout;
 
-    sa_vefp #(.D(D), .FL(FL), .SPAD_AW(SAW), .ACC_AW(CAW)) dut (
+    sa_vefp #(.D(D), .FL(FL), .NB(NB), .SPAD_AW(SAW), .ACC_AW(CAW)) dut (
         .clk(clk), .resetn(resetn), .cmd_valid(cmd_valid), .cmd_ready(cmd_ready),
         .cmd_src1(c_s1), .cmd_src2(c_s2), .cmd_dst(c_dst), .cmd_groups(c_g), .cmd_op(c_op), .cmd_types(c_ty),
         .cmd_mod(c_p2), .cmd_flags(c_fl), .cmd_imm(c_imm), .cmd_a(c_a), .cmd_b(c_b), .cmd_rowlen(c_rl),

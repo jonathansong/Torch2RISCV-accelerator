@@ -28,6 +28,18 @@
 //              segment tables are one ROM read lane by lane), then RELU /
 //              VALID, the reduction (A2 or a comparator) or the output
 //              conversion over the whole group.
+//   batched    EXP / RECIP / RSQRT without REDUCE (NB >= 6): up to NB halves
+//              are collected, then each micro-step is issued on slot 0 ..
+//              NB-1 on consecutive cycles (one per cycle; results written
+//              back at the unit's fixed latency, so a slot's next step finds
+//              its operands); a slot's registers are a per-lane LUT RAM
+//              (read: register 0 and the two operands; write: one result per
+//              cycle, every unit's result at the same stage); the segment
+//              tables are read on all lanes at once; END, RELU / VALID and
+//              the output conversion are steps too; then the groups go to
+//              the output FIFO, one half per cycle.
+//              Same operations in the same order as the sequenced mode
+//              (bit-exact), about 5x the throughput (plan P6).
 // TRANSPOSE (op 6): per D x D block, D words read at stride S into a
 // register buffer, D transposed words written.
 // Memory ports as sa_ve (one per memory, writes have priority over reads);
@@ -38,6 +50,7 @@
 module sa_vefp #(
     parameter integer D       = 8,
     parameter integer FL      = D / 2,         // physical fp lanes: D / 2 or D
+    parameter integer NB      = 8,             // batched special functions: halves per batch (>= 6; 0 off)
     parameter integer SPAD_AW = 14,
     parameter integer ACC_AW  = 13
 ) (
@@ -94,6 +107,10 @@ module sa_vefp #(
     localparam [31:0] C_LOG2E = 32'h3FB8AA3B, C_64 = 32'h42800000, C_2 = 32'h40000000,
                       C_1_5 = 32'h3FC00000, C_0_5 = 32'h3F000000;
     localparam integer OQ = 32;                   // output FIFO (>= stream latency + reads)
+    localparam         BATCH = NB >= 6;           // the batched mode is built
+    localparam integer NBS = BATCH ? NB : 1;      // (array sizes when it is not)
+    localparam integer BG  = NBS / NH;            // groups per batch
+    localparam integer LNB = $clog2(NBS + 1);
 
     // ---------------------------------------------------------- command
     reg         active, xpose;
@@ -105,7 +122,7 @@ module sa_vefp #(
     reg  [1:0]  it, ot, it2;                 // it2: src2 type (types[5:4]: 0 = as src1, 1 I8, 2 I32, 3 F32)
     reg  [2:0]  func;
     reg  [1:0]  mo1, mo2, red;
-    reg         swapneg, seqmode;
+    reg         swapneg, seqmode, bmode;      // bmode: batched special function
     reg  [31:0] imm, cA, cB;
     assign cmd_ready = !active && resetn;
     assign busy = active;
@@ -135,9 +152,10 @@ module sa_vefp #(
     wire [15:0] idx1 = mo1 == X_LIN ? rg : mo1 == X_MOD ? i1c : i1d;
     wire [15:0] idx2 = mo2 == X_LIN ? rg : mo2 == X_MOD ? i2c : i2d;
     wire        need2 = !unary && mo2 != X_IMM;
-    wire [6:0]  cap = seqmode ? 7'd1 : OQ - 4;
+    wire [6:0]  cap = seqmode && !bmode ? 7'd1 : OQ - 4;
+    wire        bq_ok;                   // batched: room in the batch being collected
     reg  [1:0]  rd_gap;                  // cycles until the next group's first read (NH > 1)
-    wire        rd_can = active && !xpose && rg < G && (rpart || (inflight < cap && rd_gap == 0));
+    wire        rd_can = active && !xpose && rg < G && (rpart || (inflight < cap && rd_gap == 0 && bq_ok));
     wire [3:0]  rd_mem = rpart ? m2 : m1;
     wire [15:0] rd_word = rpart ? b2 + idx2 : b1 + idx1;
     wire        tr_rd;                      // TRANSPOSE read (below)
@@ -382,14 +400,40 @@ module sa_vefp #(
     reg  [D-1:0] sq_mask;
     reg  [15:0] sq_dst;
     localparam [4:0] Q_IDLE = 0, Q_ISSUE = 1, Q_WAIT = 2, Q_LOOK = 3, Q_POST = 4, Q_RED = 5, Q_REDW = 6,
-                     Q_TREE = 7, Q_TREEW = 8, Q_OUT = 9, Q_OUTW = 10, Q_FIN = 11, Q_LOAD = 12;
+                     Q_TREE = 7, Q_TREEW = 8, Q_OUT = 9, Q_OUTW = 10, Q_FIN = 11, Q_LOAD = 12,
+                     Q_BLOAD = 13, Q_BRUN = 14, Q_BDRAIN = 15, Q_BPUSH = 16;
+
+    // batched mode: slot s = a half (lanes s * FL ..), index s * FL + l
+    // registers 0..7 of a slot: LUT RAM per lane (block brf below); 0 = the input (written when
+    // collected), 1 = the result at END (and after the output conversion)
+    reg  [FL-1:0]  BMASK [0:NBS-1];         // VALID mask per slot
+    reg  [15:0]    BDST [0:NBS-1];          // destination word per slot (of its group)
+    wire [31:0]    bopa_w [0:FL-1], bopb_w [0:FL-1];   // the issuing slot's operands a, b
+    wire [31:0]    brda_w [0:FL-1];         // its register u_a (1 at the output conversion / push)
+    reg  [LNB-1:0] bc_n;                    // halves collected
+    reg  [LNB-1:0] bng;                     // halves in the batch being run
+    reg  [7:0]     bpend;                   // groups read, not yet taken into a run
+    reg  [LNB-1:0] b_slot;
+    reg            b_out;                   // issuing the output conversion step
+    // write-back of an issued micro-op, all at stage 5 (the RAM's one write port): valid, I2F / F2I
+    // (latency 2, held 2 cycles), unit M2 (else A2), I2F (else F2I), computed at issue (x 2^-17, END),
+    // slot, register
+    localparam integer CQ = 5;
+    reg  [CQ:1]    cq_v, cq_l2, cq_m, cq_i, cq_d;
+    reg  [LNB-1:0] cq_s [1:CQ];
+    reg  [2:0]     cq_r [1:CQ];
+    wire           b_ready = bmode && sq_st == Q_IDLE && bc_n != 0 && {bc_n} == bpend * NH &&
+                             (bc_n == NBS || rg == G);
+    assign bq_ok = !bmode || (bpend < BG && (sq_st == Q_IDLE || sq_st == Q_BPUSH));
 
     // micro-program: {unit[3:0], a[3:0], b[3:0], dst[2:0]}
     reg [14:0] uop;
+    reg [4:0]  b_step;                      // batched: micro-step being issued
+    wire [4:0] ustep = bmode ? b_step : sq_step;
     always @* begin
         uop = 15'd0;
         case (func)
-            F_EXP: case (sq_step)
+            F_EXP: case (ustep)
                 0:  uop = {4'd1, 4'd0, 4'd8, 3'd1};     // t  = x * log2e
                 1:  uop = {4'd5, 4'd1, 4'd0, 3'd2};     // n  = floor(t)
                 2:  uop = {4'd4, 4'd2, 4'd0, 3'd3};     // nf = float(n)
@@ -401,9 +445,9 @@ module sa_vefp #(
                 8:  uop = {4'd7, 4'd5, 4'd0, 3'd0};     // T, S [i]
                 9:  uop = {4'd1, 4'd6, 4'd14, 3'd6};    // p  = r * S
                 10: uop = {4'd2, 4'd13, 4'd6, 3'd7};    // y  = T + p
-                default: uop = {4'd9, 11'd0};
+                default: uop = {4'd9, 4'd7, 4'd2, 3'd1};  // END (fres: n, y; batched: result to 1)
             endcase
-            F_RECIP: case (sq_step)
+            F_RECIP: case (ustep)
                 0:  uop = {4'd4, 4'd15, 4'd0, 3'd1};    // ri = float(frac & 0x1FFFF)
                 1:  uop = {4'd8, 4'd1, 4'd0, 3'd1};     // r  = ri * 2^-17
                 2:  uop = {4'd7, 4'd0, 4'd0, 3'd0};     // T, S [frac >> 17]
@@ -412,9 +456,9 @@ module sa_vefp #(
                 5:  uop = {4'd1, 4'd15, 4'd3, 3'd4};    // t  = m * y0
                 6:  uop = {4'd3, 4'd10, 4'd4, 3'd4};    // e  = 2 - t
                 7:  uop = {4'd1, 4'd3, 4'd4, 3'd5};     // y1 = y0 * e
-                default: uop = {4'd9, 11'd0};
+                default: uop = {4'd9, 4'd5, 4'd0, 3'd1};  // END (fres: y1)
             endcase
-            F_RSQRT: case (sq_step)
+            F_RSQRT: case (ustep)
                 0:  uop = {4'd4, 4'd15, 4'd0, 3'd1};
                 1:  uop = {4'd8, 4'd1, 4'd0, 3'd1};
                 2:  uop = {4'd7, 4'd0, 4'd0, 3'd0};     // T, S [odd * 64 + frac >> 17]
@@ -425,7 +469,7 @@ module sa_vefp #(
                 7:  uop = {4'd1, 4'd4, 4'd12, 3'd4};    // c  = b * 0.5
                 8:  uop = {4'd3, 4'd11, 4'd4, 3'd4};    // d  = 1.5 - c
                 9:  uop = {4'd1, 4'd3, 4'd4, 3'd5};     // y1 = y0 * d
-                default: uop = {4'd9, 11'd0};
+                default: uop = {4'd9, 4'd5, 4'd0, 3'd1};  // END (fres: y1)
             endcase
             default: uop = {4'd9, 11'd0};               // NONE / ABS: nothing to run
         endcase
@@ -433,67 +477,77 @@ module sa_vefp #(
     wire [3:0] u_unit = uop[14:11], u_a = uop[10:7], u_b = uop[6:3];
     wire [2:0] u_dst = uop[2:0];
 
-    // operand value of lane l
-    function [31:0] operand(input [3:0] code, input integer ln);
-        reg [31:0] x;
-        reg        odd;
+    // operand value: x = register 0 (the input), r = register code[2:0], t / s = the table row
+    function [31:0] opsel(input [3:0] code, input [31:0] x, input [31:0] r, input [31:0] t, input [31:0] s);
+        reg odd;
         begin
-            x = RF[ln][0];
             odd = ~x[23];                                   // exponent field even <=> unbiased exponent odd
             case (code)
-                4'd8:  operand = C_LOG2E;
-                4'd9:  operand = C_64;
-                4'd10: operand = C_2;
-                4'd11: operand = C_1_5;
-                4'd12: operand = C_0_5;
-                4'd13: operand = TT[ln];
-                4'd14: operand = SS[ln];
-                4'd15: operand = u_unit == 4'd4 ? {15'd0, x[16:0]}                           // frac & 0x1FFFF
-                               : func == F_RECIP ? {1'b0, 8'd127, x[22:0]}                    // m
-                               : {1'b0, 8'd127 + {7'd0, odd}, x[22:0]};                        // m' (RSQRT)
-                default: operand = RF[ln][code[2:0]];
+                4'd8:  opsel = C_LOG2E;
+                4'd9:  opsel = C_64;
+                4'd10: opsel = C_2;
+                4'd11: opsel = C_1_5;
+                4'd12: opsel = C_0_5;
+                4'd13: opsel = t;
+                4'd14: opsel = s;
+                4'd15: opsel = u_unit == 4'd4 ? {15'd0, x[16:0]}                             // frac & 0x1FFFF
+                             : func == F_RECIP ? {1'b0, 8'd127, x[22:0]}                      // m
+                             : {1'b0, 8'd127 + {7'd0, odd}, x[22:0]};                          // m' (RSQRT)
+                default: opsel = r;
             endcase
         end
+    endfunction
+    function [31:0] operand(input [3:0] code, input integer ln);           // lane l (sequenced)
+        operand = opsel(code, RF[ln][0], RF[ln][code[2:0]], TT[ln], SS[ln]);
+    endfunction
+    // segment table address: x = the input, i = register 5 (EXP: the segment)
+    function [8:0] lk_addr(input [31:0] x, input [31:0] i);
+        lk_addr = func == F_EXP   ? {2'd0, 1'b0, i[5:0]}
+                : func == F_RECIP ? {2'd1, 1'b0, x[22:17]}
+                :                   {2'd2, ~x[23], x[22:17]};
     endfunction
     function [3:0] unit_lat(input [3:0] u);
         unit_lat = u == 4'd1 || u == 4'd2 || u == 4'd3 ? 4'd4 : u == 4'd4 || u == 4'd5 || u == 4'd6 ? 4'd2 : 4'd0;
     endfunction
 
-    // function result of lane l (END): ldexp and the special cases, as llm/sfu.py
-    function [31:0] fresult(input integer ln);
-        reg [31:0] x, y;
+    // function result (END) from registers 0 (x), 2, 5, 7: ldexp and the special cases, as llm/sfu.py
+    function [31:0] fres(input [31:0] x, input [31:0] r2, input [31:0] r5, input [31:0] r7);
+        reg [31:0] y;
         reg [7:0]  e;
         reg        odd;
         reg signed [31:0] n;
         begin
-            x = RF[ln][0]; e = x[30:23];
+            e = x[30:23];
             case (func)
                 F_EXP: begin
-                    n = RF[ln][2];
-                    y = ldexp(RF[ln][7], n < -300 ? -12'sd300 : n > 300 ? 12'sd300 : n[11:0]);
-                    if (is_nan(x)) fresult = QNAN;
-                    else if (!lt_f(x, 32'h42B20000)) fresult = PINF;               // x >= 89
-                    else if (!lt_f(32'hC2D00000, x)) fresult = 32'd0;              // x <= -104
-                    else fresult = y;
+                    n = r2;
+                    y = ldexp(r7, n < -300 ? -12'sd300 : n > 300 ? 12'sd300 : n[11:0]);
+                    if (is_nan(x)) fres = QNAN;
+                    else if (!lt_f(x, 32'h42B20000)) fres = PINF;                  // x >= 89
+                    else if (!lt_f(32'hC2D00000, x)) fres = 32'd0;                 // x <= -104
+                    else fres = y;
                 end
                 F_RECIP: begin
-                    y = ldexp(RF[ln][5], 12'sd127 - $signed({4'd0, e})) | {x[31], 31'd0};
-                    if (is_nan(x)) fresult = QNAN;
-                    else if (e == 8'hFF) fresult = {x[31], 31'd0};
-                    else if (e == 0) fresult = {x[31], 8'hFF, 23'd0};
-                    else fresult = y;
+                    y = ldexp(r5, 12'sd127 - $signed({4'd0, e})) | {x[31], 31'd0};
+                    if (is_nan(x)) fres = QNAN;
+                    else if (e == 8'hFF) fres = {x[31], 31'd0};
+                    else if (e == 0) fres = {x[31], 8'hFF, 23'd0};
+                    else fres = y;
                 end
                 default: begin                                                      // RSQRT
                     odd = ~e[0];
-                    y = ldexp(RF[ln][5], -((($signed({4'd0, e}) - 12'sd127) - $signed({11'd0, odd})) >>> 1));
-                    if (is_nan(x)) fresult = QNAN;
-                    else if (e == 0) fresult = PINF;
-                    else if (x[31]) fresult = QNAN;
-                    else if (e == 8'hFF) fresult = 32'd0;
-                    else fresult = y;
+                    y = ldexp(r5, -((($signed({4'd0, e}) - 12'sd127) - $signed({11'd0, odd})) >>> 1));
+                    if (is_nan(x)) fres = QNAN;
+                    else if (e == 0) fres = PINF;
+                    else if (x[31]) fres = QNAN;
+                    else if (e == 8'hFF) fres = 32'd0;
+                    else fres = y;
                 end
             endcase
         end
+    endfunction
+    function [31:0] fresult(input integer ln);                              // lane l (sequenced)
+        fresult = fres(RF[ln][0], RF[ln][2], RF[ln][5], RF[ln][7]);
     endfunction
 
     wire red_sum = red == 2'd1;
@@ -504,14 +558,40 @@ module sa_vefp #(
     end
 
     reg retire_seq;                            // a sequenced group finished (with or without a write)
+    integer bk;
     always @(posedge clk) begin
         sq_m_v <= 0; sq_a_v <= 0; sq_i_v <= 0; sq_f_v <= 0;
         retire_seq <= 0;
+        // ---- batched mode: collection, write-back of the issued micro-ops (latency 2 at CQ stage 3, 4 at 5)
+        cq_v[1] <= 0;
+        for (bk = 2; bk <= CQ; bk = bk + 1) begin
+            cq_v[bk] <= cq_v[bk-1]; cq_l2[bk] <= cq_l2[bk-1]; cq_m[bk] <= cq_m[bk-1]; cq_i[bk] <= cq_i[bk-1];
+            cq_d[bk] <= cq_d[bk-1]; cq_s[bk] <= cq_s[bk-1]; cq_r[bk] <= cq_r[bk-1];
+        end
+        if (!resetn || !active) begin
+            bc_n <= 0; bpend <= 0; cq_v <= 0;
+        end else if (bmode) begin
+            if (pv[PL-1]) begin                    // a half's A2 result (the pipeline is free while collecting)
+                BMASK[bc_n] <= pmask[PL-1];
+                BDST[bc_n]  <= pdst[PL-1];
+                bc_n <= bc_n + 1;
+            end
+            if (rd_issue && !rpart) bpend <= bpend + 1;
+        end
         if (!resetn || !active) begin
             sq_st <= Q_IDLE; sq_act <= 0;
         end else case (sq_st)
             Q_IDLE:
-                if (seqmode && pv[PL-1]) begin     // A2 result of a half; start after the last one
+                if (b_ready) begin                 // batched: all halves read are in (registers 0); run them
+                    bng    <= bc_n;
+                    bc_n   <= 0;
+                    bpend  <= 0;
+                    b_step <= 0;
+                    b_slot <= 0;
+                    b_out  <= 0;
+                    sq_act <= 1;
+                    sq_st  <= Q_BRUN;
+                end else if (seqmode && !bmode && pv[PL-1]) begin     // A2 result of a half; start after the last one
                     for (l = 0; l < FL; l = l + 1)
                         SQIN[ph[PL-1] * FL + l] <= func == F_ABS ? {1'b0, a2o[l][30:0]} : a2o[l];
                     sq_mask[ph[PL-1] * FL +: FL] <= pmask[PL-1];
@@ -579,9 +659,7 @@ module sa_vefp #(
                     reg [63:0] row_;
                     reg [31:0] xx;
                     xx = RF[sq_lane][0];
-                    addr = func == F_EXP   ? {2'd0, 1'b0, RF[sq_lane][5][5:0]}
-                         : func == F_RECIP ? {2'd1, 1'b0, xx[22:17]}
-                         :                   {2'd2, ~xx[23], xx[22:17]};
+                    addr = lk_addr(xx, RF[sq_lane][5]);
                     row_ = sfu_rom(addr);
                     TT[sq_lane] <= row_[63:32];
                     SS[sq_lane] <= row_[31:0];
@@ -665,6 +743,59 @@ module sa_vefp #(
                         sq_st <= Q_FIN;
                 end else
                     sq_wait <= sq_wait - 1;
+            Q_BRUN: begin                                              // batched: one slot per cycle
+                if (b_out) begin                                       // output conversion (f2i) of register 1
+                    for (l = 0; l < FL; l = l + 1) sq_fx[l] <= brda_w[l];
+                    sq_f_floor <= 0;
+                    sq_f_lo <= ot == T_I8 ? -32'sd127 : 32'h8000_0000;
+                    sq_f_hi <= ot == T_I8 ? 32'sd127 : 32'h7FFF_FFFF;
+                    cq_v[1] <= 1; cq_l2[1] <= 1; cq_i[1] <= 0; cq_d[1] <= 0; cq_s[1] <= b_slot; cq_r[1] <= 3'd1;
+                end else case (u_unit)
+                    4'd1: begin
+                        for (l = 0; l < FL; l = l + 1) begin sq_ma[l] <= bopa_w[l]; sq_mb[l] <= bopb_w[l]; end
+                        cq_v[1] <= 1; cq_l2[1] <= 0; cq_m[1] <= 1; cq_d[1] <= 0; cq_s[1] <= b_slot; cq_r[1] <= u_dst;
+                    end
+                    4'd2, 4'd3: begin
+                        for (l = 0; l < FL; l = l + 1) begin sq_aa[l] <= bopa_w[l]; sq_ab[l] <= bopb_w[l]; end
+                        sq_a_sub <= u_unit == 4'd3;
+                        cq_v[1] <= 1; cq_l2[1] <= 0; cq_m[1] <= 0; cq_d[1] <= 0; cq_s[1] <= b_slot; cq_r[1] <= u_dst;
+                    end
+                    4'd4: begin
+                        for (l = 0; l < FL; l = l + 1) sq_ix[l] <= bopa_w[l];
+                        cq_v[1] <= 1; cq_l2[1] <= 1; cq_i[1] <= 1; cq_d[1] <= 0; cq_s[1] <= b_slot; cq_r[1] <= u_dst;
+                    end
+                    4'd5, 4'd6: begin
+                        for (l = 0; l < FL; l = l + 1) sq_fx[l] <= bopa_w[l];
+                        sq_f_floor <= 1;
+                        sq_f_lo <= u_unit == 4'd6 ? 32'd0 : 32'h8000_0000;
+                        sq_f_hi <= u_unit == 4'd6 ? 32'd63 : 32'h7FFF_FFFF;
+                        cq_v[1] <= 1; cq_l2[1] <= 1; cq_i[1] <= 0; cq_d[1] <= 0; cq_s[1] <= b_slot; cq_r[1] <= u_dst;
+                    end
+                    4'd8, 4'd9: begin                                  // x 2^-17, END (brf: bdat)
+                        cq_v[1] <= 1; cq_l2[1] <= 0; cq_d[1] <= 1; cq_s[1] <= b_slot; cq_r[1] <= u_dst;
+                    end
+                    default: ;                                         // LOOKUP: brf (table row RAM)
+                endcase
+                if (b_slot == NBS - 1) begin
+                    b_slot <= 0;
+                    if (b_out || (u_unit == 4'd9 && ot == T_F32)) sq_st <= Q_BDRAIN;
+                    else if (u_unit == 4'd9) b_out <= 1;
+                    else b_step <= b_step + 1;
+                end else
+                    b_slot <= b_slot + 1;
+            end
+            Q_BDRAIN:                                                  // the last write-backs
+                if (cq_v == 0) begin
+                    sq_act <= 0;
+                    b_slot <= 0;
+                    sq_st  <= Q_BPUSH;
+                end
+            Q_BPUSH: begin                                             // one half per cycle (register 1 of slot
+                for (l = 0; l < FL; l = l + 1)                         // b_slot); the group's last: bq_write
+                    VV[(b_slot % NH) * FL + l] <= brda_w[l];
+                b_slot <= b_slot + 1;
+                if (b_slot + 1 >= bng) sq_st <= Q_IDLE;
+            end
             default: begin                                             // Q_FIN: write (unless a row is still open)
                 sq_act     <= 0;
                 retire_seq <= 1;
@@ -672,9 +803,52 @@ module sa_vefp #(
             end
         endcase
     end
+    // batched register file: per lane a LUT RAM of the slots' registers 0..7 (read ports: register 0,
+    // operand registers a and b; one write port: the collected input, else the stage-5 write-back) and
+    // one of the slots' table rows (written at LOOKUP). x 2^-17 and END are computed at issue on the
+    // issuing slot (bdat) and written back through the CQ like the units' results.
+    wire          b_iss = sq_st == Q_BRUN && !b_out;
+    wire          b_col = resetn && active && bmode && pv[PL-1];
+    wire [2:0]    b_ra  = sq_st == Q_BPUSH || b_out ? 3'd1 : u_a[2:0];
+    generate
+        for (gl = 0; gl < FL; gl = gl + 1) begin : brf
+            reg  [31:0] rf [0:NBS*8-1];
+            reg  [63:0] ts [0:NBS-1];
+            reg  [31:0] dp1, dp2, dp3, dp4, dp5;            // issue-time / latency-2 results, stages 1..5
+            wire [31:0] rx = rf[b_slot * 8], ra = rf[b_slot * 8 + b_ra], rb = rf[b_slot * 8 + u_b[2:0]];
+            wire [63:0] tr = ts[b_slot];
+            wire [63:0] brow = sfu_rom(lk_addr(rx, ra));
+            wire [31:0] bdat = u_unit == 4'd8 ? ldexp(ra, -12'sd17)
+                             : BMASK[b_slot][gl] ? relu_f(fres(rx, rb, ra, ra), relu) : 32'd0;
+            wire        we = cq_v[CQ] || b_col;
+            wire [LNB+2:0] wa = cq_v[CQ] ? cq_s[CQ] * 8 + cq_r[CQ] : bc_n * 8;
+            wire [31:0] wd = !cq_v[CQ] ? a2o[gl] : cq_l2[CQ] || cq_d[CQ] ? dp5 : cq_m[CQ] ? m2o[gl] : a2o[gl];
+            integer k;
+            initial begin
+                for (k = 0; k < NBS * 8; k = k + 1) rf[k] = 32'd0;
+                for (k = 0; k < NBS; k = k + 1) ts[k] = 64'd0;
+            end
+            always @(posedge clk) begin
+                if (we) rf[wa] <= wd;
+                if (b_iss && u_unit == 4'd7) ts[b_slot] <= brow;
+                dp1 <= bdat;
+                dp2 <= dp1;
+                dp3 <= dp2;
+                dp4 <= cq_d[3] ? dp3 : cq_i[3] ? ia_y_arr[gl] : f2o[gl];
+                dp5 <= dp4;
+            end
+            assign bopa_w[gl] = opsel(u_a, rx, ra, tr[63:32], tr[31:0]);
+            assign bopb_w[gl] = opsel(u_b, rx, rb, tr[63:32], tr[31:0]);
+            assign brda_w[gl] = ra;
+        end
+    endgenerate
+
     wire seq_write = sq_st == Q_FIN && (red == 0 || sq_last);
     reg [32*D-1:0] vv_w;
     always @* for (l = 0; l < D; l = l + 1) vv_w[32*l +: 32] = VV[l];
+    wire bq_write = sq_st == Q_BPUSH && b_slot % NH == NH - 1;    // last half: from the RAM, the others: VV
+    reg [32*D-1:0] bq_w;
+    always @* for (l = 0; l < D; l = l + 1) bq_w[32*l +: 32] = l >= (NH - 1) * FL ? brda_w[l % FL] : VV[l];
 
     // ---------------------------------------------------- TRANSPOSE
     reg  [15:0] tk, tj, tkb, tks;               // block, word in block, block row / column
@@ -715,6 +889,8 @@ module sa_vefp #(
                 red <= cmd_flags[9:8]; swapneg <= cmd_flags[10];
                 seqmode <= cmd_flags[9:8] != 0 || cmd_flags[3:1] == F_EXP || cmd_flags[3:1] == F_RECIP ||
                            cmd_flags[3:1] == F_RSQRT;
+                bmode   <= BATCH && cmd_flags[9:8] == 0 && (cmd_flags[3:1] == F_EXP || cmd_flags[3:1] == F_RECIP ||
+                           cmd_flags[3:1] == F_RSQRT);
                 imm <= cmd_imm; cA <= cmd_a; cB <= cmd_b;
                 rowlen <= cmd_rowlen == 0 ? cmd_groups : cmd_rowlen;
                 vld <= cmd_vld;
@@ -774,6 +950,11 @@ module sa_vefp #(
                 push = 1;
                 push_d = vv_w;
                 push_a = sq_dst;
+            end
+            if (bq_write) begin
+                push = 1;
+                push_d = bq_w;
+                push_a = BDST[b_slot];
             end
             if (push) begin
                 oq_d[oq_wp[4:0]] <= push_d;

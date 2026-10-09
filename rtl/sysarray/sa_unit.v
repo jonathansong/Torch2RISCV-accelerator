@@ -19,7 +19,8 @@ module sa_unit #(
     parameter integer SPAD_WORDS = 131072 / D,        // 128 KB per SPAD
     parameter integer ACC_WORDS  = 262144 / (4 * D),  // 256 KB
     parameter integer PERF       = 1,                 // performance counters (0: removed)
-    parameter integer DMA_W      = 64                 // DMA masters' data width: 64 or 128 (K2a)
+    parameter integer DMA_W      = 64,                // DMA masters' data width: 64 or 128 (K2a)
+    parameter integer VEFP_NB    = 8                  // fp VE: batched special functions (P6; 0: off)
 ) (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 aclk CLK", X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m0_axi:m1_axi:m2_axi, ASSOCIATED_RESET aresetn" *)
     input  wire        aclk,
@@ -508,7 +509,7 @@ module sa_unit #(
         .ac_en(iac_en), .ac_we(iac_we), .ac_addr(iac_addr), .ac_din(iac_din), .ac_dout(vac_dout),
         .perf_ev(vi_ev));
 
-    sa_vefp #(.D(D), .SPAD_AW(SAW), .ACC_AW(CAW)) vefp (
+    sa_vefp #(.D(D), .NB(VEFP_NB), .SPAD_AW(SAW), .ACC_AW(CAW)) vefp (
         .clk(aclk), .resetn(resetn),
         .cmd_valid(ve_v && ve_to_fp && !vi_busy), .cmd_ready(vf_ready),
         .cmd_src1(ve_pkt[33:2]), .cmd_src2(ve_pkt[65:34]), .cmd_dst(ve_pkt[97:66]),

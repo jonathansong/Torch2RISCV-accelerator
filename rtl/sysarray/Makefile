@@ -32,10 +32,11 @@ sim:
 
 CLOCK_NS ?= 20.0
 SYNTH_GEN ?= D=8 NPORTS=1
+SYNTH_PART ?= xc7z020clg400-1     # KV260: xck26-sfvc784-2LV-c
 
 synth:
 	mkdir -p build/synth
-	cd build/synth && bash -c 'source $(VIVADO_SETTINGS) >/dev/null && vivado -mode batch -notrace -nojournal \
+	cd build/synth && SA_OOC_PART=$(strip $(SYNTH_PART)) bash -c 'source $(VIVADO_SETTINGS) >/dev/null && vivado -mode batch -notrace -nojournal \
 	  -log vivado.log -source $(abspath synth_ooc.tcl) -tclargs $(CLOCK_NS) $(CURDIR) $(SYNTH_GEN)' \
 	  | grep -E "^(RESULT|ERROR|CRITICAL)"
 

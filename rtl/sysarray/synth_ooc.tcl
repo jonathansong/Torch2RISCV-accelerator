@@ -1,13 +1,15 @@
-# Out-of-context synth + place + route of sa_unit on the PYNQ-Z1 part.
+# Out-of-context synth + place + route of sa_unit on the PYNQ-Z1 part (SA_OOC_PART: another part,
+# e.g. xck26-sfvc784-2LV-c for the KV260).
 # Usage: vivado -mode batch -source synth_ooc.tcl -tclargs <clock_ns> <srcdir> <generics...>
 set clock_ns [lindex $argv 0]
 set srcdir   [lindex $argv 1]
 set generics [lrange $argv 2 end]
+set part [expr {[info exists ::env(SA_OOC_PART)] ? $::env(SA_OOC_PART) : "xc7z020clg400-1"}]
 
-set_param general.maxThreads 4    ;# keep Vivado to 4 threads
+set_param general.maxThreads [expr {[info exists ::env(SA_OOC_THREADS)] ? $::env(SA_OOC_THREADS) : 4}]  ;# keep Vivado to 4 threads (SA_OOC_THREADS)
 read_verilog [glob $srcdir/*.v]
 set_property include_dirs $srcdir [current_fileset]
-synth_design -top sa_unit -part xc7z020clg400-1 -mode out_of_context \
+synth_design -top sa_unit -part $part -mode out_of_context \
     -include_dirs $srcdir -generic $generics
 create_clock -name aclk -period $clock_ns [get_ports aclk]
 opt_design

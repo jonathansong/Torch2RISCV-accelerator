@@ -79,6 +79,19 @@ def main():
     c("src2 IMM", A(0), A(256), A(512), 64, 1, F32, F32, flags=fl(m2="imm"), imm=f32b(2.5), a=one)
     c("SWAPNEG x src2", A(0), A(256), A(512), 64, 2, F32, F32, flags=fl(swapneg=1), a=one)
     c("VALID rows of 4 groups", A(0), A(256), A(512), 64, 0, F32, F32, flags=fl(), a=one, rowlen=4, vld=3 * d - 1)
+    # batched special functions (sa_vefp NB): partial batches, VALID, OP / affine before the function,
+    # integer outputs, I8 / MOD inputs
+    c("FUNC exp, 1 group", A(0), A(0), A(512), 1, 5, F32, F32, acc="exp", flags=fl("exp"), a=one)
+    c("FUNC exp, 3 groups", A(0), A(0), A(512), 3, 5, F32, F32, acc="exp", flags=fl("exp"), a=f32b(-1.0))
+    c("add IMM 1 then RECIP, 37 groups", A(0), A(0), A(512), 37, 0, F32, F32, flags=fl("recip", m2="imm"),
+      imm=one, a=one)
+    c("FUNC recip, VALID rows of 4, 36 groups", A(0), A(0), A(512), 36, 5, F32, F32, flags=fl("recip"), a=one,
+      rowlen=4, vld=3 * d - 1)
+    c("mul then RSQRT + RELU -> I32", A(0), A(256), A(512), 21, 2 | 0x10, F32, I32, flags=fl("rsqrt"),
+      a=f32b(1000.0))
+    c("FUNC exp of I8 x I8 -> I8", SA(0), SB(0), SB(600), 19, 2, I8, I8, flags=fl("exp"), a=f32b(-0.001))
+    c("FUNC exp, src1 MOD 3", A(0), A(0), A(512), 30, 5, F32, F32, acc="exp", flags=fl("exp", m1="mod"), a=one,
+      p1=3)
     for kind in ("sum", "max"):
         c(f"REDUCE {kind} rows of 16", A(0), A(0), A(512), 64, 2 if kind == "sum" else 5, F32, F32,
           flags=fl(red=kind), a=one, rowlen=16)
