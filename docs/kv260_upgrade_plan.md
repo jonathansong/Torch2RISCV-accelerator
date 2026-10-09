@@ -404,6 +404,13 @@ decode 受带宽限制，提升 1.5–1.7 倍（不到 2 倍：VE 尾部、注�
 
 **验收**：Qwen3-0.6B 在板上 prefill + decode 与 sim 逐位一致，生成文本正常（文本质量取决于并行的 Q 工作）。**不设 token/s 门槛。**
 
+**结果（2026-10-09，提前在 K2a-1 的 `d16_100mhz_w128` 上完成，通过）**：
+- **编译器**（f2479cc）：D = 16、M = 16 时，Qwen3 有 29 个 prefill dispatch 因 ACC 放不下而退回主机（主机 fp 与器件不逐位一致，prefill 与 decode 对不上）。现在 sahl-tile 的按行分片支持秩 ≥ 2（三维的 RMSNorm 应用）；连 2 行都放不下时（`reduction_16x3072`，SwiGLU 后的量化），按 2 行分片并标记 `sahl.row_by_row`，lowering 逐行执行、每行释放临时缓冲。黄金语料不变。
+- **主机**：逐 dispatch 对拍 T = 16 / 80 / 256 各 1262 个 OK；sim 中 prefill + decode 与只用 decode 的 logits 5/5 行逐位一致。
+- **板上**（`c6p_qwen3`，opt-in；启动后立即 `insmod u-dma-buf udmabuf0=671088640`，CMA 还没被泄漏）：2049 个描述符列表全部在加速器上，主机 0 个 dispatch；logits 与 sim 25/25 步逐位一致，生成的 token 与主机参考相同；器件内存峰值 595.4 MB / 640 MB。
+- **速度**（100 MHz、1.576 GB/s）：prefill 40 个 token 3500.9 ms（11.43 token/s，含首块加载）；**decode 468.5 ms/步（2.13 token/s）**。仅权重读取的下限约 0.6 GB ÷ 1.576 GB/s ≈ 380 ms，decode 已达到读权重上限的约 81%。
+- **prefill 耗时分解**（`c6p_qwen3_profile`，每个 16 token 的块约 89.9M 周期）：SwiGLU 段的 fp 运算占比最大：`reduction_16x3072`（逐行，16.4%）、`elementwise_16x3072`（14.8%），`matmul_like 16x384x16x1024`（15.2%）。逐行执行是 prefill 的首要优化点（K4b / KC）。
+
 ### K4b 长上下文与性能
 
 1. **注意力按 T 分块（C6.5）**：head_dim = 128，上下文变长时一个头的 K 行放不进一个 SPAD bank，需要分块。
@@ -473,7 +480,7 @@ decode 受带宽限制，提升 1.5–1.7 倍（不到 2 倍：VE 尾部、注�
 | K2a-1 | 100 MHz（D = 16，128 位） | 1.6 GB/s | 实测 1.576 GB/s | 通过；stories15M 61.72 token/s，SmolLM2 7.98（通用 6.89），SmolLM2 prefill 27.2 token/s；GEMM 256³ 216.0 MAC/周期 |
 | K2a-2 | 200–250 MHz | 3.2–4.0 GB/s | DMA → SPAD 有效带宽接近上限 | 观测 |
 | K2b | 200–250 MHz | 6.4–12.8 GB/s（按所选配置） | **LINEAR 写入 SPAD 有效带宽**达到所选配置的目标（例如 2 字/周期 × 250 MHz ≥ 6 GB/s）；INTERLEAVE 记录实测值 | SmolLM2 随有效带宽提升（实测比例） |
-| K4a | 同 K2b | 同 K2b | — | Qwen3-0.6B 正确运行，不设速度门槛 |
+| K4a | 同 K2b（实际在 K2a-1 上完成） | 同 K2b | — | **通过**（2026-10-09）：板上逐位一致；decode 2.13 token/s（100 MHz、1.576 GB/s），prefill 11.4 token/s |
 | K4b | 同 K2b | 同 K2b | — | 按耗时分解设目标；仅权重读取的上限：6 GB/s 约 10 token/s、10 GB/s 约 16 token/s；10–15 token/s 为冲刺目标 |
 
 **所有阶段通用的验收约束**
