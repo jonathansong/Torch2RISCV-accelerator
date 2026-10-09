@@ -684,6 +684,11 @@ module tb_system;
         if (bram[MBOX + MB_FW_STATE] !== 32'h52554E00) begin
             $display("TB ERROR: rt_fw not ready (FW_STATE %08x)", bram[MBOX + MB_FW_STATE]); errors = errors + 1;
         end
+        // RT_VERSION 2: the unit's CAPS for the host's executable check
+        if (bram[MBOX + 32'hC8 / 4] !== 2 || bram[MBOX + 32'hD0 / 4] !== mm.legacy.CAPS) begin
+            $display("TB ERROR: rt_fw version %0d, FW_CAPS %08x (CAPS %08x)", bram[MBOX + 32'hC8 / 4],
+                     bram[MBOX + 32'hD0 / 4], mm.legacy.CAPS); errors = errors + 1;
+        end
         // submit with at most RSIZE outstanding; check completions in order
         rj = 0;
         for (ri = 0; ri < NENT; ri = ri + 1) begin

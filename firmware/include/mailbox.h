@@ -69,8 +69,9 @@
 #define MBOX_FW_STATE      0xC4  /* out: RT_READY, or ERR_* when it cannot run            */
 #define MBOX_FW_VERSION    0xC8  /* out: RT_VERSION                                       */
 #define MBOX_HEARTBEAT     0xCC  /* out: idle-loop counter                                */
+#define MBOX_FW_CAPS       0xD0  /* out: the unit's CAPS register (RT_VERSION >= 2)       */
 #define RT_READY           0x52554E00u   /* "RUN\0"                                     */
-#define RT_VERSION         1u
+#define RT_VERSION         2u    /* 2: MBOX_FW_CAPS                                    */
 #define RT_RUN_LIST        0x01u /* ring entry types (w0[7:0])                           */
 #define RT_NOP             0x02u
 #define RT_RESET           0x03u /* mat_reset, then go on                                */

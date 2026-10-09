@@ -135,7 +135,7 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 - 写回每个 strip 一个周期（acc = 1 时两个：先读 ACC 原值）。
 - 包格式：LD 包的 [148:133] x word、[156:149] C step、[157] acc（`pkt_ldg`）；mode 3 一律 SHAPE；没有 GEMV 单元时 mode 2 也是 SHAPE。
 - 记分板：GEMV 在 LD 的口上**读** SPAD_A，与 ST 的读同在 SPAD_A 的 A 侧；两个读者原来不算冲突，会在同一 bank 的同一侧撞口。现在 LD 与 ST 像 EX 与 VE 一样，任何共同 bank 都冲突（原有命令不受影响：普通 LD 只写）。性能模型同样处理。
-- 编译器在 `--iree-sa-gemv-ports` 非零时在可执行文件头的 required CAPS 里置 bit 25（运行时目前不检查 CAPS，G4 前补上）。
+- 编译器在 `--iree-sa-gemv-ports` 非零时在可执行文件头的 required CAPS 里置 bit 25；运行时检查见 G4 第 4 条。
 - 测试：`tb_sa_dma GEN="NP=1|2|3 D=16 DMA_W=128"`（随机 K / strip / C step / acc / pitch、跨 4 KB、跨 bank、K = 4080、驻留命中与失效、SLVERR），`tb_sa_unit GEN="D=16 DMA_W=128 GEMV=1"`（描述符解码、记分板：VE 等 GEMV 写完、驻留、4 种错误、CAPS）；都加进了 `make test128`；固件系统仿真 `firmware/desc_run make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1`（PicoRV32 + RTL，Python `DescList.gemv` 编码：int32 x 经 VE 转 int8、4 + 2 个 strip、K 两半累加，对照功能仿真器与 NumPy）。
 
 **G3 实现（2026-10-09，RTL 与脚本；板上待测）**：
@@ -144,6 +144,13 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 - `tb_sa_unit` 的存储器模型改成每个口一个从机（`NP=2`），整个 unit 测试（GEMM、随机命令流、描述符、GEMV、计数器不变式按 `NP` 放宽）在双口下通过；加进 `make test128`。
 - BD：`build_bitstream.sh -nports 2`（后缀 `_np2`），m1_axi 默认接 **HP3**：UG1085 的 PS 互连里 HP1 与 HP2 共用 DDR 控制器的 S4 口，HP3 走 S5；`-m1_hp 2`（后缀 `_hp2`）用于对比。HP 口的位宽同 `-dma_w`，地址映射与 m0 相同（低 2 GB 恒等映射）。
 - bwtest：测试 6 / 7 是一条 64 KB 的 GEMV（8 个 strip，K = 512；6 含 x 读入，7 x 驻留 = 纯流式带宽），由 ARM 把描述符写进 DDR（`MBOX_DL_ADDR`），固件在 CAPS bit 25 时提交，结果存回 DDR 由驱动用 NumPy 校验；`m2_bw_test.py` 按 `NPORTS × 16 B` 计峰值。固件系统仿真 `firmware/bwtest make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1` 通过（单口 DDR 模型）。
+
+**G4 步骤（板上验收）**：
+
+1. **单口比特流（`d16_100mhz_w128_p6_gemv`）上的原有路径**：`SA_KV260_CONFIG=d16_100mhz_w128_p6_gemv compiler/scripts/deploy_z1_freeze.sh --reuse d16_100mhz_w128_p6_red`（LLM 测试沿用 EX 路径的可执行文件，几分钟），板上 `run_board.sh`：REGRESSION PASS 说明加了 GEMV 单元不影响现有功能；bwtest 的测试 6 / 7 给出单口 GEMV 的流式带宽并校验结果。
+2. **GEMV 路径**：完整 staging（不加 `--reuse`）。`board_env.sh` 从配置名推出 `SA_GEMV_PORTS`（`_gemv` → 1，`_gemv_np2` → 2），`compile_sa.sh` 加 `--iree-sa-gemv-ports`，构建目录带 `_gemv` 后缀；每个 LLM 测试在主机上先过逐 dispatch 检查和仿真，板上 logits 与仿真逐位比较（与 EX 路径也逐位相同，G1 已在仿真上证明）。Qwen3 另外 `deploy_z1_freeze.sh c6p_qwen3`（640 MB udmabuf）。
+3. **双口比特流（`_gemv_np2`）**：同 1、2；bwtest 测试 7 应接近 32 B / 周期；decode token/s 与模型预测（Qwen3 ×1.85 → 约 4.1–4.3 token/s 设备时间，SmolLM2 ×1.76）比较，`board_profile.py` 的 decode profile 再喂给 `perf_model.py` 校准 GEMV 的代价。
+4. **CAPS 检查**：rt_fw（RT_VERSION 2）把单元的 CAPS 写进邮箱 `0xD0`，运行时加载可执行文件时检查它要求的 bit 21–25；用 GEMV 编译的模型在没有 GEMV 的比特流上会直接报错，而不是跑出错误结果。
 
 **第二阶段（按需）**：P = 4（HP0 现在是 PicoRV32 的口，要把它挪到 HPC0 或 LPD；×2.6–3.2）；SPAD 子银行（LD 写 SPAD / ACC 也到 32 B / 周期，prefill ×1.07）；LD 命令流水（隐藏每条命令约 65 周期的延迟，+2–3%）。
 

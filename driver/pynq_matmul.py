@@ -72,6 +72,7 @@ ERR_NO_DESC = 0xDEAD0003
 # L1 resident runtime (firmware/rt, docs/llm_inference_plan.md §5.1)
 MBOX_RING_BASE, MBOX_RING_SIZE, MBOX_RING_TAIL, MBOX_RING_HEAD = 0xB0, 0xB4, 0xB8, 0xBC
 MBOX_CPL_BASE, MBOX_FW_STATE, MBOX_FW_VERSION, MBOX_HEARTBEAT = 0xC0, 0xC4, 0xC8, 0xCC
+MBOX_FW_CAPS = 0xD0                      # rt_fw (RT_VERSION >= 2): the unit's CAPS
 RT_READY = 0x52554E00
 RT_RUN_LIST, RT_NOP, RT_RESET, RT_EXIT = 0x01, 0x02, 0x03, 0x04
 RT_F_IRQ, RT_F_PERF = 1 << 8, 1 << 9

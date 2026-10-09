@@ -36,6 +36,7 @@ int main(void)
     MBOX(MBOX_FW_VERSION) = RT_VERSION;
     MBOX(MBOX_RING_HEAD) = 0;
     sa_init();
+    MBOX(MBOX_FW_CAPS) = sa_caps_runtime;          /* the host checks executables' required CAPS */
     uint32_t size = MBOX(MBOX_RING_SIZE);
     if (!sa_has_desc() || !sa_has_notify() || !sa_has_cmdx() || size == 0 || (size & (size - 1))) {
         MBOX(MBOX_FW_STATE) = (size == 0 || (size & (size - 1))) && sa_has_cmdx() ? ERR_BAD_RING : ERR_NO_L1;

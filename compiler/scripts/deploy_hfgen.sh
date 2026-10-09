@@ -11,7 +11,7 @@
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 source "$(dirname "$0")/board_env.sh"            # SA_BOARD=kv260 (the default; the PYNQ-Z1: pynq-z1 branch)
-O=${1:-$SA_REPO/build/hfgen/smollm2_p$SA_D}
+O=${1:-$SA_REPO/build/hfgen/smollm2_p$SA_D$( [ "$SA_GEMV_PORTS" = 0 ] || echo _gemv )}   # (GEMV overlays: own build)
 # (the export fixes M, so it is not seeded from another D's)
 SKIP=$([ -f "$O/sa.vmfb" ] && echo --skip-export || true)
 D=$SA_REPO/build/deploy_hfgen
