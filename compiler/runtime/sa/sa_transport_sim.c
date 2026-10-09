@@ -5,7 +5,7 @@
 // DDR window; this process maps the same file, so buffers written here are
 // what the functional simulator reads, and its results appear here.
 //   <- HELLO <D> <shm path> <physical base> <bytes>
-//   -> RUN <list physical address>
+//   -> RUN <list physical address> [<dispatch name>]  (single-dispatch lists: the export)
 //   <- DONE <status> <cycles> <descriptors> <end value>
 #include <fcntl.h>
 #include <stdio.h>
@@ -49,7 +49,8 @@ static iree_status_t sa_sim_readline(sa_sim_t* s, char* line, size_t cap) {
 static iree_status_t sa_sim_run(sa_transport_t* t, uint32_t list_phys, sa_completion_t* out) {
   sa_sim_t* s = (sa_sim_t*)t->impl;
   char line[256];
-  int n = snprintf(line, sizeof(line), "RUN 0x%08x\n", list_phys);
+  int n = t->tag.size ? snprintf(line, sizeof(line), "RUN 0x%08x %.*s\n", list_phys, (int)(t->tag.size < 200 ? t->tag.size : 200), t->tag.data)
+                       : snprintf(line, sizeof(line), "RUN 0x%08x\n", list_phys);
   if (write(s->fd, line, (size_t)n) != n) {
     return iree_make_status(IREE_STATUS_UNAVAILABLE, "sa sim: write to the simulator failed");
   }

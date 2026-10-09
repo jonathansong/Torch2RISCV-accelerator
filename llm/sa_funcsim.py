@@ -89,6 +89,7 @@ class SaFuncSim:
         self.dl_exec = 0
         self.cmds = {"LD": 0, "ST": 0, "EX": 0, "VE": 0}
         self.wlog = None                # a list: the STs' (ddr, rows, row bytes, pitch)
+        self.trace = None               # a list: each command / FENCE as [header (w0[31:0]), ddr, descriptor number in the list, w1 .. w7] (dynamic fields applied)
 
     # ------------------------------------------------------------ helpers
     def wbytes(self, mem):
@@ -435,7 +436,8 @@ class SaFuncSim:
                     e.index = idx
                     raise
             elif op == DESC_FENCE:
-                pass
+                if self.trace is not None:
+                    self.trace.append([hdr, 0, self.dl_exec] + w[1:8])
             elif op == DESC_JUMP or op == DESC_CALL:
                 target = rel(w[1]) if w[2] & 1 else w[1] & _M32
                 if target & 63:
@@ -498,6 +500,8 @@ class SaFuncSim:
         f = lambda x, lo, n: (x >> lo) & ((1 << n) - 1)
         base = self.bases[f(hdr, 13, 2) << 2 | f(hdr, 9, 2)]
         ddr = (f(w[1], 0, 32) + (base if hdr & (1 << 8) else 0)) & _M32
+        if self.trace is not None:
+            self.trace.append([hdr, ddr, self.dl_exec] + w[1:8])
         if op == DESC_LD:
             self.ld(ddr, f(w[2], 0, 32), f(w[2], 32, 16), f(w[2], 48, 16), f(w[3], 0, 32), f(w[3], 32, 2))
         elif op == DESC_ST:

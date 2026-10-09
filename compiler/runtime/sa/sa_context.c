@@ -238,7 +238,9 @@ iree_status_t sa_context_dispatch(sa_context_t* c, const sa_dispatch_t* x, sa_co
   sa_emit(w, &k, SA_OP_CALL, x->body_phys);
   sa_emit(w, &k, SA_OP_END, 0x5A);
   __sync_synchronize();
+  c->transport->tag = x->name;
   iree_status_t status = c->transport->run(c->transport, c->list_phys, out);
+  c->transport->tag = iree_string_view_empty();
   c->dispatches++;
   c->lists++;
   iree_slim_mutex_unlock(&c->mutex);

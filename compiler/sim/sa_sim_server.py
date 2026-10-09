@@ -11,7 +11,7 @@ hardware does (local memories, BASE / PARAM registers).
 
 Protocol (one text line each way, one client at a time):
   server -> client on connect:  HELLO <D> <shm path> <physical base> <bytes>
-  client -> server:             RUN <list physical address>
+  client -> server:             RUN <list physical address> [<dispatch name>]
   server -> client:             DONE <status> <cycles> <descriptors> <end value>
       status 0 = success; otherwise the unit's extended status (xstatus), and
       <descriptors> counts the descriptors decoded, the failing one included (as rt_fw's completion
@@ -58,6 +58,8 @@ def serve(args):
     print(f"sa sim: D = {args.d}, SPAD {args.spad_kb} KB, ACC {args.acc_kb} KB, {args.mb} MB at {BASE:#x} in {shm}, socket {args.socket}", flush=True)
     runs = 0
     wlog = open(args.wlog, "w") if args.wlog else None
+    trace = open(args.trace, "wb") if args.trace else None          # rows of 10 uint64 (sa_funcsim trace)
+    tidx = open(args.trace + ".idx", "w") if args.trace else None   # per list: run, rows, dispatch name
     try:
         while True:
             conn, _ = srv.accept()
@@ -72,6 +74,8 @@ def serve(args):
                         addr = int(cmd[1], 0)
                         if wlog:
                             sim.wlog = []
+                        if trace:
+                            sim.trace = []
                         try:
                             n = sim.run_list(addr)
                             reply = f"DONE 0 0 {n} {sim.dl_status}"
@@ -81,6 +85,12 @@ def serve(args):
                             if args.verbose:
                                 print(f"list {addr:#x}: {e}", flush=True)
                         runs += 1
+                        if trace:
+                            np.asarray(sim.trace, np.uint64).reshape(-1, 10).tofile(trace)
+                            tidx.write(f"{runs} {len(sim.trace)} {cmd[2] if len(cmd) > 2 else '-'}\n")
+                            sim.trace = None
+                            trace.flush()
+                            tidx.flush()
                         if wlog:
                             lo = min((a for a, *_ in sim.wlog), default=0)
                             hi = max((a + (r - 1) * p + b for a, r, b, p in sim.wlog), default=0)
@@ -115,6 +125,8 @@ def main():
     ap.add_argument("--shm", help="shared-memory file (default /dev/shm/sa_ddr_<pid>)")
     ap.add_argument("--once", action="store_true", help="exit after the first client disconnects")
     ap.add_argument("--wlog", help="per list: the range its stores wrote (debugging)")
+    ap.add_argument("--trace", help="every command of every list (performance model: compiler/tests/perf_model.py); "
+                                    "FILE gets rows of 10 uint64, FILE.idx one line per list")
     ap.add_argument("-v", "--verbose", action="store_true")
     serve(ap.parse_args())
 
