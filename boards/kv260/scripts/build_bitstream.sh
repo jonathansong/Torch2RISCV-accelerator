@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-click KV260 bitstream build (docs/kv260_upgrade_plan.md K1a / K1b / K1c / K2a). Options are
-# passed to build_bitstream.tcl: [-jobs N] [-sa_d 8|16] [-sa_mhz MHZ] [-dma_w 64|128] [-proj_dir DIR] [-bd_only]
+# passed to build_bitstream.tcl: [-jobs N] [-sa_d 8|16] [-sa_mhz MHZ] [-dma_w 64|128] [-vefp_nb N] [-proj_dir DIR] [-bd_only]
 set -euo pipefail
 
 kv_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,16 +19,17 @@ fi
 mkdir -p "$kv_root/build"
 cd "$kv_root/build"
 # the configuration's name for the log (build_bitstream.tcl names its outputs the same way)
-sa_d=8; sa_mhz=50; dma_w=64
+sa_d=8; sa_mhz=50; dma_w=64; vefp_nb=8
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
     case ${args[i]} in
         -sa_d)   sa_d=${args[i+1]:-8} ;;
         -sa_mhz) sa_mhz=${args[i+1]:-50} ;;
         -dma_w)  dma_w=${args[i+1]:-64} ;;
+        -vefp_nb) vefp_nb=${args[i+1]:-8} ;;
     esac
 done
-cfg=d${sa_d}_${sa_mhz}mhz$([ "$dma_w" = 128 ] && echo _w128 || true)
+cfg=d${sa_d}_${sa_mhz}mhz$([ "$dma_w" = 128 ] && echo _w128 || true)$([ "$vefp_nb" != 0 ] && echo _p6 || true)
 cmd=(vivado -mode batch -notrace -log "vivado_$cfg.log" -journal "vivado_$cfg.jou"
      -source "$kv_root/scripts/build_bitstream.tcl" -tclargs "$@")
 

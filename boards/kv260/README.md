@@ -8,10 +8,11 @@ K1a and K1b are accepted on the board (2026-10-08, tokens identical to the
 PYNQ-Z1 baselines; results below).
 
 ```sh
-boards/kv260/scripts/build_bitstream.sh -jobs 2                 # K1a: D = 8, 50 MHz (~25 min)
-boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_mhz 100     # K1b
-boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100   # K1c
-boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100 -dma_w 128   # K2a-1: 128-bit DMA (d16_100mhz_w128)
+boards/kv260/scripts/build_bitstream.sh -jobs 2 -vefp_nb 0     # K1a: D = 8, 50 MHz (~25 min)
+boards/kv260/scripts/build_bitstream.sh -jobs 2 -vefp_nb 0 -sa_mhz 100     # K1b
+boards/kv260/scripts/build_bitstream.sh -jobs 2 -vefp_nb 0 -sa_d 16 -sa_mhz 100   # K1c
+boards/kv260/scripts/build_bitstream.sh -jobs 2 -vefp_nb 0 -sa_d 16 -sa_mhz 100 -dma_w 128   # K2a-1: 128-bit DMA (d16_100mhz_w128)
+boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100 -dma_w 128   # + P6 batched SFU (d16_100mhz_w128_p6)
 boards/kv260/scripts/build_bitstream.sh -bd_only                # block design + address map only (minutes)
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -synth_only     # stop after synthesis (~9 min)
 ```
