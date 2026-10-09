@@ -123,7 +123,7 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 | 阶段 | 内容 | 验证 |
 |---|---|---|
 | **G1** | 功能仿真器 + 编译器（`sahl.gemv`、目标配置开关），不碰硬件 | Qwen3 / SmolLM2 / stories 的 decode 在 sim 上与现有路径逐位一致；`dispatch_check`；新基线 |
-| **G2** ✅ | RTL：`sa_gemv` + `sa_ld` 的 GEMV 模式 + `sa_sched` 的检查与掩码，先 NPORTS = 1（功能正确，16 B / 周期） | `tb_sa_gemv`（随机 K / S / cstep / acc / 对齐，对照 funcsim）；`tb_sa_ld`；`tb_sa_unit`；固件系统仿真 `desc_run`；`make test / test16 / test128` |
+| **G2** ✅（板上 ✅） | RTL：`sa_gemv` + `sa_ld` 的 GEMV 模式 + `sa_sched` 的检查与掩码，先 NPORTS = 1（功能正确，16 B / 周期） | `tb_sa_gemv`（随机 K / S / cstep / acc / 对齐，对照 funcsim）；`tb_sa_ld`；`tb_sa_unit`；固件系统仿真 `desc_run`；`make test / test16 / test128` |
 | **G3** 🔧 | NPORTS = 2：R 侧双口同时接收、BD 加第二个 HP 口（HP3）、`bwtest` 双口测试 | `tb_sa_dma GEN="NP=2 D=16 DMA_W=128"` 加 GEMV 模式；用户构建比特流；板上 bwtest |
 | **G4** | 板上验收 | REGRESSION PASS、逐位一致；decode 的 token/s 与模型预测（×1.76–1.85）对比 |
 
@@ -148,6 +148,7 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 **G4 步骤（板上验收）**：
 
 1. **单口比特流（`d16_100mhz_w128_p6_gemv`）上的原有路径**：`SA_KV260_CONFIG=d16_100mhz_w128_p6_gemv compiler/scripts/deploy_z1_freeze.sh --reuse d16_100mhz_w128_p6_red`（LLM 测试沿用 EX 路径的可执行文件，几分钟），板上 `run_board.sh`：REGRESSION PASS 说明加了 GEMV 单元不影响现有功能；bwtest 的测试 6 / 7 给出单口 GEMV 的流式带宽并校验结果。
+   **结果（2026-10-09，`d16_100mhz_w128_p6_gemv`，WNS +0.274 ns，LUT 92.3k / 78.8%（+4.1k），BRAM 132（+2），DSP 349）**：REGRESSION PASS（16 项），6 个 LLM 测试的 token 与 `p6_red` 逐字相同，速度不变（Qwen3 prefill 15.41 / decode 2.22 tok/s）；bwtest GEMV 64 KB：x 驻留 4190 周期 = **15.64 B / 周期**（单口峰值的 97.8%，普通 LD 15.70），x 读入多 15 周期，结果与 NumPy 一致。
 2. **GEMV 路径**：完整 staging（不加 `--reuse`）。`board_env.sh` 从配置名推出 `SA_GEMV_PORTS`（`_gemv` → 1，`_gemv_np2` → 2），`compile_sa.sh` 加 `--iree-sa-gemv-ports`，构建目录带 `_gemv` 后缀；每个 LLM 测试在主机上先过逐 dispatch 检查和仿真，板上 logits 与仿真逐位比较（与 EX 路径也逐位相同，G1 已在仿真上证明）。Qwen3 另外 `deploy_z1_freeze.sh c6p_qwen3`（640 MB udmabuf）。
 3. **双口比特流（`_gemv_np2`）**：同 1、2；bwtest 测试 7 应接近 32 B / 周期；decode token/s 与模型预测（Qwen3 ×1.85 → 约 4.1–4.3 token/s 设备时间，SmolLM2 ×1.76）比较，`board_profile.py` 的 decode profile 再喂给 `perf_model.py` 校准 GEMV 的代价。
 4. **CAPS 检查**：rt_fw（RT_VERSION 2）把单元的 CAPS 写进邮箱 `0xD0`，运行时加载可执行文件时检查它要求的 bit 21–25；用 GEMV 编译的模型在没有 GEMV 的比特流上会直接报错，而不是跑出错误结果。仿真上用 `SA_SIM_CAPS=0x01E00010` 模拟没有 GEMV 的单元验证过（stories15M GEMV 版本加载即报 INCOMPATIBLE）。G1 的 Qwen3 也已通过：1262 个 dispatch、logits 与 EX 路径逐字节相同。
