@@ -80,9 +80,9 @@ module sa_ld #(
     output wire [NPORTS-1:0]    m_rready,
 
     // performance events: {AR stalled by the port, local write, command active};
-    // perf_two: the local write is two lanes (counts twice: 8-byte units)
+    // perf_lanes: 8-byte lanes moved this cycle (LD_BEATS units)
     output wire [2:0]           perf_ev,
-    output wire                 perf_two
+    output wire [3:0]           perf_lanes
 );
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
@@ -317,10 +317,10 @@ module sa_ld #(
         end
     endgenerate
 
-    integer g_last;               // GEMV: bursts finished this cycle
+    integer g_last, gl;           // GEMV: bursts finished this cycle
     always @* begin
         g_last = 0;
-        for (p = 0; p < NPORTS; p = p + 1) g_last = g_last + (g_take[p] && m_rlast[p]);
+        for (gl = 0; gl < NPORTS; gl = gl + 1) g_last = g_last + (g_take[gl] && m_rlast[gl]);
     end
 
     always @(posedge clk) begin
@@ -360,7 +360,12 @@ module sa_ld #(
         end
     end
 
-    // GEMV beats count as local writes of two lanes (one per cycle at NPORTS = 1)
-    assign perf_ev  = {|(m_arvalid & ~m_arready), lw_en || |g_take, active};
-    assign perf_two = (lw_en && lw_two) || (W2 && |g_take);
+    // GEMV beats count as local writes (BL lanes each, all ports)
+    integer g_n, gc;
+    always @* begin
+        g_n = 0;
+        for (gc = 0; gc < NPORTS; gc = gc + 1) g_n = g_n + g_take[gc];
+    end
+    assign perf_ev    = {|(m_arvalid & ~m_arready), lw_en || |g_take, active};
+    assign perf_lanes = (lw_en ? (lw_two ? 4'd2 : 4'd1) : 4'd0) + BL * g_n;
 endmodule

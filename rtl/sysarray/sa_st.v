@@ -57,9 +57,9 @@ module sa_st #(
     output wire [NPORTS-1:0]    m_bready,
 
     // performance events: {W stalled by the port, beat accepted, command active};
-    // perf_two: the accepted beat carries two lanes (counts twice: 8-byte units)
+    // perf_lanes: 8-byte lanes accepted this cycle, all ports (ST_BEATS units)
     output wire [2:0]           perf_ev,
-    output wire                 perf_two
+    output wire [3:0]           perf_lanes
 );
     `include "sa_defs.vh"
     localparam integer LOGD = $clog2(D);
@@ -362,13 +362,14 @@ module sa_st #(
     end
 
     assign perf_ev = {|(m_wvalid & ~m_wready), |(m_wvalid & m_wready), active};
-    // the accepted beat's strobes cover both lanes (one port at a time accepts: NPORTS = 1 exact)
-    reg two_acc;
+    // an accepted 128-bit beat whose strobes cover both lanes counts two
+    reg [3:0] lanes_acc;
     integer t;
     always @* begin
-        two_acc = 0;
+        lanes_acc = 0;
         for (t = 0; t < NPORTS; t = t + 1)
-            if (m_wvalid[t] && m_wready[t] && W2 && m_wstrb[DMA_W/8*t] && m_wstrb[DMA_W/8*t + 8]) two_acc = 1;
+            if (m_wvalid[t] && m_wready[t])
+                lanes_acc = lanes_acc + (W2 && m_wstrb[DMA_W/8*t] && m_wstrb[DMA_W/8*t + 8] ? 2 : 1);
     end
-    assign perf_two = two_acc;
+    assign perf_lanes = lanes_acc;
 endmodule

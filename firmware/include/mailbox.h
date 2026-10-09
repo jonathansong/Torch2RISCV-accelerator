@@ -33,7 +33,8 @@
 #define MBOX_EXT_STATUS    0x40  /* out: mat_fence extended status at the end    */
 #define MBOX_BW_SRC        0x08  /* bwtest firmware: source buffer (= A_BASE)     */
 #define MBOX_BW_DST        0x10  /*                  destination (= C_BASE)       */
-#define MBOX_BW_CYCLES     0x44  /* out: bwtest cycles per test, 6 words          */
+#define MBOX_BW_CYCLES     0x44  /* out: bwtest cycles per test, 8 words (0x44..0x60:
+                                  *      6, 7 = GEMV, 0 without the unit)            */
 /* M3 vector engine (firmware/vector: standalone op; firmware/gemm: epilogue).
  * VE parameters, same meaning as the vec_cfg keys (sysarray_intrinsics.h): */
 #define MBOX_V_LEN         0x60  /* in:  vector firmware: elements, multiple of 8 */

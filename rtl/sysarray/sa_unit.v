@@ -303,7 +303,7 @@ module sa_unit #(
     wire [1:0]  pcpi_ev;
     wire [3:0]  ex_ev, ve_ev;
     wire [2:0]  ld_ev, st_ev;
-    wire        ld_two, st_two;                // 128-bit DMA: two 8-byte lanes at once
+    wire [3:0]  ld_lanes, st_lanes;            // 8-byte lanes moved per cycle (128-bit beats, ports)
     wire        perf_pctl_we, perf_cctl_we, perf_en;
     wire [1:0]  perf_pctl, perf_cctl;
     wire [4:0]  perf_prsel, perf_crsel;
@@ -403,8 +403,8 @@ module sa_unit #(
              pcpi_ev,                            // 6 PCPI_FENCE, 5 PCPI_QFULL
              sched_ev[3:0],                      // 1..4 CMD_LD/ST/EX/VE
              1'b1}),                             // 0 CYCLES
-        // LD_BEATS (19) / ST_BEATS (22) count 8-byte lanes (two per 128-bit write / beat)
-        .ev2({{PERF_NCNT-23{1'b0}}, st_two, 2'b00, ld_two, {19{1'b0}}}),
+        // LD_BEATS (19) / ST_BEATS (22) count 8-byte lanes (two per 128-bit beat, all ports)
+        .evx({{4*(PERF_NCNT-23){1'b0}}, st_lanes - 4'd1, 8'd0, ld_lanes - 4'd1, {4*19{1'b0}}}),
         .ctl_we_a(perf_pctl_we), .ctl_a(perf_pctl), .ctl_we_b(perf_cctl_we), .ctl_b(perf_cctl),
         .en(perf_en),
         .rsel_a(perf_prsel), .rdata_a(perf_prdata), .rsel_b(perf_crsel), .rdata_b(perf_crdata));
@@ -434,7 +434,7 @@ module sa_unit #(
         .g_xready(g_xready), .g_busy(g_busy), .g_valid(g_valid), .g_data(g_data), .g_s(g_s), .g_k(g_k),
         .m_araddr(araddr), .m_arlen(arlen), .m_arvalid(arvalid), .m_arready(arready),
         .m_rdata(rdata), .m_rresp(rresp), .m_rlast(rlast), .m_rvalid(rvalid), .m_rready(rready),
-        .perf_ev(ld_ev), .perf_two(ld_two));
+        .perf_ev(ld_ev), .perf_lanes(ld_lanes));
 
     wire        lr_en;
     wire [3:0]  lr_mem;
@@ -452,7 +452,7 @@ module sa_unit #(
         .m_awaddr(awaddr), .m_awlen(awlen), .m_awvalid(awvalid), .m_awready(awready),
         .m_wdata(wdata), .m_wstrb(wstrb), .m_wlast(wlast), .m_wvalid(wvalid), .m_wready(wready),
         .m_bresp(bresp), .m_bvalid(bvalid), .m_bready(bready),
-        .perf_ev(st_ev), .perf_two(st_two));
+        .perf_ev(st_ev), .perf_lanes(st_lanes));
 
     wire               sa_en, sb_en, acc_en;
     wire [SAW-1:0]     sa_addr, sb_addr;

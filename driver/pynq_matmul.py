@@ -92,7 +92,10 @@ BW_TESTS = [  # name, bytes moved (bwtest_fw.c)
     ("ST  ACC -> DDR, 64 KB", 65536),
     ("LD  8-byte rows, pitch 16 (1-beat bursts)", 65536),
     ("LD SPAD_B + ST SPAD_A concurrently", 131072),
+    ("GEMV 64 KB streamed, x loaded (K2b)", 65536),         # only with the GEMV unit
+    ("GEMV 64 KB streamed, x resident (K2b)", 65536),
 ]
+BW_GEMV_K, BW_GEMV_STRIPS = 512, 8                    # 8 strips of K = 512: 64 KB of weights
 SA_D = 8                                 # array size if the .hwh does not say (M1-M3 builds)
 SPAD_BYTES = 128 * 1024                  # per SPAD
 MBOX_WORDS = 0x100 // 4
@@ -815,12 +818,19 @@ class MatmulOverlay:
 
     def bandwidth(self, timeout=5.0):
         """DMA bandwidth self-test (bwtest_fw.bin). Returns [(name, bytes, cycles, B/cycle)]
-        and checks the three stored copies against the source."""
+        and checks the three stored copies against the source (and, with the GEMV unit,
+        the GEMV results: x = src[:K], strips = src; tests with 0 cycles did not run)."""
         src = allocate(shape=(65536,), dtype=np.uint8)
-        dst = allocate(shape=(3 * 65536,), dtype=np.uint8)
+        dst = allocate(shape=(4 * 65536,), dtype=np.uint8)
+        gemv_ok = None
         try:
             src[:] = np.random.default_rng(7).integers(0, 256, 65536, dtype=np.uint8)
             dst[:] = 0xA5
+            # one GEMV descriptor (LD mode GEMV) at dst + 192 KB + 1 KB; results stored at dst + 192 KB
+            k, ns, d = BW_GEMV_K, BW_GEMV_STRIPS, 16
+            gl = DescList().gemv(src.physical_address, laddr(MEM_ACC, 0), ns, k * d, k * d, 0)
+            lo = 3 * 65536 + 1024
+            dst[lo:lo + 64] = gl.array().view(np.uint8).ravel()[:64]
             src.flush()
             dst.flush()
             self.reset.write(1)
@@ -828,6 +838,7 @@ class MatmulOverlay:
                 self.bram.write(MBOX + 4 * w, 0)
             self.bram.write(MBOX + MBOX_A_BASE, src.physical_address)
             self.bram.write(MBOX + MBOX_C_BASE, dst.physical_address)
+            self.bram.write(MBOX + MBOX_DL_ADDR, dst.physical_address + lo)
             t0 = time.perf_counter()
             self.reset.write(0)
             while time.perf_counter() - t0 < timeout and self._mbox(MBOX_STATUS) != STATUS_DONE:
@@ -839,6 +850,12 @@ class MatmulOverlay:
                 raise RuntimeError(f"DMA error, ext status {self._mbox(MBOX_FIRST_ERR):#x}")
             dst.invalidate()
             copies_ok = all(np.array_equal(dst[65536 * i:65536 * (i + 1)], src) for i in range(3))
+            if self._mbox(MBOX_BW_CYCLES + 4 * 7):
+                x = src[:k].view(np.int8).astype(np.int64)
+                w = src.view(np.int8).reshape(ns, k, d).astype(np.int64)
+                want = np.einsum("k,skj->sj", x, w).astype(np.int32)
+                got = dst[3 * 65536:3 * 65536 + 4 * ns * d].view(np.int32).reshape(ns, d)
+                gemv_ok = bool(np.array_equal(got, want))
         finally:
             src.freebuffer()
             dst.freebuffer()
@@ -846,7 +863,7 @@ class MatmulOverlay:
         for i, (name, nbytes) in enumerate(BW_TESTS):
             cyc = self._mbox(MBOX_BW_CYCLES + 4 * i)
             res.append((name, nbytes, cyc, nbytes / cyc if cyc else 0.0))
-        return res, copies_ok
+        return res, copies_ok and gemv_ok is not False
 
 
 class Device:

@@ -124,7 +124,7 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 |---|---|---|
 | **G1** | 功能仿真器 + 编译器（`sahl.gemv`、目标配置开关），不碰硬件 | Qwen3 / SmolLM2 / stories 的 decode 在 sim 上与现有路径逐位一致；`dispatch_check`；新基线 |
 | **G2** ✅ | RTL：`sa_gemv` + `sa_ld` 的 GEMV 模式 + `sa_sched` 的检查与掩码，先 NPORTS = 1（功能正确，16 B / 周期） | `tb_sa_gemv`（随机 K / S / cstep / acc / 对齐，对照 funcsim）；`tb_sa_ld`；`tb_sa_unit`；固件系统仿真 `desc_run`；`make test / test16 / test128` |
-| **G3** | NPORTS = 2：R 侧双口同时接收、BD 加 HP2、`bwtest` 双口测试 | `tb_sa_dma GEN="NP=2 D=16 DMA_W=128"` 加 GEMV 模式；用户构建比特流；板上 bwtest |
+| **G3** 🔧 | NPORTS = 2：R 侧双口同时接收、BD 加第二个 HP 口（HP3）、`bwtest` 双口测试 | `tb_sa_dma GEN="NP=2 D=16 DMA_W=128"` 加 GEMV 模式；用户构建比特流；板上 bwtest |
 | **G4** | 板上验收 | REGRESSION PASS、逐位一致；decode 的 token/s 与模型预测（×1.76–1.85）对比 |
 
 **G2 实现（2026-10-09）**：`rtl/sysarray/sa_gemv.v` + `sa_ld` / `sa_sched` / `sa_cmdfetch` / `sa_unit`（参数 `GEMV`，要求 D = 16、DMA_W = 128；CAPS bit 25；`build_bitstream.sh -gemv 1`，配置后缀 `_gemv`）。与 §5 / §6 的差别和细节：
@@ -137,6 +137,13 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 - 记分板：GEMV 在 LD 的口上**读** SPAD_A，与 ST 的读同在 SPAD_A 的 A 侧；两个读者原来不算冲突，会在同一 bank 的同一侧撞口。现在 LD 与 ST 像 EX 与 VE 一样，任何共同 bank 都冲突（原有命令不受影响：普通 LD 只写）。性能模型同样处理。
 - 编译器在 `--iree-sa-gemv-ports` 非零时在可执行文件头的 required CAPS 里置 bit 25（运行时目前不检查 CAPS，G4 前补上）。
 - 测试：`tb_sa_dma GEN="NP=1|2|3 D=16 DMA_W=128"`（随机 K / strip / C step / acc / pitch、跨 4 KB、跨 bank、K = 4080、驻留命中与失效、SLVERR），`tb_sa_unit GEN="D=16 DMA_W=128 GEMV=1"`（描述符解码、记分板：VE 等 GEMV 写完、驻留、4 种错误、CAPS）；都加进了 `make test128`；固件系统仿真 `firmware/desc_run make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1`（PicoRV32 + RTL，Python `DescList.gemv` 编码：int32 x 经 VE 转 int8、4 + 2 个 strip、K 两半累加，对照功能仿真器与 NumPy）。
+
+**G3 实现（2026-10-09，RTL 与脚本；板上待测）**：
+
+- RTL 的多口 GEMV 在 G2 已经完成，G3 只改了：性能计数器 LD_BEATS / ST_BEATS 原来每周期最多加 2（`ev2`），多口同周期的拍会少计；现在 `sa_ld` / `sa_st` 给出每周期的 8 字节 lane 数（`perf_lanes`，所有口合计），`sa_perf` 的 `evx` 是每个计数器的额外增量。单口时不变。
+- `tb_sa_unit` 的存储器模型改成每个口一个从机（`NP=2`），整个 unit 测试（GEMM、随机命令流、描述符、GEMV、计数器不变式按 `NP` 放宽）在双口下通过；加进 `make test128`。
+- BD：`build_bitstream.sh -nports 2`（后缀 `_np2`），m1_axi 默认接 **HP3**：UG1085 的 PS 互连里 HP1 与 HP2 共用 DDR 控制器的 S4 口，HP3 走 S5；`-m1_hp 2`（后缀 `_hp2`）用于对比。HP 口的位宽同 `-dma_w`，地址映射与 m0 相同（低 2 GB 恒等映射）。
+- bwtest：测试 6 / 7 是一条 64 KB 的 GEMV（8 个 strip，K = 512；6 含 x 读入，7 x 驻留 = 纯流式带宽），由 ARM 把描述符写进 DDR（`MBOX_DL_ADDR`），固件在 CAPS bit 25 时提交，结果存回 DDR 由驱动用 NumPy 校验；`m2_bw_test.py` 按 `NPORTS × 16 B` 计峰值。固件系统仿真 `firmware/bwtest make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1` 通过（单口 DDR 模型）。
 
 **第二阶段（按需）**：P = 4（HP0 现在是 PicoRV32 的口，要把它挪到 HPC0 或 LPD；×2.6–3.2）；SPAD 子银行（LD 写 SPAD / ACC 也到 32 B / 周期，prefill ×1.07）；LD 命令流水（隐藏每条命令约 65 周期的延迟，+2–3%）。
 

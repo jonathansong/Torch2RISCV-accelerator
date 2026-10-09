@@ -63,6 +63,7 @@ test128:                  # the 128-bit DMA (K2a): the DMA engines and the unit
 	@$(MAKE) -s sim TB=tb_sa_dma GEN="NP=2 D=16 DMA_W=128"
 	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=16 DMA_W=128"
 	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=16 DMA_W=128 GEMV=1"
+	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=16 DMA_W=128 GEMV=1 NP=2"
 	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=8 DMA_W=128"
 
 clean:

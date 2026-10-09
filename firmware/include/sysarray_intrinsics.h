@@ -92,6 +92,7 @@ static inline uint32_t mat_cycles(void)
 #define SA_CAPS_CMDX    (1u << 24)    /* L1: BASE0-15, PARAM0-7, dynamic fields,
                                        *     SETREG, LOOP_END, CALL / RET, LDPARAM   */
 #define SA_CAPS_FPVE    (1u << 23)    /* L2: fp32 vector engine, SFU, TRANSPOSE       */
+#define SA_CAPS_GEMV    (1u << 25)    /* K2b: LD mode GEMV (descriptors only)         */
 static uint32_t sa_caps_runtime = 0u;
 #ifndef SA_D
 static uint32_t sa_d_runtime = 8u;
@@ -120,6 +121,8 @@ static inline int sa_has_notify(void) { return (sa_caps_runtime & SA_CAPS_NOTIFY
 static inline int sa_has_cmdx(void) { return (sa_caps_runtime & SA_CAPS_CMDX) != 0; }
 /* L2: fp32 vector engine (docs/llm_inference_plan.md §3.2) */
 static inline int sa_has_fpve(void) { return (sa_caps_runtime & SA_CAPS_FPVE) != 0; }
+/* K2b: the GEMV unit (docs/k2b_gemv_design.md) */
+static inline int sa_has_gemv(void) { return (sa_caps_runtime & SA_CAPS_GEMV) != 0; }
 #define SA_SPAD_WORDS   (131072u / SA_D)            /* per SPAD, D-byte words      */
 #define SA_ACC_WORDS    (262144u / (4u * SA_D))     /* D x int32 words             */
 #define SA_SPAD_BANK    (SA_SPAD_WORDS / 2u)        /* first word of bank 1        */

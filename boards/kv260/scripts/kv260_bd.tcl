@@ -4,12 +4,15 @@
 # on the K26 SOM's Zynq UltraScale+ PS, with the accelerator unchanged.
 #
 # Sourced by build_bitstream.tcl (project already created, IP repository
-# registered; variables ::sa_d, ::sa_mhz, ::dma_w, ::vefp_nb, ::gemv).
+# registered; variables ::sa_d, ::sa_mhz, ::dma_w, ::vefp_nb, ::gemv, ::nports, ::m1_hp).
 #
 #   zynq_ultra_ps_e_0   board preset (DDR4, MIO), then:
 #     M_AXI_HPM0_FPD    32-bit, ARM -> psAxiInterconnect -> program BRAM, interrupt controller
 #     S_AXI_HP0_FPD     64-bit, PicoRV32's DDR port (the rings in DDR)   [Z1: HP0]
 #     S_AXI_HP1_FPD     ::dma_w bits (64; K2a 128), the accelerator's DMA (m0_axi)  [Z1: HP2 + AXI4->AXI3]
+#     S_AXI_HP<m1_hp>_FPD  ::nports = 2 (K2b G3): the second DMA port (m1_axi), HP3 by default:
+#                       HP1 and HP2 share one DDR controller port (S4), HP3 has its own (S5;
+#                       UG1085 "PS Interconnect"); -m1_hp 2 for the comparison
 #     pl_clk0           ::sa_mhz MHz, the only PL clock (PicoRV32, accelerator, AXI)
 #     pl_ps_irq0[0]     the interrupt controller (PicoRV32 trap, matmul_0/notify_irq)
 #     emio_gpio_o[0]    RISC-V reset (1 = hold), as EMIO[0] on the Z1 (2 EMIO pins: xlslice needs >= 2)
@@ -52,6 +55,8 @@ set_property -dict [list \
     CONFIG.PSU__SAXIGP2__DATA_WIDTH {64} \
     CONFIG.PSU__USE__S_AXI_GP3 {1} \
     CONFIG.PSU__SAXIGP3__DATA_WIDTH $::dma_w \
+    CONFIG.PSU__USE__S_AXI_GP4 [expr {$::nports > 1 && $::m1_hp == 2}] \
+    CONFIG.PSU__USE__S_AXI_GP5 [expr {$::nports > 1 && $::m1_hp == 3}] \
     CONFIG.PSU__FPGA_PL0_ENABLE {1} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__SRCSEL {IOPLL} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $::sa_mhz \
@@ -96,6 +101,7 @@ set_property -dict [list CONFIG.D $::sa_d \
                          CONFIG.DMA_W $::dma_w \
                          CONFIG.VEFP_NB $::vefp_nb \
                          CONFIG.GEMV $::gemv \
+                         CONFIG.NPORTS $::nports \
                          CONFIG.SPAD_WORDS [expr {131072 / $::sa_d}] \
                          CONFIG.ACC_WORDS [expr {262144 / (4 * $::sa_d)}]] $matmul_0
 
@@ -107,6 +113,12 @@ connect_bd_intf_net [get_bd_intf_pins pico_processor_0/M_AXI_DDR] [get_bd_intf_p
 connect_bd_intf_net [get_bd_intf_pins pico_processor_0/M_AXI_PERIPH] [get_bd_intf_pins matmul_0/s_axi]
 connect_bd_intf_net [get_bd_intf_pins pico_processor_0/PCPI] [get_bd_intf_pins matmul_0/pcpi]
 connect_bd_intf_net [get_bd_intf_pins matmul_0/m0_axi] [get_bd_intf_pins $ps/S_AXI_HP1_FPD]
+if {$::nports > 1} {
+    # S_AXI_GP4 / GP5 = HP2 / HP3; its data width once the port exists
+    set_property CONFIG.PSU__SAXIGP[expr {$::m1_hp + 2}]__DATA_WIDTH $::dma_w $ps
+    connect_bd_intf_net [get_bd_intf_pins matmul_0/m1_axi] [get_bd_intf_pins $ps/S_AXI_HP${::m1_hp}_FPD]
+    connect_bd_net [get_bd_pins $ps/pl_clk0] [get_bd_pins $ps/saxihp${::m1_hp}_fpd_aclk]
+}
 
 # the one PL clock
 connect_bd_net [get_bd_pins $ps/pl_clk0] \
@@ -158,6 +170,10 @@ assign_bd_address -offset 0x80000000 -range 0x00001000 -target_address_space $rv
 # accelerator DMA: DDR identity-mapped (low 2 GB)
 assign_bd_address -offset 0x00000000 -range 0x80000000 -target_address_space [get_bd_addr_spaces matmul_0/m0_axi] \
     [ddr_low_seg $ps/S_AXI_HP1_FPD] -force
+if {$::nports > 1} {
+    assign_bd_address -offset 0x00000000 -range 0x80000000 -target_address_space [get_bd_addr_spaces matmul_0/m1_axi] \
+        [ddr_low_seg $ps/S_AXI_HP${::m1_hp}_FPD] -force
+}
 
 validate_bd_design
 save_bd_design

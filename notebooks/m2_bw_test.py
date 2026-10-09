@@ -11,7 +11,9 @@ Each test moves 64 KB (test 5: 64 KB each way at once) and is timed on the
 PicoRV32 (rdcycle around queue + mat_fence, at the overlay's clock: 50 MHz on
 the PYNQ-Z1 and in the KV260's K1a). One 64-bit HP port peaks at 8 B/cycle
 per direction (400 MB/s at 50 MHz); the K2a overlays' 128-bit port at 16.
-Rows of 8 bytes (test 4) fill only half of a 128-bit beat.
+Rows of 8 bytes (test 4) fill only half of a 128-bit beat. With the GEMV unit
+(K2b) two more tests stream 64 KB of weights through LD mode GEMV, which reads
+on all NPORTS ports at once (peak NPORTS x 16 B/cycle); their results are checked.
 """
 import os
 import sys
@@ -27,8 +29,13 @@ def main():
     bw = mm.info.dma_w // 8                            # peak bytes per cycle and direction
     print(f"{mm.info.board} overlay, D = {mm.d}, {mm.riscv_hz / 1e6:.1f} MHz, DMA {mm.info.dma_w} bits")
     print(f"{'test':44} {'cycles':>8} {'B/cycle':>8} {'MB/s':>8} {f'% of {bw} B/c':>10}")
+    print(f"{mm.nports} DMA port(s)")
     for name, nbytes, cyc, bpc in res:
-        print(f"{name:44} {cyc:8d} {bpc:8.2f} {bpc * mm.riscv_hz / 1e6:8.1f} {100 * bpc / bw:9.1f}%")
+        if not cyc:
+            continue                                   # (GEMV: the overlay has no GEMV unit)
+        peak = bw * (mm.nports if "GEMV" in name else 1)
+        print(f"{name:44} {cyc:8d} {bpc:8.2f} {bpc * mm.riscv_hz / 1e6:8.1f} {100 * bpc / peak:9.1f}%"
+              + (f" of {peak} B/c" if peak != bw else ""))
     print("stored data matches source" if copies_ok else "STORED DATA MISMATCH")
     print("PASS" if copies_ok else "FAIL")
     return 0 if copies_ok else 1

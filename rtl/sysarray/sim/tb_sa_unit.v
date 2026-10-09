@@ -16,6 +16,7 @@ module tb_sa_unit;
     parameter  integer PERF = 1;                  // GEN="PERF=0": build without counters
     parameter  integer DMA_W = 64;                // GEN="D=16 DMA_W=128" (K2a)
     parameter  integer GEMV = 0;                  // GEN="D=16 DMA_W=128 GEMV=1" (K2b): LD mode GEMV
+    parameter  integer NP = 1;                    // DMA ports (m0, m1): GEN="... NP=2" (K2b G3)
     localparam integer BB = DMA_W / 8;            // bytes per beat
     localparam integer AW = 32 * D;               // widest local word (ACC)
 
@@ -38,17 +39,18 @@ module tb_sa_unit;
     wire [1:0]  s_bresp, s_rresp;
     wire [31:0] s_rdata;
 
-    wire [31:0] m_araddr, m_awaddr;
-    wire [7:0]  m_arlen, m_awlen;
-    wire [BB-1:0] m_wstrb;
-    wire [2:0]  m_arsize, m_awsize, m_arprot, m_awprot;
-    wire [1:0]  m_arburst, m_awburst;
-    wire [3:0]  m_arcache, m_awcache;
-    wire        m_arvalid, m_rready, m_awvalid, m_wvalid, m_wlast, m_bready;
-    wire [DMA_W-1:0] m_wdata;
-    reg         m_arready = 0, m_rvalid = 0, m_rlast = 0, m_awready = 0, m_wready = 0, m_bvalid = 0;
-    reg  [DMA_W-1:0] m_rdata = 0;
-    reg  [1:0]  m_rresp = 0, m_bresp = 0;
+    // DMA ports m0, m1 (index p; m1 used when NP = 2), each with its own memory slave
+    wire [2*32-1:0] m_araddr, m_awaddr;
+    wire [2*8-1:0]  m_arlen, m_awlen;
+    wire [2*BB-1:0] m_wstrb;
+    wire [2*3-1:0]  m_arsize, m_awsize, m_arprot, m_awprot;
+    wire [2*2-1:0]  m_arburst, m_awburst;
+    wire [2*4-1:0]  m_arcache, m_awcache;
+    wire [1:0]      m_arvalid, m_rready, m_awvalid, m_wvalid, m_wlast, m_bready;
+    wire [2*DMA_W-1:0] m_wdata;
+    reg  [1:0]      m_arready = 0, m_rvalid = 0, m_rlast = 0, m_awready = 0, m_wready = 0, m_bvalid = 0;
+    reg  [2*DMA_W-1:0] m_rdata = 0;
+    reg  [2*2-1:0]  m_rresp = 0, m_bresp = 0;
     wire        irq, nirq;
     integer     nirq_edges = 0, nirq_high = 0;
     reg         nirq_d = 0;
@@ -63,29 +65,36 @@ module tb_sa_unit;
     wire        pcpi_wr, pcpi_wait, pcpi_ready;
     wire [31:0] pcpi_rd;
 
-    sa_unit #(.D(D), .NPORTS(1), .PERF(PERF), .DMA_W(DMA_W), .GEMV(GEMV)) dut (
+    sa_unit #(.D(D), .NPORTS(NP), .PERF(PERF), .DMA_W(DMA_W), .GEMV(GEMV)) dut (
         .aclk(aclk), .aresetn(aresetn),
         .s_axi_awaddr(s_awaddr), .s_axi_awvalid(s_awvalid), .s_axi_awready(s_awready),
         .s_axi_wdata(s_wdata), .s_axi_wstrb(4'hF), .s_axi_wvalid(s_wvalid), .s_axi_wready(s_wready),
         .s_axi_bresp(s_bresp), .s_axi_bvalid(s_bvalid), .s_axi_bready(s_bready),
         .s_axi_araddr(s_araddr), .s_axi_arvalid(s_arvalid), .s_axi_arready(s_arready),
         .s_axi_rdata(s_rdata), .s_axi_rresp(s_rresp), .s_axi_rvalid(s_rvalid), .s_axi_rready(s_rready),
-        .m0_axi_araddr(m_araddr), .m0_axi_arlen(m_arlen), .m0_axi_arsize(m_arsize),
-        .m0_axi_arburst(m_arburst), .m0_axi_arcache(m_arcache), .m0_axi_arprot(m_arprot),
-        .m0_axi_arvalid(m_arvalid), .m0_axi_arready(m_arready),
-        .m0_axi_rdata(m_rdata), .m0_axi_rresp(m_rresp), .m0_axi_rlast(m_rlast),
-        .m0_axi_rvalid(m_rvalid), .m0_axi_rready(m_rready),
-        .m0_axi_awaddr(m_awaddr), .m0_axi_awlen(m_awlen), .m0_axi_awsize(m_awsize),
-        .m0_axi_awburst(m_awburst), .m0_axi_awcache(m_awcache), .m0_axi_awprot(m_awprot),
-        .m0_axi_awvalid(m_awvalid), .m0_axi_awready(m_awready),
-        .m0_axi_wdata(m_wdata), .m0_axi_wstrb(m_wstrb), .m0_axi_wlast(m_wlast),
-        .m0_axi_wvalid(m_wvalid), .m0_axi_wready(m_wready),
-        .m0_axi_bresp(m_bresp), .m0_axi_bvalid(m_bvalid), .m0_axi_bready(m_bready),
-
-        // ports 1 and 2 unused in M1
-        .m1_axi_arready(1'b0), .m1_axi_rdata({DMA_W{1'b0}}), .m1_axi_rresp(2'd0), .m1_axi_rlast(1'b0),
-        .m1_axi_rvalid(1'b0), .m1_axi_awready(1'b0), .m1_axi_wready(1'b0), .m1_axi_bresp(2'd0),
-        .m1_axi_bvalid(1'b0),
+        .m0_axi_araddr(m_araddr[32*0 +: 32]), .m0_axi_arlen(m_arlen[8*0 +: 8]), .m0_axi_arsize(m_arsize[3*0 +: 3]),
+        .m0_axi_arburst(m_arburst[2*0 +: 2]), .m0_axi_arcache(m_arcache[4*0 +: 4]), .m0_axi_arprot(m_arprot[3*0 +: 3]),
+        .m0_axi_arvalid(m_arvalid[0]), .m0_axi_arready(m_arready[0]),
+        .m0_axi_rdata(m_rdata[DMA_W*0 +: DMA_W]), .m0_axi_rresp(m_rresp[2*0 +: 2]), .m0_axi_rlast(m_rlast[0]),
+        .m0_axi_rvalid(m_rvalid[0]), .m0_axi_rready(m_rready[0]),
+        .m0_axi_awaddr(m_awaddr[32*0 +: 32]), .m0_axi_awlen(m_awlen[8*0 +: 8]), .m0_axi_awsize(m_awsize[3*0 +: 3]),
+        .m0_axi_awburst(m_awburst[2*0 +: 2]), .m0_axi_awcache(m_awcache[4*0 +: 4]), .m0_axi_awprot(m_awprot[3*0 +: 3]),
+        .m0_axi_awvalid(m_awvalid[0]), .m0_axi_awready(m_awready[0]),
+        .m0_axi_wdata(m_wdata[DMA_W*0 +: DMA_W]), .m0_axi_wstrb(m_wstrb[BB*0 +: BB]), .m0_axi_wlast(m_wlast[0]),
+        .m0_axi_wvalid(m_wvalid[0]), .m0_axi_wready(m_wready[0]),
+        .m0_axi_bresp(m_bresp[2*0 +: 2]), .m0_axi_bvalid(m_bvalid[0]), .m0_axi_bready(m_bready[0]),
+        .m1_axi_araddr(m_araddr[32*1 +: 32]), .m1_axi_arlen(m_arlen[8*1 +: 8]), .m1_axi_arsize(m_arsize[3*1 +: 3]),
+        .m1_axi_arburst(m_arburst[2*1 +: 2]), .m1_axi_arcache(m_arcache[4*1 +: 4]), .m1_axi_arprot(m_arprot[3*1 +: 3]),
+        .m1_axi_arvalid(m_arvalid[1]), .m1_axi_arready(m_arready[1]),
+        .m1_axi_rdata(m_rdata[DMA_W*1 +: DMA_W]), .m1_axi_rresp(m_rresp[2*1 +: 2]), .m1_axi_rlast(m_rlast[1]),
+        .m1_axi_rvalid(m_rvalid[1]), .m1_axi_rready(m_rready[1]),
+        .m1_axi_awaddr(m_awaddr[32*1 +: 32]), .m1_axi_awlen(m_awlen[8*1 +: 8]), .m1_axi_awsize(m_awsize[3*1 +: 3]),
+        .m1_axi_awburst(m_awburst[2*1 +: 2]), .m1_axi_awcache(m_awcache[4*1 +: 4]), .m1_axi_awprot(m_awprot[3*1 +: 3]),
+        .m1_axi_awvalid(m_awvalid[1]), .m1_axi_awready(m_awready[1]),
+        .m1_axi_wdata(m_wdata[DMA_W*1 +: DMA_W]), .m1_axi_wstrb(m_wstrb[BB*1 +: BB]), .m1_axi_wlast(m_wlast[1]),
+        .m1_axi_wvalid(m_wvalid[1]), .m1_axi_wready(m_wready[1]),
+        .m1_axi_bresp(m_bresp[2*1 +: 2]), .m1_axi_bvalid(m_bvalid[1]), .m1_axi_bready(m_bready[1]),
+        // port 2 unused
         .m2_axi_arready(1'b0), .m2_axi_rdata({DMA_W{1'b0}}), .m2_axi_rresp(2'd0), .m2_axi_rlast(1'b0),
         .m2_axi_rvalid(1'b0), .m2_axi_awready(1'b0), .m2_axi_wready(1'b0), .m2_axi_bresp(2'd0),
         .m2_axi_bvalid(1'b0),
@@ -132,78 +141,81 @@ module tb_sa_unit;
         end
     endtask
 
-    // read channel
-    integer    rb;
-    reg [31:0] r_addr;
-    reg [7:0]  r_len;
-    integer    k;
-    initial begin : rd_slave
-        forever begin
-            @(posedge aclk);
-            if (m_arvalid && m_arready) begin
-                r_addr = m_araddr;
-                r_len  = m_arlen;
-                check_burst(r_addr, r_len, m_arsize, m_arburst, 0);
-                rd_bursts = rd_bursts + 1;
-                #1 m_arready = 0;
-                for (rb = 0; rb <= r_len; rb = rb + 1) begin
-                    repeat (rnd(3)) @(posedge aclk);
-                    #1;
-                    for (k = 0; k < BB; k = k + 1)
-                        m_rdata[8*k +: 8] = in_mem(r_addr + BB*rb + k, 1) ? mem[r_addr + BB*rb + k - MEM_BASE] : 8'hXX;
-                    // beat 3, or the last beat of a shorter burst (D = 16: 1-beat rows)
-                    m_rresp  = (inject_rresp && rb == (r_len < 3 ? r_len : 3)) ? 2'b10 : 2'b00;
-                    m_rlast  = rb == r_len;
-                    m_rvalid = 1;
+    // one slave per port (bursts one at a time, random gaps); m0 also
+    // carries the descriptor fetches
+    genvar gp;
+    generate
+        for (gp = 0; gp < NP; gp = gp + 1) begin : port
+            integer    rb, wb, k;
+            reg [31:0] r_addr, w_addr;
+            reg [7:0]  r_len, w_len;
+            // read channel
+            initial begin : rd_slave
+                forever begin
                     @(posedge aclk);
-                    while (!m_rready) @(posedge aclk);
-                    #1 m_rvalid = 0;
-                    m_rlast = 0;
+                    if (m_arvalid[gp] && m_arready[gp]) begin
+                        r_addr = m_araddr[32*gp +: 32];
+                        r_len  = m_arlen[8*gp +: 8];
+                        check_burst(r_addr, r_len, m_arsize[3*gp +: 3], m_arburst[2*gp +: 2], 0);
+                        rd_bursts = rd_bursts + 1;
+                        #1 m_arready[gp] = 0;
+                        for (rb = 0; rb <= r_len; rb = rb + 1) begin
+                            repeat (rnd(3)) @(posedge aclk);
+                            #1;
+                            for (k = 0; k < BB; k = k + 1)
+                                m_rdata[DMA_W*gp + 8*k +: 8] = in_mem(r_addr + BB*rb + k, 1) ? mem[r_addr + BB*rb + k - MEM_BASE] : 8'hXX;
+                            // beat 3, or the last beat of a shorter burst (D = 16: 1-beat rows)
+                            m_rresp[2*gp +: 2]  = (inject_rresp && rb == (r_len < 3 ? r_len : 3)) ? 2'b10 : 2'b00;
+                            m_rlast[gp]  = rb == r_len;
+                            m_rvalid[gp] = 1;
+                            @(posedge aclk);
+                            while (!m_rready[gp]) @(posedge aclk);
+                            #1 m_rvalid[gp] = 0;
+                            m_rlast[gp] = 0;
+                        end
+                    end else begin
+                        #1 m_arready[gp] = rnd(3) != 0;
+                    end
                 end
-            end else begin
-                #1 m_arready = rnd(3) != 0;
             end
-        end
-    end
 
-    // write channels
-    integer    wb;
-    reg [31:0] w_addr;
-    reg [7:0]  w_len;
-    initial begin : wr_slave
-        forever begin
-            @(posedge aclk);
-            if (m_wvalid && !m_awvalid && w_len === 8'hxx)
-                fail("W beat before any AW");
-            if (m_awvalid && m_awready) begin
-                w_addr = m_awaddr;
-                w_len  = m_awlen;
-                check_burst(w_addr, w_len, m_awsize, m_awburst, 1);
-                wr_bursts = wr_bursts + 1;
-                #1 m_awready = 0;
-                for (wb = 0; wb <= w_len; wb = wb + 1) begin
-                    repeat (rnd(3)) @(posedge aclk);
-                    #1 m_wready = 1;
+            // write channels
+            initial begin : wr_slave
+                forever begin
                     @(posedge aclk);
-                    while (!m_wvalid) @(posedge aclk);
-                    // 64-bit bus: every beat full; 128-bit: a first / last beat may be half
-                    if (DMA_W == 64 ? m_wstrb != 8'hFF : m_wstrb == 0) fail("bad WSTRB");
-                    if (m_wlast != (wb == w_len))    fail("WLAST on wrong beat");
-                    for (k = 0; k < BB; k = k + 1)
-                        if (m_wstrb[k]) mem[w_addr + BB*wb + k - MEM_BASE] = m_wdata[8*k +: 8];
-                    #1 m_wready = 0;
+                    if (m_wvalid[gp] && !m_awvalid[gp] && w_len === 8'hxx)
+                        fail("W beat before any AW");
+                    if (m_awvalid[gp] && m_awready[gp]) begin
+                        w_addr = m_awaddr[32*gp +: 32];
+                        w_len  = m_awlen[8*gp +: 8];
+                        check_burst(w_addr, w_len, m_awsize[3*gp +: 3], m_awburst[2*gp +: 2], 1);
+                        wr_bursts = wr_bursts + 1;
+                        #1 m_awready[gp] = 0;
+                        for (wb = 0; wb <= w_len; wb = wb + 1) begin
+                            repeat (rnd(3)) @(posedge aclk);
+                            #1 m_wready[gp] = 1;
+                            @(posedge aclk);
+                            while (!m_wvalid[gp]) @(posedge aclk);
+                            // 64-bit bus: every beat full; 128-bit: a first / last beat may be half
+                            if (DMA_W == 64 ? m_wstrb[BB*gp +: BB] != 8'hFF : m_wstrb[BB*gp +: BB] == 0) fail("bad WSTRB");
+                            if (m_wlast[gp] != (wb == w_len))    fail("WLAST on wrong beat");
+                            for (k = 0; k < BB; k = k + 1)
+                                if (m_wstrb[BB*gp + k]) mem[w_addr + BB*wb + k - MEM_BASE] = m_wdata[DMA_W*gp + 8*k +: 8];
+                            #1 m_wready[gp] = 0;
+                        end
+                        repeat (rnd(4)) @(posedge aclk);
+                        #1 m_bresp[2*gp +: 2] = inject_bresp ? 2'b10 : 2'b00;
+                        m_bvalid[gp] = 1;
+                        @(posedge aclk);
+                        while (!m_bready[gp]) @(posedge aclk);
+                        #1 m_bvalid[gp] = 0;
+                    end else begin
+                        #1 m_awready[gp] = rnd(3) != 0;
+                    end
                 end
-                repeat (rnd(4)) @(posedge aclk);
-                #1 m_bresp = inject_bresp ? 2'b10 : 2'b00;
-                m_bvalid = 1;
-                @(posedge aclk);
-                while (!m_bready) @(posedge aclk);
-                #1 m_bvalid = 0;
-            end else begin
-                #1 m_awready = rnd(3) != 0;
             end
         end
-    end
+    endgenerate
 
     // ------------------------------------------------ AXI4-Lite master
     reg aw_done, w_done;
@@ -963,8 +975,9 @@ module tb_sa_unit;
                 for (pi = 28; pi < NPC; pi = pi + 1) perf_true(pc_a[pi] === 0, "perf: fetch counter not zero without a list");
                 perf_true(pc_a[PC_CYCLES] + 12 >= perf_win && pc_a[PC_CYCLES] <= perf_win + 12,
                           "perf: CYCLES differs from the measured window");
-                perf_true(pc_a[PC_LD_BUSY] >= pc_a[PC_LD_BEATS], "perf: LD_BUSY < LD_BEATS");
-                perf_true(pc_a[PC_ST_BUSY] >= pc_a[PC_ST_BEATS], "perf: ST_BUSY < ST_BEATS");
+                // at most BB / 8 lanes per port and cycle
+                perf_true(pc_a[PC_LD_BUSY] * (BB / 8) * NP >= pc_a[PC_LD_BEATS], "perf: LD_BUSY < LD_BEATS");
+                perf_true(pc_a[PC_ST_BUSY] * (BB / 8) * NP >= pc_a[PC_ST_BEATS], "perf: ST_BUSY < ST_BEATS");
                 perf_true(pc_a[PC_CYCLES] >= pc_a[PC_EX_STEP], "perf: CYCLES < EX_STEP");
                 perf_true(pc_a[PC_HAZ_LD] + pc_a[PC_HAZ_ST] + pc_a[PC_HAZ_EX] + pc_a[PC_HAZ_VE] +
                           pc_a[PC_STARVE] + pc_a[PC_ALL_IDLE] <= pc_a[PC_CYCLES],
@@ -1882,7 +1895,7 @@ module tb_sa_unit;
         mat_op(F_RESET, 0, 0);
         // (funct7 = 1 uses all funct3 values: 5 mat_perf, 6 mat_submit, 7 mat_notify)
         expect_csr(8'h24, 32'h01E0_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + (GEMV ? 32'h0200_0000 : 32'd0) +
-                   32'h0001_0000 + D * 256 + D,
+                   NP * 32'h0001_0000 + D * 256 + D,
                    "CAPS");     // [25] GEMV, [24] command ext., [23] fp32 VE, [22] notify, [21] desc, [20] perf, 1 port, VL = D, D
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");

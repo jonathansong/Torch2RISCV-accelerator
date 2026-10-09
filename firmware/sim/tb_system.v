@@ -344,14 +344,23 @@ module tb_system;
 `ifdef BW_TEST
     // -------------------------------------------------------- BW_TEST
     localparam [31:0] BW_SRC = DDR_BASE, BW_DST = DDR_BASE + 32'h10000;
-    integer t;
+    // GEMV (SIM_GEMV): one descriptor at dst + 192 KB + 1 KB as the driver writes it:
+    // 8 strips of K = 512 from src, x = SPAD_A words 0.. (= src), results ACC 0..7
+    localparam [31:0] BW_GL = BW_DST + 32'h30400;
+    integer t, gs, gj, gk, gsum, gbad;
     reg [31:0] bw_cyc;
+    reg [63:0] gw [0:7];
     initial begin
         for (i = 0; i < DDR_BYTES; i = i + 1) ddr[i] = i < 65536 ? $random(seed) : 8'hA5;
         for (i = 0; i < BRAM_WORDS; i = i + 1) bram[i] = 0;
         $readmemh("fw.hex", bram);
         bram[MBOX + 2] = BW_SRC;
         bram[MBOX + 4] = BW_DST;
+        gw[0] = 64'h01; gw[1] = BW_SRC; gw[2] = {16'd8192, 16'd8, 4'd3, 28'd0};
+        gw[3] = {5'd0, 1'b0, 8'd1, 16'd0, 2'd2, 32'd8192};
+        for (i = 4; i < 8; i = i + 1) gw[i] = 0;
+        for (i = 0; i < 64; i = i + 1) ddr[BW_GL - DDR_BASE + i] = gw[i / 8][8 * (i % 8) +: 8];
+        bram[MBOX + 36] = BW_GL;                         // MBOX_DL_ADDR
         repeat (20) @(posedge clk);
         resetn <= 1;
         cycles = 0;
@@ -366,10 +375,25 @@ module tb_system;
                     errors = errors + 1;
                     if (errors <= 5) $display("TB ERROR: copy %0d byte %0d", t, i);
                 end
-        for (t = 0; t < 6; t = t + 1) begin
+        for (t = 0; t < (`SIM_GEMV ? 8 : 6); t = t + 1) begin
             bw_cyc = bram[MBOX + 17 + t];
-            $display("TB BW test %0d: %0d cycles, %0d.%02d B/cycle", t, bw_cyc,
-                     (t == 5 ? 131072 : 65536) / bw_cyc, ((t == 5 ? 131072 : 65536) * 100 / bw_cyc) % 100);
+            if (bw_cyc == 0) begin $display("TB ERROR: BW test %0d did not run", t); errors = errors + 1; end
+            else $display("TB BW test %0d: %0d cycles, %0d.%02d B/cycle", t, bw_cyc,
+                          (t == 5 ? 131072 : 65536) / bw_cyc, ((t == 5 ? 131072 : 65536) * 100 / bw_cyc) % 100);
+        end
+        if (`SIM_GEMV) begin                             // GEMV results: x = src[0:512] . strips of src
+            gbad = 0;
+            for (gs = 0; gs < 8; gs = gs + 1)
+                for (gj = 0; gj < 16; gj = gj + 1) begin
+                    gsum = 0;
+                    for (gk = 0; gk < 512; gk = gk + 1)
+                        gsum = gsum + $signed(ddr[gk]) * $signed(ddr[gs * 8192 + gk * 16 + gj]);
+                    if ({ddr[BW_DST - DDR_BASE + 32'h30000 + 64 * gs + 4 * gj + 3],
+                         ddr[BW_DST - DDR_BASE + 32'h30000 + 64 * gs + 4 * gj + 2],
+                         ddr[BW_DST - DDR_BASE + 32'h30000 + 64 * gs + 4 * gj + 1],
+                         ddr[BW_DST - DDR_BASE + 32'h30000 + 64 * gs + 4 * gj]} !== gsum) gbad = gbad + 1;
+                end
+            if (gbad) begin $display("TB ERROR: %0d GEMV results differ", gbad); errors = errors + 1; end
         end
         $display("TB %s: bandwidth test, %0d errors (simulated DDR model, not board numbers)",
                  errors ? "FAIL" : "PASS", errors);

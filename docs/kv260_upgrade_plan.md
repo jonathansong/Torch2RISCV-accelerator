@@ -379,6 +379,7 @@ decode 受带宽限制，提升 1.5–1.7 倍（不到 2 倍：VE 尾部、注�
      - H2 只对 prefill 有用（×1.08；G2 起 LD 与 ST 也按共用端口处理，H2 的三行因此比最初的 ×1.10–1.12 略低），对 decode 几乎没有（decode 的 matvec 本来就是 LD 与 EX 重叠的流水）。LD 命令流水、前端提速各只有 1–3%。
      - 模型没有包含 DDR 本身的效率（KV260 的 DDR4 峰值约 19 GB/s，64 B / 周期 × 100 MHz = 6.4 GB/s，需要 4 个 HP 口）和 GEMV 单元的具体微结构；这些在 RTL 测试平台和板上确认。
    - **微结构**（`docs/k2b_gemv_design.md`）：decode 的权重只用一次，所以 H4 做成**流式 GEMV**：LD 的新模式（`mode = 2`）把权重直接从 DMA 流进 GEMV 单元，每个读口一组 16 个 int8 乘累加，不经过 SPAD。2 口读入因此不需要 SPAD 子银行，本节方案 A 的子银行、对齐和按子银行查冲突推迟到需要 prefill 带宽时再做；阶段 G1（funcsim + 编译器）→ G2（RTL，单口）→ G3（双口 + BD）→ G4（板上）。
+   - **进度（2026-10-09）**：G1（功能仿真器 + 编译器 `--iree-sa-gemv-ports`）stories / SmolLM2 与 EX 路径逐字节一致；G2（`sa_gemv.v`、`sa_ld` GEMV 模式、比特流 `-gemv 1`）全部仿真通过，单口比特流构建中；G3（`-nports 2`，m1 接 HP3，bwtest 的 GEMV 流式测试，多口性能计数修正）RTL / 脚本完成，待构建与板上测带宽。详见 `k2b_gemv_design.md` §8。
 2. **第一版只保证 LINEAR 的多字/周期吞吐**：
    - LINEAR（权重加载，decode 的主要流量）：连续的字依次落在不同子银行，可以每周期写多个字。
    - INTERLEAVE（阵列的 A 条带）的本地地址是 `word = base + chunk × rows + row`，同一行相邻 chunk 相距 `rows` 个字。`rows` 是子银行数的整数倍时（例如 4 个子银行、`rows = 16`），同一行的所有 chunk 都落在同一个子银行，不能并行写入。相邻的行落在不同子银行，如果两行的 burst 恰好在不同的口同时返回，可以并行，但这取决于返回时机，不作为吞吐保证。

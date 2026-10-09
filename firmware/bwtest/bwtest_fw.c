@@ -9,6 +9,11 @@
  *   3  ST  ACC      -> dst+64K   64 KB            (dst[64K..128K] == src)
  *   4  LD  src      -> SPAD_B    8192 rows of 8 B, pitch 16 (single-beat bursts)
  *   5  LD  src      -> SPAD_B 64 KB  and  ST SPAD_A -> dst+128K 64 KB, concurrently
+ *   6  GEMV         64 KB of weights streamed (all read ports), x loaded first
+ *   7  GEMV         the same, x resident: the streaming rate
+ * Tests 6 / 7 (K2b) run when the unit has GEMV (CAPS bit 25) and the ARM put
+ * a one-descriptor list in MBOX_DL_ADDR (x = SPAD_A words 0.., which hold
+ * src after test 0; results ACC words 0..; then ST to dst+192K, 512 bytes).
  * Cycles go to MBOX_BW_CYCLES[i]; the ARM checks the destination data.
  */
 #include <stdint.h>
@@ -43,6 +48,7 @@ int main(void)
     MBOX(MBOX_STATUS) = STATUS_RUNNING;
     uint32_t src = MBOX(MBOX_BW_SRC), dst = MBOX(MBOX_BW_DST), t0;
 
+    sa_init();
     mat_reset();
     /* contiguous 64 KB: 64 rows of 1 KB (merged into one long row by the DMA) */
     mat_cfg_load(64, 1024, 1024, SA_LD_LINEAR);
@@ -61,6 +67,19 @@ int main(void)
     mat_load(src, SA_LADDR(SA_MEM_SPAD_B, 0));                         /* LD and ST engines */
     mat_store(dst + 2 * KB64, SA_LADDR(SA_MEM_SPAD_A, 0));             /* run concurrently  */
     record(5, t0);
+
+    uint32_t list = MBOX(MBOX_DL_ADDR);
+    if (list && sa_has_gemv() && sa_has_desc()) {
+        t0 = rdcycle(); mat_submit(list, 1);                           record(6, t0);
+        t0 = rdcycle(); mat_submit(list, 1);                           record(7, t0);
+        mat_cfg_store(1, 512, 512);
+        mat_store(dst + 3 * KB64, SA_LADDR(SA_MEM_ACC, 0));
+        if (mat_fence(SA_ENG_ALL) & SA_XST_ERROR) {
+            if (!errors) MBOX(MBOX_FIRST_ERR) = mat_fence(SA_ENG_ALL);
+            errors++;
+            mat_reset();
+        }
+    }
 
     MBOX(MBOX_ERRORS) = errors;
     MBOX(MBOX_STATUS) = STATUS_DONE;
