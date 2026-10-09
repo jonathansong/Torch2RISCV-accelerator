@@ -905,7 +905,9 @@ module sa_vefp #(
             assign bopa_w[gl] = opsel(u_a, rx, ra, tr[63:32], tr[31:0]);
             assign bopb_w[gl] = opsel(u_b, rx, rb, tr[63:32], tr[31:0]);
             assign brda_w[gl] = ra;
-            assign brv_w[gl]  = func == F_NONE || func == F_ABS ? bdat : ra;      // (u_unit 9: END value)
+            // REDUCE value: NONE / ABS straight from register 0 (kept off the fres path for timing)
+            wire [31:0] brd = BMASK[b_slot][gl] ? relu_f(rx, relu) : red_sum ? 32'd0 : NINF;
+            assign brv_w[gl]  = func == F_NONE || func == F_ABS ? brd : ra;       // (u_unit 9: END value)
         end
     endgenerate
 
