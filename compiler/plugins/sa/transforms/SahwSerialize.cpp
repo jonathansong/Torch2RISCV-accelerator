@@ -105,7 +105,9 @@ struct Serializer {
         if (o.getBase()) (inPrefix ? prefixReads : reads) |= 1u << bindingOf(o.getBase());
         w[1] = uint64_t(o.getDdr()) & M32;
         w[2] = (uint64_t(o.getLaddr()) & M32) | uint64_t(o.getRows()) << 32 | uint64_t(o.getRowBytes()) << 48;
-        w[3] = (uint64_t(o.getPitch()) & M32) | uint64_t(o.getMode()) << 32;
+        w[3] = (uint64_t(o.getPitch()) & M32) | uint64_t(o.getMode()) << 32 |
+               uint64_t(o.getXword() & 0xFFFF) << 34 | uint64_t(o.getCstep() & 0xFF) << 50 |
+               uint64_t(o.getGemvAcc()) << 58;
         put(DescList::LD);
       } else if (auto o = dyn_cast<sahw::StOp>(op)) {
         if (inPrefix) return fail(op, "a store in the prefix");

@@ -17,6 +17,9 @@ enum Mem : uint32_t { MEM_SPAD_A = 1, MEM_SPAD_B = 2, MEM_ACC = 3 };
 inline uint32_t laddr(Mem mem, uint32_t word) { return (uint32_t(mem) << 28) | word; }
 inline uint32_t acc(uint32_t word) { return laddr(MEM_ACC, word); }
 
+// LD modes (the mode field, w3[33:32]); GEMV: docs/k2b_gemv_design.md
+enum LdMode : uint32_t { LD_LINEAR = 0, LD_INTERLEAVE = 1, LD_GEMV = 2 };
+
 // Vector engine: ops, element types (VT_*), fp32 pipeline fields
 enum VOp : uint32_t { VOP_ADD = 0, VOP_SUB = 1, VOP_MUL = 2, VOP_MAX = 3, VOP_MIN = 4, VOP_COPY = 5 };
 enum VType : uint32_t { VT_I8 = 0, VT_I16 = 1, VT_I32 = 2, VT_F32 = 3 };

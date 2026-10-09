@@ -34,6 +34,7 @@ struct TargetConfig {
   int64_t maxDynamic = 256;          // upper bound of a dynamic dimension
   int64_t dynFields = 2;             // dynamic fields per descriptor
   int64_t bases = 16, params = 8;    // BASE / PARAM registers (BASE15: prefixes)
+  int64_t gemvPorts = 0;             // K2b streaming GEMV unit (LD mode GEMV) and its read ports; 0: none
   static TargetConfig fromAttr(DictionaryAttr config);
   // What the command encoding allows (empty if valid): D 8 or 16, the local
   // memories powers of two of at most 2^16 words (16-bit local addresses).

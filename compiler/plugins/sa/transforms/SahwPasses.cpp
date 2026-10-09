@@ -21,6 +21,7 @@ TargetConfig TargetConfig::fromAttr(DictionaryAttr config) {
   get("dyn_fields", c.dynFields);
   get("bases", c.bases);
   get("params", c.params);
+  get("gemv_ports", c.gemvPorts);
   return c;
 }
 
@@ -31,6 +32,7 @@ std::string TargetConfig::invalid() const {
     return "spad_bytes must be a power of two, at most 2^16 words of D bytes";
   if (!pow2(accBytes) || accBytes / (4 * d) > (1 << 16) || accBytes / (4 * d) < 64)
     return "acc_bytes must be a power of two, at most 2^16 words of 4 * D bytes";
+  if (gemvPorts < 0 || gemvPorts > 4 || (gemvPorts && d != 16)) return "gemv_ports must be 0..4 (D = 16 only)";
   return "";
 }
 
@@ -43,6 +45,7 @@ void TargetConfig::addTo(Builder &b, SmallVectorImpl<NamedAttribute> &attrs) con
   add("dyn_fields", dynFields);
   add("bases", bases);
   add("params", params);
+  if (gemvPorts) add("gemv_ports", gemvPorts);
 }
 
 bool TargetConfig::ukernel(StringRef name) const {

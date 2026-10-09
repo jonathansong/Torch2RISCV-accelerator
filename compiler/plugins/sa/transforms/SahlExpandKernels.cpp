@@ -308,7 +308,7 @@ bool firstToEmit(Operation *op) {
 }
 
 // Decode's linear layer (LinearPlan without rows).
-bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64_t d) {
+bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64_t d, int64_t gemvPorts) {
   auto nca = k->getAttrOfType<IntegerAttr>("chunk_tiles");
   if (!nca) return false;
   auto wt = cast<MemRefType>(p.w.getType());
@@ -329,17 +329,32 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   auto xt = cast<MemRefType>(p.x.getType());
   auto yt = cast<MemRefType>(p.store.getDst().getType());
   if (xt.getRank() != 1 || yt.getRank() != 2) return false;
-  const bool hoist = firstToEmit(k);
+  Type xet = xt.getElementType();
+  // K2b: the streaming GEMV unit (int8 x; a strip of at most 65535 bytes): no A strip,
+  // no SPAD_B tiles; each chunk's weights stream into the unit (groups of <= 8 strips)
+  const bool useGemv = gemvPorts && K * d <= 65535;
+  int64_t ncg = std::min<int64_t>(nc, 8);
+  while (nc % ncg) --ncg;
+  const bool hoist = firstToEmit(k) && !useGemv;
   Expander e{OpBuilder(k), k.getLoc(), d};
   MLIRContext *ctx = k.getContext();
   Type f32 = Float32Type::get(ctx), i8 = IntegerType::get(ctx, 8);
   // x -> the A strip (the strip's words first, as the lowering allocated them)
-  Value strip = e.alloc({d, K}, i8, "spad_a", "strip");
-  sahl::ReserveOp::create(e.b, e.loc, strip, false);
-  Type xet = xt.getElementType();
+  Value strip;
+  if (!useGemv) {
+    strip = e.alloc({d, K}, i8, "spad_a", "strip");
+    sahl::ReserveOp::create(e.b, e.loc, strip, false);
+  }
   Value xl = e.alloc({K}, xet, xet.isInteger(8) ? "spad_a" : "acc", "packed");
   sahl::LoadOp::create(e.b, e.loc, p.x, xl);
-  sahl::StripOp::create(e.b, e.loc, xl, strip);
+  if (!useGemv) {
+    sahl::StripOp::create(e.b, e.loc, xl, strip);
+  } else if (!xet.isInteger(8)) {
+    // int32 x (in ACC) -> int8 packed in SPAD_A for the unit (the strip's conversion, one row)
+    Value xs = e.alloc({K}, i8, "spad_a", "packed");
+    sahl::StripOp::create(e.b, e.loc, xl, xs)->setAttr("sa.packed", e.b.getUnitAttr());
+    xl = xs;
+  }
   // scalar epilogue inputs: loaded once, in the broadcast layout
   llvm::DenseMap<int, Value> bc;
   for (auto &[i, s] : p.whole) {
@@ -366,6 +381,7 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
       Type et = cast<MemRefType>(epi.getDpsInputs()[p.chunked[m].first].getType()).getElementType();
       cols[bank].push_back(placed({nc, d}, et, c + slot(m)));
     }
+    if (useGemv) continue;
     tiles[bank] = e.alloc({nc, K, d}, i8, "spad_b", "");
     tiles[bank].getDefiningOp()->setAttr("sa.bank", e.b.getI64IntegerAttr(bank));
   }
@@ -374,15 +390,23 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
     if (dyn) o->setAttr("sa.advance", e.b.getI64IntegerAttr(j));
   };
   auto loadChunk = [&](int64_t i, bool dyn) {
-    auto lw = sahl::LoadOp::create(e.b, e.loc, e.sub(p.w, {i * nc, 0, 0}, {nc, K, d}), tiles[i & 1]);
-    adv(lw, dyn, 0);
-    if (i == 0 && hoist) lw->setAttr("sa.prefix", e.b.getUnitAttr());
+    if (!useGemv) {
+      auto lw = sahl::LoadOp::create(e.b, e.loc, e.sub(p.w, {i * nc, 0, 0}, {nc, K, d}), tiles[i & 1]);
+      adv(lw, dyn, 0);
+      if (i == 0 && hoist) lw->setAttr("sa.prefix", e.b.getUnitAttr());
+    }
     for (size_t m = 0; m < p.chunked.size(); ++m)
       adv(sahl::LoadOp::create(e.b, e.loc, e.sub(p.chunked[m].second, {i * nc, 0}, {nc, d}), cols[i & 1][m]), dyn, 1);
   };
   auto chunkAt = [&](int64_t i, bool dyn, bool prefetch) {
     const int bank = int(i & 1);
-    sahl::MmaOp::create(e.b, e.loc, strip, tiles[bank], acc[bank], false);
+    if (useGemv)
+      for (int64_t g = 0; g < nc; g += ncg)
+        adv(sahl::GemvOp::create(e.b, e.loc, xl, e.sub(p.w, {i * nc + g, 0, 0}, {ncg, K, d}),
+                                 e.sub(acc[bank], {g, 0}, {ncg, d}), false),
+            dyn, 0);
+    else
+      sahl::MmaOp::create(e.b, e.loc, strip, tiles[bank], acc[bank], false);
     if (prefetch) loadChunk(i + 1, dyn);
     Value ys = e.sub(y, {i * nc, 0}, {nc, d});
     if (!epi) {
@@ -934,6 +958,7 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
       cfg.d = optD;
       cfg.spadBytes = optSpadKB * 1024;
       cfg.accBytes = optAccKB * 1024;
+      cfg.gemvPorts = optGemvPorts;
     }
     func::FuncOp f = getOperation();
     SmallVector<sahl::KernelOp> ks(f.getBody().front().getOps<sahl::KernelOp>());
@@ -967,7 +992,7 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
         if (!km.matchLinear(g)) break;
         LinearPlan p = km.linears[g.getOperation()];
         if (p.rows) expandLinearRows(k, p, cfg.d);
-        else expandLinear(k, p, lay, cfg.d);
+        else expandLinear(k, p, lay, cfg.d, cfg.gemvPorts);
         break;
       }
     }
@@ -983,6 +1008,8 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
   Option<int64_t> optD{*this, "d", llvm::cl::desc("array size D"), llvm::cl::init(8)};
   Option<int64_t> optSpadKB{*this, "spad-kb", llvm::cl::desc("SPAD size (KB, two banks)"), llvm::cl::init(128)};
   Option<int64_t> optAccKB{*this, "acc-kb", llvm::cl::desc("ACC size (KB, two banks)"), llvm::cl::init(256)};
+  Option<int64_t> optGemvPorts{*this, "gemv-ports", llvm::cl::desc("read ports of the GEMV unit (0: none)"),
+                               llvm::cl::init(0)};
 };
 
 }  // namespace

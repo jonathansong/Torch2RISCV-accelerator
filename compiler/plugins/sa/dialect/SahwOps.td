@@ -103,9 +103,16 @@ def Sahw_PrivateOp : Sahw_Op<"private", [HasParent<"TemplateOp">]> {
 //===----------------------------------------------------------------------===//
 
 def Sahw_LdOp : Sahw_Op<"ld", [AttrSizedOperandSegments]> {
-  let summary = "LD: DDR -> local (rows x row_bytes, DDR stride pitch; mode LINEAR / INTERLEAVE)";
+  let summary = "LD: DDR -> local (rows x row_bytes, DDR stride pitch; mode LINEAR / INTERLEAVE / GEMV)";
+  let description = [{
+    Mode GEMV (2, docs/k2b_gemv_design.md): `rows` weight strips of row_bytes
+    (K x D) stream into the GEMV unit; ACC word laddr + s * cstep = x . strip s
+    (+ itself with gemv_acc), x = K int8 at SPAD_A word xword.
+  }];
   let arguments = !con((ins Optional<Sahw_BaseType>:$base, I64Attr:$ddr, I64Attr:$laddr, I64Attr:$rows,
-                            I64Attr:$row_bytes, I64Attr:$pitch, DefaultValuedAttr<I64Attr, "0">:$mode), DynArgs);
+                            I64Attr:$row_bytes, I64Attr:$pitch, DefaultValuedAttr<I64Attr, "0">:$mode), DynArgs,
+                       (ins DefaultValuedAttr<I64Attr, "0">:$xword, DefaultValuedAttr<I64Attr, "0">:$cstep,
+                            UnitAttr:$gemv_acc));
   let assemblyFormat = "($base^)? (`dyn` `(` $dyn^ `)`)? attr-dict";
 }
 def Sahw_StOp : Sahw_Op<"st", [AttrSizedOperandSegments]> {

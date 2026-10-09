@@ -15,6 +15,8 @@
    RELU, FUNC, SWAPNEG, index modes (LIN / MOD / DIV / IMM), VALID, row
    reductions, TRANSPOSE, softmax and RMSNorm as command sequences, errors;
    references in NumPy float32 (normal-range data: IEEE = the FTZ model).
+7. LD mode GEMV (docs/k2b_gemv_design.md): random K / strips / C step /
+   accumulate against NumPy and against EX's row 0, through descriptors, errors.
 
     python3 llm/test_funcsim.py        (exit status 0 = all passed)
 """
@@ -509,6 +511,71 @@ def l2_fp(d, rng):
     expect("TRANSPOSE with stride 0", lambda: sim.ve(pm.laddr(ACC, 0), 0, pm.laddr(ACC, 64), d, 6, F32 | F32 << 2))
 
 
+def gemv(d, rng, count):
+    def desc(op, w1=0, w2=0, w3=0):
+        return np.array([op, w1, w2, w3, 0, 0, 0, 0], np.uint64)
+
+    def gemv_desc(ddr, c, strips, rb, pitch, xword, cstep, acc):
+        return desc(0x01, ddr, (3 << 28 | c) | strips << 32 | rb << 48,
+                    pitch | 2 << 32 | xword << 34 | cstep << 50 | acc << 58)
+
+    for t in range(count):
+        k = d * int(rng.integers(1, 65535 // (d * d) + 1))
+        strips, cstep, acc = int(rng.integers(1, 9)), int(rng.integers(1, 4)), int(rng.integers(0, 2))
+        pitch = k * d + 16 * int(rng.integers(0, 3))
+        xword, c = int(rng.integers(0, 64)), int(rng.integers(0, 64))
+        sim = SaFuncSim(d, BASE, 1 << 22)
+        x = rng.integers(-128, 128, k, dtype=np.int8)
+        w = rng.integers(-128, 128, (strips, k, d), dtype=np.int8)
+        old = rng.integers(-2**31, 2**31, (strips, d), dtype=np.int64).astype(np.int32)
+        sim.mem[1][xword * d:xword * d + k] = x.view(np.uint8)
+        for s_ in range(strips):
+            sim.ddr_write(BASE + 0x1000 + s_ * pitch, w[s_].tobytes())
+            o = (c + s_ * cstep) * 4 * d
+            sim.mem[3][o:o + 4 * d] = old[s_].view(np.uint8)
+        dl = np.concatenate([gemv_desc(BASE + 0x1000, c, strips, k * d, pitch, xword, cstep, acc), desc(0x12, 7)])
+        sim.ddr_write(BASE, dl.tobytes())
+        n = sim.run_list(BASE)
+        exp = (x.astype(np.int64) @ w.astype(np.int64)) + (old.astype(np.int64) if acc else 0)
+        exp = ((exp + 2**31) % 2**32 - 2**31).astype(np.int32)
+        got = np.stack([sim.mem[3][(c + s_ * cstep) * 4 * d:(c + s_ * cstep + 1) * 4 * d].view("<i4")
+                        for s_ in range(strips)])
+        ok = n == 2 and np.array_equal(got, exp)
+        if t < 8 and ok and strips * k <= sim.spad_words:
+            # the same as EX's row 0: x copied over the D rows (INTERLEAVE strip), weights in SPAD_B
+            sim2 = SaFuncSim(d, BASE, 1 << 22)
+            strip = np.tile(x, (d, 1))
+            sim2.ddr_write(BASE + 0x100000, strip.tobytes())
+            sim2.ld(BASE + 0x100000, 1 << 28, d, k, k, 1)
+            for s_ in range(strips):
+                sim2.ddr_write(BASE + 0x1000 + s_ * k * d, w[s_].tobytes())
+            sim2.ld(BASE + 0x1000, 2 << 28, strips, k * d, k * d, 0)
+            sim2.ex(0, 0, 0, k // d, False, strips, k, 1, strips)
+            row0 = sim2.mem[3][:strips * 4 * d].view("<i4").reshape(strips, d)
+            exp0 = ((x.astype(np.int64) @ w.astype(np.int64) + 2**31) % 2**32 - 2**31).astype(np.int32)
+            ok = ok and np.array_equal(row0, exp0)
+        check(f"D={d} GEMV K={k} strips={strips} cstep={cstep} acc={acc}", ok)
+
+    def expect(name, dl, eng, code):
+        sim = SaFuncSim(d, BASE, 1 << 22)
+        sim.ddr_write(BASE, np.concatenate(dl + [desc(0x12)]).tobytes())
+        try:
+            sim.run_list(BASE)
+        except SaError as e:
+            check(f"D={d} GEMV error: {name}", (e.engine, e.code) == (eng, code), f"got {e.engine} {e.code}")
+            return
+        check(f"D={d} GEMV error: {name}", False, "no error")
+    a = BASE + 0x1000
+    expect("result not in ACC", [desc(0x01, a, (2 << 28) | 1 << 32 | (d * d) << 48, d * d | 2 << 32 | 1 << 50)],
+           ENG_LD, XERR_RANGE)
+    expect("weights not 16-byte aligned", [gemv_desc(a + 8, 0, 1, d * d, d * d, 0, 1, 0)], ENG_LD, XERR_SHAPE)
+    expect("9 strips", [gemv_desc(a, 0, 9, d * d, d * d, 0, 1, 0)], ENG_LD, XERR_SHAPE)
+    expect("K not a multiple of D", [gemv_desc(a, 0, 1, d * 8 if d == 16 else d * 4, d * d, 0, 1, 0)], ENG_LD, XERR_SHAPE)
+    expect("C step 0", [gemv_desc(a, 0, 2, d * d, d * d, 0, 0, 0)], ENG_LD, XERR_SHAPE)
+    expect("result range", [gemv_desc(a, 4095 if d == 16 else 8191, 2, d * d, d * d, 0, 1, 0)], ENG_LD, XERR_RANGE)
+    expect("LD mode 3", [desc(0x01, a, (1 << 28) | 1 << 32 | 16 << 48, 16 | 3 << 32)], ENG_LD, XERR_SHAPE)
+
+
 def main():
     rng = np.random.default_rng(2026)
     for d in (8, 16):
@@ -520,6 +587,7 @@ def main():
         errors(d)
         l1_extensions(d)
         l2_fp(d, rng)
+        gemv(d, rng, 24)
     print("PASS" if not fails else f"FAIL: {len(fails)}")
     return 0 if not fails else 1
 

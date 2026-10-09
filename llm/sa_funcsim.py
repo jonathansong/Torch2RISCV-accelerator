@@ -13,7 +13,8 @@ with the RTL engine and error code, and the list stops (sticky error).
 
 Covers the M5 hardware: LD / ST (LINEAR, INTERLEAVE), EX (repeat, bstep,
 cstep, crow, accumulate), integer VE (ADD SUB MUL MAX MIN COPY, RELU,
-REQUANT, clamp, periodic src2), FENCE, JUMP, END, count limit; and the L1
+REQUANT, clamp, periodic src2), FENCE, JUMP, END, count limit; LD mode GEMV
+(K2b, docs/k2b_gemv_design.md); and the L1
 command extensions (docs/llm_inference_plan.md §5.3): BASE0-15, PARAM0-7,
 two dynamic field slots per descriptor, SETREG, LOOP_END (2 nested levels),
 relative JUMP, CALL / RET (depth 4), LDPARAM. L2 is added here first too.
@@ -51,6 +52,8 @@ FUNC_NONE, FUNC_EXP, FUNC_RECIP, FUNC_RSQRT, FUNC_ABS = range(5)
 IDX_LIN, IDX_MOD, IDX_DIV, IDX_IMM = range(4)
 RED_NONE, RED_SUM, RED_MAX = range(3)
 MODE_INTERLEAVE = 1
+MODE_GEMV = 2                   # LD: weights streamed into the GEMV unit (docs/k2b_gemv_design.md); w3[49:34] x word,
+GEMV_STRIPS = 8                 # w3[57:50] C step, w3[58] accumulate; at most 8 strips per command
 _VT_DTYPE = {VT_I8: "<i1", VT_I16: "<i2", VT_I32: "<i4"}
 _VT_RANGE = {VT_I8: (-128, 127), VT_I16: (-32768, 32767), VT_I32: (-2**31, 2**31 - 1)}
 _M32 = 0xFFFFFFFF
@@ -130,6 +133,32 @@ class SaFuncSim:
             else:
                 start = (word + r * wpr) * wb
                 buf[start:start + rb] = row
+        self.cmds["LD"] += 1
+
+    def gemv(self, ddr, laddr, strips, rb, pitch, xword, cstep, acc):
+        """LD mode GEMV (docs/k2b_gemv_design.md §4): the weights stream from DDR into
+        the GEMV unit; per strip s < strips, ACC word laddr + s * cstep (D int32) =
+        (acc ? itself : 0) + x . W_s, x = K int8 from SPAD_A word xword on, W_s = K rows
+        of D int8 at ddr + s * pitch (K = rb / D); int32 wrap-around."""
+        d = self.d
+        mem, word = (laddr >> 28) & 0xF, laddr & 0xFFFF
+        k = rb // d
+        if ddr & 15 or pitch & 15 or rb == 0 or rb % (d * d) or not 1 <= strips <= GEMV_STRIPS or cstep == 0:
+            raise SaError(ENG_LD, XERR_SHAPE, msg="GEMV shape")
+        if mem != MEM_ACC:
+            raise SaError(ENG_LD, XERR_RANGE, msg=f"GEMV result memory id {mem}")
+        if xword + k // d - 1 >= self.spad_words or word + (strips - 1) * cstep >= self.acc_words:
+            raise SaError(ENG_LD, XERR_RANGE, msg="GEMV local range")
+        x = self.mem[MEM_SPAD_A][xword * d:xword * d + k].view(np.int8).astype(np.int64)
+        accm = self.mem[MEM_ACC]
+        for s in range(strips):
+            src = self._ddr(ddr + s * pitch, rb)
+            w = self.ddr[src:src + rb].view(np.int8).reshape(k, d).astype(np.int64)
+            y = x @ w
+            o = (word + s * cstep) * 4 * d
+            if acc:
+                y = y + accm[o:o + 4 * d].view("<i4").astype(np.int64)
+            accm[o:o + 4 * d] = ((y + 2**31) % 2**32 - 2**31).astype("<i4").view(np.uint8)
         self.cmds["LD"] += 1
 
     def st(self, ddr, laddr, rows, rb, pitch):
@@ -502,7 +531,12 @@ class SaFuncSim:
         ddr = (f(w[1], 0, 32) + (base if hdr & (1 << 8) else 0)) & _M32
         if self.trace is not None:
             self.trace.append([hdr, ddr, self.dl_exec] + w[1:8])
-        if op == DESC_LD:
+        if op == DESC_LD and f(w[3], 32, 2) == MODE_GEMV:
+            self.gemv(ddr, f(w[2], 0, 32), f(w[2], 32, 16), f(w[2], 48, 16), f(w[3], 0, 32),
+                      f(w[3], 34, 16), f(w[3], 50, 8), f(w[3], 58, 1))
+        elif op == DESC_LD:
+            if f(w[3], 32, 2) == 3:
+                raise SaError(ENG_LD, XERR_SHAPE, msg="LD mode 3")
             self.ld(ddr, f(w[2], 0, 32), f(w[2], 32, 16), f(w[2], 48, 16), f(w[3], 0, 32), f(w[3], 32, 2))
         elif op == DESC_ST:
             self.st(ddr, f(w[2], 0, 32), f(w[2], 32, 16), f(w[2], 48, 16), f(w[3], 0, 32))

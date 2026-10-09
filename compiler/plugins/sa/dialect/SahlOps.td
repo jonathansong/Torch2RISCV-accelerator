@@ -97,7 +97,8 @@ def Sahl_StripOp : Sahl_Op<"strip"> {
     The A operand of sahl.mma. From rows of int8 x in DDR ([D, K], prefill's
     rows): element k of row r at word k, lane r (one LD with INTERLEAVE).
     From a local vector [K] (decode): every element over the D rows (a VE
-    copy in the DIV mode).
+    copy in the DIV mode); with `sa.packed`, one row only (int8 x packed, the
+    GEMV unit's operand).
   }];
   let arguments = (ins Arg<AnyMemRef, "the rows", [MemRead]>:$src, Arg<AnyMemRef, "the strip", [MemWrite]>:$dst);
   let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
@@ -113,6 +114,18 @@ def Sahl_MmaOp : Sahl_Op<"mma"> {
   let arguments = (ins Arg<AnyMemRef, "the A strip", [MemRead]>:$a, Arg<AnyMemRef, "the B tiles", [MemRead]>:$b,
                        Arg<AnyMemRef, "the accumulator", [MemRead, MemWrite]>:$acc, UnitAttr:$accumulate);
   let assemblyFormat = "$a `,` $b `,` $acc attr-dict `:` type($a) `,` type($b) `,` type($acc)";
+}
+
+def Sahl_GemvOp : Sahl_Op<"gemv"> {
+  let summary = "acc[nc, D] = x [K] . w [nc, K, D] on the streaming GEMV unit (LD mode GEMV; + acc with `accumulate`)";
+  let description = [{
+    K2b (docs/k2b_gemv_design.md): `x` int8 in SPAD_A (packed), `w` nc weight
+    strips in DDR (the packed [nc, K, D] layout), streamed into the unit without
+    SPAD; `acc` int32 in ACC, one word per strip (EX's row 0 of sahl.mma).
+  }];
+  let arguments = (ins Arg<AnyMemRef, "x", [MemRead]>:$x, Arg<AnyMemRef, "the weight strips (DDR)", [MemRead]>:$w,
+                       Arg<AnyMemRef, "the accumulator", [MemRead, MemWrite]>:$acc, UnitAttr:$accumulate);
+  let assemblyFormat = "$x `,` $w `,` $acc attr-dict `:` type($x) `,` type($w) `,` type($acc)";
 }
 
 def Sahl_BcastOp : Sahl_Op<"bcast"> {

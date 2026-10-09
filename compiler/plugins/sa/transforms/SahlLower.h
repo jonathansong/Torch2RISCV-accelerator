@@ -149,6 +149,7 @@ private:
   // an expanded kernel's steps (sahl-expand-kernels)
   bool strip(sahl::StripOp st);
   bool mma(sahl::MmaOp m);
+  bool gemv(sahl::GemvOp g);
   bool loop(sahl::LoopOp lp);
   int64_t leadingPitch(Value v, int64_t rb);
   int64_t placedElems(memref::AllocOp alloc, LocalBuf &l);

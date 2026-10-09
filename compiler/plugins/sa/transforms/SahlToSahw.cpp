@@ -96,6 +96,10 @@ bool Lowerer::lowerBlock(Block &block) {
       if (!mma(mm)) return false;
       continue;
     }
+    if (auto gv = dyn_cast<sahl::GemvOp>(op)) {
+      if (!gemv(gv)) return false;
+      continue;
+    }
     if (auto bc = dyn_cast<sahl::BcastOp>(op)) {
       auto l = bufOf(bc.getSrc());
       if (!l) return false;
@@ -611,6 +615,12 @@ bool Lowerer::strip(sahl::StripOp st) {
     // a local vector [K] -> every element over the D rows (a VE copy, DIV mode)
     auto x = bufOf(st.getSrc());
     if (!x) return false;
+    if (st->hasAttr("sa.packed")) {                // K2b GEMV: one row, packed (no copies over the D rows)
+      if (x->dyn) return fail("packed strip of a dynamic length");
+      ve({x->la, x->vt, ::sa::IDX_LIN, 0}, std::nullopt, dst->la, ::sa::VT_I8, x->n, ::sa::VOP_COPY, 1.0f, NEG0,
+         ::sa::FUNC_NONE, ::sa::RED_NONE, 0, 0, {});
+      return true;
+    }
     SmallVector<DynF> dyn;
     if (x->dyn) {                                  // a dynamic length (x * D elements)
       Lin l = *x->dyn;
@@ -711,6 +721,30 @@ bool Lowerer::mma(sahl::MmaOp m) {
     ex.setDynFields(df);
     ex.setDynAdd(SmallVector<bool>(df.size(), false));
   }
+  return true;
+}
+
+bool Lowerer::gemv(sahl::GemvOp g) {
+  // acc = x . weight strips: one LD in mode GEMV (docs/k2b_gemv_design.md §4)
+  if (!cfg.gemvPorts) return fail("gemv: the target has no GEMV unit");
+  auto x = bufOf(g.getX()), c = bufOf(g.getAcc());
+  if (!x || !c) return false;
+  if ((x->la >> 28) != uint32_t(::sa::MEM_SPAD_A) || x->vt != ::sa::VT_I8 || x->dyn) return fail("gemv: x");
+  if ((c->la >> 28) != uint32_t(::sa::MEM_ACC)) return fail("gemv: accumulator");
+  auto wt = cast<MemRefType>(g.getW().getType());
+  if (wt.getRank() != 3 || !wt.hasStaticShape() || wt.getDimSize(2) != d) return fail("gemv: weights [nc, K, D]");
+  auto r = ddrOf(g.getW(), /*allowPitch=*/true);
+  if (!r) return false;
+  const int64_t nc = wt.getDimSize(0), k = wt.getDimSize(1), rb = k * d, pitch = leadingPitch(g.getW(), rb);
+  if (r->dyn || r->dynRows || r->off % 16 || pitch % 16 || rb > 65535 || k % d || nc < 1 || nc > 8)
+    return fail("gemv: weight strips");
+  Value adv = advanceOf(g);
+  auto ld = sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(c->la), nc, rb, pitch, ::sa::LD_GEMV,
+                               adv ? ValueRange{adv} : ValueRange{});
+  ld.setXword(int64_t(x->la & 0xFFFF));
+  ld.setCstep(1);
+  if (g.getAccumulate()) ld.setGemvAcc(true);
+  advanced(ld, adv);
   return true;
 }
 
@@ -855,6 +889,7 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
       cfg.d = optD;
       cfg.spadBytes = optSpadKB * 1024;
       cfg.accBytes = optAccKB * 1024;
+      cfg.gemvPorts = optGemvPorts;
       cfg.ukernels = optUkernels;
     }
     ModuleOp m = getOperation();
@@ -882,6 +917,8 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
   Option<int64_t> optAccKB{*this, "acc-kb", llvm::cl::desc("ACC size (KB, two banks)"), llvm::cl::init(256)};
   Option<std::string> optUkernels{*this, "ukernels", llvm::cl::desc("micro-kernels: all, none or a list"),
                                   llvm::cl::init("all")};
+  Option<int64_t> optGemvPorts{*this, "gemv-ports", llvm::cl::desc("read ports of the GEMV unit (0: none)"),
+                               llvm::cl::init(0)};
 };
 
 }  // namespace

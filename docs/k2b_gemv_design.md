@@ -111,8 +111,8 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 
 ## 7. 编译器与运行时
 
-- **目标配置**：`TargetConfig` 加 `gemv_ports`（0 = 没有 GEMV 单元）和 `gemv_kmax`；`.hwh` / 驱动报告 `NPORTS` 与是否有 GEMV。
-- **SAHL**：新 op `sahl.gemv(x, w, acc)`（x：SPAD_A 中连续的 int8 向量；w：DDR 中 nc 个 strip 的子视图；acc：ACC 的 nc × 16 块）。`expandLinear` 在目标有 GEMV 时：不再分配 A strip、不发 `sahl.strip`（省掉把 x 复制到 16 行的 VE 命令），每个 chunk 的 `sahl.load` 权重 + `sahl.mma` 换成一条 `sahl.gemv`；SPAD_B 的两个权重 bank 不再需要。epilogue、ACC 布局（`sa.word`）、`sahl.loop` 的 advance（ddr 每次加两个 chunk）都不变。
+- **目标配置**：`TargetConfig` 加 `gemv_ports`（0 = 没有 GEMV 单元；`--iree-sa-gemv-ports=N`，只支持 D = 16）；`.hwh` / 驱动报告 `NPORTS` 与是否有 GEMV。
+- **SAHL**：新 op `sahl.gemv(x, w, acc)`（x：SPAD_A 中连续的 int8 向量；w：DDR 中 nc 个 strip 的子视图；acc：ACC 的 nc × 16 块）。`expandLinear` 在目标有 GEMV 时：不再分配 A strip，每个 chunk 的 `sahl.load` 权重 + `sahl.mma` 换成 `sahl.gemv`（nc > 8 时分成每条 ≤ 8 个 strip 的几条）；SPAD_B 的两个权重 bank 不再需要。x 是 int8 时直接用；x 是 int32（在 ACC 里，stories / SmolLM2 / Qwen3 的 decode 都是）时用一条 `sahl.strip {sa.packed}` 转成 SPAD_A 中连续的 int8（与原来的 strip 同样的 VE 转换，只是不复制到 16 行）。epilogue、ACC 布局（`sa.word`）、`sahl.loop` 的 advance（ddr 每次加两个 chunk）都不变。
 - **约束**：K ≤ `gemv_kmax`（4095），nc ≤ S_MAX；不满足时退回现在的 LD + EX（正确但慢）。权重的打包格式与 irpa 不变。
 - **SAHW / 序列化**：LD 描述符的新字段（mode 2、xword、cstep、acc）；`DescList` 编码；动态字段只用到 ddr（字段 1）。
 - **功能仿真器 / oracle**：`sa_funcsim.ld` 实现 mode 2（§4 的语义，逐位）和 sched 的检查；`dispatch_check` 覆盖 decode 的所有 matvec；新目标配置建立自己的黄金语料基线（§5 第 3 条约束）。

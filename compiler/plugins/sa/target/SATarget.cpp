@@ -59,6 +59,8 @@ struct SAOptions {
   // Testing the fallback: dispatches whose name contains one of these
   // (comma-separated) run on the host even if the sa backend compiles them.
   std::string hostDispatches;
+  // K2b: the streaming GEMV unit (docs/k2b_gemv_design.md) with this many read ports (0: none).
+  int gemvPorts = 0;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -79,6 +81,8 @@ struct SAOptions {
     binder.opt<std::string>("iree-sa-host-dispatches", hostDispatches, llvm::cl::cat(category),
                             llvm::cl::desc("With the host fallback: run these dispatches (name substrings, "
                                            "comma-separated) on the host (testing)."));
+    binder.opt<int>("iree-sa-gemv-ports", gemvPorts, llvm::cl::cat(category),
+                    llvm::cl::desc("Read ports of the streaming GEMV unit (K2b; 0: none): decode's linear layers use it."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -93,6 +97,7 @@ getSAExecutableTarget(MLIRContext *context, const SAOptions &options) {
   tc.maxDynamic = options.maxDynamic;
   tc.spadBytes = int64_t(options.spadKB) << 10;
   tc.accBytes = int64_t(options.accKB) << 10;
+  tc.gemvPorts = options.gemvPorts;
   tc.addTo(b, config);
   return b.getAttr<IREE::HAL::ExecutableTargetAttr>(
       b.getStringAttr("sa"), b.getStringAttr("sa-desc-v1"),

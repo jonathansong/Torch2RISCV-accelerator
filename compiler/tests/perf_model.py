@@ -73,6 +73,7 @@ class Arch:
     ex_scale: float = 1.0       # EX steps scale (D = 32 for the same work: about 1 / 2)
     gemv_bpc: float = 0.0       # H4: decode GEMV unit, weight bytes per cycle (0: none)
     ooo: bool = False           # H2: a blocked command does not block later independent ones (per-engine windows)
+    gemv_ports: int = 2         # LD mode GEMV (K2b streaming unit): 16 B / cycle per read port
 
 
 def field(x, lo, n):
@@ -81,7 +82,7 @@ def field(x, lo, n):
 
 class Cmd:
     __slots__ = ("op", "eng", "n", "fence_before", "mask", "r", "w", "kind", "groups", "bytes", "beats", "bursts",
-                 "steps", "wbytes", "gemv", "rng")
+                 "steps", "wbytes", "gemv", "rng", "xw", "k")
 
 
 def banks(arch, mem, first, last):
@@ -149,12 +150,22 @@ def decode(arch, r):
     c.groups = c.bytes = c.beats = c.bursts = c.steps = c.wbytes = 0
     c.gemv = False
     c.rng = []                                         # (mem, first word, last word, write): H2's fine-grained check
+    c.xw = c.k = 0
     d = arch.d
     if c.op in (OP_LD, OP_ST):
         laddr = field(w[2], 0, 32)
         mem, word = (laddr >> 28) & 0xF, laddr & 0xFFFF
         rows, rb, pitch = field(w[2], 32, 16), field(w[2], 48, 16), field(w[3], 0, 32)
         mode = field(w[3], 32, 2) if c.op == OP_LD else 0
+        if mode == 2:                                  # GEMV: x in SPAD_A, one ACC word per strip
+            c.gemv, c.xw, c.k = True, field(w[3], 34, 16), rb // d
+            cstep = field(w[3], 50, 8)
+            c.r = banks(arch, MEM_SPAD_A, c.xw, c.xw + c.k // d - 1)
+            c.w = banks(arch, MEM_ACC, word, word + (rows - 1) * cstep)
+            c.rng = [(MEM_SPAD_A, c.xw, c.xw + c.k // d - 1, False), (MEM_ACC, word, word + (rows - 1) * cstep, True)]
+            c.bytes, c.steps = rows * rb, rows
+            c.beats, c.bursts = dma_shape(arch, ddr, 1, rows * rb, rows * rb, MEM_SPAD_B)
+            return c
         wb = 4 * d if mem == MEM_ACC else d
         words = (rb // d) * rows if mode else ((rb + wb - 1) // wb) * rows
         m = banks(arch, mem, word, word + max(words, 1) - 1)
@@ -220,6 +231,9 @@ def conflict(a, b):
 
 
 def cost(arch, c, gemv=False):
+    if c.op == OP_LD and c.gemv:                       # streamed into the unit; strips written back
+        return arch.ld_lat + max(c.beats / max(arch.gemv_ports, 1), arch.c_burst * c.bursts / max(arch.gemv_ports, 1)) \
+            + 2 * c.steps
     if c.op == OP_LD:
         bpc = arch.ld_bpc / 16.0                       # (ports: bursts dealt round-robin, issue per port)
         return arch.ld_lat + max(c.beats / bpc, arch.c_burst * c.bursts / bpc)
@@ -235,9 +249,22 @@ def cost(arch, c, gemv=False):
     return 0
 
 
+def xload(c, xtag, d):
+    """GEMV: x read from SPAD_A (K / D words) unless resident; any write to SPAD_A drops it"""
+    if c.op == OP_LD and c.gemv:
+        if xtag[0] == (c.xw, c.k):
+            return 0
+        xtag[0] = (c.xw, c.k)
+        return c.k // d
+    if c.w & 3:
+        xtag[0] = None
+    return 0
+
+
 def run_list(arch, cmds, gemv=False):
     """-> (cycles, busy per engine [LD, ST, EX, VE]) of one list"""
     eng_free = [0.0] * 4                    # engine idle from
+    xtag = [None]                           # the GEMV unit's resident x (word, K)
     hist = [[] for _ in range(4)]           # per engine: (dispatch, start, done, r, w)
     busy = [0.0] * 4
     t_disp = 0.0                            # last dispatch
@@ -274,7 +301,7 @@ def run_list(arch, cmds, gemv=False):
                 break
         t_disp = t
         disp_hist.append(t)
-        cy = cost(arch, c, gemv)
+        cy = cost(arch, c, gemv) + xload(c, xtag, arch.d)
         start = max(t + 1, eng_free[e])
         if c.op == OP_LD and arch.ld_overlap and h:
             start = max(t + 1, eng_free[e] - arch.ld_lat)
@@ -293,6 +320,7 @@ def run_list_ooo(arch, cmds, gemv=False, window=16):
     dispatched or not) whose address ranges conflict; EX / VE still share the SPAD_B / ACC ports.
     The scheduler looks at most `window` commands past the oldest undispatched one."""
     eng_free = [0.0] * 4
+    xtag = [None]
     last_start = [0.0] * 4
     busy = [0.0] * 4
     done_t = []
@@ -321,7 +349,7 @@ def run_list_ooo(arch, cmds, gemv=False, window=16):
             share = (e == 2 and p.eng == 3) or (e == 3 and p.eng == 2)
             if conflict(c, p) or (share and ((c.r | c.w) & (p.r | p.w))):
                 t = max(t, done_t[j])
-        cy = cost(arch, c, gemv)
+        cy = cost(arch, c, gemv) + xload(c, xtag, arch.d)
         start = max(t + 1, eng_free[e])
         if c.op == OP_LD and arch.ld_overlap:
             start = max(t + 1, eng_free[e] - arch.ld_lat)
