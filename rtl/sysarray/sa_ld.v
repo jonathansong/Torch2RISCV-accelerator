@@ -91,6 +91,49 @@ module sa_ld #(
     localparam integer BL   = DMA_W / 64;             // lanes per beat (1 or 2)
     localparam integer W2   = BL == 2;
 
+    // R channel as seen by the logic below: with several ports, each port's R
+    // goes through a 2-entry skid buffer first (registered valid / data /
+    // ready: the PS R outputs then feed only flops, not the port arbitration
+    // and the local write address); one port: straight through
+    wire [NPORTS-1:0]       i_rvalid, i_rlast, i_rready;
+    wire [NPORTS*DMA_W-1:0] i_rdata;
+    wire [NPORTS*2-1:0]     i_rresp;
+    genvar gs;
+    generate
+        if (NPORTS > 1) begin : rsl
+            for (gs = 0; gs < NPORTS; gs = gs + 1) begin : port
+                localparam integer RW = DMA_W + 3;
+                reg [RW-1:0] d0, d1;                // output, skid
+                reg          v0, v1;
+                wire         push = m_rvalid[gs] && !v1;
+                assign m_rready[gs] = !v1;
+                assign i_rvalid[gs] = v0;
+                assign {i_rlast[gs], i_rresp[2*gs +: 2], i_rdata[DMA_W*gs +: DMA_W]} = d0;
+                always @(posedge clk) begin
+                    if (!resetn) begin
+                        v0 <= 0; v1 <= 0;
+                    end else if (!v0 || i_rready[gs]) begin
+                        if (v1) begin
+                            d0 <= d1; v1 <= 0;
+                        end else begin
+                            v0 <= push;
+                            d0 <= {m_rlast[gs], m_rresp[2*gs +: 2], m_rdata[DMA_W*gs +: DMA_W]};
+                        end
+                    end else if (push) begin
+                        d1 <= {m_rlast[gs], m_rresp[2*gs +: 2], m_rdata[DMA_W*gs +: DMA_W]};
+                        v1 <= 1;
+                    end
+                end
+            end
+        end else begin : rdirect
+            assign i_rvalid = m_rvalid;
+            assign i_rlast  = m_rlast;
+            assign i_rresp  = m_rresp;
+            assign i_rdata  = m_rdata;
+            assign m_rready = i_rready;
+        end
+    endgenerate
+
     // lanes per word (log2) of a memory
     function [3:0] lpw_log2(input [3:0] mem);
         lpw_log2 = mem == MEM_ACC  ? LOGD - 1 :       // 4D bytes = D/2 lanes
@@ -246,9 +289,9 @@ module sa_ld #(
                 done   <= 1;
                 err    <= rerr;
             end
-            if (r_take && m_rresp[2*r_sel +: 2] != 2'b00) rerr <= 1;
+            if (r_take && i_rresp[2*r_sel +: 2] != 2'b00) rerr <= 1;
             for (p = 0; p < NPORTS; p = p + 1)
-                if (g_take[p] && m_rresp[2*p +: 2] != 2'b00) rerr <= 1;
+                if (g_take[p] && i_rresp[2*p +: 2] != 2'b00) rerr <= 1;
         end
     end
 
@@ -267,7 +310,7 @@ module sa_ld #(
         end else
             for (s = NPORTS - 1; s >= 0; s = s - 1) begin
                 cand = (r_rr + s) % NPORTS;
-                if (!gmode && m_rvalid[cand] && !q_empty[cand]) begin
+                if (!gmode && i_rvalid[cand] && !q_empty[cand]) begin
                     r_any = 1;
                     r_sel = cand;
                 end
@@ -280,20 +323,20 @@ module sa_ld #(
     generate
         for (gp = 0; gp < NPORTS; gp = gp + 1) begin : gq
             wire [2:0] hp = q_rp[gp][2:0];
-            assign g_take[gp] = gmode && active && g_xready && m_rvalid[gp] && !q_empty[gp];
+            assign g_take[gp] = gmode && active && g_xready && i_rvalid[gp] && !q_empty[gp];
             assign g_s[3*gp +: 3]    = q_s[gp][hp];
             assign g_k[12*gp +: 12]  = q_k[gp][hp] + beat_idx[gp];
         end
     endgenerate
     assign g_valid = g_take;
-    assign g_data  = m_rdata;
+    assign g_data  = i_rdata;
     wire [15:0] h_word = q_word[r_sel][q_rp[r_sel][2:0]];
     wire [7:0]  h_lane = q_lane[r_sel][q_rp[r_sel][2:0]];
     wire        h_s0   = q_s0[r_sel][q_rp[r_sel][2:0]];
     wire        h_tf   = q_tf[r_sel][q_rp[r_sel][2:0]];
     wire        h_first = beat_idx[r_sel] == 0;
     wire        v0     = !(h_first && h_s0);                       // lower lane ours
-    wire        v1     = W2 && !(m_rlast[r_sel] && !h_tf);         // upper lane ours
+    wire        v1     = W2 && !(i_rlast[r_sel] && !h_tf);         // upper lane ours
     // lane of this beat's lower lane in the burst's sequence (it is ours when v0)
     wire [8:0]  h_sum0 = h_lane + ({4'd0, beat_idx[r_sel]} << W2) - h_s0;
     wire        two    = v0 && v1;
@@ -302,7 +345,7 @@ module sa_ld #(
     wire [8:0]  w_sum  = h_sum0 + upper;
     assign      r_take = r_any && !(two && !merge && !r_hold);     // the beat is consumed
 
-    wire [DMA_W-1:0] r_beat = m_rdata[DMA_W*r_sel +: DMA_W];
+    wire [DMA_W-1:0] r_beat = i_rdata[DMA_W*r_sel +: DMA_W];
     wire [63:0]      r_lane = upper ? r_beat[DMA_W-1 -: 64] : r_beat[63:0];
 
     assign lw_en   = r_any;
@@ -313,14 +356,14 @@ module sa_ld #(
 
     generate
         for (gp = 0; gp < NPORTS; gp = gp + 1) begin : rr
-            assign m_rready[gp] = (r_take && r_sel == gp) || g_take[gp];
+            assign i_rready[gp] = (r_take && r_sel == gp) || g_take[gp];
         end
     endgenerate
 
     integer g_last, gl;           // GEMV: bursts finished this cycle
     always @* begin
         g_last = 0;
-        for (gl = 0; gl < NPORTS; gl = gl + 1) g_last = g_last + (g_take[gl] && m_rlast[gl]);
+        for (gl = 0; gl < NPORTS; gl = gl + 1) g_last = g_last + (g_take[gl] && i_rlast[gl]);
     end
 
     always @(posedge clk) begin
@@ -337,7 +380,7 @@ module sa_ld #(
             else if (gmode) completed <= completed + g_last;
             for (p = 0; p < NPORTS; p = p + 1)
                 if (g_take[p]) begin
-                    if (m_rlast[p]) begin
+                    if (i_rlast[p]) begin
                         beat_idx[p] <= 0;
                         q_rp[p]     <= q_rp[p] + 1;
                     end else
@@ -350,7 +393,7 @@ module sa_ld #(
             if (r_take) begin
                 r_hold <= 0;
                 r_rr   <= r_sel == NPORTS - 1 ? 0 : r_sel + 1;
-                if (m_rlast[r_sel]) begin
+                if (i_rlast[r_sel]) begin
                     beat_idx[r_sel] <= 0;
                     q_rp[r_sel]     <= q_rp[r_sel] + 1;
                     completed       <= completed + 1;
