@@ -150,7 +150,7 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 1. **单口比特流（`d16_100mhz_w128_p6_gemv`）上的原有路径**：`SA_KV260_CONFIG=d16_100mhz_w128_p6_gemv compiler/scripts/deploy_z1_freeze.sh --reuse d16_100mhz_w128_p6_red`（LLM 测试沿用 EX 路径的可执行文件，几分钟），板上 `run_board.sh`：REGRESSION PASS 说明加了 GEMV 单元不影响现有功能；bwtest 的测试 6 / 7 给出单口 GEMV 的流式带宽并校验结果。
 2. **GEMV 路径**：完整 staging（不加 `--reuse`）。`board_env.sh` 从配置名推出 `SA_GEMV_PORTS`（`_gemv` → 1，`_gemv_np2` → 2），`compile_sa.sh` 加 `--iree-sa-gemv-ports`，构建目录带 `_gemv` 后缀；每个 LLM 测试在主机上先过逐 dispatch 检查和仿真，板上 logits 与仿真逐位比较（与 EX 路径也逐位相同，G1 已在仿真上证明）。Qwen3 另外 `deploy_z1_freeze.sh c6p_qwen3`（640 MB udmabuf）。
 3. **双口比特流（`_gemv_np2`）**：同 1、2；bwtest 测试 7 应接近 32 B / 周期；decode token/s 与模型预测（Qwen3 ×1.85 → 约 4.1–4.3 token/s 设备时间，SmolLM2 ×1.76）比较，`board_profile.py` 的 decode profile 再喂给 `perf_model.py` 校准 GEMV 的代价。
-4. **CAPS 检查**：rt_fw（RT_VERSION 2）把单元的 CAPS 写进邮箱 `0xD0`，运行时加载可执行文件时检查它要求的 bit 21–25；用 GEMV 编译的模型在没有 GEMV 的比特流上会直接报错，而不是跑出错误结果。
+4. **CAPS 检查**：rt_fw（RT_VERSION 2）把单元的 CAPS 写进邮箱 `0xD0`，运行时加载可执行文件时检查它要求的 bit 21–25；用 GEMV 编译的模型在没有 GEMV 的比特流上会直接报错，而不是跑出错误结果。仿真上用 `SA_SIM_CAPS=0x01E00010` 模拟没有 GEMV 的单元验证过（stories15M GEMV 版本加载即报 INCOMPATIBLE）。G1 的 Qwen3 也已通过：1262 个 dispatch、logits 与 EX 路径逐字节相同。
 
 **第二阶段（按需）**：P = 4（HP0 现在是 PicoRV32 的口，要把它挪到 HPC0 或 LPD；×2.6–3.2）；SPAD 子银行（LD 写 SPAD / ACC 也到 32 B / 周期，prefill ×1.07）；LD 命令流水（隐藏每条命令约 65 周期的延迟，+2–3%）。
 

@@ -39,6 +39,7 @@ struct sa_transport_t {
   uint32_t mem_size;
   uint32_t heap_offset;   // first byte the arena may use (after transport-private data)
   uint32_t d;             // array size of the device
+  uint32_t caps;          // the unit's CAPS register (0: unknown, executables' required CAPS not checked)
   iree_string_view_t tag; // the dispatch being run (single-dispatch lists; else empty): sim traces
   // Runs the descriptor list at |list_phys| and waits for its completion.
   iree_status_t (*run)(sa_transport_t* t, uint32_t list_phys, sa_completion_t* out);

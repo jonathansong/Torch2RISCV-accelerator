@@ -323,6 +323,14 @@ static iree_status_t sa_executable_create(sa_context_t* context, iree_const_byte
                             "sa-desc-v1: executable compiled for D = %u, the %s device has D = %u", h.d,
                             context->transport->name, context->transport->d);
   }
+  // required unit features: DESC, NOTIFY, FPVE, CMDX, GEMV (CAPS bits 21..25)
+  uint32_t missing = h.caps & ~context->transport->caps & 0x03E00000u;
+  if (context->transport->caps && missing) {
+    return iree_make_status(IREE_STATUS_INCOMPATIBLE,
+                            "sa-desc-v1: executable needs CAPS %#x, the %s device lacks %#x (CAPS %#x)%s", h.caps,
+                            context->transport->name, missing, context->transport->caps,
+                            (missing & (1u << 25)) ? ": compiled with --iree-sa-gemv-ports for an overlay without GEMV" : "");
+  }
   IREE_RETURN_IF_ERROR(
       sa_check_range(data, h.export_offset, (uint64_t)h.export_count * sizeof(sa_file_export_t), "export table"));
   IREE_RETURN_IF_ERROR(sa_check_range(data, h.templates_offset, h.templates_bytes, "templates"));

@@ -55,7 +55,7 @@
 
 enum {
   MBOX_RING_BASE = 0xB0, MBOX_RING_SIZE = 0xB4, MBOX_RING_TAIL = 0xB8, MBOX_RING_HEAD = 0xBC,
-  MBOX_CPL_BASE = 0xC0, MBOX_FW_STATE = 0xC4,
+  MBOX_CPL_BASE = 0xC0, MBOX_FW_STATE = 0xC4, MBOX_FW_VERSION = 0xC8, MBOX_FW_CAPS = 0xD0,
 };
 #define RT_READY 0x52554E00u
 #define RT_RUN_LIST 0x01u
@@ -264,6 +264,7 @@ iree_status_t sa_transport_board_open(iree_allocator_t host_allocator, sa_transp
   t->mem_size = sa_board_attached.mem_size;
   t->heap_offset = SA_BOARD_HEAP_OFFSET;
   t->d = sa_board_attached.d;
+  t->caps = mbox_rd(b, MBOX_FW_VERSION) >= 2 ? mbox_rd(b, MBOX_FW_CAPS) : 0;   // (older rt_fw: unknown)
   t->run = sa_board_run;
   t->close = sa_board_close;
   t->impl = b;

@@ -103,6 +103,10 @@ iree_status_t sa_transport_sim_open(iree_allocator_t host_allocator, sa_transpor
   t->mem_size = size;
   t->heap_offset = 0;
   t->d = d;
+  // the functional simulator has it all; SA_SIM_CAPS=<CAPS> stands in for another unit (tests)
+  t->caps = (1u << 21) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);
+  const char* caps = getenv("SA_SIM_CAPS");
+  if (caps) t->caps = (uint32_t)strtoul(caps, NULL, 0);
   t->run = sa_sim_run;
   t->close = sa_sim_close;
   t->impl = s;

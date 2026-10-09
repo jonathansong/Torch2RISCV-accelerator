@@ -203,7 +203,8 @@ public:
     // sa-desc version 3 (compiler/runtime/tools/sadesc.py): header, export
     // table, templates (64-byte aligned), names, register setup tables, the
     // export extensions (prefix, head, bindings read / written, SPAD_B use)
-    constexpr uint32_t CAPS = (1u << 21) | (1u << 23) | (1u << 24);   // DESC, FPVE, CMDX
+    // required CAPS: DESC, FPVE, CMDX; [25] LD mode GEMV when the target has the unit
+    const uint32_t CAPS = (1u << 21) | (1u << 23) | (1u << 24) | (tc.gemvPorts ? 1u << 25 : 0u);
     uint32_t n = exports.size(), expOff = 64;
     uint32_t tmplOff = (expOff + 32 * n + 63) / 64 * 64;
     std::string tmpl, strings, table, setups;
