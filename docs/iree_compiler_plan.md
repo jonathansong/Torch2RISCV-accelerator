@@ -970,7 +970,7 @@ C5.5 的模型（§8.9 的第一步）：
     - 分析：生成的 VE 指令已经最少（exp 一条、recip 一条，各覆盖全部元素）；时间花在硬件的多拍 SFU 上：每元素约 19 周期（exp 115k 周期 / 6144 元素）。
     - 把 SiLU 融进 W13 的分块循环（§8.8 的做法，纯编译器）最多藏住 W13 的 EX 时间（每层 83k，SiLU 238k），约 **−10%**。
 
-**P6：SFU 多槽交错**（`rtl/sysarray/sa_vefp.v` 的微程序控制器；RTL 完成 2026-10-09，待板上验收，结果见本节末）
+**P6：SFU 多槽交错**（`rtl/sysarray/sa_vefp.v` 的微程序控制器；板上验收通过 2026-10-09，结果见本节末）
 - **现状**：
   - 多拍模式一次只处理一组；每个微步只给一个半组（FL = 4 lane）发一条运算，然后等单元延迟（M2 / A2 4 拍、i2f / f2i 2 拍，加发出与写回约 6 拍）才发下一步。
   - EXP 11 步、RECIP 8 步、RSQRT 10 步，查表按 lane 逐个读一个 ROM。
@@ -1006,6 +1006,10 @@ C5.5 的模型（§8.9 的第一步）：
   - 第一版用触发器 + 按槽多路器：sa_unit +33k LUT（96%），不可用；LUTRAM 版 **+2.65k LUT**（KV260 OOC，D = 16、128 位 DMA：82.2k 对 79.6k，70%），触发器 −0.8k；最差路径仍是 `ld` → BRAM 使能（与 NB = 0 相同），fmax 估计 123 MHz（NB = 0 为 134）。
   - 仿真：`tb_sa_vefp` 新增 7 个批量用例（不满一批、VALID、OP + IMM 后 RECIP、I32 / I8 输出、I8 输入、MOD），38 个用例在 D = 8 / 16、NB = 0 / 8 / 16、FL = D 下逐位一致；`make test / test16 / test128` 全部 PASS。
   - 周期（D = 16，32 组 EXP）：4502 → 1042（4.3 倍）；每组 EXP 约 150 → 32，RECIP 约 116 → 26，RSQRT 约 140 → 30。Qwen3 prefill 估计每块 89.9M 周期中省约 18M（约 −20%）。
+- **板上验收（2026-10-09，overlay `d16_100mhz_w128_p6`，100 MHz，WNS +0.113 ns，LUT 84.5k / 72.1%，比 w128 多 9.0k）**：REGRESSION PASS，全部测试与 sim 逐位一致，所有模型的 token 与 w128 相同。
+  - Qwen3-0.6B prefill 每块（profile）89.9M → **70.0M 周期（−22%）**：`elementwise_16x3072`（exp）13.34M → 3.24M，`reduction_16x3072`（含 RECIP）14.72M → 7.02M；prefill 11.43 → **13.96 token/s**，decode 2.13 → 2.20。
+  - 其余 prefill（token/s，w128 → p6）：stories15M 227.6 → 284.3，SmolLM2（qhf）27.2 → 34.9，hfgen 11.2 → 13.3；decode 小幅提升（SmolLM2 7.26 → 7.67，hfgen 6.89 → 7.45）。
+  - 现在 Qwen3 prefill 的大头是 W13 matmul（19.5%）、q/k/v matmul（13.1%）和 `reduction_16x3072`（10.0%，其中 SUM / MAX 归约仍走单组定序器）。
 
 ### 8.14 C8 代码生成分层重构：把 `sahl-to-sahw` 拆成 pass
 
