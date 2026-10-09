@@ -1010,6 +1010,16 @@ C5.5 的模型（§8.9 的第一步）：
   - Qwen3-0.6B prefill 每块（profile）89.9M → **70.0M 周期（−22%）**：`elementwise_16x3072`（exp）13.34M → 3.24M，`reduction_16x3072`（含 RECIP）14.72M → 7.02M；prefill 11.43 → **13.96 token/s**，decode 2.13 → 2.20。
   - 其余 prefill（token/s，w128 → p6）：stories15M 227.6 → 284.3，SmolLM2（qhf）27.2 → 34.9，hfgen 11.2 → 13.3；decode 小幅提升（SmolLM2 7.26 → 7.67，hfgen 6.89 → 7.45）。
   - 现在 Qwen3 prefill 的大头是 W13 matmul（19.5%）、q/k/v matmul（13.1%）和 `reduction_16x3072`（10.0%，其中 SUM / MAX 归约仍走单组定序器）。
+- **REDUCE 批量化（2026-10-09，`e6f0575`、`b10da84`）**：
+  - 批量模式扩展到带 REDUCE（SUM / MAX）的命令，FUNC 任意：收集、函数微步照常批量；之后状态 `Q_BRED` 按槽顺序归约（第一个槽存入；MAX 每槽 1 周期 fmax；SUM 走 A2，两个半组的累加链交错，同一半组有结果在途时停发）。每 lane 的累加顺序不变，结果逐位一致。行尾等 A2 排空后走原来的 tree / 写回，写回后回到 `Q_BRED` 继续下一个槽；非最后的组由 `b_ret` 退役。
+  - FUNC = NONE / ABS（absmax、平方和）不做函数微步，归约时直接从寄存器 0 取值做 VALID 掩码与 RELU（ABS 在收集时做）。
+  - 第一次构建时序失败（−0.730 ns：寄存器堆 → fres → relu → fmax → `ACCR`，FUNC 是运行时寄存器，综合器不知道 NONE / ABS 用不到 fres）；NONE / ABS 的归约值改为绕开 fres 后 WNS +0.123 ns。
+  - 仿真中发现的问题：每行 1 组时，`retire_seq` 在 FIN 的下一周期才算（`sq_last` 已清），在途计数重复减一下溢（挂死）；批量模式下该项不再计数。
+  - 仿真：`tb_sa_vefp` 新增 7 个用例（每行 1 / 3 / 5 / 6 / 10 / 24 组与整段、ABS、VALID + RELU、函数后归约、I8 输入、MOD），45 个用例在 D = 8 / 16、NB = 0 / 8 / 16、FL = D 下逐位一致；`make test / test16 / test128` PASS。周期（D = 16）：absmax 每行 24 组 2108 → 746，exp 后 MAX 6026 → 1414，rsqrt 后 SUM 4607 → 1284。
+  - **板上验收（overlay `d16_100mhz_w128_p6_red`，100 MHz，WNS +0.123 ns，LUT 88.25k / 75.4%，比 p6 多 3.7k）**：REGRESSION PASS，全部 token 与 p6 相同。
+    - Qwen3 每块（profile）70.0M → **62.2M 周期（−11%）**：`reduction_16x3072`（absmax）7.02M → 5.39M，RMSNorm 平方和 244 / 242 / 246 共 6.41M → 2.82M，decode 的 `main` 18（softmax）2.05M → 0.97M。prefill 13.96 → **15.45 token/s**，decode 2.20 → 2.22。
+    - 其余（token/s，p6 → red）：prefill stories15M 284.3 → 311.8，SmolLM2（qhf）34.9 → 38.4，hfgen 13.3 → 14.2；decode SmolLM2 7.67 → 7.71，hfgen 7.45 → 7.62，stories 61.3 → 61.9。
+    - 现在 Qwen3 prefill 的大头是 W13 matmul（21.9%）、q/k/v matmul（14.7%）、down（10.1%）、`reduction_16x3072`（8.7%）。
 
 ### 8.14 C8 代码生成分层重构：把 `sahl-to-sahw` 拆成 pass
 
