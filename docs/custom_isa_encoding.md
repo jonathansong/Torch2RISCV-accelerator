@@ -7,9 +7,10 @@
 > `rtl/ip/`, the current overlay in `boards/kv260/`.
 
 The PicoRV32 hands every instruction it does not implement to its
-co-processor port (PCPI). `rtl/matmul/matmul_pcpi.v` claims a small set of
-R-type instructions in the RISC-V **custom-0** opcode space and drives the
-matmul unit directly, bypassing its AXI4-Lite CSRs.
+co-processor port (PCPI). The Phase 4 unit's `matmul_pcpi.v` (tag
+`v1.0-pynq-z1`; today `rtl/sysarray/sa_pcpi.v` + `sa_legacy.v`) claims a small
+set of R-type instructions in the RISC-V **custom-0** opcode space and drives
+the matmul unit directly, bypassing its AXI4-Lite CSRs.
 
 > **Status.** This page specifies the Phase 4 group (funct7 = 0). Since M1 the
 > overlay runs the double-buffered accelerator `rtl/sysarray`. It keeps these
@@ -134,7 +135,8 @@ compared on identical data.
 
 ## Verification
 
-- `rtl/matmul` `make sim`: all 32 golden cases through both the CSR and the
+- Phase 4 `rtl/matmul` `make sim` (tag `v1.0-pynq-z1`; the same cases now run in
+  `rtl/sysarray` `tb_sa_unit`, part 1): all 32 golden cases through both the CSR and the
   PCPI path, `mat_status` while busy, trigger-while-busy stall, descriptor
   alignment / DIM errors, `mat_reset`, unclaimed encodings (funct3 = 5,
   funct7 ≠ 0, standard `mul`), CSR/PCPI interleaving; the PCPI driver

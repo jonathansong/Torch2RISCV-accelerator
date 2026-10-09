@@ -6,8 +6,8 @@
  * needed; the Phase 5 MLIR lowering emits the same `.insn` strings as LLVM
  * inline asm.
  *
- * funct7 = 0 is executed by rtl/matmul/matmul_pcpi.v (Phase 4) or
- * rtl/sysarray/sa_legacy.v; funct7 = 1 / 2 by rtl/sysarray (M1-M3).
+ * funct7 = 0 is executed by rtl/sysarray/sa_legacy.v (the Phase 4 matmul_pcpi
+ * interface); funct7 = 1 / 2 by rtl/sysarray (M1-M3).
  */
 #ifndef SYSARRAY_INTRINSICS_H
 #define SYSARRAY_INTRINSICS_H

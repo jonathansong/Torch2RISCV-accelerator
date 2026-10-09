@@ -1,7 +1,7 @@
 # Memory model (overlay)
 
 Three bus masters share the PS DDR; only the ARM goes through the CPU caches.
-This page was written for Phase 3 (`matmul_unit`). It was then extended for
+This page was written for Phase 3 (`matmul_unit`, removed since; its interface is `sa_legacy`). It was then extended for
 the double-buffered accelerator `sa_unit` (M1–M5: `rtl/sysarray`,
 `docs/double_buffer_design.md`), which keeps the same address map, and for
 the LLM levels L1–L5b (`docs/llm_inference_plan.md`): the command ring, the

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generate 8x8x8 int8 test vectors and the NumPy golden result for tb_matmul_unit.
+"""Generate 8x8x8 int8 test vectors and the NumPy golden result: the legacy (Phase 2-4
+matmul interface) cases of tb_sa_unit and firmware/sim/tb_system.v.
 
 Writes into OUT_DIR (default: vectors/):
   a.hex, b.hex   one 64-bit little-endian word per matrix row (8 rows/case)

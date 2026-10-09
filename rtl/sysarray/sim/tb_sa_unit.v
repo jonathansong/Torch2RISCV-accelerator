@@ -1,5 +1,5 @@
 // Full-unit test of sa_unit (double-buffered accelerator, M1).
-//  1. Phase 2-4 compatibility: the tb_matmul_unit tests (NumPy golden vectors
+//  1. Phase 2-4 compatibility: the former tb_matmul_unit tests (NumPy golden vectors
 //     through the CSR and mat_trigger paths, errors, irq, busy writes,
 //     PCPI legacy instructions), ported to the new top level.
 //  2. New ISA (funct7 = 1): double-buffered tiled GEMMs incl. bias preload,

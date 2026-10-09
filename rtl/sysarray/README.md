@@ -7,8 +7,8 @@
 > `rtl/ip/`, the current overlay in `boards/kv260/`.
 
 Implementation of [`docs/double_buffer_design.md`](../../docs/double_buffer_design.md).
-Replaces `rtl/matmul` (Phase 2–4) in the overlay from M1 on; the old unit's
-behavior (CSRs, funct7 = 0 instructions) is kept by `sa_legacy`.
+Replaced the Phase 2–4 `matmul_unit` in the overlay from M1 on; the old unit's
+behavior (CSRs, funct7 = 0 instructions) is kept by `sa_legacy` (map below).
 
 | File | Contents |
 |---|---|
@@ -20,10 +20,42 @@ behavior (CSRs, funct7 = 0 instructions) is kept by `sa_legacy`.
 | `sa_ex.v` | EX engine: K-streaming feed (one SPAD_A + one SPAD_B word per cycle), shadow drain, accumulate, repeat (M2: several C tiles per command with B / C strides) |
 | `sa_perf.v` | performance counters: 32 × 32-bit event counters (28 defined, `PC_*` in `sa_defs.vh`), read by `mat_perf` (funct7 = 1, funct3 = 5) or the CSR mirror 0x40 + 4·i, control via `mat_perf` or `PERF_CTRL` (0x3C); `PERF = 0` removes them ([plan](../../docs/perf_counters_and_desc_dma_plan.md), P1) |
 | `sa_cmdfetch.v` | descriptor fetch unit: `mat_submit(list, count)` reads 64-byte descriptors from DDR (shares DMA port 0 with LD), decodes LD/ST/EX/VE into the same packets as PCPI (`pkt_*` in `sa_defs.vh`), handles FENCE / JUMP / END, relocation bases, errors (engine 4), status CSRs 0xC0–0xD0 ([design §8.6](../../docs/double_buffer_design.md)) |
+| `sa_gemv.v` | K2b GEMV unit: LD mode GEMV streams decode weights from DMA into 16 int8 MACs per read port, x buffer with residency, results to ACC (`GEMV = 1`; [design](../../docs/k2b_gemv_design.md)) |
+| `sa_vefp.v` (+ `sa_fp32_*.v`, `sa_sfu_tables.vh`) | L2 fp32 vector engine: fp32 ops, affine, exp / recip / rsqrt (batched, P6), row REDUCE, TRANSPOSE |
 | `sa_ve.v` | M3 vector engine: VL = D lanes, ADD/SUB/MUL/MAX/MIN/COPY + RELU/REQUANT/clamp, int8/int16 (SPAD) and int32 (ACC), src2 period (broadcast / bias vector) |
 | `sa_array.v` | D×D PEs (`sa_pe_dsp` / `sa_pe_lut` per column), shadow accumulators |
 | `sa_bankmem.v`, `sa_tdpram.v` | double-banked byte-write TDP memories (UG901 template → RAMB36) |
 | `sa_defs.vh`, `sa_macros.vh` | memory ids, command packet layout, cfg keys, error codes |
+| `sim/gen_vectors.py` | 8×8×8 golden vectors (NumPy) for the legacy cases of `tb_sa_unit` and the firmware system sim |
+
+## Legacy CSR map (`sa_legacy`)
+
+The Phase 2–4 `matmul_unit` interface (its RTL, `rtl/matmul`, was removed after
+it had been superseded; it is in the history and tag `v1.0-pynq-z1`). The
+unit answers it unchanged: an 8×8×8 job (CTRL.start or `mat_trigger`) runs as
+LD A, LD B, EX, ST C through the scheduler, after a fence.
+
+| Offset | Name | Access | Description |
+|---|---|---|---|
+| 0x00 | CTRL | RW | bit0 start (write 1, reads 0) · bit1 soft reset (clears STATUS / IRQ_STATUS, reads 0) · bit2 irq_enable |
+| 0x04 | STATUS | RO | bit0 done · bit1 busy · bit2 error · bits[11:8] error code |
+| 0x08 | SRC_A_ADDR | RW | DDR address of A |
+| 0x0C | SRC_B_ADDR | RW | DDR address of B |
+| 0x10 | DST_ADDR | RW | DDR address of C |
+| 0x14 | DIM_M_N_K | RW | M = [9:0], N = [19:10], K = [29:20]; resets to 8×8×8, only 8×8×8 is accepted |
+| 0x18 | IRQ_STATUS | RW1C | bit0 set on every completion (also on error), write 1 to clear |
+| 0x1C | CYCLES | RO | cycles from start to done of the last run |
+| 0x20 | ID | RO | `0x4D4D3038` ("MM08") |
+
+- `irq = IRQ_STATUS[0] & irq_enable`. IRQ_STATUS latches even when irq_enable is 0, so clear it before enabling the interrupt.
+- Writes to SRC/DST/DIM and start/soft reset are ignored while busy.
+- Error codes: 1 DIM is not 8×8×8 · 2 address misaligned or crossing 4 KB · 3 read response SLVERR/DECERR (C is not written) · 4 write response SLVERR/DECERR. An error still sets done and IRQ_STATUS, so polling loops terminate.
+- CSR writes are full 32-bit (WSTRB is ignored).
+| 0x24 | CAPS | RO | [7:0] D · [15:8] VL · [19:16] DMA ports · [20] performance counters · [21] descriptor fetch · [22] notify · [23] fp32 VE · [24] command extensions · [25] GEMV (K2b) |
+| 0x28 | EXT_STATUS | RO | new-ISA status: idle, sticky error, engine busy, error code / engine, queued commands, list running |
+
+(Further CSRs: performance counters 0x3C–0xBC, descriptor status 0xC0–0xD4;
+`sa_legacy.v`, `docs/double_buffer_design.md` §8.5–8.6.)
 
 ## Verify / build
 

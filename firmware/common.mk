@@ -43,7 +43,7 @@ $(SIM)/fw.hex: $(FW).bin
 	$(PYTHON) -c "import struct; d=open('$<','rb').read(); d+=b'\0'*(-len(d)%4); \
 	open('$@','w').write('\n'.join('%08x'%w for w in struct.unpack('<%dI'%(len(d)//4),d))+'\n')"
 
-$(SIM)/n_cases.vh: $(ROOT)/rtl/matmul/sim/gen_vectors.py
+$(SIM)/n_cases.vh: $(ROOT)/rtl/sysarray/sim/gen_vectors.py
 	mkdir -p $(SIM)
 	$(PYTHON) $< --out $(SIM)
 

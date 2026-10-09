@@ -1,4 +1,4 @@
-"""PYNQ driver for the overlay: ARM -> PicoRV32 -> matmul_unit.
+"""PYNQ driver for the overlay: ARM -> PicoRV32 -> the accelerator (sa_unit, instance matmul_0).
 
 The ARM allocates A/B/C (and a table of job descriptors) in DDR, hands
 their physical addresses to the PicoRV32 through the BRAM mailbox and

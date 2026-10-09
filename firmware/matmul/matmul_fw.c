@@ -1,6 +1,6 @@
 /*
- * Phase 3 firmware: run a batch of 8x8x8 int8 matmuls on matmul_unit
- * through its CSRs (loosely coupled path).
+ * Phase 3 firmware: run a batch of 8x8x8 int8 matmuls through the legacy
+ * matmul_unit CSRs (loosely coupled path; sa_unit: sa_legacy).
  *
  * Per job: program SRC_A / SRC_B / DST, set CTRL.start, poll STATUS.done.
  * Results and timing are reported through the mailbox (mailbox.h).

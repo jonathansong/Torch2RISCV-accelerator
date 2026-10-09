@@ -1,5 +1,6 @@
 /*
- * matmul_unit CSRs as seen from the PicoRV32 (rtl/matmul/README.md).
+ * The legacy (Phase 2-4 matmul_unit) CSRs as seen from the PicoRV32; sa_unit implements
+ * them in sa_legacy.v (map: rtl/sysarray/README.md).
  * The block design maps them at 0x80000000 on the RISC-V bus only.
  */
 #ifndef MATMUL_CSR_H

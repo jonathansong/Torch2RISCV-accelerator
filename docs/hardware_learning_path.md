@@ -102,8 +102,9 @@ parameters and `generate`, signed arithmetic.
 **In this repo.**
 1. `rtl/sysarray/sa_tdpram.v` - a 50-line true-dual-port RAM: two
    `always @(posedge clk)` blocks, byte-write enables, read-first behavior.
-2. `rtl/matmul/systolic_array.v` - the Phase 2 array: `generate` loops,
-   a PE grid wired by index arithmetic.
+2. `rtl/sysarray/sa_array.v` - the array: `generate` loops, a PE grid
+   wired by index arithmetic (the simpler Phase 2 `systolic_array.v`:
+   `git show v1.0-pynq-z1:rtl/matmul/systolic_array.v`).
 3. `rtl/sysarray/sa_ld.v`, the `qst` generate block - a circular queue with
    read/write pointers.
 
@@ -203,8 +204,8 @@ custom instructions, and how bare-metal firmware is built and loaded.
 4. `firmware/include/mailbox.h` - the ARM ↔ RISC-V contract: the mailbox in
    the last 256 bytes of the program BRAM and the performance counter area
    below it (0x1E00).
-5. `rtl/matmul/matmul_pcpi.v`, then `rtl/sysarray/sa_pcpi.v` - the PCPI
-   decoders (Phase 4, then M1-M5).
+5. `rtl/sysarray/sa_pcpi.v` - the PCPI decoder (funct7 = 0 legacy, 1 / 2
+   new ISA; the Phase 4 one: `matmul_pcpi.v` in tag `v1.0-pynq-z1`).
 6. `docs/execution_walkthrough.md` - one GEMM traced from Python through the
    firmware, PCPI and scheduler to the engines (Chinese).
 
@@ -238,8 +239,11 @@ complex one: a systolic array, CSRs, an AXI master, and a job sequencer.
   Unit", ISCA 2017 - a production systolic array (weight-stationary) and
   why memory bandwidth dominates.
 
-**In this repo** (`rtl/matmul`, the Phase 2-4 unit, kept as reference).
-1. `rtl/matmul/README.md` - CSR map, memory layout, timing of one run.
+**In this repo** (the Phase 2-4 unit `rtl/matmul` was removed from main; read it in
+tag `v1.0-pynq-z1`: `git worktree add /tmp/z1 v1.0-pynq-z1`,
+or `git show v1.0-pynq-z1:rtl/matmul/<file>`).
+1. `rtl/matmul/README.md` - CSR map, memory layout, timing of one run (the
+   CSR map is also in `rtl/sysarray/README.md`, which still implements it).
 2. `systolic_array.v` - output-stationary 8×8 array: A flows right, B flows
    down, each PE keeps its C[i][j].
 3. `matmul_unit.v` - AXI4-Lite CSR slave, AXI4 master (load A/B, store C),
@@ -250,7 +254,8 @@ complex one: a systolic array, CSRs, an AXI master, and a job sequencer.
 6. `notebooks/phase3_matmul_demo.py`, `phase4_insn_demo.py`;
    `RISCV-on-PYNQ-Z1/bitstreams/phase3|phase4/README.md` for the board numbers.
 
-**Lab.** `cd rtl/matmul && make sim`. Then draw, on paper, the operand
+**Lab.** In a worktree of tag `v1.0-pynq-z1`: `cd rtl/matmul && make sim`
+(on main the same golden cases run in `rtl/sysarray` `make sim TB=tb_sa_unit`). Then draw, on paper, the operand
 skew for a 3×3 output-stationary array: which A and B element enters which
 PE at cycle t, and when the last product reaches PE(2,2).
 
@@ -742,7 +747,7 @@ In this repository
 - `docs/perf_counters_and_desc_dma_plan.md` - plan, verification and results of the counters and the descriptor DMA (Chinese).
 - `docs/execution_walkthrough.md` - one GEMM through every layer (Chinese).
 - `docs/custom_isa_encoding.md`, `docs/memory_model.md` - Phase 4 ISA and address maps.
-- `rtl/matmul/README.md`, `rtl/sysarray/README.md` - the two RTL units.
+- `rtl/sysarray/README.md` - the RTL unit (the Phase 2-4 `rtl/matmul/README.md`: tag `v1.0-pynq-z1`).
 - `RISCV-on-PYNQ-Z1/bitstreams/*/README.md` (`pynq-z1` branch) - board results per milestone.
 - `RISCV-on-PYNQ-Z1/pynq-z1-riscv-accelerator-plan-v2.md` (`pynq-z1` branch) - the original project plan (Chinese).
 - `boards/kv260/README.md` - the KV260 overlay: builds, address map, board setup and results.

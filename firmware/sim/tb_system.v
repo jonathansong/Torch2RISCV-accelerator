@@ -13,7 +13,7 @@
 //               completion records, notify_irq edges, errors, wrap-around
 // Mirrors the overlay's RISC-V memory map:
 //   0xC0000000  8 KB program BRAM (+ mailbox at 0xC0001F00)
-//   0x80000000  matmul_unit CSRs
+//   0x80000000  the accelerator's CSRs (sa_unit)
 //   DDR         S_AXI_HP0 (identity-mapped physical addresses; same model)
 // and the matmul DMA view of DDR (identity-mapped physical addresses).
 // The "ARM" side (initial block) plays driver/pynq_matmul.py.
@@ -61,7 +61,7 @@ module tb_system;
     wire        c_awready, c_wready, c_bvalid, c_arready, c_rvalid;
     wire [31:0] c_rdata;
 
-    wire        pcpi_valid, pcpi_wr, pcpi_wait, pcpi_ready;   // CPU <-> matmul_unit
+    wire        pcpi_valid, pcpi_wr, pcpi_wait, pcpi_ready;   // CPU <-> sa_unit
     wire [31:0] pcpi_insn, pcpi_rs1, pcpi_rs2, pcpi_rd;
 
     picorv32_axi #(
@@ -155,7 +155,7 @@ module tb_system;
         end
     end
 
-    // ------------------------------------------------------ matmul_unit
+    // ------------------------------------------------------ sa_unit
     wire [31:0] m_araddr, m_awaddr;
     localparam integer DW = `SIM_DMA_W, BB = DW / 8;
     wire [7:0]  m_arlen, m_awlen;

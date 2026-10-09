@@ -17,7 +17,7 @@ empty :=
 space := $(empty) $(empty)
 SIM := build/$(TB)$(subst $(space),_,$(subst =,,$(strip $(GEN))))
 
-VECTORS := $(abspath ../matmul/sim/gen_vectors.py)
+VECTORS := $(abspath sim/gen_vectors.py)
 # L2 fp32 units: vectors from the bit-exact model llm/fp32.py (NumPy in PYTHON)
 FPVEC   := $(abspath sim/gen_fp32_vectors.py)
 

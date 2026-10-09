@@ -239,7 +239,7 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 |---|---|---|---|
 | 0 | Environment, one-shot Vivado build | ✅ done | `RISCV-on-PYNQ-Z1/scripts/build_bitstream.sh` (pynq-z1 branch; KV260: `boards/kv260/scripts/build_bitstream.sh`) |
 | 1 | PicoRV32 bring-up on PYNQ-Z1, RISC-V → DDR access | ✅ board-verified | `tests/ddr_access` |
-| 2 | 8×8×8 matrix unit (CSR + AXI master, loose coupling) | ✅ simulation-verified vs NumPy | `rtl/matmul` |
+| 2 | 8×8×8 matrix unit (CSR + AXI master, loose coupling) | ✅ simulation-verified vs NumPy | `rtl/matmul` (tag `v1.0-pynq-z1`; its interface lives on in `rtl/sysarray/sa_legacy.v`) |
 | 3 | End-to-end closed loop, CSR path, hand-written firmware | ✅ board-verified | 522.6 cycles/job; `bitstreams/phase3` |
 | 4 | Custom instructions (PCPI, `.insn`) | ✅ board-verified | 311.9 cycles/job; `bitstreams/phase4` |
 | M1–M4 | Accelerator rebuild: double-buffered systolic array (table below) | ✅ board-verified | `rtl/sysarray`, `bitstreams/m1`–`m4` |
