@@ -99,6 +99,21 @@ def main():
           rowlen=8, vld=5 * d + 3)
         c(f"REDUCE {kind} whole, exp", A(0), A(0), A(512), 16, 5, F32, F32, acc="exp",
           flags=fl(func="exp", red=kind), a=one)
+    # batched REDUCE (sa_vefp NB): rows across / within batches, one-group rows, ABS (absmax), VALID + RELU,
+    # functions before the reduction, I8 inputs
+    c("mul then REDUCE max ABS, rows of 24", A(0), A(256), A(512), 72, 2, F32, F32, flags=fl("abs", red="max"),
+      a=one, rowlen=24)
+    c("REDUCE sum, rows of 1", A(0), A(0), A(512), 13, 5, F32, F32, flags=fl(red="sum"), a=f32b(-0.5), rowlen=1)
+    c("REDUCE sum + RELU, rows of 5, VALID", A(0), A(256), A(512), 35, 0 | 0x10, F32, F32, flags=fl(red="sum"),
+      a=one, rowlen=5, vld=4 * d + 1)
+    c("REDUCE max of recip, rows of 3", A(0), A(0), A(512), 33, 5, F32, F32, flags=fl("recip", red="max"), a=one,
+      rowlen=3)
+    c("REDUCE sum of I8 x I8, whole (37 groups)", SA(0), SB(0), A(512), 37, 2, I8, F32, flags=fl(red="sum"),
+      a=f32b(0.01))
+    c("REDUCE sum of rsqrt, rows of 6", A(0), A(0), A(512), 30, 5, F32, F32, flags=fl("rsqrt", red="sum"), a=one,
+      rowlen=6)
+    c("REDUCE max of exp, src1 MOD 7, rows of 10", A(0), A(0), A(512), 40, 5, F32, F32, acc="exp",
+      flags=fl("exp", m1="mod", red="max"), a=f32b(-1.0), p1=7, rowlen=10)
     # groups = words of the R x S matrix (R = 2d / 3d rows); source and destination must not overlap
     c("TRANSPOSE F32 (2d rows, S = 3)", A(0), 0, A(512), 2 * d * 3, 6, F32, F32, s=3)
     c("TRANSPOSE I8 (3d rows, S = 2)", SA(0), 0, SB(512), 3 * d * 2, 6, I8, I8, s=2)

@@ -37,7 +37,10 @@
 //              cycle, every unit's result at the same stage); the segment
 //              tables are read on all lanes at once; END, RELU / VALID and
 //              the output conversion are steps too; then the groups go to
-//              the output FIFO, one half per cycle.
+//              the output FIFO, one half per cycle. With REDUCE (any FUNC):
+//              after END the slots are reduced in order (MAX one per cycle,
+//              SUM on A2 with the halves' chains interleaved), the row ends
+//              through the tree as in the sequenced mode.
 //              Same operations in the same order as the sequenced mode
 //              (bit-exact), about 5x the throughput (plan P6).
 // TRANSPOSE (op 6): per D x D block, D words read at stride S into a
@@ -401,15 +404,19 @@ module sa_vefp #(
     reg  [15:0] sq_dst;
     localparam [4:0] Q_IDLE = 0, Q_ISSUE = 1, Q_WAIT = 2, Q_LOOK = 3, Q_POST = 4, Q_RED = 5, Q_REDW = 6,
                      Q_TREE = 7, Q_TREEW = 8, Q_OUT = 9, Q_OUTW = 10, Q_FIN = 11, Q_LOAD = 12,
-                     Q_BLOAD = 13, Q_BRUN = 14, Q_BDRAIN = 15, Q_BPUSH = 16;
+                     Q_BLOAD = 13, Q_BRUN = 14, Q_BDRAIN = 15, Q_BPUSH = 16, Q_BRED = 17, Q_BREDL = 18;
 
     // batched mode: slot s = a half (lanes s * FL ..), index s * FL + l
     // registers 0..7 of a slot: LUT RAM per lane (block brf below); 0 = the input (written when
     // collected), 1 = the result at END (and after the output conversion)
     reg  [FL-1:0]  BMASK [0:NBS-1];         // VALID mask per slot
     reg  [15:0]    BDST [0:NBS-1];          // destination word per slot (of its group)
+    reg  [NBS-1:0] BFIRST, BLAST;           // REDUCE: the slot's group starts / ends its row
+    reg  [5:1]     rp_v, rp_h;              // REDUCE SUM: A2 accumulations in flight (half), written at 5
+    reg            b_ret;                   // a reduced group without a write retired
     wire [31:0]    bopa_w [0:FL-1], bopb_w [0:FL-1];   // the issuing slot's operands a, b
     wire [31:0]    brda_w [0:FL-1];         // its register u_a (1 at the output conversion / push)
+    wire [31:0]    brv_w [0:FL-1];          // REDUCE: the slot's value (register 1, or NONE / ABS: 0 after VALID)
     reg  [LNB-1:0] bc_n;                    // halves collected
     reg  [LNB-1:0] bng;                     // halves in the batch being run
     reg  [7:0]     bpend;                   // groups read, not yet taken into a run
@@ -471,7 +478,7 @@ module sa_vefp #(
                 9:  uop = {4'd1, 4'd3, 4'd4, 3'd5};     // y1 = y0 * d
                 default: uop = {4'd9, 4'd5, 4'd0, 3'd1};  // END (fres: y1)
             endcase
-            default: uop = {4'd9, 11'd0};               // NONE / ABS: nothing to run
+            default: uop = {4'd9, 4'd0, 4'd0, 3'd1};    // NONE / ABS: nothing to run (batched: x to 1)
         endcase
     end
     wire [3:0] u_unit = uop[14:11], u_a = uop[10:7], u_b = uop[6:3];
@@ -562,6 +569,10 @@ module sa_vefp #(
     always @(posedge clk) begin
         sq_m_v <= 0; sq_a_v <= 0; sq_i_v <= 0; sq_f_v <= 0;
         retire_seq <= 0;
+        b_ret <= 0;
+        rp_v <= {rp_v[4:1], 1'b0};
+        rp_h <= {rp_h[4:1], 1'b0};
+        if (rp_v[5]) for (l = 0; l < FL; l = l + 1) ACCR[rp_h[5] * FL + l] <= a2o[l];
         // ---- batched mode: collection, write-back of the issued micro-ops (latency 2 at CQ stage 3, 4 at 5)
         cq_v[1] <= 0;
         for (bk = 2; bk <= CQ; bk = bk + 1) begin
@@ -573,6 +584,8 @@ module sa_vefp #(
         end else if (bmode) begin
             if (pv[PL-1]) begin                    // a half's A2 result (the pipeline is free while collecting)
                 BMASK[bc_n] <= pmask[PL-1];
+                BFIRST[bc_n] <= pfirst[PL-1];
+                BLAST[bc_n]  <= plast[PL-1];
                 BDST[bc_n]  <= pdst[PL-1];
                 bc_n <= bc_n + 1;
             end
@@ -590,7 +603,8 @@ module sa_vefp #(
                     b_slot <= 0;
                     b_out  <= 0;
                     sq_act <= 1;
-                    sq_st  <= Q_BRUN;
+                    sq_last <= 0;
+                    sq_st  <= red != 0 && (func == F_NONE || func == F_ABS) ? Q_BRED : Q_BRUN;   // nothing to run
                 end else if (seqmode && !bmode && pv[PL-1]) begin     // A2 result of a half; start after the last one
                     for (l = 0; l < FL; l = l + 1)
                         SQIN[ph[PL-1] * FL + l] <= func == F_ABS ? {1'b0, a2o[l][30:0]} : a2o[l];
@@ -778,7 +792,7 @@ module sa_vefp #(
                 endcase
                 if (b_slot == NBS - 1) begin
                     b_slot <= 0;
-                    if (b_out || (u_unit == 4'd9 && ot == T_F32)) sq_st <= Q_BDRAIN;
+                    if (b_out || (u_unit == 4'd9 && (ot == T_F32 || red != 0))) sq_st <= Q_BDRAIN;
                     else if (u_unit == 4'd9) b_out <= 1;
                     else b_step <= b_step + 1;
                 end else
@@ -786,9 +800,53 @@ module sa_vefp #(
             end
             Q_BDRAIN:                                                  // the last write-backs
                 if (cq_v == 0) begin
-                    sq_act <= 0;
                     b_slot <= 0;
-                    sq_st  <= Q_BPUSH;
+                    if (red != 0) begin
+                        sq_last <= 0;
+                        sq_st   <= Q_BRED;
+                    end else begin
+                        sq_act <= 0;
+                        sq_st  <= Q_BPUSH;
+                    end
+                end
+            Q_BRED: begin                                              // reduce slot b_slot (register 1), in order
+                begin : bred
+                    reg bh, blast_;
+                    bh = NH > 1 ? b_slot[0] : 1'b0;
+                    blast_ = BLAST[b_slot] && bh == NH - 1;
+                    if (!(rp_v[1] && rp_h[1] == bh || rp_v[2] && rp_h[2] == bh || rp_v[3] && rp_h[3] == bh ||
+                          rp_v[4] && rp_h[4] == bh || rp_v[5] && rp_h[5] == bh)) begin
+                        if (BFIRST[b_slot])
+                            for (l = 0; l < FL; l = l + 1) ACCR[bh * FL + l] <= brv_w[l];
+                        else if (!red_sum)
+                            for (l = 0; l < FL; l = l + 1) ACCR[bh * FL + l] <= fmax(ACCR[bh * FL + l], brv_w[l]);
+                        else begin
+                            for (l = 0; l < FL; l = l + 1) begin sq_aa[l] <= ACCR[bh * FL + l]; sq_ab[l] <= brv_w[l]; end
+                            sq_a_sub <= 0;
+                            rp_v[1] <= 1;
+                            rp_h[1] <= bh;
+                        end
+                        if (blast_) begin                              // row end: the tree, then the write
+                            sq_dst  <= BDST[b_slot];
+                            sq_last <= 1;
+                            sq_st   <= Q_BREDL;
+                        end else begin
+                            if (bh == NH - 1) b_ret <= 1;
+                            if (b_slot + 1 >= bng) sq_st <= Q_BREDL;
+                            else b_slot <= b_slot + 1;
+                        end
+                    end
+                end
+            end
+            Q_BREDL:                                                   // accumulations done: row end or batch end
+                if (rp_v == 0) begin
+                    if (sq_last) begin
+                        sq_lvl <= 0;
+                        sq_st  <= Q_TREE;
+                    end else begin
+                        sq_act <= 0;
+                        sq_st  <= Q_IDLE;
+                    end
                 end
             Q_BPUSH: begin                                             // one half per cycle (register 1 of slot
                 for (l = 0; l < FL; l = l + 1)                         // b_slot); the group's last: bq_write
@@ -797,9 +855,15 @@ module sa_vefp #(
                 if (b_slot + 1 >= bng) sq_st <= Q_IDLE;
             end
             default: begin                                             // Q_FIN: write (unless a row is still open)
-                sq_act     <= 0;
                 retire_seq <= 1;
-                sq_st      <= Q_IDLE;
+                if (bmode && b_slot + 1 < bng) begin                   // batched REDUCE: the batch's next slot
+                    b_slot  <= b_slot + 1;
+                    sq_last <= 0;
+                    sq_st   <= Q_BRED;
+                end else begin
+                    sq_act <= 0;
+                    sq_st  <= Q_IDLE;
+                end
             end
         endcase
     end
@@ -809,7 +873,7 @@ module sa_vefp #(
     // issuing slot (bdat) and written back through the CQ like the units' results.
     wire          b_iss = sq_st == Q_BRUN && !b_out;
     wire          b_col = resetn && active && bmode && pv[PL-1];
-    wire [2:0]    b_ra  = sq_st == Q_BPUSH || b_out ? 3'd1 : u_a[2:0];
+    wire [2:0]    b_ra  = sq_st == Q_BPUSH || sq_st == Q_BRED || b_out ? 3'd1 : u_a[2:0];
     generate
         for (gl = 0; gl < FL; gl = gl + 1) begin : brf
             reg  [31:0] rf [0:NBS*8-1];
@@ -818,11 +882,12 @@ module sa_vefp #(
             wire [31:0] rx = rf[b_slot * 8], ra = rf[b_slot * 8 + b_ra], rb = rf[b_slot * 8 + u_b[2:0]];
             wire [63:0] tr = ts[b_slot];
             wire [63:0] brow = sfu_rom(lk_addr(rx, ra));
+            wire [31:0] bfv  = func == F_NONE || func == F_ABS ? rx : fres(rx, rb, ra, ra);
             wire [31:0] bdat = u_unit == 4'd8 ? ldexp(ra, -12'sd17)
-                             : BMASK[b_slot][gl] ? relu_f(fres(rx, rb, ra, ra), relu) : 32'd0;
+                             : BMASK[b_slot][gl] ? relu_f(bfv, relu) : red == 2'd0 || red_sum ? 32'd0 : NINF;
             wire        we = cq_v[CQ] || b_col;
             wire [LNB+2:0] wa = cq_v[CQ] ? cq_s[CQ] * 8 + cq_r[CQ] : bc_n * 8;
-            wire [31:0] wd = !cq_v[CQ] ? a2o[gl] : cq_l2[CQ] || cq_d[CQ] ? dp5 : cq_m[CQ] ? m2o[gl] : a2o[gl];
+            wire [31:0] wd = !cq_v[CQ] ? (func == F_ABS ? {1'b0, a2o[gl][30:0]} : a2o[gl]) : cq_l2[CQ] || cq_d[CQ] ? dp5 : cq_m[CQ] ? m2o[gl] : a2o[gl];
             integer k;
             initial begin
                 for (k = 0; k < NBS * 8; k = k + 1) rf[k] = 32'd0;
@@ -840,6 +905,7 @@ module sa_vefp #(
             assign bopa_w[gl] = opsel(u_a, rx, ra, tr[63:32], tr[31:0]);
             assign bopb_w[gl] = opsel(u_b, rx, rb, tr[63:32], tr[31:0]);
             assign brda_w[gl] = ra;
+            assign brv_w[gl]  = func == F_NONE || func == F_ABS ? bdat : ra;      // (u_unit 9: END value)
         end
     endgenerate
 
@@ -889,7 +955,7 @@ module sa_vefp #(
                 red <= cmd_flags[9:8]; swapneg <= cmd_flags[10];
                 seqmode <= cmd_flags[9:8] != 0 || cmd_flags[3:1] == F_EXP || cmd_flags[3:1] == F_RECIP ||
                            cmd_flags[3:1] == F_RSQRT;
-                bmode   <= BATCH && cmd_flags[9:8] == 0 && (cmd_flags[3:1] == F_EXP || cmd_flags[3:1] == F_RECIP ||
+                bmode   <= BATCH && (cmd_flags[9:8] != 0 || cmd_flags[3:1] == F_EXP || cmd_flags[3:1] == F_RECIP ||
                            cmd_flags[3:1] == F_RSQRT);
                 imm <= cmd_imm; cA <= cmd_a; cB <= cmd_b;
                 rowlen <= cmd_rowlen == 0 ? cmd_groups : cmd_rowlen;
@@ -962,7 +1028,7 @@ module sa_vefp #(
                 oq_wp <= oq_wp + 1;
             end
             if (wr_now && !tw_en) oq_rp <= oq_rp + 1;
-            retire = (wr_now && !tw_en ? 1 : 0) + (retire_seq && !(red == 0 || sq_last) ? 1 : 0);
+            retire = (wr_now && !tw_en ? 1 : 0) + (retire_seq && !bmode && !(red == 0 || sq_last) ? 1 : 0) + (b_ret ? 1 : 0);
             inflight <= inflight + (rd_issue && !rpart ? 1 : 0) - retire;
 
             // ---- TRANSPOSE: read D words of a block, then write D words
