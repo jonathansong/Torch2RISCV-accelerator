@@ -22,6 +22,8 @@
 #   c6p_stories  stories15M prefill (M = D, the overlay's array size) + decode       deploy_c6p.sh stories D
 #   c6p_smollm2  SmolLM2-135M prefill (M = D) + decode, qhf                         deploy_c6p.sh smollm2 D
 #   hfgen        SmolLM2-135M prefill (M = D) + decode, unmodified HF                deploy_hfgen.sh
+#   c6p_qwen3    Qwen3-0.6B prefill (M = D) + decode (KV260 only; not in the default set: name it;
+#                the board needs a 640 MB udmabuf, insmod'ed right after boot)    deploy_c6p.sh qwen3 D
 # D = SA_D (board_env.sh: from the overlay's configuration); at D != 8 the host builds go to
 # build/<test>/<model>_d<D> (the D = 8 ones feed the golden corpus)
 # Each deploy runs in a memory-capped scope (MEM, default 12G).
@@ -80,7 +82,7 @@ reuse() {                      # <test>: the test's directory from $R, with this
 }
 for t in "${TESTS[@]}"; do
   if [ -n "$REUSE" ]; then
-    case $t in c1|c3|c55|c6p_stories|c6p_smollm2|hfgen) reuse "$t"; continue ;; esac
+    case $t in c1|c3|c55|c6p_stories|c6p_smollm2|hfgen|c6p_qwen3) reuse "$t"; continue ;; esac
   fi
   case $t in
     ddr)
@@ -104,7 +106,8 @@ for t in "${TESTS[@]}"; do
     c6p_stories) stage c6p_stories "$SA_REPO/build/deploy_c6p_stories_m$SA_D" "$SA_COMPILER/scripts/deploy_c6p.sh" stories "$SA_D" ;;
     c6p_smollm2) stage c6p_smollm2 "$SA_REPO/build/deploy_c6p_smollm2_m$SA_D" "$SA_COMPILER/scripts/deploy_c6p.sh" smollm2 "$SA_D" ;;
     hfgen)       stage hfgen "$SA_REPO/build/deploy_hfgen" "$SA_COMPILER/scripts/deploy_hfgen.sh" ;;
-    *) echo "unknown test $t (${ALL[*]})"; exit 2 ;;
+    c6p_qwen3)   stage c6p_qwen3 "$SA_REPO/build/deploy_c6p_qwen3_m$SA_D" "$SA_COMPILER/scripts/deploy_c6p.sh" qwen3 "$SA_D" ;;
+    *) echo "unknown test $t (${ALL[*]} c6p_qwen3)"; exit 2 ;;
   esac
 done
 cp "$SA_COMPILER/tests/board_regress.py" "$SA_COMPILER/tests/run_board.sh" "$Z/"

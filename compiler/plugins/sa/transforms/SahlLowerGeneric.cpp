@@ -208,9 +208,14 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
                   (isInnerIndex(c.getRhs()) && isa<BlockArgument>(c.getLhs()));
     });
   }
+  // marked by sahl-tile (rows too long for two at a time with a temp per
+  // operation: Qwen3's [16, 3072] at D = 16): one row at a time too, each row's
+  // temps released after it
+  bool tightRows = !dynInner && !maskRows && !sel && nloops == 2 && ranges[0] > 1 && ranges[1] % d == 0 &&
+                   g->hasAttr("sahl.row_by_row");
   // a dynamic innermost length: one row at a time (each VE then needs only a
   // dynamic LEN, and VALID for a mask)
-  if ((dynInner || maskRows) && !sel) {
+  if ((dynInner || maskRows || tightRows) && !sel) {
     int64_t H = nloops == 2 ? ranges[0] : 1;
     if (H > 16) return fail("more than 16 rows of a dynamic length or with a mask");
     if (dynInner) {

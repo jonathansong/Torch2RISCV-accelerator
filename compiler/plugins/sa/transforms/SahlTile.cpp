@@ -7,8 +7,9 @@
 //     combined over the pieces: the later pieces' reductions are marked
 //     sahl.accumulate, their result buffer allocated before the pieces with
 //     sahl.reserve and its fill done once);
-//   row pieces: every operation row by row over [R, C] (an even number of
-//     rows per piece).
+//   row pieces: every operation row by row over [R, C] or [R, C1, C2, ...]
+//     (an even number of rows per piece; two rows whose generics are lowered
+//     one row at a time, sahl.row_by_row, when not even two fit).
 // The ACC estimate is the lowering's (an upper bound: every buffer, a temp per
 // fp32 operation); sahl-plan-memory replaces it (R4).
 #include "SahlDialect.h"
@@ -29,29 +30,37 @@ namespace {
 struct Decider {
   func::FuncOp f;
   int64_t d;
-  // A dispatch whose operations go row by row over [R, C] (R != C): generics
-  // with maps (r, c), (r), (c) or () (reductions over c only, no indices or
-  // gathers) or over [R] / [C]; loads / stores of [R, C] (contiguous or a
-  // column slice), [R], [C] or scalars. Its rows are independent: (R, C).
-  std::optional<std::pair<int64_t, int64_t>> rowPieceable() {
-    int64_t R = -1, C = -1;
+  // A dispatch whose operations go row by row over [R, C] (R != C) or
+  // [R, C1, C2, ...] (a row's shape T = [C] or [C1, C2, ...]): generics over all
+  // the dimensions with maps (r, c...), (r), (c...) or () (reductions over c...
+  // only, no indices or gathers) or over [R] / [C]; loads / stores of [R, T]
+  // (contiguous or a column slice), [R], T or scalars. Its rows are
+  // independent: R and T.
+  std::optional<std::pair<int64_t, SmallVector<int64_t>>> rowPieceable() {
+    int64_t R = -1;
+    SmallVector<int64_t> T;
     for (Operation &op : f.getBody().front())
       for (Value v : op.getOperands())
-        if (auto mt = dyn_cast<MemRefType>(v.getType()); mt && mt.hasStaticShape() && mt.getRank() == 2 && R < 0 &&
+        if (auto mt = dyn_cast<MemRefType>(v.getType()); mt && mt.hasStaticShape() && mt.getRank() >= 2 && R < 0 &&
                                                             isa<linalg::GenericOp, sahl::LoadOp, sahl::StoreOp>(op)) {
           R = mt.getDimSize(0);
-          C = mt.getDimSize(1);
+          T.assign(mt.getShape().begin() + 1, mt.getShape().end());
         }
-    if (R <= 1 || C <= 1 || R == C) return std::nullopt;
+    if (R <= 1 || T.empty() || llvm::product_of(T) <= 1 || (T.size() == 1 && R == T[0])) return std::nullopt;
+    const unsigned rank = T.size() + 1;
     auto shapeOk = [&](Value v) {
       auto mt = dyn_cast<MemRefType>(v.getType());
       if (!mt || !mt.hasStaticShape()) return false;
       if (mt.getNumElements() == 1) return true;
-      if (mt.getRank() == 2) return mt.getDimSize(0) == R && mt.getDimSize(1) == C;
-      return mt.getRank() == 1 && (mt.getDimSize(0) == R || mt.getDimSize(0) == C);
+      ArrayRef<int64_t> sh = mt.getShape();
+      if (sh.size() == rank) return sh[0] == R && sh.drop_front() == ArrayRef<int64_t>(T);
+      return (sh.size() == 1 && sh[0] == R) || sh == ArrayRef<int64_t>(T);
     };
     MLIRContext *ctx = f.getContext();
-    AffineExpr r = getAffineDimExpr(0, ctx), c = getAffineDimExpr(1, ctx);
+    SmallVector<AffineExpr> all, inner;
+    for (unsigned i = 0; i < rank; ++i) (i ? inner : all).push_back(getAffineDimExpr(i, ctx));
+    all.append(inner);
+    AffineExpr r = getAffineDimExpr(0, ctx);
     for (Operation &op : f.getBody().front()) {
       if (auto l = dyn_cast<sahl::LoadOp>(&op)) {
         if (!shapeOk(l.getSrc()) || !shapeOk(l.getDst())) return std::nullopt;
@@ -64,12 +73,12 @@ struct Decider {
         if (!b.getOps<linalg::IndexOp>().empty() || !b.getOps<sahl::GatherOp>().empty()) return std::nullopt;
         auto iters = g.getIteratorTypesArray();
         auto maps = g.getIndexingMapsArray();
-        if (iters.size() == 2) {
+        if (iters.size() == rank) {
           if (iters[0] != utils::IteratorType::parallel) return std::nullopt;
           for (auto [v, m] : llvm::zip(g->getOperands(), maps)) {
             if (!shapeOk(v)) return std::nullopt;
-            if (m != AffineMap::get(2, 0, {r, c}, ctx) && m != AffineMap::get(2, 0, {r}, ctx) &&
-                m != AffineMap::get(2, 0, {c}, ctx) && m.getNumResults() != 0)
+            if (m != AffineMap::get(rank, 0, all, ctx) && m != AffineMap::get(rank, 0, {r}, ctx) &&
+                m != AffineMap::get(rank, 0, inner, ctx) && m.getNumResults() != 0)
               return std::nullopt;
           }
         } else if (iters.size() == 1) {
@@ -85,26 +94,44 @@ struct Decider {
         return std::nullopt;
       }
     }
-    return std::make_pair(R, C);
+    return std::make_pair(R, T);
   }
-  // ACC words such a dispatch may need at once: every [R, C] buffer, a temp per
-  // fp32 operation of a two-loop generic
-  int64_t pieceWords2D(int64_t R, int64_t C) {
-    int64_t bufs = 0;
+  // ACC words such a dispatch may need at once: every [R, T] buffer, a temp per
+  // fp32 operation of a generic over all the dimensions (with more than one
+  // dimension in a row: only the operations on a whole row's values, not those
+  // on a per-row scalar, e.g. RMSNorm's rsqrt of the mean, which with the other
+  // buffers (T, [R]) go into a part that does not scale with the rows; [R, C] as
+  // before): {words that scale with the rows, words that do not}
+  std::pair<int64_t, int64_t> pieceWordsRows(int64_t R, ArrayRef<int64_t> T) {
+    const unsigned rank = T.size() + 1;
+    int64_t bufs = 0, fixed = 0;
     for (Operation &op : f.getBody().front()) {
       if (auto a = dyn_cast<memref::AllocOp>(&op)) {
         auto mt = cast<MemRefType>(a.getType());
-        if (mt.getRank() == 2 && !mt.getElementType().isInteger(8)) ++bufs;
-      } else if (auto g = dyn_cast<linalg::GenericOp>(&op); g && g.getNumLoops() == 2) {
+        if (mt.getElementType().isInteger(8) || !mt.hasStaticShape()) continue;
+        if (mt.getRank() == int64_t(rank) && mt.getDimSize(0) == R) ++bufs;
+        else if (rank > 2) fixed += (mt.getNumElements() + d - 1) / d;
+      } else if (auto g = dyn_cast<linalg::GenericOp>(&op); g && g.getNumLoops() == rank) {
+        // the values that vary within a row: from an operand mapped to more than d0
+        llvm::DenseSet<Value> wide;
+        Block &blk = g.getRegion().front();
+        for (auto [arg, m] : llvm::zip(blk.getArguments(), g.getIndexingMapsArray()))
+          if (rank == 2 || m.getNumResults() > 1 || (m.getNumResults() == 1 && m.getResult(0) != getAffineDimExpr(0, f.getContext())))
+            wide.insert(arg);
         // the operations that make a new fp32 value (casts, compares, selects and
         // the to_i8 chain are stages of the VE that consumes them)
-        for (Operation &o : g.getRegion().front().without_terminator())
+        for (Operation &o : blk.without_terminator()) {
+          if (llvm::any_of(o.getOperands(), [&](Value v) { return wide.contains(v); }))
+            for (Value r : o.getResults()) wide.insert(r);
           if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp, arith::MaximumFOp, arith::MinimumFOp,
-                  math::ExpOp, math::RsqrtOp, math::AbsFOp, arith::NegFOp>(o))
-            ++bufs;
+                  math::ExpOp, math::RsqrtOp, math::AbsFOp, arith::NegFOp>(o)) {
+            if (rank == 2 || wide.contains(o.getResult(0))) ++bufs;
+            else fixed += R;                     // (a word per row: the broadcast layout)
+          }
+        }
       }
     }
-    return bufs * ((R * C + d - 1) / d);
+    return {bufs * ((R * llvm::product_of(T) + d - 1) / d), fixed};
   }
 
   // An element-wise dispatch (static contiguous loads / stores, generics with
@@ -254,8 +281,8 @@ void flatPieces(func::FuncOp f, int64_t N, int64_t len) {
   for (Operation *op : llvm::reverse(work)) op->erase();
 }
 
-// row pieces [r0, r0 + rn) of the [R, C] and [R] operands
-void rowPieces(func::FuncOp f, int64_t R, int64_t C, int64_t rn) {
+// row pieces [r0, r0 + rn) of the [R, T] and [R] operands
+void rowPieces(func::FuncOp f, int64_t R, ArrayRef<int64_t> T, int64_t rn, bool rowByRow) {
   Block &blk = f.getBody().front();
   SmallVector<Operation *> work;
   for (Operation &op : blk)
@@ -264,7 +291,7 @@ void rowPieces(func::FuncOp f, int64_t R, int64_t C, int64_t rn) {
   auto byRow = [&](Value v) {
     auto mt = dyn_cast<MemRefType>(v.getType());
     return mt && mt.hasStaticShape() && mt.getRank() >= 1 && mt.getDimSize(0) == R &&
-           (mt.getRank() == 1 || mt.getDimSize(1) == C);
+           (mt.getRank() == 1 || mt.getShape().drop_front() == T);
   };
   for (int64_t r0 = 0; r0 < R; r0 += rn) {
     int64_t n = std::min(rn, R - r0);
@@ -289,7 +316,8 @@ void rowPieces(func::FuncOp f, int64_t R, int64_t C, int64_t rn) {
         }
         map.map(v, r);
       }
-      ib.clone(*op, map);
+      Operation *c = ib.clone(*op, map);
+      if (rowByRow && isa<linalg::GenericOp>(c)) c->setAttr("sahl.row_by_row", UnitAttr::get(c->getContext()));
     }
   }
   for (Operation *op : llvm::reverse(work)) op->erase();
@@ -325,14 +353,18 @@ struct SahlTilePass : public PassWrapper<SahlTilePass, OperationPass<func::FuncO
       flatPieces(f, *n, len);
       return;
     }
-    if (auto rc = dc.rowPieceable()) {
-      auto [R, C] = *rc;
-      int64_t words = dc.pieceWords2D(R, C);
-      if (words > cap) {
-        // rows per piece: even (the per-row vectors' DMAs stay 8-byte aligned)
-        int64_t rn = std::max<int64_t>(R * cap / words, 1) / 2 * 2;
-        if (rn < 2) return;                      // (the lowering reports ACC full)
-        rowPieces(f, R, C, rn);
+    if (auto rt = dc.rowPieceable()) {
+      auto &[R, T] = *rt;
+      auto [words, fixed] = dc.pieceWordsRows(R, T);
+      if (words + fixed > cap) {
+        // rows per piece: even (the per-row vectors' DMAs stay 8-byte aligned); if
+        // not even two fit, two whose generics the lowering takes one row at a time
+        // (a row's temps released after it; it reports ACC full if that does not fit)
+        int64_t rn = R * std::max<int64_t>(cap - fixed, 0) / words / 2 * 2;
+        bool rowByRow = rn < 2;
+        if (rowByRow) rn = 2;
+        if (rn >= R) return;
+        rowPieces(f, R, T, rn, rowByRow);
       }
     }
   }

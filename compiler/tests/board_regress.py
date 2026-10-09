@@ -17,6 +17,7 @@ K1a verification (docs/kv260_upgrade_plan.md):
   c6p_stories  board_llm.py: stories15M prefill + decode; board_profile.py (+ event counters: *_perf.csv)
   c6p_smollm2  board_llm.py: SmolLM2-135M prefill + decode (qhf); board_profile.py
   hfgen        board_llm.py: SmolLM2-135M prefill + decode (generic HF); board_profile.py
+  c6p_qwen3    board_llm.py: Qwen3-0.6B prefill + decode (KV260; a 640 MB udmabuf); board_profile.py
 """
 import glob
 import os
@@ -45,6 +46,8 @@ RUNS = [
     ("c6p_smollm2", "c6p_smollm2_profile", "board_profile.py", [f"SA_PROFILE_PERF={RES}/c6p_smollm2_perf.csv"], False),
     ("hfgen", "hfgen", "board_llm.py", [], True),
     ("hfgen", "hfgen_profile", "board_profile.py", [f"SA_PROFILE_PERF={RES}/hfgen_perf.csv"], False),
+    ("c6p_qwen3", "c6p_qwen3", "board_llm.py", [], True),
+    ("c6p_qwen3", "c6p_qwen3_profile", "board_profile.py", [f"SA_PROFILE_PERF={RES}/c6p_qwen3_perf.csv"], False),
 ]
 
 
