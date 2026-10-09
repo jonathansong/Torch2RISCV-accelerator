@@ -211,7 +211,8 @@ module sa_cmdfetch #(
     reg  [`SA_PKT_W-1:0] cmd_pkt;
     always @* begin
         case (op)
-            DESC_LD: cmd_pkt = pkt_ld(ddr, w[2][31:0], w[2][47:32], w[2][63:48], w[3][31:0], w[3][33:32]);
+            DESC_LD: cmd_pkt = pkt_ldg(ddr, w[2][31:0], w[2][47:32], w[2][63:48], w[3][31:0], w[3][33:32],
+                                       w[3][49:34], w[3][57:50], w[3][58]);
             DESC_ST: cmd_pkt = pkt_st(ddr, w[2][31:0], w[2][47:32], w[2][63:48], w[3][31:0]);
             DESC_EX: cmd_pkt = pkt_ex(w[1][15:0], w[1][31:16], w[1][47:32], w[1][59:48], w[1][60],
                                       rep == 0 ? 12'd0 : rep - 12'd1, w[2][31:16], w[2][47:32], w[2][63:48]);

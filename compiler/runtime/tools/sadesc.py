@@ -69,6 +69,7 @@ EXT = struct.Struct("<8I")
 MAX_CONSTANTS = 6                    # PARAM0..5; PARAM6 / 7 belong to the template
 MAX_BINDINGS = 16                    # BASE0..15
 CAPS_DESC, CAPS_NOTIFY, CAPS_FPVE, CAPS_CMDX = 1 << 21, 1 << 22, 1 << 23, 1 << 24
+CAPS_GEMV = 1 << 25                  # LD mode GEMV (K2b)
 OP_JUMP, OP_CALL, OP_RET = DescList.JUMP, DescList.CALL, DescList.RET
 
 

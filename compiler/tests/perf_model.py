@@ -15,7 +15,7 @@ Timing rules follow the RTL (rtl/sysarray):
               calls, END, completion record)
   scheduler   program order; a command waits while another engine has an
               in-flight command with a conflicting bank access (6 banks:
-              SPAD_A / SPAD_B / ACC halves; EX and VE share ports, so any
+              SPAD_A / SPAD_B / ACC halves; EX and VE (and LD and ST) share ports, so any
               common bank); engine queues of 4, in-flight masks of 8 (sa_sched)
   LD / ST     one command at a time; fixed latency + max(beats, bursts x
               c_burst); bursts <= 16 beats, split at 4 KB; a 128-bit beat whose
@@ -291,7 +291,7 @@ def run_list(arch, cmds, gemv=False):
             for o in range(4):
                 if o == e:
                     continue
-                share = (e == 2 and o == 3) or (e == 3 and o == 2)
+                share = {e, o} in ({2, 3}, {0, 1})
                 for (_, _, dn, r, w) in reversed(hist[o][-8:]):
                     if dn <= t:
                         continue
@@ -317,7 +317,7 @@ def run_list(arch, cmds, gemv=False):
 
 def run_list_ooo(arch, cmds, gemv=False, window=16):
     """H2: per-engine issue in order, but a command waits only for earlier commands (any engine,
-    dispatched or not) whose address ranges conflict; EX / VE still share the SPAD_B / ACC ports.
+    dispatched or not) whose address ranges conflict; EX / VE (LD / ST) still share their ports.
     The scheduler looks at most `window` commands past the oldest undispatched one."""
     eng_free = [0.0] * 4
     xtag = [None]
@@ -346,7 +346,7 @@ def run_list_ooo(arch, cmds, gemv=False, window=16):
             p = cmds[j]
             if p.op == OP_FENCE or p.eng == e or done_t[j] <= t:
                 continue
-            share = (e == 2 and p.eng == 3) or (e == 3 and p.eng == 2)
+            share = {e, p.eng} in ({2, 3}, {0, 1})
             if conflict(c, p) or (share and ((c.r | c.w) & (p.r | p.w))):
                 t = max(t, done_t[j])
         cy = cost(arch, c, gemv) + xload(c, xtag, arch.d)

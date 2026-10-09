@@ -136,7 +136,7 @@ MATMUL_ERR_CODES = {1: "bad DIM", 2: "bad address", 3: "read SLVERR/DECERR",
 
 # ------------------------------------------------------------------ descriptors
 MEM_SPAD_A, MEM_SPAD_B, MEM_ACC = 1, 2, 3
-LD_LINEAR, LD_INTERLEAVE = 0, 1
+LD_LINEAR, LD_INTERLEAVE, LD_GEMV = 0, 1, 2   # LD modes (GEMV: K2b, docs/k2b_gemv_design.md)
 _M32, _M64 = 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF
 
 
@@ -195,6 +195,15 @@ class DescList:
     def ld(self, ddr, la, rows, row_bytes, pitch, mode=LD_LINEAR, base=None, fence_before=False, dyn=()):
         return self._put(self.LD, self._flags(base, fence_before), ddr & _M32,
                          la | rows << 32 | row_bytes << 48, pitch | mode << 32, dyn=dyn)
+
+    def gemv(self, ddr, la, strips, row_bytes, pitch, xword, cstep=1, acc=False, base=None, fence_before=False,
+             dyn=()):
+        """LD mode GEMV: ACC word la + s * cstep (+)= x . W_s for s < strips (<= 8); x = row_bytes / D int8
+        at SPAD_A word xword on, W_s = row_bytes bytes (K rows of D int8) at ddr + s * pitch."""
+        return self._put(self.LD, self._flags(base, fence_before), ddr & _M32,
+                         la | strips << 32 | row_bytes << 48,
+                         pitch | LD_GEMV << 32 | (xword & 0xFFFF) << 34 | (cstep & 0xFF) << 50 | int(acc) << 58,
+                         dyn=dyn)
 
     def st(self, ddr, la, rows, row_bytes, pitch, base=None, fence_before=False, dyn=()):
         return self._put(self.ST, self._flags(base, fence_before), ddr & _M32,

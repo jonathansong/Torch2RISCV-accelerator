@@ -24,7 +24,9 @@ localparam [1:0] CMD_VE = 2'd3;       // M3
 
 // Transfer modes (LD_MODE)
 localparam integer MODE_INTERLEAVE = 0;   // bit index
-localparam integer MODE_ZERO_PAD   = 1;   // bit index (M4)
+localparam integer MODE_ZERO_PAD   = 1;   // bit index (M4; unused)
+localparam [1:0]   MODE_GEMV       = 2'd2;  // mode value: weights streamed into sa_gemv (K2b,
+                                            // docs/k2b_gemv_design.md §4); mode 3 is invalid
 
 // mat_cfg keys
 localparam [7:0] CFG_LD_ROWS      = 8'd0;
@@ -79,6 +81,7 @@ localparam [3:0] XERR_BRESP = 4'd4;   // DMA write response SLVERR/DECERR
 //   [129:98]  pitch                 (LD/ST)
 //   [131:130] mode                  (LD)
 //   [132]     internal              (issued by the legacy sequencer; allows MEM_DESC)
+//   [148:133] x word  [156:149] C step  [157] accumulate   (LD mode GEMV, K2b)
 // VE (M3):
 //   [33:2] src1 LADDR  [65:34] src2 LADDR  [97:66] dst LADDR  [113:98] groups (of VL elements)
 //   [121:114] op byte  [127:122] types {out[3:2], in[1:0]}  [143:128] src2 period
@@ -111,6 +114,12 @@ localparam integer PC_CYCLES = 0,  PC_CMD_LD = 1,  PC_CMD_ST = 2,  PC_CMD_EX = 3
 function [PKT_W-1:0] pkt_ld(input [31:0] ddr, input [31:0] laddr, input [15:0] rows,
                             input [15:0] rb, input [31:0] pitch, input [1:0] mode);
     pkt_ld = {1'b0, mode, pitch, rb, rows, laddr, ddr, CMD_LD};
+endfunction
+// LD with the GEMV fields (descriptor w3[49:34] x word, [57:50] C step, [58] accumulate)
+function [PKT_W-1:0] pkt_ldg(input [31:0] ddr, input [31:0] laddr, input [15:0] rows,
+                             input [15:0] rb, input [31:0] pitch, input [1:0] mode,
+                             input [15:0] xword, input [7:0] cstep, input acc);
+    pkt_ldg = pkt_ld(ddr, laddr, rows, rb, pitch, mode) | ({acc, cstep, xword} << 133);
 endfunction
 function [PKT_W-1:0] pkt_st(input [31:0] ddr, input [31:0] laddr, input [15:0] rows,
                             input [15:0] rb, input [31:0] pitch);

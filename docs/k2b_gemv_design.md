@@ -123,9 +123,20 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 | 阶段 | 内容 | 验证 |
 |---|---|---|
 | **G1** | 功能仿真器 + 编译器（`sahl.gemv`、目标配置开关），不碰硬件 | Qwen3 / SmolLM2 / stories 的 decode 在 sim 上与现有路径逐位一致；`dispatch_check`；新基线 |
-| **G2** | RTL：`sa_gemv` + `sa_ld` 的 GEMV 模式 + `sa_sched` 的检查与掩码，先 NPORTS = 1（功能正确，16 B / 周期） | `tb_sa_gemv`（随机 K / S / cstep / acc / 对齐，对照 funcsim）；`tb_sa_ld`；`tb_sa_unit`；固件系统仿真 `desc_run`；`make test / test16 / test128` |
+| **G2** ✅ | RTL：`sa_gemv` + `sa_ld` 的 GEMV 模式 + `sa_sched` 的检查与掩码，先 NPORTS = 1（功能正确，16 B / 周期） | `tb_sa_gemv`（随机 K / S / cstep / acc / 对齐，对照 funcsim）；`tb_sa_ld`；`tb_sa_unit`；固件系统仿真 `desc_run`；`make test / test16 / test128` |
 | **G3** | NPORTS = 2：R 侧双口同时接收、BD 加 HP2、`bwtest` 双口测试 | `tb_sa_dma GEN="NP=2 D=16 DMA_W=128"` 加 GEMV 模式；用户构建比特流；板上 bwtest |
 | **G4** | 板上验收 | REGRESSION PASS、逐位一致；decode 的 token/s 与模型预测（×1.76–1.85）对比 |
+
+**G2 实现（2026-10-09）**：`rtl/sysarray/sa_gemv.v` + `sa_ld` / `sa_sched` / `sa_cmdfetch` / `sa_unit`（参数 `GEMV`，要求 D = 16、DMA_W = 128；CAPS bit 25；`build_bitstream.sh -gemv 1`，配置后缀 `_gemv`）。与 §5 / §6 的差别和细节：
+
+- lane 数 = `NPORTS`，R 侧的 GEMV 路径从一开始就是每口独立接收（G3 只剩 BD 和带宽测试）；`tb_sa_dma` 在 NP = 1 / 2 / 3 下都测了多 lane 求和。
+- 累加器每 lane `acc[s]`（8 × 16 × int32），不清零：每个 strip 在该 lane 上的第一拍直接写入（touched 掩码），没碰到的 strip 写回时当 0。
+- x 读入期间 `rready` 拉低（AR 照发，返回的拍在互连里等），读入一个字一个周期；驻留标记在任何 SPAD_A 写（LD 写口或 VE 写）时清除。
+- 写回每个 strip 一个周期（acc = 1 时两个：先读 ACC 原值）。
+- 包格式：LD 包的 [148:133] x word、[156:149] C step、[157] acc（`pkt_ldg`）；mode 3 一律 SHAPE；没有 GEMV 单元时 mode 2 也是 SHAPE。
+- 记分板：GEMV 在 LD 的口上**读** SPAD_A，与 ST 的读同在 SPAD_A 的 A 侧；两个读者原来不算冲突，会在同一 bank 的同一侧撞口。现在 LD 与 ST 像 EX 与 VE 一样，任何共同 bank 都冲突（原有命令不受影响：普通 LD 只写）。性能模型同样处理。
+- 编译器在 `--iree-sa-gemv-ports` 非零时在可执行文件头的 required CAPS 里置 bit 25（运行时目前不检查 CAPS，G4 前补上）。
+- 测试：`tb_sa_dma GEN="NP=1|2|3 D=16 DMA_W=128"`（随机 K / strip / C step / acc / pitch、跨 4 KB、跨 bank、K = 4080、驻留命中与失效、SLVERR），`tb_sa_unit GEN="D=16 DMA_W=128 GEMV=1"`（描述符解码、记分板：VE 等 GEMV 写完、驻留、4 种错误、CAPS）；都加进了 `make test128`；固件系统仿真 `firmware/desc_run make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1`（PicoRV32 + RTL，Python `DescList.gemv` 编码：int32 x 经 VE 转 int8、4 + 2 个 strip、K 两半累加，对照功能仿真器与 NumPy）。
 
 **第二阶段（按需）**：P = 4（HP0 现在是 PicoRV32 的口，要把它挪到 HPC0 或 LPD；×2.6–3.2）；SPAD 子银行（LD 写 SPAD / ACC 也到 32 B / 周期，prefill ×1.07）；LD 命令流水（隐藏每条命令约 65 周期的延迟，+2–3%）。
 

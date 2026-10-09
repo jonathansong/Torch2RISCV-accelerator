@@ -20,7 +20,8 @@
 module sa_sched #(
     parameter integer D          = 8,
     parameter integer SPAD_WORDS = 16384,
-    parameter integer ACC_WORDS  = 8192
+    parameter integer ACC_WORDS  = 8192,
+    parameter integer GEMV       = 0               // LD mode GEMV accepted (sa_gemv present)
 ) (
     input  wire               clk,
     input  wire               resetn,
@@ -106,6 +107,7 @@ module sa_sched #(
     reg [31:0]       d1_span;          // LD/ST words;  EX: Kt*D
     reg [31:0]       d1_bext;          // EX: (repeat-1) * B step
     reg [31:0]       d1_cext;          // EX: (repeat-1) * C step + (D-1) * C row stride
+    reg [11:0]       d1_gext;          // LD GEMV: (strips-1) * C step
     wire [3:0]  f_mem = fh[65:62];
     wire [15:0] f_rows = fh[81:66];
     wire [15:0] f_rb   = fh[97:82];
@@ -114,6 +116,7 @@ module sa_sched #(
     wire [15:0] f_crow = fh[122:107] == 0 ? 16'd1 : fh[122:107];
     wire [31:0] f_bext = fh[74:63] * fh[90:75];
     wire [31:0] f_cext = fh[74:63] * fh[106:91] + (D - 1) * f_crow;
+    wire [11:0] f_gext = (fh[69:66] - 4'd1) * fh[156:149];   // strips <= 8 is checked in d2
     wire [31:0] f_span = fh[1:0] == CMD_EX ? fh[61:50] * D :
                          fh[130] ? (f_rb >> LOGD) * f_rows : f_wpr * f_rows;
 
@@ -132,6 +135,9 @@ module sa_sched #(
     wire [15:0] h_c    = d1[49:34];
     wire [11:0] h_kt   = d1[61:50];
     wire        h_acc  = d1[62];
+    wire [15:0] h_xword = d1[148:133];              // LD GEMV
+    wire [7:0]  h_gcstep = d1[156:149];
+    wire        h_gacc  = d1[157];
 
     wire        h_ilv     = h_mode[MODE_INTERLEAVE];
     wire [31:0] last_word = h_word + d1_span - 1;
@@ -145,6 +151,16 @@ module sa_sched #(
     wire [31:0] b_last    = h_b + d1_bext + k_words - 1;
     wire [31:0] c_last    = h_c + d1_cext;
     wire        ex_range  = h_a + k_words <= SPAD_WORDS && b_last < SPAD_WORDS && c_last < ACC_WORDS;
+
+    // LD mode GEMV (K2b): x = SPAD_A [xword, xword + K/D), results = ACC words
+    // C + s * C step (s < strips <= 8); 16-byte aligned DDR, K a multiple of D
+    wire        h_gemv    = h_type == CMD_LD && h_mode == MODE_GEMV;
+    wire [15:0] g_xlast   = h_xword + (h_rb >> (2 * LOGD)) - 1;
+    wire [31:0] g_clast   = h_word + d1_gext;
+    wire        g_shape   = GEMV != 0 && h_ddr[3:0] == 0 && h_pitch[3:0] == 0 && h_rb != 0 &&
+                            h_rb[2*LOGD-1:0] == 0 && h_rows != 0 && h_rows <= 8 && h_gcstep != 0;
+    wire        g_range   = h_mem == MEM_ACC && {16'd0, h_xword} + (h_rb >> (2 * LOGD)) <= SPAD_WORDS &&
+                            g_clast < ACC_WORDS;
 
     // VE command (M3)
     wire [3:0]  v_m1 = d1[33:30],  v_m2 = d1[65:62],  v_md = d1[97:94];
@@ -218,6 +234,18 @@ module sa_sched #(
             CMD_LD:
                 if (h_int && h_mem == MEM_DESC) begin
                     // legacy descriptor fetch into internal registers: no banks
+                end else if (h_mode == 2'd3) begin
+                    c_valid_cmd = 0; c_err_code = XERR_SHAPE;
+                end else if (h_gemv) begin
+                    if (!g_shape) begin
+                        c_valid_cmd = 0; c_err_code = XERR_SHAPE;
+                    end else if (!g_range) begin
+                        c_valid_cmd = 0; c_err_code = XERR_RANGE;
+                    end else begin
+                        c_r = banks(MEM_SPAD_A, h_xword, g_xlast) |
+                              (h_gacc ? banks(MEM_ACC, h_word, g_clast) : 6'd0);
+                        c_w = banks(MEM_ACC, h_word, g_clast);
+                    end
                 end else if (!shape_ok) begin
                     c_valid_cmd = 0; c_err_code = XERR_SHAPE;
                 end else if (!range_ok) begin
@@ -311,7 +339,8 @@ module sa_sched #(
 
     // hazard against the other engines (RAW, WAR, WAW); EX and VE also share
     // the memory ports of SPAD side B / ACC side A, so any common bank
-    // between them conflicts, even two readers (M3)
+    // between them conflicts, even two readers (M3); likewise LD and ST
+    // (SPAD side A / ACC side B: a GEMV reads x on the LD port, K2b)
     reg hazard;
     integer o;
     always @* begin
@@ -319,7 +348,8 @@ module sa_sched #(
         for (o = 0; o < 4; o = o + 1)
             if (o != h_eng) begin
                 hazard = hazard | |(h_r & eng_w[o]) | |(h_w & eng_r[o]) | |(h_w & eng_w[o]);
-                if ((h_eng == ENG_EX && o == ENG_VE) || (h_eng == ENG_VE && o == ENG_EX))
+                if ((h_eng == ENG_EX && o == ENG_VE) || (h_eng == ENG_VE && o == ENG_EX) ||
+                    (h_eng == ENG_LD && o == ENG_ST) || (h_eng == ENG_ST && o == ENG_LD))
                     hazard = hazard | |((h_r | h_w) & (eng_r[o] | eng_w[o]));
             end
     end
@@ -376,6 +406,7 @@ module sa_sched #(
                 d1_span <= f_span;
                 d1_bext <= f_bext;
                 d1_cext <= f_cext;
+                d1_gext <= f_gext;
                 in_rp   <= in_rp + 1;
             end
             if (d1_free) d1_v <= fifo_pop;

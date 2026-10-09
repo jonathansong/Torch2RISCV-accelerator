@@ -20,7 +20,8 @@ module sa_unit #(
     parameter integer ACC_WORDS  = 262144 / (4 * D),  // 256 KB
     parameter integer PERF       = 1,                 // performance counters (0: removed)
     parameter integer DMA_W      = 64,                // DMA masters' data width: 64 or 128 (K2a)
-    parameter integer VEFP_NB    = 8                  // fp VE: batched special functions (P6; 0: off)
+    parameter integer VEFP_NB    = 8,                 // fp VE: batched special functions (P6; 0: off)
+    parameter integer GEMV       = 0                  // LD mode GEMV, sa_gemv (K2b; D = 16, DMA_W = 128)
 ) (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 aclk CLK", X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m0_axi:m1_axi:m2_axi, ASSOCIATED_RESET aresetn" *)
     input  wire        aclk,
@@ -316,7 +317,7 @@ module sa_unit #(
     wire [PKT_W-1:0] ld_pkt, st_pkt, ex_pkt, ve_pkt;
     wire        ld_done, ld_err, st_done, st_err, ex_done, ve_done;
 
-    sa_sched #(.D(D), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS)) sched (
+    sa_sched #(.D(D), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS), .GEMV(GEMV)) sched (
         .clk(aclk), .resetn(resetn),
         .in_valid(in_valid), .in_ready(in_ready), .in_pkt(in_pkt),
         .ld_valid(ld_v), .ld_ready(ld_r), .ld_pkt(ld_pkt),
@@ -373,7 +374,7 @@ module sa_unit #(
     wire [DMA_W-1:0] lw_data;
 
     sa_legacy #(.D(D), .NPORTS(NPORTS), .VL(D), .SPAD_WORDS(SPAD_WORDS), .ACC_WORDS(ACC_WORDS),
-                .PERF(PERF)) legacy (
+                .PERF(PERF), .GEMV(GEMV)) legacy (
         .clk(aclk), .resetn(resetn),
         .s_axi_awaddr(s_axi_awaddr), .s_axi_awvalid(s_axi_awvalid), .s_axi_awready(s_axi_awready),
         .s_axi_wdata(s_axi_wdata), .s_axi_wvalid(s_axi_wvalid), .s_axi_wready(s_axi_wready),
@@ -417,12 +418,20 @@ module sa_unit #(
     wire [NPORTS*DMA_W/8-1:0] wstrb;
     wire [NPORTS*2-1:0]  rresp, bresp;
 
+    // LD mode GEMV: the weight beats go to sa_gemv (below)
+    wire                 g_xready, g_busy;
+    wire [NPORTS-1:0]    g_valid;
+    wire [NPORTS*DMA_W-1:0] g_data;
+    wire [NPORTS*3-1:0]  g_s;
+    wire [NPORTS*12-1:0] g_k;
+
     sa_ld #(.D(D), .NPORTS(NPORTS), .DMA_W(DMA_W)) ld (
         .clk(aclk), .resetn(resetn), .cmd_valid(ld_v), .cmd_ready(ld_r),
         .cmd_ddr(ld_pkt[33:2]), .cmd_mem(ld_pkt[65:62]), .cmd_word(ld_pkt[49:34]),
         .cmd_rows(ld_pkt[81:66]), .cmd_row_bytes(ld_pkt[97:82]), .cmd_pitch(ld_pkt[129:98]),
         .cmd_mode(ld_pkt[131:130]), .done(ld_done), .err(ld_err), .busy(),
         .lw_en(lw_en), .lw_mem(lw_mem), .lw_word(lw_word), .lw_lane(lw_lane), .lw_two(lw_two), .lw_data(lw_data),
+        .g_xready(g_xready), .g_busy(g_busy), .g_valid(g_valid), .g_data(g_data), .g_s(g_s), .g_k(g_k),
         .m_araddr(araddr), .m_arlen(arlen), .m_arvalid(arvalid), .m_arready(arready),
         .m_rdata(rdata), .m_rresp(rresp), .m_rlast(rlast), .m_rvalid(rvalid), .m_rready(rready),
         .perf_ev(ld_ev), .perf_two(ld_two));
@@ -523,6 +532,36 @@ module sa_unit #(
         .ac_en(fac_en), .ac_we(fac_we), .ac_addr(fac_addr), .ac_din(fac_din), .ac_dout(vac_dout),
         .perf_ev(vf_ev));
 
+    // -------------------------------------------------------------- GEMV
+    // x from SPAD_A side A requester 0 and results to ACC side B requester 0:
+    // both are the LD engine's write ports, idle while it runs a GEMV
+    wire            gx_en, gc_en, gc_we;
+    wire [SAW-1:0]  gx_addr;
+    wire [CAW-1:0]  gc_addr;
+    wire [32*D-1:0] gc_din;
+    wire [8*D-1:0]  spad_a_r0;
+    wire [32*D-1:0] acc_r0;
+    wire            g_xinval;                    // a write to SPAD_A (x residency)
+    generate if (GEMV != 0) begin : gemv_u
+        if (D != 16 || DMA_W != 128) begin : bad
+            initial $fatal(1, "sa_unit: GEMV needs D = 16 and DMA_W = 128");
+        end
+        sa_gemv #(.D(D), .NL(NPORTS), .SAW(SAW), .CAW(CAW)) gemv (
+            .clk(aclk), .resetn(resetn),
+            .start(ld_v && ld_r && ld_pkt[131:130] == MODE_GEMV),
+            .cmd_xword(ld_pkt[148:133]), .cmd_c(ld_pkt[49:34]), .cmd_strips(ld_pkt[81:66]),
+            .cmd_rb(ld_pkt[97:82]), .cmd_cstep(ld_pkt[156:149]), .cmd_acc(ld_pkt[157]),
+            .busy(g_busy), .xready(g_xready),
+            .b_valid(g_valid), .b_data(g_data), .b_s(g_s), .b_k(g_k),
+            .x_inval(g_xinval),
+            .xr_en(gx_en), .xr_addr(gx_addr), .xr_data(spad_a_r0),
+            .c_en(gc_en), .c_we(gc_we), .c_addr(gc_addr), .c_din(gc_din), .c_dout(acc_r0));
+    end else begin : no_gemv
+        assign g_xready = 1; assign g_busy = 0;
+        assign gx_en = 0; assign gx_addr = 0;
+        assign gc_en = 0; assign gc_we = 0; assign gc_addr = 0; assign gc_din = 0;
+    end endgenerate
+
     // ---------------------------------------------------------- memories
     // SPAD side A: [0] LD write, [1] ST read; side B: [0] EX read, [1] VE.
     // ACC  side A: [0] EX drain / accumulate, [1] VE;  side B: [0] LD write, [1] ST read.
@@ -538,15 +577,15 @@ module sa_unit #(
         assign spad_lwd = lw_data[8*D-1:0];
     end endgenerate
     wire ld_a = lw_en && lw_mem == MEM_SPAD_A, ld_b = lw_en && lw_mem == MEM_SPAD_B, ld_c = lw_en && lw_mem == MEM_ACC;
+    assign g_xinval = ld_a || (vsa_en && |vsa_we);
     wire st_a = lr_en && lr_mem == MEM_SPAD_A, st_b = lr_en && lr_mem == MEM_SPAD_B, st_c = lr_en && lr_mem == MEM_ACC;
-    wire [8*D-1:0]  unused_a, unused_b;
-    wire [32*D-1:0] unused_c;
+    wire [8*D-1:0]  unused_b;
 
     sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(2)) spad_a (
         .clk(aclk),
-        .a_en({st_a, ld_a}), .a_we({{D{1'b0}}, spad_we}),
-        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_lwd}),
-        .a_dout({lr_a, unused_a}),
+        .a_en({st_a, ld_a || gx_en}), .a_we({{D{1'b0}}, ld_a ? spad_we : {D{1'b0}}}),
+        .a_addr({lr_word[SAW-1:0], gx_en ? gx_addr : lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_lwd}),
+        .a_dout({lr_a, spad_a_r0}),
         .b_en({vsa_en, sa_en}), .b_we({vsa_we, {D{1'b0}}}), .b_addr({vsa_addr, sa_addr}),
         .b_din({vsa_din, {8*D{1'b0}}}), .b_dout({vsa_dout, sa_dout}));
     sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(2)) spad_b (
@@ -560,9 +599,10 @@ module sa_unit #(
         .clk(aclk),
         .a_en({vac_en, acc_en}), .a_we({vac_we, acc_we}), .a_addr({vac_addr, acc_addr}),
         .a_din({vac_din, acc_din}), .a_dout({vac_dout, acc_dout}),
-        .b_en({st_c, ld_c}), .b_we({{4*D{1'b0}}, acc_lwe}),
-        .b_addr({lr_word[CAW-1:0], lw_word[CAW-1:0]}), .b_din({{32*D{1'b0}}, acc_lwd}),
-        .b_dout({lr_c, unused_c}));
+        .b_en({st_c, ld_c || gc_en}), .b_we({{4*D{1'b0}}, gc_en ? {4*D{gc_we}} : acc_lwe}),
+        .b_addr({lr_word[CAW-1:0], gc_en ? gc_addr : lw_word[CAW-1:0]}),
+        .b_din({{32*D{1'b0}}, gc_en ? gc_din : acc_lwd}),
+        .b_dout({lr_c, acc_r0}));
 
     // ------------------------------------------------------ AXI masters
     // Port p of the engines -> m<p>_axi; ports >= NPORTS are tied off.

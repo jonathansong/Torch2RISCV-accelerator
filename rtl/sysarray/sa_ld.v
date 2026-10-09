@@ -20,6 +20,13 @@
 // facts). A beat whose two lanes fall into one local word at an even lane is
 // written in one cycle (lw_two; e.g. SPAD at D = 16 from a 16-byte aligned
 // address); otherwise its lanes are written one per cycle (R held one cycle).
+//
+// Mode GEMV (K2b, docs/k2b_gemv_design.md §5; D = 16, DMA_W = 128): rows =
+// strips, each row is K beats of one k row of weights. Nothing is written
+// locally: each burst remembers its (strip, first k), and every port hands
+// its beats to its own sa_gemv lane in the same cycle (g_valid / g_s / g_k),
+// as long as the x buffer is loaded (g_xready). The command is done when all
+// beats are taken and sa_gemv has written the results (!g_busy).
 `timescale 1ns / 1ps
 `include "sa_macros.vh"
 
@@ -53,6 +60,14 @@ module sa_ld #(
     output wire [7:0]           lw_lane,
     output wire                 lw_two,
     output wire [DMA_W-1:0]     lw_data,
+
+    // mode GEMV: beats to the sa_gemv lanes (one per port)
+    input  wire                 g_xready,
+    input  wire                 g_busy,
+    output wire [NPORTS-1:0]    g_valid,
+    output wire [NPORTS*DMA_W-1:0] g_data,
+    output wire [NPORTS*3-1:0]  g_s,
+    output wire [NPORTS*12-1:0] g_k,
 
     output reg  [NPORTS*32-1:0] m_araddr,
     output reg  [NPORTS*8-1:0]  m_arlen,
@@ -99,11 +114,13 @@ module sa_ld #(
     reg  [7:0]  cur_lane;
     reg  [31:0] issued, completed;
     reg         rerr;
+    reg         gmode;            // the command is a GEMV
+    wire [NPORTS-1:0] g_take;     // GEMV: beats taken this cycle, by port
 
     assign cmd_ready = !active && resetn;
 
     wire [3:0] c_lpwl = lpw_log2(cmd_mem);
-    wire       flat   = !cmd_mode[MODE_INTERLEAVE] && cmd_pitch == cmd_row_bytes &&
+    wire       flat   = cmd_mode == 2'd0 && cmd_pitch == cmd_row_bytes &&
                         (cmd_row_bytes & ((16'd8 << c_lpwl) - 16'd1)) == 0;
     assign busy      = active;
 
@@ -126,6 +143,8 @@ module sa_ld #(
     reg  [7:0]  q_lane  [0:NPORTS-1][0:QD-1];
     reg         q_s0    [0:NPORTS-1][0:QD-1];
     reg         q_tf    [0:NPORTS-1][0:QD-1];
+    reg  [2:0]  q_s     [0:NPORTS-1][0:QD-1];    // GEMV: strip, first k
+    reg  [11:0] q_k     [0:NPORTS-1][0:QD-1];
     reg  [3:0]  q_wp    [0:NPORTS-1];
     reg  [3:0]  q_rp    [0:NPORTS-1];
     wire [NPORTS-1:0] q_full, q_empty;
@@ -186,6 +205,7 @@ module sa_ld #(
                 cur_lane  <= 0;
                 issued    <= 0;
                 rerr      <= 0;
+                gmode     <= cmd_mode == MODE_GEMV;
             end else if (issue_ok) begin
                 m_arvalid[ar_rr]            <= 1;
                 m_araddr[32*ar_rr +: 32]    <= W2 ? {addr[31:4], 4'd0} : addr;
@@ -194,6 +214,8 @@ module sa_ld #(
                 q_lane[ar_rr][q_wp[ar_rr][2:0]] <= cur_lane;
                 q_s0[ar_rr][q_wp[ar_rr][2:0]]   <= s0;
                 q_tf[ar_rr][q_wp[ar_rr][2:0]]   <= tfull;
+                q_s[ar_rr][q_wp[ar_rr][2:0]]    <= r[2:0];
+                q_k[ar_rr][q_wp[ar_rr][2:0]]    <= off[15:4];
                 q_wp[ar_rr]                 <= q_wp[ar_rr] + 1;
                 issued                      <= issued + 1;
                 ar_rr <= ar_rr == NPORTS - 1 ? 0 : ar_rr + 1;
@@ -219,12 +241,14 @@ module sa_ld #(
                 ar_rr <= ar_rr == NPORTS - 1 ? 0 : ar_rr + 1;      // try the next port
             end
 
-            if (active && !gen && completed == issued && !(cmd_valid && cmd_ready)) begin
+            if (active && !gen && completed == issued && !g_busy && !(cmd_valid && cmd_ready)) begin
                 active <= 0;
                 done   <= 1;
                 err    <= rerr;
             end
             if (r_take && m_rresp[2*r_sel +: 2] != 2'b00) rerr <= 1;
+            for (p = 0; p < NPORTS; p = p + 1)
+                if (g_take[p] && m_rresp[2*p +: 2] != 2'b00) rerr <= 1;
         end
     end
 
@@ -243,7 +267,7 @@ module sa_ld #(
         end else
             for (s = NPORTS - 1; s >= 0; s = s - 1) begin
                 cand = (r_rr + s) % NPORTS;
-                if (m_rvalid[cand] && !q_empty[cand]) begin
+                if (!gmode && m_rvalid[cand] && !q_empty[cand]) begin
                     r_any = 1;
                     r_sel = cand;
                 end
@@ -251,6 +275,18 @@ module sa_ld #(
     end
 
     reg  [4:0] beat_idx [0:NPORTS-1];     // beats already taken from the head burst
+
+    // mode GEMV: every port with a beat hands it to its lane, all in one cycle
+    generate
+        for (gp = 0; gp < NPORTS; gp = gp + 1) begin : gq
+            wire [2:0] hp = q_rp[gp][2:0];
+            assign g_take[gp] = gmode && active && g_xready && m_rvalid[gp] && !q_empty[gp];
+            assign g_s[3*gp +: 3]    = q_s[gp][hp];
+            assign g_k[12*gp +: 12]  = q_k[gp][hp] + beat_idx[gp];
+        end
+    endgenerate
+    assign g_valid = g_take;
+    assign g_data  = m_rdata;
     wire [15:0] h_word = q_word[r_sel][q_rp[r_sel][2:0]];
     wire [7:0]  h_lane = q_lane[r_sel][q_rp[r_sel][2:0]];
     wire        h_s0   = q_s0[r_sel][q_rp[r_sel][2:0]];
@@ -277,9 +313,15 @@ module sa_ld #(
 
     generate
         for (gp = 0; gp < NPORTS; gp = gp + 1) begin : rr
-            assign m_rready[gp] = r_take && r_sel == gp;
+            assign m_rready[gp] = (r_take && r_sel == gp) || g_take[gp];
         end
     endgenerate
+
+    integer g_last;               // GEMV: bursts finished this cycle
+    always @* begin
+        g_last = 0;
+        for (p = 0; p < NPORTS; p = p + 1) g_last = g_last + (g_take[p] && m_rlast[p]);
+    end
 
     always @(posedge clk) begin
         if (!resetn) begin
@@ -292,6 +334,15 @@ module sa_ld #(
             end
         end else begin
             if (cmd_valid && cmd_ready) completed <= 0;
+            else if (gmode) completed <= completed + g_last;
+            for (p = 0; p < NPORTS; p = p + 1)
+                if (g_take[p]) begin
+                    if (m_rlast[p]) begin
+                        beat_idx[p] <= 0;
+                        q_rp[p]     <= q_rp[p] + 1;
+                    end else
+                        beat_idx[p] <= beat_idx[p] + 1;
+                end
             if (r_any && !r_take) begin
                 r_hold  <= 1;
                 r_hport <= r_sel;
@@ -309,6 +360,7 @@ module sa_ld #(
         end
     end
 
-    assign perf_ev  = {|(m_arvalid & ~m_arready), lw_en, active};
-    assign perf_two = lw_en && lw_two;
+    // GEMV beats count as local writes of two lanes (one per cycle at NPORTS = 1)
+    assign perf_ev  = {|(m_arvalid & ~m_arready), lw_en || |g_take, active};
+    assign perf_two = (lw_en && lw_two) || (W2 && |g_take);
 endmodule

@@ -2,7 +2,8 @@
 #   make sim TB=tb_sa_ex      run one testbench from sim/ in Vivado xsim
 #   make sim TB=tb_sa_dma GEN="NP=3 D=16"   ... with top-level generics
 #   make test                 run all unit testbenches (D = 8); make test16: D = 16;
-#                             make test128: the 128-bit DMA (K2a, DMA_W=128)
+#                             make test128: the 128-bit DMA (K2a, DMA_W=128) and the
+#                             GEMV unit (K2b; tb_sa_dma at D = 16 tests it on its own)
 #   make synth                out-of-context synth/place/route (CLOCK_NS, SYNTH_GEN)
 #   make clean
 
@@ -59,7 +60,9 @@ test128:                  # the 128-bit DMA (K2a): the DMA engines and the unit
 	@$(MAKE) -s sim TB=tb_sa_dma GEN="NP=1 D=16 DMA_W=128"
 	@$(MAKE) -s sim TB=tb_sa_dma GEN="NP=3 D=16 DMA_W=128"
 	@$(MAKE) -s sim TB=tb_sa_dma GEN="NP=1 D=8 DMA_W=128"
+	@$(MAKE) -s sim TB=tb_sa_dma GEN="NP=2 D=16 DMA_W=128"
 	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=16 DMA_W=128"
+	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=16 DMA_W=128 GEMV=1"
 	@$(MAKE) -s sim TB=tb_sa_unit GEN="D=8 DMA_W=128"
 
 clean:

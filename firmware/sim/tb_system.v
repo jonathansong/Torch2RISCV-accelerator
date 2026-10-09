@@ -26,6 +26,9 @@
 `ifndef SIM_DMA_W
 `define SIM_DMA_W 64     // DMA data width: make sim SIM_DMA_W=128 (K2a)
 `endif
+`ifndef SIM_GEMV
+`define SIM_GEMV 0       // GEMV unit: make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1 (K2b)
+`endif
 module tb_system;
     `include "n_cases.vh"
 
@@ -167,7 +170,7 @@ module tb_system;
     wire        mm_irq, mm_nirq;
 
     localparam integer D = `SIM_D;
-    sa_unit #(.D(D), .NPORTS(1), .DMA_W(DW)) mm (
+    sa_unit #(.D(D), .NPORTS(1), .DMA_W(DW), .GEMV(`SIM_GEMV)) mm (
         .aclk(clk), .aresetn(resetn),
         .s_axi_awaddr(c_awaddr[7:0]), .s_axi_awvalid(c_awvalid & aw_csr), .s_axi_awready(mm_awready),
         .s_axi_wdata(c_wdata), .s_axi_wstrb(c_wstrb), .s_axi_wvalid(c_wvalid & aw_csr), .s_axi_wready(mm_wready),

@@ -3,6 +3,9 @@
 // protocol checks. Expected local/DDR contents come from an independent
 // byte-by-byte reference of the transfer shapes; every command's target
 // region plus neighbours is compared, so stray writes are caught too.
+// At D = 16, DMA_W = 128 the LD mode GEMV is tested as well (sa_gemv, one
+// lane per port; docs/k2b_gemv_design.md): random K / strips / C step /
+// accumulate / pitch, x residency (hit, invalidated by SPAD_A writes), SLVERR.
 `timescale 1ns / 1ps
 `include "sa_macros.vh"
 
@@ -21,6 +24,7 @@ module tb_sa_dma;
     localparam integer CAW        = $clog2(ACC_WORDS);
     localparam [31:0]  DDR_BASE   = 32'h2000_0000;
     localparam integer DDR_BYTES  = 65536;
+    localparam integer GV         = D == 16 && DMA_W == 128;   // GEMV tested
 
     reg clk = 0, resetn = 0;
     always #10 clk = ~clk;
@@ -41,6 +45,9 @@ module tb_sa_dma;
     reg  [3:0]  c_mem;
     reg  [15:0] c_word, c_rows, c_rb;
     reg  [1:0]  c_mode;
+    reg  [15:0] c_xword = 0;
+    reg  [7:0]  c_cstep = 0;
+    reg         c_acc = 0;
 
     wire        lw_en;
     wire [3:0]  lw_mem;
@@ -63,12 +70,19 @@ module tb_sa_dma;
     wire [NP*DMA_W-1:0] wdata;
     wire [NP*BB-1:0]    wstrb;
 
+    wire             g_xready, g_busy;
+    wire [NP-1:0]    g_valid;
+    wire [NP*DMA_W-1:0] g_data;
+    wire [NP*3-1:0]  g_s;
+    wire [NP*12-1:0] g_k;
+
     sa_ld #(.D(D), .NPORTS(NP), .DMA_W(DMA_W)) ld (
         .clk(clk), .resetn(resetn), .cmd_valid(ld_valid), .cmd_ready(ld_ready),
         .cmd_ddr(c_ddr), .cmd_mem(c_mem), .cmd_word(c_word), .cmd_rows(c_rows),
         .cmd_row_bytes(c_rb), .cmd_pitch(c_pitch), .cmd_mode(c_mode),
         .done(ld_done), .err(ld_err), .busy(ld_busy),
         .lw_en(lw_en), .lw_mem(lw_mem), .lw_word(lw_word), .lw_lane(lw_lane), .lw_two(lw_two), .lw_data(lw_data),
+        .g_xready(g_xready), .g_busy(g_busy), .g_valid(g_valid), .g_data(g_data), .g_s(g_s), .g_k(g_k),
         .m_araddr(araddr), .m_arlen(arlen), .m_arvalid(arvalid), .m_arready(arready),
         .m_rdata(rdata), .m_rresp(rresp), .m_rlast(rlast), .m_rvalid(rvalid), .m_rready(rready));
     sa_st #(.D(D), .NPORTS(NP), .DMA_W(DMA_W)) st (
@@ -93,8 +107,8 @@ module tb_sa_dma;
     wire [8*D-1:0]  ta_dout, tb_dout;
     wire [32*D-1:0] tc_dout;
 
-    wire [8*D-1:0]  ta_unused_a, ta_unused_b;
-    wire [32*D-1:0] tc_unused;
+    wire [8*D-1:0]  ta_r0, ta_unused_b;
+    wire [32*D-1:0] tc_r0;
 
     // as sa_unit: one lane (its data in every 64-bit piece) or two (lw_two)
     wire [15:0] lw_bytes = lw_two ? 16'hFFFF : 16'h00FF;
@@ -109,13 +123,38 @@ module tb_sa_dma;
     wire [4*D-1:0] acc_we  = {4*D{1'b0}} | (lw_bytes << (8 * lw_lane));
 
     wire ld_a = lw_en && lw_mem == MEM_SPAD_A, ld_b = lw_en && lw_mem == MEM_SPAD_B, ld_c = lw_en && lw_mem == MEM_ACC;
+
+    // GEMV unit (as sa_unit): x from SPAD_A side A [0], results on ACC side B [0]
+    wire            gx_en, gc_en, gc_we;
+    wire [SAW-1:0]  gx_addr;
+    wire [CAW-1:0]  gc_addr;
+    wire [32*D-1:0] gc_din;
+    integer         xreads = 0;                  // x words read (residency check)
+    always @(posedge clk) if (gx_en) xreads = xreads + 1;
+    generate if (GV) begin : gemv_u
+        sa_gemv #(.D(D), .NL(NP), .SAW(SAW), .CAW(CAW)) gemv (
+            .clk(clk), .resetn(resetn),
+            .start(ld_valid && ld_ready && c_mode == MODE_GEMV),
+            .cmd_xword(c_xword), .cmd_c(c_word), .cmd_strips(c_rows), .cmd_rb(c_rb),
+            .cmd_cstep(c_cstep), .cmd_acc(c_acc),
+            .busy(g_busy), .xready(g_xready),
+            .b_valid(g_valid), .b_data(g_data), .b_s(g_s), .b_k(g_k),
+            .x_inval(ld_a || (t_en && t_we && t_mem == MEM_SPAD_A)),
+            .xr_en(gx_en), .xr_addr(gx_addr), .xr_data(ta_r0),
+            .c_en(gc_en), .c_we(gc_we), .c_addr(gc_addr), .c_din(gc_din), .c_dout(tc_r0));
+    end else begin : no_gemv
+        assign g_xready = 1; assign g_busy = 0;
+        assign gx_en = 0; assign gx_addr = 0;
+        assign gc_en = 0; assign gc_we = 0; assign gc_addr = 0; assign gc_din = 0;
+    end endgenerate
+
     wire st_a = lr_en && lr_mem == MEM_SPAD_A, st_b = lr_en && lr_mem == MEM_SPAD_B, st_c = lr_en && lr_mem == MEM_ACC;
 
     sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(1)) spad_a (
         .clk(clk),
-        .a_en({st_a, ld_a}), .a_we({{D{1'b0}}, spad_we}),
-        .a_addr({lr_word[SAW-1:0], lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_din}),
-        .a_dout({lr_a, ta_unused_a}),
+        .a_en({st_a, ld_a || gx_en}), .a_we({{D{1'b0}}, ld_a ? spad_we : {D{1'b0}}}),
+        .a_addr({lr_word[SAW-1:0], gx_en ? gx_addr : lw_word[SAW-1:0]}), .a_din({{8*D{1'b0}}, spad_din}),
+        .a_dout({lr_a, ta_r0}),
         .b_en(t_en && t_mem == MEM_SPAD_A), .b_we({D{t_we}}), .b_addr(t_word[SAW-1:0]),
         .b_din(t_din[8*D-1:0]), .b_dout(ta_dout));
     sa_bankmem #(.W(8*D), .DEPTH(SPAD_WORDS), .NA(2), .NB(1)) spad_b (
@@ -129,9 +168,10 @@ module tb_sa_dma;
         .clk(clk),
         .a_en(t_en && t_mem == MEM_ACC), .a_we({4*D{t_we}}), .a_addr(t_word[CAW-1:0]),
         .a_din(t_din), .a_dout(tc_dout),
-        .b_en({st_c, ld_c}), .b_we({{4*D{1'b0}}, acc_we}),
-        .b_addr({lr_word[CAW-1:0], lw_word[CAW-1:0]}), .b_din({{32*D{1'b0}}, acc_din}),
-        .b_dout({lr_c, tc_unused}));
+        .b_en({st_c, ld_c || gc_en}), .b_we({{4*D{1'b0}}, gc_en ? {4*D{gc_we}} : acc_we}),
+        .b_addr({lr_word[CAW-1:0], gc_en ? gc_addr : lw_word[CAW-1:0]}),
+        .b_din({{32*D{1'b0}}, gc_en ? gc_din : acc_din}),
+        .b_dout({lr_c, tc_r0}));
 
     // shadows of the local memories (expected contents)
     reg [8*D-1:0]  sh_a [0:SPAD_WORDS-1];
@@ -279,6 +319,59 @@ module tb_sa_dma;
         end
     endtask
 
+    // GEMV: rows = strips, rb = K * D, word = C
+    task run_gemv(input [31:0] ddr_a, input integer xw, input integer c, input integer strips,
+                  input integer k, input integer pitch, input integer cs, input acc);
+        begin
+            @(posedge clk); #1;
+            c_ddr = ddr_a; c_mem = MEM_ACC; c_word = c; c_rows = strips; c_rb = k * D; c_pitch = pitch;
+            c_mode = MODE_GEMV; c_xword = xw; c_cstep = cs; c_acc = acc;
+            ld_valid = 1;
+            @(posedge clk); while (!ld_ready) @(posedge clk);
+            #1 ld_valid = 0;
+            @(posedge clk); while (!ld_done) @(posedge clk);
+        end
+    endtask
+
+    task ref_gemv(input [31:0] ddr_a, input integer xw, input integer c, input integer strips,
+                  input integer k, input integer pitch, input integer cs, input acc);
+        integer ss, jj, kk, sum;
+        reg signed [7:0] xv, wv;
+        begin
+            for (ss = 0; ss < strips; ss = ss + 1)
+                for (jj = 0; jj < D; jj = jj + 1) begin
+                    sum = acc ? sh_c[c + ss * cs][32*jj +: 32] : 0;
+                    for (kk = 0; kk < k; kk = kk + 1) begin
+                        xv  = sh_a[xw + kk / D][8*(kk % D) +: 8];
+                        wv  = ddr[ddr_a - DDR_BASE + ss * pitch + kk * D + jj];
+                        sum = sum + xv * wv;
+                    end
+                    sh_c[c + ss * cs][32*jj +: 32] = sum;
+                end
+        end
+    endtask
+
+    // one GEMV: x region (re)written when newx, results region plus neighbours
+    // compared; xr: x words expected to be read (-1: don't check)
+    integer xr0;
+    task do_gemv(input [31:0] ddr_a, input integer xw, input integer c, input integer strips,
+                 input integer k, input integer pitch, input integer cs, input acc, input newx,
+                 input integer xr);
+        begin
+            if (newx) init_region(MEM_SPAD_A, xw, xw + k / D - 1);
+            init_region(MEM_ACC, c - 2, c + (strips - 1) * cs + 2);
+            xr0 = xreads;
+            run_gemv(ddr_a, xw, c, strips, k, pitch, cs, acc);
+            if (ld_err) fail("unexpected GEMV error");
+            if (xr >= 0 && xreads - xr0 != xr) begin
+                errors = errors + 1;
+                $display("TB ERROR GEMV x words read: %0d, expected %0d", xreads - xr0, xr);
+            end
+            ref_gemv(ddr_a, xw, c, strips, k, pitch, cs, acc);
+            check_region(MEM_ACC, c - 2, c + (strips - 1) * cs + 2);
+        end
+    endtask
+
     task run_st(input [31:0] ddr_a, input [3:0] mem, input integer word, input integer rows,
                 input integer rb, input integer pitch);
         begin
@@ -408,6 +501,38 @@ module tb_sa_dma;
             else        do_st(base, m == 0 ? MEM_SPAD_A : m == 1 ? MEM_SPAD_B : MEM_ACC, wd, rws, rbb, pt);
         end
 
+        // ---- GEMV (D = 16, 128-bit DMA)
+        if (GV) begin : gemv_tests
+            integer kk, ss, cs, pt, xw, cw, base, t0;
+            do_gemv(DDR_BASE + 32'h0100, 40, 30, 1, 16, 256, 1, 0, 1, 1);          // one burst
+            do_gemv(DDR_BASE + 32'h0100, 40, 30, 1, 64, 1024, 1, 0, 1, 4);         // longer x: reload
+            do_gemv(DDR_BASE + 32'h0F00, 40, 30, 3, 64, 1040, 2, 1, 0, 0);         // x resident; crosses 4 KB; acc
+            do_gemv(DDR_BASE + 32'h2000, 40, 30, 8, 96, 1536, 1, 0, 1, 6);         // new x (SPAD_A written): reload
+            do_ld(DDR_BASE + 32'h6000, MEM_SPAD_A, 2000, 1, 64, 64, 0);           // LD to SPAD_A elsewhere ...
+            do_gemv(DDR_BASE + 32'h2000, 40, 30, 8, 96, 1536, 1, 1, 0, 6);         // ... also invalidates
+            do_gemv(DDR_BASE + 32'h0000, SB - 100, CB - 3, 1, 4080, 65280, 1, 0, 1, 255);   // K max, banks
+            t0 = $time;
+            do_gemv(DDR_BASE + 32'h0000, SB - 100, CB - 3, 1, 4080, 65280, 1, 1, 0, 0);     // resident, acc
+            $display("TB   GEMV K = 4080, x resident: %0d cycles (incl. testbench setup)", ($time - t0) / 20);
+            for (q = 0; q < 40; q = q + 1) begin
+                kk = 16 * (1 + rnd(20));
+                ss = 1 + rnd(7);
+                cs = 1 + rnd(5);
+                pt = kk * D + 16 * rnd(3);
+                base = DDR_BASE + 16 * rnd(1024);
+                if (base + ss * pt > DDR_BASE + DDR_BYTES) base = DDR_BASE;
+                xw = rnd(SPAD_WORDS - kk / D);
+                cw = 4 + rnd(ACC_WORDS - (ss - 1) * cs - 8);
+                do_gemv(base, xw, cw, ss, kk, pt, cs, rnd(1), 1, kk / D);
+            end
+            inj_rresp = 1;                                                         // SLVERR
+            run_gemv(DDR_BASE + 32'h3000, 40, 30, 2, 32, 512, 1, 0);
+            inj_rresp = 0;
+            if (!ld_err) fail("GEMV SLVERR not reported");
+            init_region(MEM_ACC, 28, 33);                                          // forget what it wrote
+            do_gemv(DDR_BASE + 32'h3000, 40, 30, 2, 32, 512, 1, 0, 1, 2);          // recovery
+        end
+
         // ---- errors, then recovery
         inj_rresp = 1;
         run_ld(DDR_BASE + 32'hD000, MEM_SPAD_A, 700, 2, 64, 64, 0);
@@ -423,8 +548,8 @@ module tb_sa_dma;
         do_st(DDR_BASE + 32'hE800, MEM_SPAD_A, 900, 4, 32, 32);
 
         repeat (20) @(posedge clk);
-        $display("TB %s: NP=%0d D=%0d DMA_W=%0d, %0d errors (%0d read / %0d write bursts)",
-                 errors ? "FAIL" : "PASS", NP, D, DMA_W, errors, ar_bursts, aw_bursts);
+        $display("TB %s: NP=%0d D=%0d DMA_W=%0d%0s, %0d errors (%0d read / %0d write bursts)",
+                 errors ? "FAIL" : "PASS", NP, D, DMA_W, GV ? " +GEMV" : "", errors, ar_bursts, aw_bursts);
         $finish;
     end
 

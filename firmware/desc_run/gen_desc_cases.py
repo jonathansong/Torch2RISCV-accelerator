@@ -38,7 +38,7 @@ def write_sparse(path, chunks):
             f.write("\n".join(f"{b:02x}" for b in data) + "\n")
 
 
-def build_cases(d, seed=11):
+def build_cases(d, seed=11, gemv=False):
     """[(name, DescList, [(DDR offset, bytes)], output offset, expected bytes,
     descriptors decoded)] for array size d; DDR offsets are relative to
     DDR_BASE. The last two cases use the L1 command extensions (loops,
@@ -329,6 +329,31 @@ def build_cases(d, seed=11):
             sim.ddr_write(DDR_BASE + IO5, args5)
             sim.run_list(DDR_BASE + LIST_OFF)
 
+    # ---- K2b: LD mode GEMV (needs the unit: --gemv, SIM_GEMV=1), as the compiler's decode matvec:
+    # int32 x in ACC -> VE copy to packed int8 in SPAD_A; 6 strips as 4 + 2 per GEMV, K split in two
+    # halves (the second accumulates; x resident across a half's two GEMVs); results stored from ACC
+    if gemv:
+        kg, ns = 256, 6
+        xg = rng.integers(-128, 128, kg).astype(np.int32)
+        wg = rng.integers(-128, 128, (kg, ns * d), dtype=np.int8)
+        strips = np.ascontiguousarray(wg.reshape(kg, ns, d).transpose(1, 0, 2))     # [s][k][j]
+        G_OFF, GX_OFF = 0x0, 0x18000
+        dl = pm.DescList().ld(DDR_BASE + GX_OFF, la(ACC, 100), 1, 4 * kg, 4 * kg)
+        dl.ve(la(ACC, 100), 0, la(SPA, 40), kg, 5, I32 | I8 << 2)                     # packed int8 x
+        h = kg // 2
+        for k0, acc in ((0, False), (h, True)):
+            for s0, n in ((0, 4), (4, 2)):
+                dl.gemv(DDR_BASE + G_OFF + s0 * kg * d + k0 * d, la(ACC, 10 + 2 * s0), n, h * d, kg * d,
+                        40 + k0 // d, cstep=2, acc=acc)
+        for s in range(ns):                                                           # (results at C step 2)
+            dl.st(DDR_BASE + O_OFF + 4 * d * s, la(ACC, 10 + 2 * s), 1, 4 * d, 4 * d)
+        dl.end(0x56)
+
+        def gv_ok(out):
+            return out == (xg.astype(np.int64) @ wg.astype(np.int64)).astype(np.int32).tobytes()
+        l2_case(f"K2b GEMV: x int32 -> packed int8, {ns} strips (4 + 2), K = {kg} in two accumulating halves",
+                dl, [(G_OFF, strips.tobytes()), (GX_OFF, xg.tobytes())], O_OFF, 4 * ns * d, gv_ok)
+
     return cases
 
 
@@ -414,9 +439,10 @@ def main():
     ap.add_argument("--d", type=int, default=8)
     ap.add_argument("--out", default=".")
     ap.add_argument("--random", type=int, default=12, help="random fp32 lists appended")
+    ap.add_argument("--gemv", action="store_true", help="add the LD mode GEMV case (the unit has GEMV)")
     args = ap.parse_args()
     d = args.d
-    cases = build_cases(d)
+    cases = build_cases(d, gemv=args.gemv)
     rng = np.random.default_rng(23)
     cases += [random_fp_case(rng, d) for _ in range(args.random)]
 

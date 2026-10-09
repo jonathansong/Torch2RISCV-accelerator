@@ -15,6 +15,7 @@ module tb_sa_unit;
     parameter  integer D  = 8;                    // make sim TB=tb_sa_unit GEN=D=16
     parameter  integer PERF = 1;                  // GEN="PERF=0": build without counters
     parameter  integer DMA_W = 64;                // GEN="D=16 DMA_W=128" (K2a)
+    parameter  integer GEMV = 0;                  // GEN="D=16 DMA_W=128 GEMV=1" (K2b): LD mode GEMV
     localparam integer BB = DMA_W / 8;            // bytes per beat
     localparam integer AW = 32 * D;               // widest local word (ACC)
 
@@ -62,7 +63,7 @@ module tb_sa_unit;
     wire        pcpi_wr, pcpi_wait, pcpi_ready;
     wire [31:0] pcpi_rd;
 
-    sa_unit #(.D(D), .NPORTS(1), .PERF(PERF), .DMA_W(DMA_W)) dut (
+    sa_unit #(.D(D), .NPORTS(1), .PERF(PERF), .DMA_W(DMA_W), .GEMV(GEMV)) dut (
         .aclk(aclk), .aresetn(aresetn),
         .s_axi_awaddr(s_awaddr), .s_axi_awvalid(s_awvalid), .s_axi_awready(s_awready),
         .s_axi_wdata(s_wdata), .s_axi_wstrb(4'hF), .s_axi_wvalid(s_wvalid), .s_axi_wready(s_wready),
@@ -1379,6 +1380,104 @@ module tb_sa_unit;
         end
     endtask
 
+    // ============================== K2b: LD mode GEMV through a descriptor list
+    // (docs/k2b_gemv_design.md §4). Without the unit, mode 2 is a SHAPE error.
+    integer gemv_checks = 0, gx_reads = 0;
+    always @(posedge aclk) if (dut.gx_en) gx_reads = gx_reads + 1;
+    localparam [31:0] GW = MEM_BASE + 32'h34000, GX = MEM_BASE + 32'h3A000;
+    task d_gemv(input [31:0] ddr, input integer c, input integer strips, input integer k,
+                input [31:0] pitch, input integer xw, input integer cs, input acc);
+        d_put(DS_LD, 8'd0, {32'd0, ddr}, {k[11:0] * 16'd16, strips[15:0], la(M_C, c)},
+              {5'd0, acc, cs[7:0], xw[15:0], 2'd2, pitch}, 0, 0);
+    endtask
+    // expected ACC words: c + s * cs = (acc ? old : 0) + x . W_s (x at GX + xo)
+    reg [AW-1:0] g_exp [0:7];
+    task gemv_ref(input [31:0] w, input integer xo, input integer strips, input integer k,
+                  input [31:0] pitch, input acc);
+        integer ss, jj, kk, sum;
+        reg signed [7:0] xv, wv;
+        for (ss = 0; ss < strips; ss = ss + 1)
+            for (jj = 0; jj < D; jj = jj + 1) begin
+                sum = acc ? g_exp[ss][32*jj +: 32] : 0;
+                for (kk = 0; kk < k; kk = kk + 1) begin
+                    xv = mem[GX - MEM_BASE + xo + kk];
+                    wv = mem[w - MEM_BASE + ss * pitch + kk * D + jj];
+                    sum = sum + xv * wv;
+                end
+                g_exp[ss][32*jj +: 32] = sum;
+            end
+    endtask
+    task gemv_check(input integer c, input integer strips, input integer cs, input [8*48-1:0] what);
+        integer ss, bad;
+        begin
+            bad = xst[1];
+            for (ss = 0; ss < strips; ss = ss + 1) if (hw_c(c + ss * cs) !== g_exp[ss]) bad = bad + 1;
+            gemv_checks = gemv_checks + 1;
+            if (bad) fail(what);
+        end
+    endtask
+
+    task gemv_tests;
+        integer i, r0, r1, r2;
+        begin
+            for (i = 0; i < 8 * 1040; i = i + 1) mem[GW - MEM_BASE + i] = $random(seed);
+            for (i = 0; i < 512; i = i + 1)       mem[GX - MEM_BASE + i] = $random(seed);
+            if (GEMV) begin
+                // x (K = 64: 4 words) by LD; GEMV 3 strips, C step 2; again with acc
+                // (x resident: no SPAD_A reads); a VE COPY of the results (waits for it)
+                dl_begin(DL);
+                d_ld(GX, la(M_A, 500), 1, 64, 64, 0, 0);
+                d_gemv(GW, 40, 3, 64, 1040, 500, 2, 0);
+                d_end(0);
+                r0 = gx_reads;
+                submit(DL, 0); fence(0);
+                r1 = gx_reads;
+                gemv_ref(GW, 0, 3, 64, 1040, 0);
+                gemv_check(40, 3, 2, "GEMV: 3 strips, C step 2");
+                dl_begin(DL);
+                d_gemv(GW + 16, 40, 3, 64, 1040, 500, 2, 1);
+                d_ve(la(M_C, 40), la(M_C, 40), la(M_C, 60), 5 * D, 8'd5, {2'd0, 2'd2, 2'd2}, 0, 1, 0, 0,
+                     32'h80000000, 32'h7FFFFFFF);
+                d_end(0);
+                submit(DL, 0); fence(0);
+                r2 = gx_reads;
+                gemv_ref(GW + 16, 0, 3, 64, 1040, 1);
+                gemv_check(40, 3, 2, "GEMV: accumulate, x resident");
+                gemv_checks = gemv_checks + 1;
+                if (r1 - r0 != 4 || r2 != r1) fail("GEMV: x words read (4, then resident)");
+                gemv_checks = gemv_checks + 1;
+                if (hw_c(60) !== g_exp[0] || hw_c(64) !== g_exp[2]) fail("GEMV: VE after GEMV saw stale ACC");
+                // new x (LD to SPAD_A invalidates); 8 strips, K = 256 across the SPAD_A banks
+                dl_begin(DL);
+                d_ld(GX + 64, la(M_A, SW/2 - 8), 1, 256, 256, 0, 0);
+                d_gemv(GW, CW/2 - 4, 8, 256, 4096 + 16, SW/2 - 8, 1, 0);
+                d_end(0);
+                for (i = 0; i < 8 * 4112; i = i + 1)
+                    if (i >= 8 * 1040) mem[GW - MEM_BASE + i] = $random(seed);
+                r0 = gx_reads;
+                submit(DL, 0); fence(0);
+                gemv_ref(GW, 64, 8, 256, 4096 + 16, 0);
+                gemv_check(CW/2 - 4, 8, 1, "GEMV: 8 strips, K = 256, across banks");
+                gemv_checks = gemv_checks + 1;
+                if (gx_reads - r0 != 16) fail("GEMV: x reloaded after an LD to SPAD_A");
+                // errors: 9 strips, result not in ACC, mode 3, unaligned DDR
+                dl_begin(DL); d_gemv(GW, 40, 9, 64, 1024, 500, 1, 0); d_end(0);
+                submit(DL, 0); desc_expect_err(4'd1, 4'd0, "GEMV err: 9 strips");
+                dl_begin(DL);
+                d_put(DS_LD, 8'd0, {32'd0, GW}, {16'd1024, 16'd1, la(M_B, 40)}, {5'd0, 1'b0, 8'd1, 16'd500, 2'd2, 32'd1024}, 0, 0);
+                d_end(0);
+                submit(DL, 0); desc_expect_err(4'd2, 4'd0, "GEMV err: result in SPAD_B");
+                dl_begin(DL); d_ld(GW, la(M_A, 40), 1, 64, 64, 2'd3, 0); d_end(0);
+                submit(DL, 0); desc_expect_err(4'd1, 4'd0, "GEMV err: LD mode 3");
+                dl_begin(DL); d_gemv(GW + 8, 40, 1, 64, 1024, 500, 1, 0); d_end(0);
+                submit(DL, 0); desc_expect_err(4'd1, 4'd0, "GEMV err: DDR not 16-byte aligned");
+            end else begin
+                dl_begin(DL); d_gemv(GW, 40, 3, 64, 1040, 500, 2, 0); d_end(0);
+                submit(DL, 0); desc_expect_err(4'd1, 4'd0, "GEMV err: no GEMV unit");
+            end
+        end
+    endtask
+
     task desc_tests;
         integer i;
         begin
@@ -1751,6 +1850,7 @@ module tb_sa_unit;
         desc_tests;
         l1_tests;
         l2_pcpi_tests;
+        if (D == 16) gemv_tests;
 
         // ================================================ new-ISA errors
         cfg_ld(2, 12, 16, 0);                                 // row_bytes not a multiple of 8
@@ -1781,16 +1881,17 @@ module tb_sa_unit;
         if (xst[11:8] !== 4'd2) fail("bad memory id: wrong ext status");
         mat_op(F_RESET, 0, 0);
         // (funct7 = 1 uses all funct3 values: 5 mat_perf, 6 mat_submit, 7 mat_notify)
-        expect_csr(8'h24, 32'h01E0_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + 32'h0001_0000 + D * 256 + D,
-                   "CAPS");     // [24] command ext., [23] fp32 VE, [22] notify, [21] desc, [20] perf, 1 port, VL = D, D
+        expect_csr(8'h24, 32'h01E0_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + (GEMV ? 32'h0200_0000 : 32'd0) +
+                   32'h0001_0000 + D * 256 + D,
+                   "CAPS");     // [25] GEMV, [24] command ext., [23] fp32 VE, [22] notify, [21] desc, [20] perf, 1 port, VL = D, D
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");
 
         repeat (20) @(posedge aclk);
-        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | descriptors: list GEMM %0d cycles, %0d checks | L1: %0d checks | L2 PCPI: %0d checks | error paths",
+        $display("TB %s: %0d errors | legacy: %0d golden cases x (CSR + PCPI), %0d cycles/job avg | D=%0d | new ISA: 4 GEMMs (%0dx%0dx%0d in %0d cycles = %0d MAC/cycle) | random stream %0d LD / %0d EX / %0d ST / %0d VE | 3 quantized GEMMs (%0dx%0dx%0d in %0d cycles) | perf counters: %0d checks | descriptors: list GEMM %0d cycles, %0d checks | L1: %0d checks | L2 PCPI: %0d checks | GEMV: %0d checks | error paths",
                  errors ? "FAIL" : "PASS", errors, NC, total_cycles / NC, D, 4*D, 4*D, 8*D, gemm_cycles_main, 4*D*4*D*8*D / gemm_cycles_main,
                  n_ld, n_ex, n_st, n_ve, 4*D, 4*D, 8*D, qgemm_cycles_first, perf_checks,
-                 gemm_cycles_list, desc_checks, l1_checks, l2_checks);
+                 gemm_cycles_list, desc_checks, l1_checks, l2_checks, gemv_checks);
         $finish;
     end
 

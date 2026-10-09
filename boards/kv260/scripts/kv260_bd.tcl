@@ -4,7 +4,7 @@
 # on the K26 SOM's Zynq UltraScale+ PS, with the accelerator unchanged.
 #
 # Sourced by build_bitstream.tcl (project already created, IP repository
-# registered; variables ::sa_d, ::sa_mhz, ::dma_w, ::vefp_nb).
+# registered; variables ::sa_d, ::sa_mhz, ::dma_w, ::vefp_nb, ::gemv).
 #
 #   zynq_ultra_ps_e_0   board preset (DDR4, MIO), then:
 #     M_AXI_HPM0_FPD    32-bit, ARM -> psAxiInterconnect -> program BRAM, interrupt controller
@@ -95,6 +95,7 @@ set_property -dict [list CONFIG.D $::sa_d \
                          CONFIG.DSP_COLS $::sa_d \
                          CONFIG.DMA_W $::dma_w \
                          CONFIG.VEFP_NB $::vefp_nb \
+                         CONFIG.GEMV $::gemv \
                          CONFIG.SPAD_WORDS [expr {131072 / $::sa_d}] \
                          CONFIG.ACC_WORDS [expr {262144 / (4 * $::sa_d)}]] $matmul_0
 
