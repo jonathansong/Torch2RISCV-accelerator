@@ -9,7 +9,8 @@
 #                               build directories of other D apart (the golden corpus reads the D = 8 ones)
 #   SA_GEMV_PORTS               the overlay's GEMV unit (K2b), from the configuration's name: _gemv -> 1,
 #                               _gemv_np2 -> 2 (default 0); compile_sa.sh passes --iree-sa-gemv-ports, and
-#                               SA_DSUF gets _gemv (GEMV builds apart from the EX-path ones)
+#                               SA_DSUF gets _gemv / _gemv2 (GEMV builds apart from the EX-path ones and
+#                               by port count: the descriptors differ)
 # The driver and the launcher read the board's addresses and clock from the
 # .hwh (driver/pynq_matmul.py overlay_info), so a bundle is the same apart
 # from the runtime binaries and the overlay.
@@ -31,7 +32,8 @@ if [ -z "${SA_GEMV_PORTS:-}" ]; then
   case "${SA_KV260_CONFIG:-}" in *_gemv_np2*) SA_GEMV_PORTS=2 ;; *_gemv*) SA_GEMV_PORTS=1 ;; *) SA_GEMV_PORTS=0 ;; esac
 fi
 export SA_GEMV_PORTS
-SA_DSUF=$( [ "$SA_D" = 8 ] || echo "_d$SA_D" )$( [ "$SA_GEMV_PORTS" = 0 ] || echo _gemv )
+SA_GSUF=_gemv$( [ "$SA_GEMV_PORTS" -le 1 ] || echo "$SA_GEMV_PORTS" )   # GEMV builds: _gemv, _gemv2
+SA_DSUF=$( [ "$SA_D" = 8 ] || echo "_d$SA_D" )$( [ "$SA_GEMV_PORTS" = 0 ] || echo "$SA_GSUF" )
 
 # seed_export <d8 export dir> <dir>: the exports do not depend on D (the attention
 # length is dynamic), so another D's build directory starts from a copy of the
