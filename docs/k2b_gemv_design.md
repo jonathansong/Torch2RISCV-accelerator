@@ -204,6 +204,17 @@ prefill 不变。4 口之后，decode 剩下的是 LD 命令的固定延迟（�
 
 **G5-2 / G5-3 结果（2026-10-10，`d16_100mhz_w128_p6_gemv_np4`，m2 HP2、m3 HPC0）**：WNS **+0.168 ns**（双口 +0.138；最差路径变成 PicoRV32 复位到阵列 PE 的扇出，97% 是布线，GEMV / LD 数据通路不再关键），LUT 101,878（87.0%），FF 67,688，BRAM 138 / 144（每条 lane 的 x 缓冲一个），DSP 349。板上 `--reuse p6_red`：REGRESSION PASS（14 项），5 个 LLM 测试的 token 与 `p6_red` 逐字相同；bwtest GEMV 64 KB：x 驻留 1131 周期 = **57.95 B / 周期**（64 的 90.5%），x 读入 1164 周期 / 56.30。比例低于双口（95.5%）是因为传输时间减半而每条命令约 100 周期的固定开销不变（双口 2145 = 2048 + 97，4 口 1131 = 1024 + 107）：稳态带宽接近 64 B / 周期，HPC0 经 CCI、HP1 / HP2 共用 S4 都没有看到瓶颈，不需要构建 `-m3_port hp0` 对比。普通 LD / ST 仍约 15.7 B / 周期，1 拍 burst 的短行 LD 5.48 → 7.61。
 
+**G5-4 结果（2026-10-10，`_gemv_np4`，GEMV 4 口编译，`build/deploy_kv260_d16_100mhz_w128_p6_gemv_np4/results`）**：主机上每个 LLM 测试的逐 dispatch 检查、仿真 logits 逐位相同（`sa.vmfb` 与 2 口版本不同，hfgen 重新编译到 `smollm2_p16_gemv4`）；板上 REGRESSION PASS（含 Qwen3，16 项），logits 与仿真逐位相同，token 与 2 口 / EX 路径逐字相同；bwtest GEMV 57.44–57.64 B / 周期。decode 每步（板上实测，含主机开销）：
+
+| 模型 | EX 路径 | GEMV 2 口 | GEMV 4 口 | 4 口 / 2 口 | 4 口 / EX | 模型预测 |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 451.4 ms（2.22） | 251.3 ms（3.98） | 159.2 ms（**6.28 tok/s**） | ×1.58 | ×2.83 | ×3.15 |
+| SmolLM2-135M（c6p） | 129.6 ms（7.71） | 79.5 ms（12.58） | 58.7 ms（**17.04**） | ×1.35 | ×2.21 | ×2.74 |
+| SmolLM2（hfgen） | 131.2 ms（7.62） | 78.5 ms（12.73） | 58.2 ms（17.19） | ×1.35 | ×2.25 | — |
+| stories15M | 16.2 ms（61.9） | 9.9 ms（100.8） | 7.6 ms（131.65） | ×1.31 | ×2.13 | — |
+
+prefill 不变（Qwen3 15.90 tok/s，SmolLM2 39.0）。低于预测的原因：设每步 = 固定部分 F + 与口数成反比的 GEMV 部分 G，由 2 口 / 4 口两点解出 Qwen3 G ≈ 184 ms（2 口时）、**F ≈ 67 ms**，SmolLM2 G ≈ 42 ms、**F ≈ 38 ms**；4 口时固定部分已占 Qwen3 每步的 42%、SmolLM2 的 65%（attention 的 EX、VE / SFU、LD 命令延迟、dispatch 与主机开销），GEMV 本身已接近线性加速。继续提高 decode 要削减 F（H2 乱序发射、LD 命令流水、减少 dispatch 数和主机开销），而不是更多的口；int4 权重只缩小 G。
+
 **步骤**：G5-1 RTL / 测试平台 / BD 参数，仿真通过后 `-bd_only` 检查；G5-2 构建 `-nports 4`；G5-3 板上 `--reuse p6_red` 回归 + bwtest（测试 7 应接近 64 B / 周期）；G5-4 完整 GEMV 4 口 staging，板上 decode 与预测比较。
 
 ## 9. 资源与时序估计（P = 2）

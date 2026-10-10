@@ -238,22 +238,25 @@ rt_fw at mailbox `0xD0`). Prefill and attention stay on the array.
 (95.5% of 32). Regression passes on both overlays; every LLM test is
 bit-exact with the sim and gives the EX path's tokens.
 
-| Decode (tok/s, board) | EX path (`p6_red`) | GEMV, two ports |
-|---|---|---|
-| Qwen3-0.6B (c6p_qwen3) | 2.22 | **3.98** (x1.80) |
-| SmolLM2-135M (c6p) | 7.71 | **12.58** (x1.63) |
-| SmolLM2 generic (hfgen) | 7.62 | **12.73** (x1.67) |
-| stories15M (c6p) | 61.9 | **100.8** (x1.63) |
+| Decode (tok/s, board) | EX path (`p6_red`) | GEMV, two ports | GEMV, four ports |
+|---|---|---|---|
+| Qwen3-0.6B (c6p_qwen3) | 2.22 | 3.98 (x1.80) | **6.28** (x2.83) |
+| SmolLM2-135M (c6p) | 7.71 | 12.58 (x1.63) | **17.04** (x2.21) |
+| SmolLM2 generic (hfgen) | 7.62 | 12.73 (x1.67) | **17.19** (x2.25) |
+| stories15M (c6p) | 61.9 | 100.8 (x1.63) | **131.65** (x2.13) |
 
-Prefill is unchanged (Qwen3 15.45 -> 15.76 tok/s).
+Prefill is unchanged (Qwen3 15.45 -> 15.76 -> 15.90 tok/s).
 
 G5, four ports (`d16_100mhz_w128_p6_gemv_np4`, m2 on HP2, m3 on HPC0): the
 regression passes with the EX-path executables (tokens of `p6_red`); `bwtest`
 GEMV 64 KB **57.95 B/cycle** (90.5% of 64: the same ~100-cycle command overhead
 on half the transfer time, so close to 64 B/cycle in the steady state; no
-bottleneck from HPC0 through the CCI or from HP1 / HP2 sharing S4). The
-four-port GEMV executables are being staged (model: Qwen3 decode about 6.5-7
-tok/s).
+bottleneck from HPC0 through the CCI or from HP1 / HP2 sharing S4). With the
+four-port GEMV executables (table above) the regression passes, logits are
+bit-exact with the sim and tokens match. Below the model (Qwen3 x3.15): per
+decode step a fixed part that does not scale with the ports (attention on EX,
+VE / SFU, LD command latency, dispatch and host overhead; about 67 ms for Qwen3,
+38 ms for SmolLM2) is now 42% / 65% of the step.
 
 ## Accelerator memory pool (K5-M step M1, installed 2026-10-10)
 
