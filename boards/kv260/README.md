@@ -245,7 +245,7 @@ bit-exact with the sim and gives the EX path's tokens.
 
 Prefill is unchanged (Qwen3 15.45 -> 15.76 tok/s).
 
-## Accelerator memory pool (K5-M step M1, ready to install)
+## Accelerator memory pool (K5-M step M1, installed 2026-10-10)
 
 The runtime's window is `/dev/udmabuf0`, today allocated from the global CMA
 (`cma=1000M` from the Kria boot script, at `0x3740_0000`) by `insmod
@@ -273,6 +273,12 @@ sudo sh accel_mem_install.sh check               # udmabuf0 at 0x10000000, 1280 
 # no insmod any more; rollback: sudo sh accel_mem_install.sh uninstall && sudo reboot
 # (or delete user-override.dtb from the SD card's boot partition on a PC)
 ```
+
+Installed on the board 2026-10-10 (`check` after the reboot): command line
+`... cma=1000M cma=256M`; `Reserved memory: created CMA memory pool at
+0x0000000010000000, size 1280 MiB`; the global CMA (256 MiB) at
+`0x65C0_0000`; u-dma-buf loaded at boot, `udmabuf0` at `0x10000000`, 1280 MiB,
+`sync_mode` 2; `CmaTotal` 1536 MiB.
 
 A pool that overlaps a region in use at boot is rejected by the kernel (the
 system boots without it). A kernel update keeps `user-override.dtb` (the tree
