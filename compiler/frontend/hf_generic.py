@@ -204,8 +204,15 @@ def calibrate_kv(model, tokens, max_len):
 
 
 def hf_model(model_dir, layers=None):
-    """The HF model in fp32 (layers: only the first ones, a truncated model for tests)."""
+    """The HF model in fp32 (layers: only the first ones, a truncated model for tests).
+    A compressed-tensors W8A8 checkpoint (ct_import.py): its quantized layers
+    dequantized, their weights carrying the checkpoint's (q, s) for quantize()."""
     from transformers import AutoConfig
+    import ct_import
+    if ct_import.quant_config(model_dir) is not None:
+        m, r = ct_import.load_model(model_dir, layers)
+        print(f"  ct_import: {len(r['quantized'])} quantized linear layers from the checkpoint, ignored {r['ignored']}")
+        return m
     cfg = AutoConfig.from_pretrained(model_dir)
     if layers:
         cfg.num_hidden_layers = layers
@@ -361,6 +368,11 @@ def rope_rewrite(model, max_len):
                 w = lin.weight.data
                 heads = w.shape[0] // hd
                 lin.weight.data = w.reshape(heads, hd, -1)[:, perm].reshape(w.shape).contiguous()
+                qs = getattr(lin.weight, "_sa_qs", None)
+                if qs is not None:        # an imported checkpoint's int8 rows and scales, alike
+                    q, s = qs
+                    lin.weight._sa_qs = (q.reshape(heads, hd, -1)[:, perm].reshape(q.shape).contiguous(),
+                                         s.reshape(heads, hd)[:, perm].reshape(-1).contiguous())
                 if lin.bias is not None:
                     lin.bias.data = lin.bias.data.reshape(heads, hd)[:, perm].reshape(-1).contiguous()
                 n["projections"] += 1
@@ -406,13 +418,17 @@ def quantize(model):
     """Every nn.Linear -> QLinear, nn.Embedding -> QEmbedding (W8A8, qhf's
     scheme). A weight shared by several modules (a classifier tied to the
     embedding) is quantized once and the int8 tensor shared (the packed-gather
-    optimization of the sa backend reads it once, plan §8.12 C6.0)."""
-    shared, n = {}, {"linear": 0, "embedding": 0}
+    optimization of the sa backend reads it once, plan §8.12 C6.0). A weight
+    with `_sa_qs` (an imported checkpoint, ct_import.py) keeps its int8 rows
+    and scales as they are."""
+    shared, n = {}, {"linear": 0, "embedding": 0, "imported": 0}
 
     def qs_of(weight):
         key = weight.data_ptr()
         if key not in shared:
-            shared[key] = _quantize_rows(weight)
+            qs = getattr(weight, "_sa_qs", None)
+            shared[key] = qs if qs is not None else _quantize_rows(weight)
+            n["imported"] += qs is not None
         return shared[key]
 
     for name, mod in list(model.named_modules()):
@@ -421,7 +437,14 @@ def quantize(model):
                 q = QLinear(child, qs_of(child.weight))
                 n["linear"] += 1
             elif isinstance(child, torch.nn.Embedding):
-                q = QEmbedding(child, qs_of(child.weight))
+                qs = qs_of(child.weight)
+                if getattr(child.weight, "_sa_qs", None) is not None and bool((qs[0] == -128).any()):
+                    # the row gather copies through the VE, whose int8 output saturates to +-127
+                    import ct_import
+                    raise ct_import.UnsupportedCheckpoint(
+                        f"{name or 'model'}.{cname}: the embedding shares the imported int8 table of a quantized "
+                        "classifier, which has -128; supported: the classifier in `ignore` (quantized here) or untied")
+                q = QEmbedding(child, qs)
                 n["embedding"] += 1
             else:
                 continue

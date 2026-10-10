@@ -35,6 +35,8 @@ declare -A cmd=(
   [fallback]="$SA_PY -u $T/test_fallback.py"
   # the generic frontend (plan §8.16): unmodified HF SmolLM2 on sim vs transformers
   [hfgen]="$SA_PY -u $T/test_hf_generic.py --model build/llm_cache/SmolLM2-135M --out build/hfgen/smollm2_raw"
+  # WP2: compressed-tensors W8A8 import (synthetic checkpoints: refused / accepted, byte-identical; end to end on sim)
+  [ctimport]="$SA_PY -u $T/test_ct_import.py --e2e"
   [c3]="$SA_PY -u $T/test_c3.py --skip-export --out build/c4/fuse"
   [c5]="$SA_PY -u $T/test_c5.py"
   [c5cfg]="$SA_PY -u $T/test_c5.py --configs"

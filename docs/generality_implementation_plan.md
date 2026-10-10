@@ -128,6 +128,18 @@ G5-4 收尾（已完成，只剩 perf_model 校准）
 
 ## 6. 工作包 WP2：compressed-tensors W8A8 importer
 
+**进度（2026-10-10）**：第一版完成，主机上验证。
+- `compiler/frontend/ct_import.py`：按 §6.1 检查 `quantization_config`（拒绝时给出 config group / 层名、字段与支持范围）；safetensors 按张量 mmap 读入（单文件或分片），每个量化线性层的 `(q int8, s fp32)` 挂在权重 Parameter 上（`_sa_qs`），权重本身为反量化的 `q * s`（fp32 参考与 KV 校准用）；`ignore` 的层与非 Linear 张量按原浮点载入。
+- `hf_generic.py`：`hf_model()` 遇到 `quantization_config` 走 importer；`rope_rewrite()` 同时置换 `_sa_qs` 的行与 scale；`quantize()` 有 `_sa_qs` 就原样使用（不经 `_quantize_rows`，-128 保留）。普通模型的导出与改动前逐字节相同（SmolLM2 截 2 层：irpa / mlir 相同）。
+- `synth_hf.py --ct VARIANT`：合成 checkpoint（scale = amax / 127.5、[-128, 127]，如 llm-compressor 的 minmax）；接受的 ok / neg128 / bf16-scale，拒绝的 group / static-act / asym / int4 / fp8 / missing-scale / bad-shape / kv-scheme。
+- `compiler/tests/test_ct_import.py [--e2e]`（`run_tests.sh ctimport`）：8 种拒绝都报出对应字段；3 种接受的 14 个线性层 int8 与 scale 与文件逐字节相同（q / k 按 RoPE 置换），-128 保留，嵌入与分类层一张共享表，反量化权重 = q × s；变异（`quantize()` 不用 `_sa_qs`、`rope_rewrite` 不置换 `_sa_qs`）都被发现。`--e2e`（D = 16、GEMV 4 口）：Llama 形状的 neg128 / bf16-scale 导出、编译（全部在加速器上）、sim 与 torch W8A8 逐步一致，teacher-forced 40/40 与 torch 相同。主机内存峰值 436 MB（小模型）。
+- `dispatch_check.py --full-i8`：int8 数据取 [-128, 127]（默认仍为 [-127, 127]，前端自量化的范围）。
+
+**这一步发现的问题**（都不是 importer 引入的）：
+1. **嵌入的行 gather 经过 VE**，VE 的 int8 输出饱和到 ±127：表里的 -128 变成 -127（`dispatch_check --full-i8` 的 `elementwise_broadcast_*_i64xi8`）。自量化的表没有 -128；compressed-tensors 只量化 Linear，嵌入由本项目量化。只有“嵌入与一个被量化（不在 `ignore`）的分类层共用一张表”时会碰到，`quantize()` 现在明确拒绝这种情况。根治：gather 改用 LD（动态地址）而不是 VE 拷贝，另行评估。
+2. **通用前端的 Qwen3 形式**（q_norm / k_norm）：合成 Qwen3（dim 64 / 256）在 decode 每步有 36–135 个 dispatch 回退到主机，prefill 与 decode-only 不逐位一致。板上的 c6p_qwen3 走手写的 `qhf` 路径，不受影响；但 WP4 导入外部 Qwen3 checkpoint 要走通用前端，所以这是 **WP4 的前置任务**：先把 Qwen3 在通用前端上的回退清掉。
+3. **prefill + decode 与 decode-only 的逐位等价依赖数据**：Llama 形状的随机权重模型，自量化、不经 importer，seed 0 为 5/5，seed 1–3 为 0/5、4/5、4/5（token 相同，logits 差约 0.7 / 相关 0.99995）。真实模型（stories、SmolLM2、Qwen3 手写路径）一直逐位相同。要定位第一个分歧的 dispatch（候选：注意力里随长度变化的归约顺序、概率的 int8 舍入），列为新的独立任务；`test_ct_import --e2e` 暂不带 `--prefill`。
+
 ### 6.1 接受格式
 
 第一版只接受：
@@ -413,7 +425,7 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 | 日期 | 目标 | 停止条件 / 降级动作 |
 |---|---|---|
 | ~~10/11–10/14~~ | WP0–WP1：四口收尾 | **10/10 已完成**（剩 perf_model 校准，可与 WP2 并行）；bitstream 冻结为 `d16_100mhz_w128_p6_gemv_np4` |
-| 10/11–10/18 | WP2：importer schema 与合成测试 | 10/18 前格式解析不稳定，则缩小到单一已验证 checkpoint schema |
+| 10/11–10/18 | WP2：importer schema 与合成测试（**10/10 第一版完成**；剩：通用前端 Qwen3 的回退、prefill 等价问题定位） | 10/18 前格式解析不稳定，则缩小到单一已验证 checkpoint schema |
 | 10/19–10/24 | WP3–WP4：SmolLM2、Qwen3 | 10/24 前 Qwen 质量无改善，也必须输出四层定位结论，不继续盲调 scale |
 | 10/25–10/29 | WP5：Llama 前端、EX 基线、内存预检 | 内存门禁失败则暂停板上 staging，保留 sim 结果并启动 M2 评估 |
 | 10/30–11/03 | WP6–WP7：K 分块与 Llama | K 分块不稳定则演讲使用 EX 正确性基线，把性能优化标为进行中 |
@@ -427,10 +439,10 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 每个提交应能独立测试和回退：
 
 1. ~~`docs: sync KV260 G4/G5 status and metrics`~~（`fb01909`、`b42fec6`）
-2. `frontend: parse compressed-tensors W8A8 config`
-3. `frontend: add external int8 weight/scale representation`
-4. `frontend: preserve imported int8 values including -128`
-5. `tests: add synthetic compressed-tensors checkpoints`
+2. ~~`frontend: parse compressed-tensors W8A8 config`~~
+3. ~~`frontend: add external int8 weight/scale representation`~~
+4. ~~`frontend: preserve imported int8 values including -128`~~
+5. ~~`tests: add synthetic compressed-tensors checkpoints`~~（2–5 合为一个提交）
 6. `frontend: import SmolLM2 and Qwen3 W8A8 checkpoints`
 7. `tools: add quantization quality comparison pipeline`
 8. `frontend: add Llama 3.2 tokenizer and RoPE coverage`

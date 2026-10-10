@@ -109,10 +109,15 @@ def binding_regions(func, interp):
     return regions
 
 
+FULL_I8 = False
+
+
 def fill(rng, et, n, t):
     if et == "f32":
         return rng.standard_normal(n).astype(np.float32).tobytes()
-    if et in ("i8", "i32", "i16"):
+    if et == "i8" and FULL_I8:         # imported checkpoints have -128 (WP2); a VE int8 output saturates to +-127
+        return rng.integers(-128, 128, n, dtype=np.int8).tobytes()
+    if et in ("i32", "i16"):
         return rng.integers(-127, 128, n, dtype=O.NP[et]).tobytes()      # no int64 temporary
     if et == "i64":
         # pos + 1 < T: partly masked rows; a vector (prefill's positions of a
@@ -229,8 +234,12 @@ def main():
     ap.add_argument("--t", type=int, default=16)
     ap.add_argument("--skew", type=int, default=0, help="binding k's base at a page + skew * (k + 1) bytes")
     ap.add_argument("--dirty", action="store_true", help="local memories start with garbage, not zeros")
+    ap.add_argument("--full-i8", action="store_true", help="int8 data over [-128, 127] (default [-127, 127], "
+                    "the range of the frontend's own quantization)")
     ap.add_argument("numbers", nargs="*")
     args = ap.parse_args()
+    global FULL_I8
+    FULL_I8 = args.full_i8
     global SKEW, DIRTY
     SKEW, DIRTY = args.skew, args.dirty
     # module_<function>$async_dispatch_<n>.mlir: numbered per function (a module
