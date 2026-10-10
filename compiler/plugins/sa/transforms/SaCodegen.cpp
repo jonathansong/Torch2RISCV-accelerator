@@ -48,7 +48,8 @@ struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL
     bool ok;
     {
       ScopedDiagnosticHandler h(func.getContext(), [&](Diagnostic &dg) {
-        if (why.empty()) why = dg.str();
+        // the first error with a message (multithreaded, notes / empty ones can come first)
+        if (why.empty() && dg.getSeverity() == DiagnosticSeverity::Error && !dg.str().empty()) why = dg.str();
         return success();
       });
       ok = succeeded(runPipeline(pm, tmp));
@@ -95,7 +96,18 @@ struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL
         for (StringRef p : pats) forced |= exportOp.getSymName().contains(p);
         if (forced) why = "--iree-sa-host-dispatches";
       }
-      if (!forced && compile(inner, func, cfg, bindings, constants, why)) {
+      bool ok = !forced && compile(inner, func, cfg, bindings, constants, why);
+      // ACC full: sahl-tile's estimate was too optimistic (a buffer never spans
+      // the two ACC banks, ...): again with smaller pieces. Dispatches that
+      // compile the first time are unchanged.
+      for (int64_t shrink = 1; !ok && !forced && shrink <= 3 && why.find("ACC full") != std::string::npos; ++shrink) {
+        TargetConfig c = cfg;
+        c.tileShrink = shrink;
+        std::string why2;
+        ok = compile(inner, func, c, bindings, constants, why2);
+        if (!ok && !why2.empty()) why = why2;
+      }
+      if (ok) {
         if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": ok\n";
         continue;
       }

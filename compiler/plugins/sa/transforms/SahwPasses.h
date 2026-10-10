@@ -43,6 +43,9 @@ struct TargetConfig {
   // not a hardware parameter: the micro-kernels sahl-to-sahw may use (§8.8)
   bool ukernel(StringRef name) const;
   std::string ukernels = "all";
+  // not a hardware parameter: sahl-tile plans its pieces for ACC / 2^tileShrink
+  // (SaCodegen retries a dispatch whose lowering ran out of ACC with 1, 2, 3)
+  int64_t tileShrink = 0;
 };
 
 // Code generation of every export (SaCodegen.cpp): the C5 pipeline

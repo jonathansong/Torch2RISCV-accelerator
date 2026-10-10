@@ -137,7 +137,10 @@ G5-4 收尾（已完成，只剩 perf_model 校准）
 
 **这一步发现的问题**（都不是 importer 引入的）：
 1. **嵌入的行 gather 经过 VE**，VE 的 int8 输出饱和到 ±127：表里的 -128 变成 -127（`dispatch_check --full-i8` 的 `elementwise_broadcast_*_i64xi8`）。自量化的表没有 -128；compressed-tensors 只量化 Linear，嵌入由本项目量化。只有“嵌入与一个被量化（不在 `ignore`）的分类层共用一张表”时会碰到，`quantize()` 现在明确拒绝这种情况。根治：gather 改用 LD（动态地址）而不是 VE 拷贝，另行评估。
-2. **通用前端的 Qwen3 形式**（q_norm / k_norm）：合成 Qwen3（dim 64 / 256）在 decode 每步有 36–135 个 dispatch 回退到主机，prefill 与 decode-only 不逐位一致。板上的 c6p_qwen3 走手写的 `qhf` 路径，不受影响；但 WP4 导入外部 Qwen3 checkpoint 要走通用前端，所以这是 **WP4 的前置任务**：先把 Qwen3 在通用前端上的回退清掉。
+2. **通用前端的 Qwen3 形式（已解决，2026-10-10）**：真实 Qwen3-0.6B（截 2 层）走通用前端时 decode 已全部在加速器上，回退都在 prefill：QK-norm（`reduction_16x16x128` / `16x8x128`）、Q 的 RoPE 与转置、RoPE 表 gather（`elementwise_broadcast_32768`）、K 的置换加量化、注意力输出的反量化（`elementwise_16x2048`），都是 M × heads × head_dim 的张量（32768 个 fp32 = 2048 字，超过一个 ACC bank 的 1536 字），且 HF 在 norm 后的 `transpose(1, 2)` 融进同一 dispatch，现有按行分片不接受。修复两处：
+   - **前端**（`hf_generic._attention_rows`）：prefill（M > 1）时注意力模块的 forward 按行执行，与 qhf.prefill 相同的结构：q / k / v 投影对 M 行一起算（整数，与逐行相同），然后每行调用模块**原本的** forward（投影换成该行的结果、o_proj 暂时去掉；QK-norm、RoPE、写 KV、sa 注意力都与 decode 一步完全相同），最后 o_proj 对 M 行一起算。HF 的注意力代码原样复用，对 Llama / Qwen3 / Gemma 通用，prefill 与 decode 在构造上逐位一致。decode（M = 1）不变。
+   - **编译器**（`SaCodegen`）：lowering 报 `ACC full` 时以 `tileShrink` = 1、2、3 重试（sahl-tile 按 ACC / 2^n 规划分片）；第一次就能编译的 dispatch 不变（黄金语料逐字节相同）。`elementwise_16x2048` 由此上了加速器。另外报告只取第一条非空的 error 诊断（多线程编译时原来常打印 “failed ()”）。
+   结果：Qwen3（2 层）prefill + decode 0 个主机回退，prefill 与 decode-only 5/5 逐位一致，teacher-forced 22/40（torch W8A8 21/40）；SmolLM2（30 层）decode 的数字与改动前完全相同，prefill 5/5。代价：导出的计算图变大（SmolLM2 的 mlir 18.7 → 35.4 MB，导出 7.5 分钟 / 3.0 GB，编译 21 分钟 / 4.5 GB），板上 prefill 的速度待测（每行多出注意力部分的 dispatch）。剩下：head_dim = 64 且有 QK-norm 的模型（只在合成模型上）norm 权重 256 字节，被 IREE 内联成 dispatch 内的常量（`bufferization.to_buffer` 不支持）；目标模型（Qwen3 128、Gemma3 256、Llama 无 QK-norm）不受影响。
 3. **prefill + decode 与 decode-only 的逐位等价依赖数据（已定位并修复，2026-10-10）**：Llama 形状的随机权重模型（自量化、不经 importer）seed 1–3 为 0/5、4/5、4/5。定位过程：sim 结束时的 DDR 对比 → 只有第 1 层的 K / V 在第 18、28、36 个位置差 ±1（第 0 层相同）；torch eager 的 prefill 与 decode 的 KV 完全相同、sim 的 decode 与 eager 相同 → 偏离的是 sim 的 prefill；逐 dispatch 检查各 T / dirty 都通过，只剩 3 个 UNSUPPORTED，即**回退到主机的 dispatch**，其中 `prefill:161` 是第 0 层融合了 SwiGLU 的 gate 投影（`silu(g)·u`，含 exp 与除法）。它代码生成失败（`sahl-to-sahw: ACC full`），在主机上用 libm 的 exp / 除法计算，而 decode 的同一运算在设备 SFU 上（近似 exp / RECIP），偶尔差一个舍入单位，经第 1 层的激活量化变成 KV 的 ±1。根因：prefill 按行线性内核的块大小（`linearSchedule`，`chunk_tiles`）只按 SPAD_B 选，K = 256 时取 16 个 tile；而每个 ACC bank 在 scratch 之上只有 1536 个字、缓冲不跨 bank，scope 要放 15 个 D × nc 字的缓冲（累加、结果、up 的 int32 输入、epilogue 每步一个临时值）。真实模型的 K ≥ 576，块小，从未碰到。修复：块大小再按每个 bank 的可用空间与缓冲个数取上限（这里 16 → 12）；黄金语料 4232 个 dispatch 逐字节不变；seed 1–3 与 neg128 都 5/5，`test_ct_import --e2e` 恢复 `--prefill`。剩下：这类合成形状的 prefill 还有 2 个 dispatch 在主机上（`elementwise_broadcast_*`：pair swap 以外的固定下标 gather；`elementwise_transpose_4x16x64`：超过两层循环），都是数据搬移与乘加、目前逐位一致，但主机上的乘加若被收缩成 FMA 就会再出现同类问题，列为后续项；另外整体编译的 `--iree-sa-codegen-report` 在这种失败时只打印 “failed ()”（多线程编译时诊断没有传回），单独编译该 dispatch 才看到原因，待修。
    **教训**：主机回退（VMVX）的 dispatch 若含 exp / 除法等 SFU 近似的运算，与设备上的同一运算不逐位一致；prefill 与 decode 只要有一方回退就会破坏等价性。回退清单（WP9）应标出这类 dispatch。
 
@@ -426,7 +429,7 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 | 日期 | 目标 | 停止条件 / 降级动作 |
 |---|---|---|
 | ~~10/11–10/14~~ | WP0–WP1：四口收尾 | **10/10 已完成**（剩 perf_model 校准，可与 WP2 并行）；bitstream 冻结为 `d16_100mhz_w128_p6_gemv_np4` |
-| 10/11–10/18 | WP2：importer schema 与合成测试（**10/10 第一版完成**，prefill 等价问题已修复；剩：通用前端 Qwen3 的回退） | 10/18 前格式解析不稳定，则缩小到单一已验证 checkpoint schema |
+| 10/11–10/18 | WP2：importer schema 与合成测试（**10/10 第一版完成**；prefill 等价问题、通用前端 Qwen3 的回退都已解决） | 10/18 前格式解析不稳定，则缩小到单一已验证 checkpoint schema |
 | 10/19–10/24 | WP3–WP4：SmolLM2、Qwen3 | 10/24 前 Qwen 质量无改善，也必须输出四层定位结论，不继续盲调 scale |
 | 10/25–10/29 | WP5：Llama 前端、EX 基线、内存预检 | 内存门禁失败则暂停板上 staging，保留 sim 结果并启动 M2 评估 |
 | 10/30–11/03 | WP6–WP7：K 分块与 Llama | K 分块不稳定则演讲使用 EX 正确性基线，把性能优化标为进行中 |

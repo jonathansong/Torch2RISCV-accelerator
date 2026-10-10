@@ -168,6 +168,56 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
     return (outs[0] if M == 1 else torch.cat(outs, dim=1)), None
 
 
+class _Given(torch.nn.Module):
+    """A projection replaced by its precomputed output (_attention_rows)."""
+    def __init__(self, v):
+        super().__init__()
+        self.v = v
+
+    def forward(self, x):
+        return self.v
+
+
+def _attention_rows(forward):
+    """The attention module's own forward in prefill (M > 1) row by row, each
+    exactly as a decode step's (as qhf.prefill): the q / k / v projections of
+    the M rows computed together first (the linear layers are what gain from
+    the rows), then the module's forward on each row with those projections
+    given (QK-norm, RoPE, the KV row, the sa attention at the row's scalar
+    position), and o_proj on the M rows together. In one piece the chunk's
+    QK-norm / RoPE / attention inputs are M x heads x head_dim tensors that do
+    not fit ACC (left to the host: not bit-exact with decode), and their row
+    slices strided views. Decode (M = 1): the forward unchanged."""
+    names = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+    def rows(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kw):
+        M = hidden_states.shape[1]
+        if M == 1:
+            return forward(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kw)
+        saved = {n: getattr(self, n) for n in names}
+        proj = {n: saved[n](hidden_states) for n in names[:3]}
+        cache = self.sa_cache
+        positions = cache.positions
+        cos, sin = position_embeddings
+        outs = []
+        try:
+            setattr(self, "o_proj", _Given(None))
+            self.o_proj.forward = lambda x: x
+            for m in range(M):
+                for n in names[:3]:
+                    setattr(self, n, _Given(proj[n][:, m:m + 1]))
+                cache.positions = positions[m:m + 1]
+                o, _ = forward(self, hidden_states[:, m:m + 1], (cos[:, m:m + 1], sin[:, m:m + 1]),
+                               None, past_key_values, **kw)
+                outs.append(o)
+        finally:
+            for n, v in saved.items():
+                setattr(self, n, v)
+            cache.positions = positions
+        return saved["o_proj"](torch.cat(outs, dim=1)), None
+    return rows
+
+
 class SaDecoder(HFDecoder):
     """HFDecoder with the sa KV cache and attention (F4)."""
     def __init__(self, model, max_len, kv_scales):
@@ -187,6 +237,7 @@ class SaDecoder(HFDecoder):
         for mod in model.modules():
             if hasattr(mod, "layer_idx") and hasattr(mod, "q_proj"):
                 mod.sa_cache = self.cache
+                mod.forward = types.MethodType(_attention_rows(type(mod).forward), mod)
         model.set_attn_implementation("sa")
 
 

@@ -345,7 +345,8 @@ struct SahlTilePass : public PassWrapper<SahlTilePass, OperationPass<func::FuncO
     func::FuncOp f = getOperation();
     if (!f.getBody().front().getOps<sahl::KernelOp>().empty()) return;   // (kernels tile themselves)
     ::sa::Layout lay(uint32_t(cfg.d), uint32_t(cfg.spadBytes), uint32_t(cfg.accBytes));
-    const int64_t cap = 2 * (lay.cbank - lay.scr), d = cfg.d;
+    // (tileShrink: SaCodegen's retry after ACC full, the estimate being too optimistic)
+    const int64_t cap = (2 * (lay.cbank - lay.scr)) >> cfg.tileShrink, d = cfg.d;
     Decider dc{f, d};
     if (auto n = dc.pieceable(); n && dc.pieceWords(*n) > cap) {
       int64_t pieces = (dc.pieceWords(*n) + cap - 1) / cap;
