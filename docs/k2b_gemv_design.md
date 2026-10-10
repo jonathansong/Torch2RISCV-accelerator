@@ -165,7 +165,42 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
    prefill 不变（Qwen3 15.45 → 15.76 tok/s，SmolLM2 38.4 → 38.8）。SmolLM2 比预测低一些：模型小，每步固定开销（非线性层、命令和 dispatch 开销）占比更大。
 4. **CAPS 检查**：rt_fw（RT_VERSION 2）把单元的 CAPS 写进邮箱 `0xD0`，运行时加载可执行文件时检查它要求的 bit 21–25；用 GEMV 编译的模型在没有 GEMV 的比特流上会直接报错，而不是跑出错误结果。仿真上用 `SA_SIM_CAPS=0x01E00010` 模拟没有 GEMV 的单元验证过（stories15M GEMV 版本加载即报 INCOMPATIBLE）。G1 的 Qwen3 也已通过：1262 个 dispatch、logits 与 EX 路径逐字节相同。
 
-**第二阶段（按需）**：P = 4（HP0 现在是 PicoRV32 的口，要把它挪到 HPC0 或 LPD；×2.6–3.2）；SPAD 子银行（LD 写 SPAD / ACC 也到 32 B / 周期，prefill ×1.07）；LD 命令流水（隐藏每条命令约 65 周期的延迟，+2–3%）。
+**第二阶段**：P = 4（§8.1）；SPAD 子银行（LD 写 SPAD / ACC 也到 32 B / 周期，prefill ×1.07）；LD 命令流水（隐藏每条命令约 65 周期的延迟，+2–3%）。
+
+### 8.1 P = 4：4 个读口（G5）
+
+decode 仍受读带宽限制（GEMV 单元按带宽消耗权重），4 口 = 64 B / 周期 = 6.4 GB/s（KV260 DDR4 峰值约 19 GB/s）。
+
+**性能模型**（100 MHz，设备时间，相对 EX 路径；括号内按双口实测 / 预测之比 0.97（Qwen3）、0.93（SmolLM2）折算）：
+
+| | Qwen3 decode | SmolLM2 decode |
+|---|---|---|
+| 2 口（现在） | ×1.85（实测 ×1.80，3.98 tok/s） | ×1.76（实测 ×1.63） |
+| **4 口** | **×3.15**（约 6.5–7 tok/s） | **×2.74**（约 20 tok/s） |
+| 4 口 + H2 + LD 命令流水 | ×3.46 | ×3.06 |
+
+prefill 不变。4 口之后，decode 剩下的是 LD 命令的固定延迟（约 1.6M 周期 / 步）、attention 的 EX、VE（2.65M）；PS 上也没有更多 HP 口。再往上的主要手段是 int4 权重（W4A8，字节减半），另行评估。
+
+**口的分配**：PS 的 HP0 / HP1–HP2 / HP3 分别接 DDR 控制器的 S3 / S4 / S5，HPC0 / HPC1 经 CCI 到 S1 / S2。现在 HP0 = PicoRV32，HP1 = m0，HP3 = m1。
+
+| 方案 | m2 | m3 | PicoRV32 | |
+|---|---|---|---|---|
+| **A**（先做） | HP2 | HPC0（非一致性） | HP0 不动 | 改动最小；HPC0 经 CCI，延迟较大（每口 8 个 burst 在途，应能掩盖），与 APU 共用 S1 / S2 |
+| B | HP2 | HP0 | 挪到 HPC0 | 四个 DMA 口都在 HP 上；PicoRV32 只访问 ring，流量很小 |
+
+`build_bitstream -nports 4 [-m3_port hpc0|hp0]`（B 加后缀 `_m3hp0`）；先构建 A，bwtest 测试 7 明显低于 60 B / 周期再构建 B 对比。HP1 与 HP2 共用 S4 也由这个测试确认。
+
+**RTL**：
+- `sa_unit`：加 `m3_axi`（现在 m0..m2）；
+- `sa_ld`：本身支持任意口数（每口队列 + skid buffer）；R 侧仲裁变成 4 选 1，`lw_word`（乘法）→ ACC 地址的路径更长（双口时余量 +0.138 ns），必要时把 `lw_word` / `lw_lane` 提前一级（本地写多 1 周期延迟，吞吐不变）；
+- `sa_gemv`（NL = 4）：每条 lane 一份 x 缓冲（1 个 RAMB36）、累加器、16 个乘法；写回时每列 4 条 lane + ACC 原值相加，加一级流水；
+- 测试平台：`tb_sa_dma` NP = 4、`tb_sa_unit` 的内存从机到 4 个、Makefile 加 GEMV NP = 4。
+
+**资源估计**：单口 → 双口 +4.0k LUT，4 口约 101–103k LUT（87–88%）、BRAM 136 / 144、DSP 349。LUT 是主要风险（布线拥挤，时序更难收敛）；放不下时把 GEMV 的乘法放到 DSP（还有约 900 个）或两条 lane 共用一个双读口 x 缓冲。
+
+**软件**：编译器已接受 `gemv_ports` 0..4；`board_env.sh` 加 `_gemv_np4` → `SA_GEMV_PORTS=4`（构建后缀 `_gemv4`）；bwtest 的 GEMV 峰值已按 NPORTS × 16 计算。
+
+**步骤**：G5-1 RTL / 测试平台 / BD 参数，仿真通过后 `-bd_only` 检查；G5-2 构建 `-nports 4`；G5-3 板上 `--reuse p6_red` 回归 + bwtest（测试 7 应接近 64 B / 周期）；G5-4 完整 GEMV 4 口 staging，板上 decode 与预测比较。
 
 ## 9. 资源与时序估计（P = 2）
 

@@ -14,6 +14,8 @@ boards/kv260/scripts/build_bitstream.sh -jobs 2 -vefp_nb 0 -sa_d 16 -sa_mhz 100 
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -vefp_nb 0 -sa_d 16 -sa_mhz 100 -dma_w 128   # K2a-1: 128-bit DMA (d16_100mhz_w128)
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100 -dma_w 128   # + P6 batched SFU (d16_100mhz_w128_p6)
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100 -dma_w 128 -tag red   # + batched REDUCE (d16_100mhz_w128_p6_red; -tag only renames the config)
+boards/kv260/scripts/build_bitstream.sh -jobs 1 -sa_d 16 -sa_mhz 100 -dma_w 128 -gemv 1   # + K2b GEMV unit, one port (d16_100mhz_w128_p6_gemv)
+boards/kv260/scripts/build_bitstream.sh -jobs 1 -sa_d 16 -sa_mhz 100 -dma_w 128 -gemv 1 -nports 2   # K2b: two DMA ports, m1 on HP3 (d16_100mhz_w128_p6_gemv_np2; -m1_hp 2: HP2, suffix _hp2)
 boards/kv260/scripts/build_bitstream.sh -bd_only                # block design + address map only (minutes)
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -synth_only     # stop after synthesis (~9 min)
 ```
@@ -48,6 +50,11 @@ PYNQ (Kria-PYNQ, which installs the PYNQ venv and XRT setup under
 | **K1a: D = 8, 50 MHz** (`output/d8_50mhz`, commit `0b9c414`) | 2026-10-04 | 40,257 (34.4%) | | 115 | 130 / 144 | 0 / 64 | +7.800 / +0.010 ns | with the LDPARAM stage; the overlay for K1a's board tests |
 | **K1b: D = 8, 100 MHz** (`output/d8_100mhz`, LDPARAM fix `b4bd8a6`) | 2026-10-04 | 40,275 (34.4%) | 31,550 (13.5%) | 115 | 130 / 144 | 0 / 64 | +1.171 / +0.010 ns | `clk_pl_0` 10 ns; worst path LD `q_lane` -> DSP -> ACC BRAM write enable (7.8 ns, 13 levels): about 113 MHz |
 | **K1c: D = 16, 100 MHz** (`output/d16_100mhz`, commit `4bd8389`) | 2026-10-08 | 74,951 (64.0%) | 59,944 (25.6%) | 347 (27.8%) | 130 / 144 | 0 / 64 | +0.630 / +0.011 ns | every PE column on DSPs (`DSP_COLS = D`: 256 for the array); the fp VE at FL = 8; worst path LD `q_rp` -> DSP -> ACC BRAM write enable (8.4 ns, 12 levels) |
+| **K2a-1: 128-bit DMA** (`output/d16_100mhz_w128`, commit `094d535`) | 2026-10-08 | 75,503 (64.5%) | 60,270 | 347 | 130 / 144 | 0 / 64 | +0.311 / +0.010 ns | |
+| **P6: batched SFU** (`output/d16_100mhz_w128_p6`, commit `2f13840`) | 2026-10-09 | 84,468 (72.1%) | 61,283 | 347 | 130 / 144 | 0 / 64 | +0.113 / +0.011 ns | `sa_vefp` LUTRAM register file, `VEFP_NB = 8` |
+| **+ batched REDUCE** (`output/d16_100mhz_w128_p6_red`, commit `b10da84`) | 2026-10-09 | 88,250 (75.4%) | 60,823 | 347 | 130 / 144 | 0 / 64 | +0.123 / +0.010 ns | the EX-path overlay the GEMV ones are compared with |
+| **K2b: GEMV, one port** (`output/d16_100mhz_w128_p6_gemv`, commit `17efed9`) | 2026-10-09 | 92,329 (78.8%) | 61,566 | 349 | 132 / 144 | 0 / 64 | +0.274 / +0.010 ns | `sa_gemv` (16 int8 MACs per port, x buffer) |
+| **K2b: GEMV, two ports** (`output/d16_100mhz_w128_p6_gemv_np2`, commit `3127e6a`) | 2026-10-10 | 96,294 (82.2%) | 63,675 | 349 | 134 / 144 | 0 / 64 | +0.138 / +0.010 ns | m1 on HP3; the first build failed (-0.576 ns: PS RVALID -> R-side port arbitration -> `lw_word` DSP -> ACC address), fixed by a per-port R skid buffer in `sa_ld` |
 
 K1a: the worst setup path (10.5 ns data path, 14 levels including a DSP
 multiplier) runs from the DMA port's read data (`PS8_i/SAXIGP3RCLK`, HP1)
@@ -81,7 +88,8 @@ IP `rtl/ip`) and
 |---|---|---|
 | ARM -> PL | `M_AXI_HPM0_FPD` (32-bit) | `M_AXI_GP0` |
 | PicoRV32 -> DDR (rings) | `S_AXI_HP0_FPD` (64-bit, AXI4) | `S_AXI_HP0` |
-| accelerator DMA | `S_AXI_HP1_FPD` (64-bit, AXI4, direct) | `S_AXI_HP2` via an AXI4 -> AXI3 converter |
+| accelerator DMA | `S_AXI_HP1_FPD` (`-dma_w` bits, AXI4, direct) | `S_AXI_HP2` via an AXI4 -> AXI3 converter |
+| second DMA port (`-nports 2`, K2b) | `S_AXI_HP3_FPD` (`-m1_hp 2`: HP2; HP1 and HP2 share the DDR controller's S4 port, HP3 has S5) | - |
 | PL clock | `pl_clk0` = `-sa_mhz`, the only clock | FCLK0 50 MHz + clk_wiz 50 MHz |
 | RISC-V reset | EMIO GPIO[0] (1 = hold) | EMIO GPIO[0] |
 | interrupts | axi_intc -> `pl_ps_irq0` (In0 PicoRV32 trap, In1 `matmul_0/notify_irq`) | axi_intc -> IRQ_F2P |
@@ -97,6 +105,7 @@ IP `rtl/ip`) and
 | PicoRV32 | accelerator CSRs | `0x8000_0000` | 4 KB |
 | PicoRV32 | program BRAM (reset vector) | `0xC000_0000` | 8 KB |
 | accelerator DMA | DDR (HP1, low 2 GB, identity-mapped) | `0x0000_0000` | 2 GB |
+| accelerator DMA port 1 (`-nports 2`) | DDR (HP3 / HP2, low 2 GB, identity-mapped) | `0x0000_0000` | 2 GB |
 
 The RISC-V / accelerator side is the Z1's (firmware unchanged); on the ARM
 side only the window moves (Z1: BRAM at `0x4001_0000`, so the driver's
@@ -210,6 +219,29 @@ B/cycle (1.57 GB/s, 98% of the 128-bit limit; K1c 7.9), LD + ST concurrently
 | SmolLM2 generic decode (hfgen) | 4.38 | **6.89** |
 | SmolLM2 generic prefill | 10.04 | **11.21** |
 | GEMM 256³ (MAC/cycle) | 202.6 | **216.0** |
+
+## K2b: streaming GEMV, two DMA ports (passed)
+
+Decode matvecs stream their weights from DMA straight into a GEMV unit (LD
+mode GEMV, `rtl/sysarray/sa_gemv.v`, docs/k2b_gemv_design.md): 16 int8 MACs
+per read port, no SPAD. The staging picks the compiler's
+`--iree-sa-gemv-ports` from the configuration's name (`_gemv` -> 1,
+`_gemv_np2` -> 2; build directories `_gemv` / `_gemv2`); the runtime refuses a
+GEMV executable on an overlay without the unit (CAPS bit 25, reported by
+rt_fw at mailbox `0xD0`). Prefill and attention stay on the array.
+
+`bwtest` GEMV 64 KB: one port 15.64 B/cycle, two ports **30.55 B/cycle**
+(95.5% of 32). Regression passes on both overlays; every LLM test is
+bit-exact with the sim and gives the EX path's tokens.
+
+| Decode (tok/s, board) | EX path (`p6_red`) | GEMV, two ports |
+|---|---|---|
+| Qwen3-0.6B (c6p_qwen3) | 2.22 | **3.98** (x1.80) |
+| SmolLM2-135M (c6p) | 7.71 | **12.58** (x1.63) |
+| SmolLM2 generic (hfgen) | 7.62 | **12.73** (x1.67) |
+| stories15M (c6p) | 61.9 | **100.8** (x1.63) |
+
+Prefill is unchanged (Qwen3 15.45 -> 15.76 tok/s).
 
 ## To confirm on the board
 
