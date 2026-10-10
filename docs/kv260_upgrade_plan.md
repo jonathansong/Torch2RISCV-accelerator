@@ -1,6 +1,6 @@
 # PYNQ-Z1 → Kria KV260 升级方案
 
-状态：草案（2026-10-02，按三轮实现前评审修订：K1 拆为 50 / 100 MHz 两步，K2 改为 DMA 与片上存储接口重构，K4 拆为正确性与性能两步验收）。**2026-10-04：Z1 已冻结**（§7.2 完成：tag `v1.0-pynq-z1`、分支 `pynq-z1`、基线文件 `tests/baselines/pynq-z1/`，含实测的耗时分解 `z1_profile.md`）；之后的所有优化都在 KV260 上做，包括编译器的带生存期内存规划（K2b 的编译器工作项）。**2026-10-08：K1 验收完成**（K1a 50 MHz、K1b 100 MHz，板上 token 序列与 Z1 基线完全相同；100 MHz 下 stories15M 35.44 token/s、SmolLM2 4.43 token/s），`kv260` 分支合入 main，main 从此是 KV260 版本（§7.3）。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
+状态：草案（2026-10-02，按三轮实现前评审修订：K1 拆为 50 / 100 MHz 两步，K2 改为 DMA 与片上存储接口重构，K4 拆为正确性与性能两步验收）。**2026-10-04：Z1 已冻结**（§7.2 完成：tag `v1.0-pynq-z1`、分支 `pynq-z1`、基线文件 `tests/baselines/pynq-z1/`，含实测的耗时分解 `z1_profile.md`）；之后的所有优化都在 KV260 上做，包括编译器的带生存期内存规划（K2b 的编译器工作项）。**2026-10-08：K1 验收完成**（K1a 50 MHz、K1b 100 MHz，板上 token 序列与 Z1 基线完全相同；100 MHz 下 stories15M 35.44 token/s、SmolLM2 4.43 token/s），`kv260` 分支合入 main，main 从此是 KV260 版本（§7.3）。**2026-10-10：K2b 以 100 MHz 流式 GEMV（H4）+ 4 个读口验收**（D = 16 不变，不再以 D = 32 为前提；设计见 [`k2b_gemv_design.md`](k2b_gemv_design.md)）：decode Qwen3-0.6B 2.22 → **6.28 token/s**、SmolLM2 7.71 → 17.04，prefill 不变；K5-M 第 1 步（启动时保留的 1280 MiB 加速器内存池）完成。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
 
 相关文档：[`iree_compiler_plan.md`](iree_compiler_plan.md) §8.18（FPGA 规模估计）、[`double_buffer_design.md`](double_buffer_design.md)（加速器架构）、[`memory_model.md`](memory_model.md)（地址与一致性）。
 
@@ -112,7 +112,7 @@
 | **K1c** | 只把 D 从 8 改为 16（Z1 因 LUT 只能放 D = 8 的 LLM 加速器） | 资源、时序；VE 的 fp 通道折叠（FL）随 D 变化 | 小 |
 | **KC** | 计算侧（§3.1 的 H1、H2）：VE 定序模式多组交错（P6）、调度器乱序发射 / 细粒度冲突检查；K1c 之后，可与 K2 并行 | 与功能仿真器逐位一致；记分板的正确性 | 中 |
 | **K2a** | 单口 128 位：LD 入口、DMA 与 SPAD 写入加宽；测 DMA → SPAD 的端到端有效带宽 | DMA 与存储写入接口改动 | 中 |
-| **K2b** | 多口接收 + 存储分银行，逐步追求 6–10 GB/s；**同时 D = 16 → 32**（decode 时阵列每周期只消耗 D 字节权重，见 §3.1） | **DMA + 片上存储接口重构**、D = 32 的资源与时序、内存规划 | 大 |
+| **K2b** | 多口接收 + 存储分银行，逐步追求 6–10 GB/s；**同时 D = 16 → 32**（decode 时阵列每周期只消耗 D 字节权重，见 §3.1）。**实际做法**：D = 16 不变，decode 走流式 GEMV 单元（H4）+ 2 / 4 个读口，4 口 64 B / 周期 = 6.4 GB/s，2026-10-10 板上验收（`k2b_gemv_design.md`） | **DMA + 片上存储接口重构**、D = 32 的资源与时序、内存规划 | 大 |
 | **K3** | URAM 扩展 SPAD/ACC 容量（K2b 之后 D = 32：SPAD 字 256 位、ACC 字 1024 位） | URAM 的端口语义、初值、读延迟 | 中 |
 | **K4a** | Qwen3-0.6B 全模型板上正确运行 | 地址与容量、长上下文 | 中 |
 | **K4b** | 长上下文分块（C6.5）与性能调优，按实测耗时分解定目标 | 注意力 T 分块、调度 | 中 |

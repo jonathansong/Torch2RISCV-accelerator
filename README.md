@@ -5,6 +5,11 @@
 > stage (K1: the same accelerator, then 100 MHz) is accepted on the board:
 > every test's tokens are identical to the PYNQ-Z1 baselines, stories15M at
 > 35.4 tok/s and SmolLM2-135M at 4.4 tok/s (generic HuggingFace path 3.7).
+> Since then: 128-bit DMA, a batched SFU and REDUCE, Qwen3-0.6B (int8, all 28
+> layers) on the board, and a streaming GEMV unit for decode fed by four DMA
+> ports (K2b, 64 B/cycle at 100 MHz). Decode on the board, bit-exact with the
+> sim: Qwen3-0.6B 6.28 tok/s (prefill 15.9), SmolLM2-135M 17.0, stories15M
+> 131.7. The accelerator's buffers come from a 1280 MiB pool reserved at boot.
 > The PYNQ-Z1 version is frozen at tag
 > [`v1.0-pynq-z1`](../../tree/v1.0-pynq-z1) (branch `pynq-z1`): stories15M at
 > 17.6 tok/s and SmolLM2-135M (prefill + decode, the hand-written and the
@@ -222,7 +227,9 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   port in stages (platform at the same accelerator, clock, DMA and on-chip
   memory bandwidth, URAM capacity, Qwen3-0.6B), the measured Z1 time breakdown
   it starts from, and the repository strategy (Z1 frozen at `v1.0-pynq-z1`).
-  K1 (K1a 50 MHz, K1b 100 MHz) is accepted on the board; the overlay, its
+  K1 (K1a 50 MHz, K1b 100 MHz), K2a (128-bit DMA), Qwen3-0.6B (K4a) and the
+  four-port streaming GEMV (K2b, [design](docs/k2b_gemv_design.md)) are
+  accepted on the board; the overlay, its
   builds, address map and board setup are in [boards/kv260/README.md](boards/kv260/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the
   `rtl/sysarray` architecture, ISA and board results (M1-M5)

@@ -1,6 +1,6 @@
 # K2b / H4：2 口读入 + 流式 GEMV 单元的微结构
 
-（2026-10-09。依据：`kv260_upgrade_plan.md` K2b 第 1 步的性能模型，`compiler/tests/perf_model.py`。）
+（2026-10-09；**状态 2026-10-10：G1–G5 全部完成，4 口板上验收，Qwen3 decode 6.28 token/s、SmolLM2 17.04**，见 §8 / §8.1。依据：`kv260_upgrade_plan.md` K2b 第 1 步的性能模型，`compiler/tests/perf_model.py`。）
 
 ## 1. 目标
 
@@ -176,7 +176,7 @@ decode 仍受读带宽限制（GEMV 单元按带宽消耗权重），4 口 = 64 
 | | Qwen3 decode | SmolLM2 decode |
 |---|---|---|
 | 2 口（现在） | ×1.85（实测 ×1.80，3.98 tok/s） | ×1.76（实测 ×1.63） |
-| **4 口** | **×3.15**（约 6.5–7 tok/s） | **×2.74**（约 20 tok/s） |
+| **4 口** | **×3.15**（约 6.5–7 tok/s；实测 ×2.83，6.28 tok/s） | **×2.74**（约 20 tok/s；实测 ×2.21，17.04） |
 | 4 口 + H2 + LD 命令流水 | ×3.46 | ×3.06 |
 
 prefill 不变。4 口之后，decode 剩下的是 LD 命令的固定延迟（约 1.6M 周期 / 步）、attention 的 EX、VE（2.65M）；PS 上也没有更多 HP 口。再往上的主要手段是 int4 权重（W4A8，字节减半），另行评估。

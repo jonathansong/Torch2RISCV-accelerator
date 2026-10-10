@@ -86,7 +86,10 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   `build/deploy_kv260_<config>`), `tests/compare_z1_baselines.py` compares
   the board's tokens with the Z1 baselines. K1a (50 MHz) and K1b (100 MHz)
   pass with identical tokens; at 100 MHz stories15M runs at 35.4 tok/s and
-  SmolLM2-135M at 4.4 tok/s (boards/kv260/README.md).
+  SmolLM2-135M at 4.4 tok/s (boards/kv260/README.md). With the four-port
+  streaming GEMV (`--iree-sa-gemv-ports 4`, configuration
+  `d16_100mhz_w128_p6_gemv_np4`, docs/k2b_gemv_design.md) decode reaches
+  Qwen3-0.6B 6.28 tok/s, SmolLM2-135M 17.0 tok/s, bit-exact with the sim.
 - Setup: the frontend Python environment is checked. A turbine export of a
   small torch model (matmul + softmax), compiled with the pip `iree-compile`,
   matches torch.
