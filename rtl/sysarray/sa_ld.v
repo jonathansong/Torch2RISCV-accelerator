@@ -348,11 +348,36 @@ module sa_ld #(
     wire [DMA_W-1:0] r_beat = i_rdata[DMA_W*r_sel +: DMA_W];
     wire [63:0]      r_lane = upper ? r_beat[DMA_W-1 -: 64] : r_beat[63:0];
 
-    assign lw_en   = r_any;
-    assign lw_word = h_word + (w_sum >> lpwl) * step;
-    assign lw_lane = w_sum[7:0] & lane_mask;
-    assign lw_two  = merge;
-    assign lw_data = merge ? r_beat : {BL{r_lane}};
+    wire             c_lw_en   = r_any;
+    wire [15:0]      c_lw_word = h_word + (w_sum >> lpwl) * step;
+    wire [7:0]       c_lw_lane = w_sum[7:0] & lane_mask;
+    wire             c_lw_two  = merge;
+    wire [DMA_W-1:0] c_lw_data = merge ? r_beat : {BL{r_lane}};
+
+    // local write: NPORTS > 2 registers it (the port arbitration and the word
+    // multiply then end at flops, not at the memories' address pins); the
+    // command's done comes a cycle after its last beat is taken, with the
+    // write already in this register, so it is written by then
+    generate
+        if (NPORTS > 2) begin : lwreg
+            reg             r_en, r_two;
+            reg [15:0]      r_word;
+            reg [7:0]       r_lane;
+            reg [DMA_W-1:0] r_data;
+            always @(posedge clk) begin
+                r_en   <= resetn && c_lw_en;
+                r_word <= c_lw_word;
+                r_lane <= c_lw_lane;
+                r_two  <= c_lw_two;
+                r_data <= c_lw_data;
+            end
+            assign lw_en = r_en; assign lw_word = r_word; assign lw_lane = r_lane;
+            assign lw_two = r_two; assign lw_data = r_data;
+        end else begin : lwdirect
+            assign lw_en = c_lw_en; assign lw_word = c_lw_word; assign lw_lane = c_lw_lane;
+            assign lw_two = c_lw_two; assign lw_data = c_lw_data;
+        end
+    endgenerate
 
     generate
         for (gp = 0; gp < NPORTS; gp = gp + 1) begin : rr

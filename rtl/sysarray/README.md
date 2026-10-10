@@ -12,15 +12,15 @@ behavior (CSRs, funct7 = 0 instructions) is kept by `sa_legacy` (map below).
 
 | File | Contents |
 |---|---|
-| `sa_unit.v` | top level: CSR slave, 3 AXI4 masters (NPORTS used), PCPI, memories, engines |
+| `sa_unit.v` | top level: CSR slave, 4 AXI4 masters (NPORTS used), PCPI, memories, engines |
 | `sa_sched.v` | input queue → 2-stage decode (validation, bank masks) → bank scoreboard → engine queues |
 | `sa_pcpi.v` | custom-0 decoder: funct7 = 0 (legacy), funct7 = 1 (`mat_cfg/load/store/exec/fence`), funct7 = 2 (`vec_cfg/run`) |
 | `sa_legacy.v` | Phase 2–4 CSR map + CAPS/EXT_STATUS; sequencer turning an 8×8×8 job into LD/LD/EX/ST |
-| `sa_ld.v`, `sa_st.v` | DMA engines: 2D shapes (LINEAR / INTERLEAVE), ≤ 16-beat 4 KB-safe bursts striped over NPORTS |
+| `sa_ld.v`, `sa_st.v` | DMA engines: 2D shapes (LINEAR / INTERLEAVE), ≤ 16-beat 4 KB-safe bursts striped over NPORTS; with NPORTS > 1 each read port's R channel goes through a skid buffer, with NPORTS > 2 the local write is registered too (timing) |
 | `sa_ex.v` | EX engine: K-streaming feed (one SPAD_A + one SPAD_B word per cycle), shadow drain, accumulate, repeat (M2: several C tiles per command with B / C strides) |
 | `sa_perf.v` | performance counters: 32 × 32-bit event counters (28 defined, `PC_*` in `sa_defs.vh`), read by `mat_perf` (funct7 = 1, funct3 = 5) or the CSR mirror 0x40 + 4·i, control via `mat_perf` or `PERF_CTRL` (0x3C); `PERF = 0` removes them ([plan](../../docs/perf_counters_and_desc_dma_plan.md), P1) |
 | `sa_cmdfetch.v` | descriptor fetch unit: `mat_submit(list, count)` reads 64-byte descriptors from DDR (shares DMA port 0 with LD), decodes LD/ST/EX/VE into the same packets as PCPI (`pkt_*` in `sa_defs.vh`), handles FENCE / JUMP / END, relocation bases, errors (engine 4), status CSRs 0xC0–0xD0 ([design §8.6](../../docs/double_buffer_design.md)) |
-| `sa_gemv.v` | K2b GEMV unit: LD mode GEMV streams decode weights from DMA into 16 int8 MACs per read port, x buffer with residency, results to ACC (`GEMV = 1`; [design](../../docs/k2b_gemv_design.md)) |
+| `sa_gemv.v` | K2b GEMV unit: LD mode GEMV streams decode weights from DMA into 16 int8 MACs per read port, x buffer with residency, results to ACC (more than 2 ports: the lane sum registered before the ACC add) (`GEMV = 1`; [design](../../docs/k2b_gemv_design.md)) |
 | `sa_vefp.v` (+ `sa_fp32_*.v`, `sa_sfu_tables.vh`) | L2 fp32 vector engine: fp32 ops, affine, exp / recip / rsqrt (batched, P6), row REDUCE, TRANSPOSE |
 | `sa_ve.v` | M3 vector engine: VL = D lanes, ADD/SUB/MUL/MAX/MIN/COPY + RELU/REQUANT/clamp, int8/int16 (SPAD) and int32 (ACC), src2 period (broadcast / bias vector) |
 | `sa_array.v` | D×D PEs (`sa_pe_dsp` / `sa_pe_lut` per column), shadow accumulators |

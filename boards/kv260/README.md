@@ -16,6 +16,7 @@ boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100 -dma_w 128 
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -sa_d 16 -sa_mhz 100 -dma_w 128 -tag red   # + batched REDUCE (d16_100mhz_w128_p6_red; -tag only renames the config)
 boards/kv260/scripts/build_bitstream.sh -jobs 1 -sa_d 16 -sa_mhz 100 -dma_w 128 -gemv 1   # + K2b GEMV unit, one port (d16_100mhz_w128_p6_gemv)
 boards/kv260/scripts/build_bitstream.sh -jobs 1 -sa_d 16 -sa_mhz 100 -dma_w 128 -gemv 1 -nports 2   # K2b: two DMA ports, m1 on HP3 (d16_100mhz_w128_p6_gemv_np2; -m1_hp 2: HP2, suffix _hp2)
+boards/kv260/scripts/build_bitstream.sh -jobs 1 -sa_d 16 -sa_mhz 100 -dma_w 128 -gemv 1 -nports 4   # G5: four DMA ports, m2 HP2, m3 HPC0 (d16_100mhz_w128_p6_gemv_np4; -m3_port hp0: m3 on HP0, PicoRV32 on HPC0, suffix _m3hp0)
 boards/kv260/scripts/build_bitstream.sh -bd_only                # block design + address map only (minutes)
 boards/kv260/scripts/build_bitstream.sh -jobs 2 -synth_only     # stop after synthesis (~9 min)
 ```
@@ -90,6 +91,7 @@ IP `rtl/ip`) and
 | PicoRV32 -> DDR (rings) | `S_AXI_HP0_FPD` (64-bit, AXI4) | `S_AXI_HP0` |
 | accelerator DMA | `S_AXI_HP1_FPD` (`-dma_w` bits, AXI4, direct) | `S_AXI_HP2` via an AXI4 -> AXI3 converter |
 | second DMA port (`-nports 2`, K2b) | `S_AXI_HP3_FPD` (`-m1_hp 2`: HP2; HP1 and HP2 share the DDR controller's S4 port, HP3 has S5) | - |
+| DMA ports 2, 3 (`-nports 4`, G5) | m2 `S_AXI_HP2_FPD`, m3 `S_AXI_HPC0_FPD` (through the CCI, used non-coherently); `-m3_port hp0`: m3 on `S_AXI_HP0_FPD`, PicoRV32 on `S_AXI_HPC0_FPD` | - |
 | PL clock | `pl_clk0` = `-sa_mhz`, the only clock | FCLK0 50 MHz + clk_wiz 50 MHz |
 | RISC-V reset | EMIO GPIO[0] (1 = hold) | EMIO GPIO[0] |
 | interrupts | axi_intc -> `pl_ps_irq0` (In0 PicoRV32 trap, In1 `matmul_0/notify_irq`) | axi_intc -> IRQ_F2P |

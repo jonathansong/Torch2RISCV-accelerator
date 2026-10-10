@@ -16,7 +16,7 @@ module tb_sa_unit;
     parameter  integer PERF = 1;                  // GEN="PERF=0": build without counters
     parameter  integer DMA_W = 64;                // GEN="D=16 DMA_W=128" (K2a)
     parameter  integer GEMV = 0;                  // GEN="D=16 DMA_W=128 GEMV=1" (K2b): LD mode GEMV
-    parameter  integer NP = 1;                    // DMA ports (m0, m1): GEN="... NP=2" (K2b G3)
+    parameter  integer NP = 1;                    // DMA ports (m0..m3): GEN="... NP=2" (K2b G3), NP=4 (G5)
     localparam integer BB = DMA_W / 8;            // bytes per beat
     localparam integer AW = 32 * D;               // widest local word (ACC)
 
@@ -39,18 +39,18 @@ module tb_sa_unit;
     wire [1:0]  s_bresp, s_rresp;
     wire [31:0] s_rdata;
 
-    // DMA ports m0, m1 (index p; m1 used when NP = 2), each with its own memory slave
-    wire [2*32-1:0] m_araddr, m_awaddr;
-    wire [2*8-1:0]  m_arlen, m_awlen;
-    wire [2*BB-1:0] m_wstrb;
-    wire [2*3-1:0]  m_arsize, m_awsize, m_arprot, m_awprot;
-    wire [2*2-1:0]  m_arburst, m_awburst;
-    wire [2*4-1:0]  m_arcache, m_awcache;
-    wire [1:0]      m_arvalid, m_rready, m_awvalid, m_wvalid, m_wlast, m_bready;
-    wire [2*DMA_W-1:0] m_wdata;
-    reg  [1:0]      m_arready = 0, m_rvalid = 0, m_rlast = 0, m_awready = 0, m_wready = 0, m_bvalid = 0;
-    reg  [2*DMA_W-1:0] m_rdata = 0;
-    reg  [2*2-1:0]  m_rresp = 0, m_bresp = 0;
+    // DMA ports m0..m3 (index p; the first NP used), each with its own memory slave
+    wire [4*32-1:0] m_araddr, m_awaddr;
+    wire [4*8-1:0]  m_arlen, m_awlen;
+    wire [4*BB-1:0] m_wstrb;
+    wire [4*3-1:0]  m_arsize, m_awsize, m_arprot, m_awprot;
+    wire [4*2-1:0]  m_arburst, m_awburst;
+    wire [4*4-1:0]  m_arcache, m_awcache;
+    wire [3:0]      m_arvalid, m_rready, m_awvalid, m_wvalid, m_wlast, m_bready;
+    wire [4*DMA_W-1:0] m_wdata;
+    reg  [3:0]      m_arready = 0, m_rvalid = 0, m_rlast = 0, m_awready = 0, m_wready = 0, m_bvalid = 0;
+    reg  [4*DMA_W-1:0] m_rdata = 0;
+    reg  [4*2-1:0]  m_rresp = 0, m_bresp = 0;
     wire        irq, nirq;
     integer     nirq_edges = 0, nirq_high = 0;
     reg         nirq_d = 0;
@@ -94,10 +94,28 @@ module tb_sa_unit;
         .m1_axi_wdata(m_wdata[DMA_W*1 +: DMA_W]), .m1_axi_wstrb(m_wstrb[BB*1 +: BB]), .m1_axi_wlast(m_wlast[1]),
         .m1_axi_wvalid(m_wvalid[1]), .m1_axi_wready(m_wready[1]),
         .m1_axi_bresp(m_bresp[2*1 +: 2]), .m1_axi_bvalid(m_bvalid[1]), .m1_axi_bready(m_bready[1]),
-        // port 2 unused
-        .m2_axi_arready(1'b0), .m2_axi_rdata({DMA_W{1'b0}}), .m2_axi_rresp(2'd0), .m2_axi_rlast(1'b0),
-        .m2_axi_rvalid(1'b0), .m2_axi_awready(1'b0), .m2_axi_wready(1'b0), .m2_axi_bresp(2'd0),
-        .m2_axi_bvalid(1'b0),
+        .m2_axi_araddr(m_araddr[32*2 +: 32]), .m2_axi_arlen(m_arlen[8*2 +: 8]), .m2_axi_arsize(m_arsize[3*2 +: 3]),
+        .m2_axi_arburst(m_arburst[2*2 +: 2]), .m2_axi_arcache(m_arcache[4*2 +: 4]), .m2_axi_arprot(m_arprot[3*2 +: 3]),
+        .m2_axi_arvalid(m_arvalid[2]), .m2_axi_arready(m_arready[2]),
+        .m2_axi_rdata(m_rdata[DMA_W*2 +: DMA_W]), .m2_axi_rresp(m_rresp[2*2 +: 2]), .m2_axi_rlast(m_rlast[2]),
+        .m2_axi_rvalid(m_rvalid[2]), .m2_axi_rready(m_rready[2]),
+        .m2_axi_awaddr(m_awaddr[32*2 +: 32]), .m2_axi_awlen(m_awlen[8*2 +: 8]), .m2_axi_awsize(m_awsize[3*2 +: 3]),
+        .m2_axi_awburst(m_awburst[2*2 +: 2]), .m2_axi_awcache(m_awcache[4*2 +: 4]), .m2_axi_awprot(m_awprot[3*2 +: 3]),
+        .m2_axi_awvalid(m_awvalid[2]), .m2_axi_awready(m_awready[2]),
+        .m2_axi_wdata(m_wdata[DMA_W*2 +: DMA_W]), .m2_axi_wstrb(m_wstrb[BB*2 +: BB]), .m2_axi_wlast(m_wlast[2]),
+        .m2_axi_wvalid(m_wvalid[2]), .m2_axi_wready(m_wready[2]),
+        .m2_axi_bresp(m_bresp[2*2 +: 2]), .m2_axi_bvalid(m_bvalid[2]), .m2_axi_bready(m_bready[2]),
+        .m3_axi_araddr(m_araddr[32*3 +: 32]), .m3_axi_arlen(m_arlen[8*3 +: 8]), .m3_axi_arsize(m_arsize[3*3 +: 3]),
+        .m3_axi_arburst(m_arburst[2*3 +: 2]), .m3_axi_arcache(m_arcache[4*3 +: 4]), .m3_axi_arprot(m_arprot[3*3 +: 3]),
+        .m3_axi_arvalid(m_arvalid[3]), .m3_axi_arready(m_arready[3]),
+        .m3_axi_rdata(m_rdata[DMA_W*3 +: DMA_W]), .m3_axi_rresp(m_rresp[2*3 +: 2]), .m3_axi_rlast(m_rlast[3]),
+        .m3_axi_rvalid(m_rvalid[3]), .m3_axi_rready(m_rready[3]),
+        .m3_axi_awaddr(m_awaddr[32*3 +: 32]), .m3_axi_awlen(m_awlen[8*3 +: 8]), .m3_axi_awsize(m_awsize[3*3 +: 3]),
+        .m3_axi_awburst(m_awburst[2*3 +: 2]), .m3_axi_awcache(m_awcache[4*3 +: 4]), .m3_axi_awprot(m_awprot[3*3 +: 3]),
+        .m3_axi_awvalid(m_awvalid[3]), .m3_axi_awready(m_awready[3]),
+        .m3_axi_wdata(m_wdata[DMA_W*3 +: DMA_W]), .m3_axi_wstrb(m_wstrb[BB*3 +: BB]), .m3_axi_wlast(m_wlast[3]),
+        .m3_axi_wvalid(m_wvalid[3]), .m3_axi_wready(m_wready[3]),
+        .m3_axi_bresp(m_bresp[2*3 +: 2]), .m3_axi_bvalid(m_bvalid[3]), .m3_axi_bready(m_bready[3]),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
         .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
         .irq(irq), .notify_irq(nirq)

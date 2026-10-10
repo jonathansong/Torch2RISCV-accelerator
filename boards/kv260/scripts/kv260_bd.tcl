@@ -4,7 +4,8 @@
 # on the K26 SOM's Zynq UltraScale+ PS, with the accelerator unchanged.
 #
 # Sourced by build_bitstream.tcl (project already created, IP repository
-# registered; variables ::sa_d, ::sa_mhz, ::dma_w, ::vefp_nb, ::gemv, ::nports, ::m1_hp).
+# registered; variables ::sa_d, ::sa_mhz, ::dma_w, ::vefp_nb, ::gemv, ::nports, ::m1_hp,
+# ::pico_port, ::dma_ports: the PS slave port of PicoRV32 and of m0, m1, ...).
 #
 #   zynq_ultra_ps_e_0   board preset (DDR4, MIO), then:
 #     M_AXI_HPM0_FPD    32-bit, ARM -> psAxiInterconnect -> program BRAM, interrupt controller
@@ -13,6 +14,9 @@
 #     S_AXI_HP<m1_hp>_FPD  ::nports = 2 (K2b G3): the second DMA port (m1_axi), HP3 by default:
 #                       HP1 and HP2 share one DDR controller port (S4), HP3 has its own (S5;
 #                       UG1085 "PS Interconnect"); -m1_hp 2 for the comparison
+#     ::nports = 4 (G5): m2_axi on HP2, m3_axi on HPC0 (through the CCI to the DDR
+#                       controller's S1 / S2; used non-coherently) or, -m3_port hp0, on HP0
+#                       with PicoRV32 moved to HPC0
 #     pl_clk0           ::sa_mhz MHz, the only PL clock (PicoRV32, accelerator, AXI)
 #     pl_ps_irq0[0]     the interrupt controller (PicoRV32 trap, matmul_0/notify_irq)
 #     emio_gpio_o[0]    RISC-V reset (1 = hold), as EMIO[0] on the Z1 (2 EMIO pins: xlslice needs >= 2)
@@ -42,6 +46,13 @@ create_bd_design $design_name
 current_bd_design $design_name
 
 # ---------------------------------------------------------------- PS
+# PS slave ports: S_AXI_GP index, interface, clock pin
+set ::ps_ports {HPC0 {0 S_AXI_HPC0_FPD saxihpc0_fpd_aclk} HP0 {2 S_AXI_HP0_FPD saxihp0_fpd_aclk}
+              HP1 {3 S_AXI_HP1_FPD saxihp1_fpd_aclk} HP2 {4 S_AXI_HP2_FPD saxihp2_fpd_aclk}
+              HP3 {5 S_AXI_HP3_FPD saxihp3_fpd_aclk}}
+proc ps_port_used {p} { expr {$p eq $::pico_port || $p in $::dma_ports} }
+proc ps_port {p field} { lindex [dict get $::ps_ports $p] [lsearch {gp intf clk} $field] }
+if {[llength $::dma_ports] != $::nports} { error "dma_ports '$::dma_ports' for NPORTS $::nports" }
 set ps [create_bd_cell -type ip -vlnv [ipdef zynq_ultra_ps_e] zynq_ultra_ps_e_0]
 if {[get_property BOARD_PART [current_project]] ne ""} {
     apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e -config {apply_board_preset "1"} $ps
@@ -51,12 +62,11 @@ set_property -dict [list \
     CONFIG.PSU__MAXIGP0__DATA_WIDTH {32} \
     CONFIG.PSU__USE__M_AXI_GP1 {0} \
     CONFIG.PSU__USE__M_AXI_GP2 {0} \
-    CONFIG.PSU__USE__S_AXI_GP2 {1} \
-    CONFIG.PSU__SAXIGP2__DATA_WIDTH {64} \
-    CONFIG.PSU__USE__S_AXI_GP3 {1} \
-    CONFIG.PSU__SAXIGP3__DATA_WIDTH $::dma_w \
-    CONFIG.PSU__USE__S_AXI_GP4 [expr {$::nports > 1 && $::m1_hp == 2}] \
-    CONFIG.PSU__USE__S_AXI_GP5 [expr {$::nports > 1 && $::m1_hp == 3}] \
+    CONFIG.PSU__USE__S_AXI_GP0 [ps_port_used HPC0] \
+    CONFIG.PSU__USE__S_AXI_GP2 [ps_port_used HP0] \
+    CONFIG.PSU__USE__S_AXI_GP3 [ps_port_used HP1] \
+    CONFIG.PSU__USE__S_AXI_GP4 [ps_port_used HP2] \
+    CONFIG.PSU__USE__S_AXI_GP5 [ps_port_used HP3] \
     CONFIG.PSU__FPGA_PL0_ENABLE {1} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__SRCSEL {IOPLL} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $::sa_mhz \
@@ -109,20 +119,20 @@ set_property -dict [list CONFIG.D $::sa_d \
 connect_bd_intf_net [get_bd_intf_pins $ps/M_AXI_HPM0_FPD] [get_bd_intf_pins psAxiInterconnect/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins psAxiInterconnect/M00_AXI] [get_bd_intf_pins psInterruptController/s_axi]
 connect_bd_intf_net [get_bd_intf_pins psAxiInterconnect/M01_AXI] [get_bd_intf_pins pico_processor_0/S_AXI_MEM]
-connect_bd_intf_net [get_bd_intf_pins pico_processor_0/M_AXI_DDR] [get_bd_intf_pins $ps/S_AXI_HP0_FPD]
+# each used PS slave port: its data width once the port exists (PicoRV32 64 bits, DMA ::dma_w)
+set_property CONFIG.PSU__SAXIGP[ps_port $::pico_port gp]__DATA_WIDTH 64 $ps
+foreach p $::dma_ports { set_property CONFIG.PSU__SAXIGP[ps_port $p gp]__DATA_WIDTH $::dma_w $ps }
+connect_bd_intf_net [get_bd_intf_pins pico_processor_0/M_AXI_DDR] [get_bd_intf_pins $ps/[ps_port $::pico_port intf]]
 connect_bd_intf_net [get_bd_intf_pins pico_processor_0/M_AXI_PERIPH] [get_bd_intf_pins matmul_0/s_axi]
 connect_bd_intf_net [get_bd_intf_pins pico_processor_0/PCPI] [get_bd_intf_pins matmul_0/pcpi]
-connect_bd_intf_net [get_bd_intf_pins matmul_0/m0_axi] [get_bd_intf_pins $ps/S_AXI_HP1_FPD]
-if {$::nports > 1} {
-    # S_AXI_GP4 / GP5 = HP2 / HP3; its data width once the port exists
-    set_property CONFIG.PSU__SAXIGP[expr {$::m1_hp + 2}]__DATA_WIDTH $::dma_w $ps
-    connect_bd_intf_net [get_bd_intf_pins matmul_0/m1_axi] [get_bd_intf_pins $ps/S_AXI_HP${::m1_hp}_FPD]
-    connect_bd_net [get_bd_pins $ps/pl_clk0] [get_bd_pins $ps/saxihp${::m1_hp}_fpd_aclk]
+foreach p $::dma_ports i [lsearch -all $::dma_ports *] {
+    connect_bd_intf_net [get_bd_intf_pins matmul_0/m${i}_axi] [get_bd_intf_pins $ps/[ps_port $p intf]]
 }
 
 # the one PL clock
 connect_bd_net [get_bd_pins $ps/pl_clk0] \
-    [get_bd_pins $ps/maxihpm0_fpd_aclk] [get_bd_pins $ps/saxihp0_fpd_aclk] [get_bd_pins $ps/saxihp1_fpd_aclk] \
+    [get_bd_pins $ps/maxihpm0_fpd_aclk] \
+    {*}[lmap p [concat [list $::pico_port] $::dma_ports] {get_bd_pins $ps/[ps_port $p clk]}] \
     [get_bd_pins psAxiInterconnect/ACLK] [get_bd_pins psAxiInterconnect/S00_ACLK] \
     [get_bd_pins psAxiInterconnect/M00_ACLK] [get_bd_pins psAxiInterconnect/M01_ACLK] \
     [get_bd_pins psInterruptController/s_axi_aclk] [get_bd_pins porReset/slowest_sync_clk] \
@@ -163,16 +173,15 @@ assign_bd_address -offset 0xA0020000 -range 0x00010000 -target_address_space $ps
 # RISC-V: DDR identity-mapped (low 2 GB, below the CSRs), CSRs at 0x8000_0000,
 # program BRAM at 0xC000_0000 (reset vector) - as on the Z1
 set rv [get_bd_addr_spaces pico_processor_0/picorv32/mem_axi]
-assign_bd_address -offset 0x00000000 -range 0x80000000 -target_address_space $rv [ddr_low_seg $ps/S_AXI_HP0_FPD] -force
+assign_bd_address -offset 0x00000000 -range 0x80000000 -target_address_space $rv \
+    [ddr_low_seg $ps/[ps_port $::pico_port intf]] -force
 assign_bd_address -offset 0xC0000000 -range 0x00002000 -target_address_space $rv \
     [get_bd_addr_segs pico_processor_0/riscvBramController/S_AXI/Mem0] -force
 assign_bd_address -offset 0x80000000 -range 0x00001000 -target_address_space $rv [get_bd_addr_segs matmul_0/s_axi/reg0] -force
 # accelerator DMA: DDR identity-mapped (low 2 GB)
-assign_bd_address -offset 0x00000000 -range 0x80000000 -target_address_space [get_bd_addr_spaces matmul_0/m0_axi] \
-    [ddr_low_seg $ps/S_AXI_HP1_FPD] -force
-if {$::nports > 1} {
-    assign_bd_address -offset 0x00000000 -range 0x80000000 -target_address_space [get_bd_addr_spaces matmul_0/m1_axi] \
-        [ddr_low_seg $ps/S_AXI_HP${::m1_hp}_FPD] -force
+foreach p $::dma_ports i [lsearch -all $::dma_ports *] {
+    assign_bd_address -offset 0x00000000 -range 0x80000000 -target_address_space [get_bd_addr_spaces matmul_0/m${i}_axi] \
+        [ddr_low_seg $ps/[ps_port $p intf]] -force
 }
 
 validate_bd_design

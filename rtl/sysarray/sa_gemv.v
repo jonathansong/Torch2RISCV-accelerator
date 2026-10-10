@@ -16,6 +16,8 @@
 //              lane overwrites instead of adding (touched mask), so no clear.
 //   writeback  after all S * K beats: per strip, the lanes' acc[s] summed
 //              (+ the ACC word, read first, when acc) and written to ACC.
+//              NL > 2 (G5): the lane sum is registered first, so a strip
+//              takes two cycles (read / sum, then add + write) either way.
 //
 // D = 16 only (a beat of the 128-bit DMA is one k row). The ACC port is the
 // LD engine's (side B, requester 0), SPAD_A read is the LD write port (side
@@ -171,21 +173,27 @@ module sa_gemv #(
     endgenerate
 
     // --------------------------------------------------------- writeback
-    // per strip: (acc) read the ACC word, then write; else write only
+    // per strip: (acc) read the ACC word, then write; else write only.
+    // WBP: first cycle reads (acc) and registers the lane sum, second writes
+    localparam integer WBP = NL > 2;
     reg         wb_rd;                              // the ACC word was read last cycle
     reg  [15:0] wb_word;
-    reg  [32*D-1:0] sum;
+    reg  [32*D-1:0] lsum, lsum_r, sum;
     integer q, n;
     always @* begin
-        sum = 0;
-        for (q = 0; q < D; q = q + 1) begin
-            sum[32*q +: 32] = acc ? c_dout[32*q +: 32] : 32'd0;
+        lsum = 0;
+        for (q = 0; q < D; q = q + 1)
             for (n = 0; n < NL; n = n + 1)
-                if (l_tch[n]) sum[32*q +: 32] = sum[32*q +: 32] + l_acc[n][32*q +: 32];
-        end
+                if (l_tch[n]) lsum[32*q +: 32] = lsum[32*q +: 32] + l_acc[n][32*q +: 32];
     end
-    wire wb_write = wb && (!acc || wb_rd);
-    assign c_en   = wb;
+    always @(posedge clk) lsum_r <= lsum;
+    always @* begin
+        for (q = 0; q < D; q = q + 1)
+            sum[32*q +: 32] = (acc ? c_dout[32*q +: 32] : 32'd0) +
+                              (WBP ? lsum_r[32*q +: 32] : lsum[32*q +: 32]);
+    end
+    wire wb_write = wb && (WBP ? wb_rd : !acc || wb_rd);
+    assign c_en   = WBP ? wb && (acc || wb_rd) : wb;
     assign c_we   = wb_write;
     assign c_addr = wb_word[CAW-1:0];
     assign c_din  = sum;
@@ -217,7 +225,7 @@ module sa_gemv #(
                     wb_word <= c_word;
                 end
             end else if (wb) begin
-                wb_rd <= acc && !wb_rd;
+                wb_rd <= WBP ? !wb_rd : acc && !wb_rd;
                 if (wb_write) begin
                     if (wb_s == s_last) begin
                         wb   <= 0;

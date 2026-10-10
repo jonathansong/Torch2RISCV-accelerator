@@ -194,6 +194,9 @@ module tb_system;
         .m2_axi_arready(1'b0), .m2_axi_rdata({DW{1'b0}}), .m2_axi_rresp(2'd0), .m2_axi_rlast(1'b0),
         .m2_axi_rvalid(1'b0), .m2_axi_awready(1'b0), .m2_axi_wready(1'b0), .m2_axi_bresp(2'd0),
         .m2_axi_bvalid(1'b0),
+        .m3_axi_arready(1'b0), .m3_axi_rdata({DW{1'b0}}), .m3_axi_rresp(2'd0), .m3_axi_rlast(1'b0),
+        .m3_axi_rvalid(1'b0), .m3_axi_awready(1'b0), .m3_axi_wready(1'b0), .m3_axi_bresp(2'd0),
+        .m3_axi_bvalid(1'b0),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
         .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
         .irq(mm_irq), .notify_irq(mm_nirq)

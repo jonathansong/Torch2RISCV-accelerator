@@ -2,7 +2,7 @@
 // (docs/double_buffer_design.md). M1 configuration: D = 8, one DMA port.
 //
 //   s_axi       legacy CSRs (Phase 2 map + CAPS / EXT_STATUS)
-//   m0..2_axi   DMA masters (NPORTS used, the rest tied off) -> S_AXI_HP1..3
+//   m0..3_axi   DMA masters (NPORTS used, the rest tied off) -> the PS's HP / HPC ports
 //   pcpi        custom-0 instructions: funct7 = 0 legacy, funct7 = 1 new ISA
 //
 // Engines: LD (DDR -> SPAD/ACC), ST (SPAD/ACC -> DDR), EX (array),
@@ -23,7 +23,7 @@ module sa_unit #(
     parameter integer VEFP_NB    = 8,                 // fp VE: batched special functions (P6; 0: off)
     parameter integer GEMV       = 0                  // LD mode GEMV, sa_gemv (K2b; D = 16, DMA_W = 128)
 ) (
-    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 aclk CLK", X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m0_axi:m1_axi:m2_axi, ASSOCIATED_RESET aresetn" *)
+    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 aclk CLK", X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:m0_axi:m1_axi:m2_axi:m3_axi, ASSOCIATED_RESET aresetn" *)
     input  wire        aclk,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 aresetn RST", X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
     input  wire        aresetn,
@@ -64,7 +64,7 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 s_axi RREADY" *)
     input  wire         s_axi_rready,
 
-    // AXI4 master 0 (DMA_W bits) -> S_AXI_HP1 via protocol converter; unused when NPORTS <= 0
+    // AXI4 master 0 (DMA_W bits): KV260 HP1 (Z1: HP2 via a protocol converter); also the descriptor fetches
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
     output wire [31:0]  m0_axi_araddr,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi ARLEN" *)
@@ -124,7 +124,7 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m0_axi BREADY" *)
     output wire         m0_axi_bready,
 
-    // AXI4 master 1 (DMA_W bits) -> S_AXI_HP2 via protocol converter; unused when NPORTS <= 1
+    // AXI4 master 1 (DMA_W bits): KV260 HP3 (-m1_hp 2: HP2); unused when NPORTS <= 1
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
     output wire [31:0]  m1_axi_araddr,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi ARLEN" *)
@@ -184,7 +184,7 @@ module sa_unit #(
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m1_axi BREADY" *)
     output wire         m1_axi_bready,
 
-    // AXI4 master 2 (DMA_W bits) -> S_AXI_HP3 via protocol converter; unused when NPORTS <= 2
+    // AXI4 master 2 (DMA_W bits): KV260 HP2 (G5); unused when NPORTS <= 2
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
     output wire [31:0]  m2_axi_araddr,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi ARLEN" *)
@@ -243,6 +243,66 @@ module sa_unit #(
     input  wire         m2_axi_bvalid,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m2_axi BREADY" *)
     output wire         m2_axi_bready,
+
+    // AXI4 master 3 (DMA_W bits): KV260 HPC0 or HP0 (G5); unused when NPORTS <= 3
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi ARADDR", X_INTERFACE_PARAMETER = "PROTOCOL AXI4, ADDR_WIDTH 32, ID_WIDTH 0, MAX_BURST_LENGTH 16, NUM_READ_OUTSTANDING 4, NUM_WRITE_OUTSTANDING 4" *)
+    output wire [31:0]  m3_axi_araddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi ARLEN" *)
+    output wire [7:0]   m3_axi_arlen,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi ARSIZE" *)
+    output wire [2:0]   m3_axi_arsize,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi ARBURST" *)
+    output wire [1:0]   m3_axi_arburst,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi ARCACHE" *)
+    output wire [3:0]   m3_axi_arcache,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi ARPROT" *)
+    output wire [2:0]   m3_axi_arprot,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi ARVALID" *)
+    output wire         m3_axi_arvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi ARREADY" *)
+    input  wire         m3_axi_arready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi RDATA" *)
+    input  wire [DMA_W-1:0] m3_axi_rdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi RRESP" *)
+    input  wire [1:0]   m3_axi_rresp,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi RLAST" *)
+    input  wire         m3_axi_rlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi RVALID" *)
+    input  wire         m3_axi_rvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi RREADY" *)
+    output wire         m3_axi_rready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi AWADDR" *)
+    output wire [31:0]  m3_axi_awaddr,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi AWLEN" *)
+    output wire [7:0]   m3_axi_awlen,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi AWSIZE" *)
+    output wire [2:0]   m3_axi_awsize,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi AWBURST" *)
+    output wire [1:0]   m3_axi_awburst,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi AWCACHE" *)
+    output wire [3:0]   m3_axi_awcache,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi AWPROT" *)
+    output wire [2:0]   m3_axi_awprot,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi AWVALID" *)
+    output wire         m3_axi_awvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi AWREADY" *)
+    input  wire         m3_axi_awready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi WDATA" *)
+    output wire [DMA_W-1:0] m3_axi_wdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi WSTRB" *)
+    output wire [DMA_W/8-1:0] m3_axi_wstrb,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi WLAST" *)
+    output wire         m3_axi_wlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi WVALID" *)
+    output wire         m3_axi_wvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi WREADY" *)
+    input  wire         m3_axi_wready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi BRESP" *)
+    input  wire [1:0]   m3_axi_bresp,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi BVALID" *)
+    input  wire         m3_axi_bvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 m3_axi BREADY" *)
+    output wire         m3_axi_bready,
 
     // PicoRV32 co-processor interface (bus definition in rtl/ip/pcpi_v1_0)
     (* X_INTERFACE_INFO = "cliffordwolf:ip:pcpi:1.0 pcpi pcpi_valid", X_INTERFACE_MODE = "slave" *)
@@ -732,4 +792,38 @@ module sa_unit #(
     assign m2_axi_arburst = 2'b01;   assign m2_axi_awburst = 2'b01;     // INCR
     assign m2_axi_arcache = 4'b0011; assign m2_axi_awcache = 4'b0011;
     assign m2_axi_arprot  = 3'b000;  assign m2_axi_awprot  = 3'b000;
+
+    generate if (NPORTS > 3) begin : port3
+        assign m3_axi_araddr  = araddr[32*3 +: 32];
+        assign m3_axi_arlen   = arlen[8*3 +: 8];
+        assign m3_axi_arvalid = arvalid[3];
+        assign arready[3]     = m3_axi_arready;
+        assign rdata[DMA_W*3 +: DMA_W] = m3_axi_rdata;
+        assign rresp[2*3 +: 2]   = m3_axi_rresp;
+        assign rlast[3]       = m3_axi_rlast;
+        assign rvalid[3]      = m3_axi_rvalid;
+        assign m3_axi_rready  = rready[3];
+        assign m3_axi_awaddr  = awaddr[32*3 +: 32];
+        assign m3_axi_awlen   = awlen[8*3 +: 8];
+        assign m3_axi_awvalid = awvalid[3];
+        assign awready[3]     = m3_axi_awready;
+        assign m3_axi_wdata   = wdata[DMA_W*3 +: DMA_W];
+        assign m3_axi_wstrb   = wstrb[DMA_W/8*3 +: DMA_W/8];
+        assign m3_axi_wlast   = wlast[3];
+        assign m3_axi_wvalid  = wvalid[3];
+        assign wready[3]      = m3_axi_wready;
+        assign bresp[2*3 +: 2]   = m3_axi_bresp;
+        assign bvalid[3]      = m3_axi_bvalid;
+        assign m3_axi_bready  = bready[3];
+    end else begin : tie3
+        assign m3_axi_araddr = 0; assign m3_axi_arlen = 0; assign m3_axi_arvalid = 0;
+        assign m3_axi_rready = 0; assign m3_axi_awaddr = 0; assign m3_axi_awlen = 0;
+        assign m3_axi_awvalid = 0; assign m3_axi_wdata = 0; assign m3_axi_wlast = 0; assign m3_axi_wstrb = 0;
+        assign m3_axi_wvalid = 0; assign m3_axi_bready = 0;
+    end endgenerate
+    assign m3_axi_arsize  = DMA_W == 128 ? 3'd4 : 3'd3;                  // DMA_W-bit beats
+    assign m3_axi_awsize  = DMA_W == 128 ? 3'd4 : 3'd3;
+    assign m3_axi_arburst = 2'b01;   assign m3_axi_awburst = 2'b01;     // INCR
+    assign m3_axi_arcache = 4'b0011; assign m3_axi_awcache = 4'b0011;
+    assign m3_axi_arprot  = 3'b000;  assign m3_axi_awprot  = 3'b000;
 endmodule

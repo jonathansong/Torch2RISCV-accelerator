@@ -200,6 +200,8 @@ prefill 不变。4 口之后，decode 剩下的是 LD 命令的固定延迟（�
 
 **软件**：编译器已接受 `gemv_ports` 0..4；`board_env.sh` 加 `_gemv_np4` → `SA_GEMV_PORTS=4`（构建后缀 `_gemv4`）；bwtest 的 GEMV 峰值已按 NPORTS × 16 计算。
 
+**G5-1 实现（2026-10-10）**：`sa_unit` 加 `m3_axi`；`sa_ld` 在 NPORTS > 2 时把本地写（`lw_*`）寄存一级（4 选 1 仲裁和 `lw_word` 乘法止于寄存器；命令的 done 在最后一拍被取走后的下一周期，那时写已在寄存器里，同一时钟沿写入）；`sa_gemv` 在 NL > 2 时先寄存各 lane 之和，再加 ACC 原值（每个 strip 两个周期）；`build_bitstream -nports 4 [-m3_port hpc0|hp0]`，`kv260_bd.tcl` 按口列表（PicoRV32 的口、m0..m3 的口）配置 PS、连线、时钟、地址；`board_env.sh`：`_gemv_np4` → 4 口，构建后缀 `_gemv4`。验证：`make test / test16 / test128` 全过（新增 `tb_sa_dma` NP = 4、`tb_sa_unit` GEMV NP = 4），变异（去掉第 4 条 lane、去掉寄存的 lane 和、`lw_lane` 寄存值出错）均被发现；固件 bwtest / desc_run 联合仿真通过；stories 用 `gemv_ports = 4` 编译，逐 dispatch 检查与仿真 logits 逐位相同。
+
 **步骤**：G5-1 RTL / 测试平台 / BD 参数，仿真通过后 `-bd_only` 检查；G5-2 构建 `-nports 4`；G5-3 板上 `--reuse p6_red` 回归 + bwtest（测试 7 应接近 64 B / 周期）；G5-4 完整 GEMV 4 口 staging，板上 decode 与预测比较。
 
 ## 9. 资源与时序估计（P = 2）
