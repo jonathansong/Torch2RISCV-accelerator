@@ -330,9 +330,14 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   auto yt = cast<MemRefType>(p.store.getDst().getType());
   if (xt.getRank() != 1 || yt.getRank() != 2) return false;
   Type xet = xt.getElementType();
-  // K2b: the streaming GEMV unit (int8 x; a strip of at most 65535 bytes): no A strip,
-  // no SPAD_B tiles; each chunk's weights stream into the unit (groups of <= 8 strips)
-  const bool useGemv = gemvPorts && K * d <= 65535;
+  // K2b: the streaming GEMV unit (int8 x): no A strip, no SPAD_B tiles; each
+  // chunk's weights stream into the unit (groups of <= 8 strips). A strip is at
+  // most 65535 bytes (row_bytes, K x D): a longer K in blocks of at most 4080
+  // (a multiple of D), the first writing the accumulator, the others adding to
+  // it (acc; int32, |sum| <= K x 2^14, no overflow below K = 2^17); the
+  // epilogue reads it after the last (docs/generality_implementation_plan.md WP6)
+  const bool useGemv = gemvPorts != 0;
+  const int64_t kBlock = std::min<int64_t>(K, 65535 / d / d * d);
   int64_t ncg = std::min<int64_t>(nc, 8);
   while (nc % ncg) --ncg;
   const bool hoist = firstToEmit(k) && !useGemv;
@@ -402,9 +407,13 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
     const int bank = int(i & 1);
     if (useGemv)
       for (int64_t g = 0; g < nc; g += ncg)
-        adv(sahl::GemvOp::create(e.b, e.loc, xl, e.sub(p.w, {i * nc + g, 0, 0}, {ncg, K, d}),
-                                 e.sub(acc[bank], {g, 0}, {ncg, d}), false),
-            dyn, 0);
+        for (int64_t k0 = 0; k0 < K; k0 += kBlock) {
+          const int64_t kb = std::min(kBlock, K - k0);
+          Value xs = kb == K ? xl : e.sub(xl, {k0}, {kb});
+          adv(sahl::GemvOp::create(e.b, e.loc, xs, e.sub(p.w, {i * nc + g, k0, 0}, {ncg, kb, d}),
+                                   e.sub(acc[bank], {g, 0}, {ncg, d}), k0 > 0),
+              dyn, 0);
+        }
     else
       sahl::MmaOp::create(e.b, e.loc, strip, tiles[bank], acc[bank], false);
     if (prefetch) loadChunk(i + 1, dyn);

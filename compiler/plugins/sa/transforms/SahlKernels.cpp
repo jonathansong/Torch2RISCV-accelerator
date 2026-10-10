@@ -258,7 +258,7 @@ std::optional<SmallVector<SmallVector<int64_t>>> gatherDomain(linalg::GenericOp 
   return points(ranges);
 }
 
-KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int64_t d) {
+KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int64_t d, int64_t gemvPorts) {
   KernelSchedule ks;
   auto wt = cast<MemRefType>(p.w.getType());
   const int64_t k = wt.getDimSize(1), nt = wt.getDimSize(0);
@@ -297,6 +297,13 @@ KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int6
   uint32_t extra = p.chunked.size() > 1 ? uint32_t(p.chunked.size()) - 1 : 0;
   uint32_t scratchRows = std::max<uint32_t>(steps > 2 ? 2 : 1, 1 + extra);
   ks.chunkTiles = lay.chunkTiles(uint32_t(k), uint32_t(nt), scratchRows);
+  if (gemvPorts && k > int64_t(lay.sbank)) {
+    // the GEMV unit streams the weights (no SPAD_B tile): a K beyond one bank
+    // (in K blocks, expandLinear) takes the chunk the ACC scratch holds
+    int64_t cap = int64_t(lay.scr) / (d + 1 + scratchRows), nc = std::min<int64_t>(cap, nt);
+    while (nc > 1 && nt % nc) --nc;
+    ks.chunkTiles = nc > 0 ? nc : 0;
+  }
   ks.loop = ks.chunkTiles && nt / ks.chunkTiles > 4;
   return ks;
 }
@@ -678,9 +685,10 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
   if (p.store) {                                   // the accumulator stored as it is (no epilogue)
     if (p.epi) return false;
     const int64_t kk = cast<MemRefType>(p.w.getType()).getDimSize(1);
-    if (kk * d > 65535 || (p.rows / d) * kk > 2 * int64_t(lay.sbank)) return false;
+    if ((kk * d > 65535 && (rows4 || !gemvHolds(kk))) || (p.rows / d) * kk > 2 * int64_t(lay.sbank)) return false;
     // decode's form: the K its schedule holds (as below)
-    if (!rows4 && (kk > int64_t(lay.sbank) || kk + kk / d > 2 * int64_t(lay.sbank) || lay.acc0 + kk / d + 2 > lay.cbank))
+    if (!rows4 && !gemvHolds(kk) &&
+        (kk > int64_t(lay.sbank) || kk + kk / d > 2 * int64_t(lay.sbank) || lay.acc0 + kk / d + 2 > lay.cbank))
       return false;
     SmallVector<Operation *> cover = {con.getOperation(), fill.getOperation(), p.store.getOperation(),
                                       lx.getOperation(), lw.getOperation()};
@@ -730,8 +738,8 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
   // a K the micro-kernel's schedule cannot hold (one weight tile per SPAD_B bank,
   // x and its strip in SPAD_A, x in the ACC scratch): the generic lowering (K blocks)
   const int64_t k = cast<MemRefType>(p.w.getType()).getDimSize(1);
-  if (k > int64_t(lay.sbank) || k * d > 65535 || k + k / d > 2 * int64_t(lay.sbank) ||
-      lay.acc0 + k / d + 2 > lay.cbank)
+  if ((rows4 || !gemvHolds(k)) && (k > int64_t(lay.sbank) || k * d > 65535 || k + k / d > 2 * int64_t(lay.sbank) ||
+                                   lay.acc0 + k / d + 2 > lay.cbank))
     return false;
   if (rows4 && (p.rows / d) * k > 2 * int64_t(lay.sbank)) return false;   // the strips of all row blocks
   record(con, cover);

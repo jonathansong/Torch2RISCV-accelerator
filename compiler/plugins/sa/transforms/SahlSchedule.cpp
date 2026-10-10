@@ -40,7 +40,7 @@ struct SahlSchedulePass : public PassWrapper<SahlSchedulePass, OperationPass<fun
         KernelMatcher km(cfg);
         if (!km.matchLinear(g)) return;
         const LinearPlan &p = km.linears[g.getOperation()];
-        KernelSchedule ks = linearSchedule(p, lay, cfg.d);
+        KernelSchedule ks = linearSchedule(p, lay, cfg.d, cfg.gemvPorts);
         k->setAttr("chunk_tiles", b.getI64IntegerAttr(ks.chunkTiles));
         if (!p.rows) k->setAttr("loop", b.getBoolAttr(ks.loop));
       }

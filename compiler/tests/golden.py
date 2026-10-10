@@ -46,6 +46,10 @@ CASES = [
     ("cfg_d16", "build/c6/cfg/d16/sa_sources", []),                         # other targets
     ("cfg_big", "build/c6/cfg/big/sa_sources", []),
     ("smollm2_d16", "build/c55/smollm2_d16/sa_sources", []),               # D = 16, GQA (K1c: per-row broadcasts of 9 rows)
+    # K2b: the streaming GEMV unit, 4 read ports (the board's d16_100mhz_w128_p6_gemv_np4 builds)
+    ("qwen3_gemv4", "build/c6p/qwen3_m16_d16_gemv4/sa_sources", []),
+    ("smollm2_gemv4", "build/c6p/smollm2_m16_d16_gemv4/sa_sources", []),
+    ("stories_gemv4", "build/c6p/stories_m16_d16_gemv4/sa_sources", []),
 ]
 
 

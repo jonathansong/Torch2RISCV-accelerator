@@ -327,6 +327,12 @@ QLinearExternal(
 
 ## 10. 工作包 WP6：GEMV K 分块
 
+**进度（2026-10-11）**：decode 的 K 分块完成。
+- 原来 K 超过 SPAD_B 一个 bank（D = 16 时 4096）时，decode 的线性层微内核**根本不被选中**（调度的块大小按 SPAD_B 算出 0），整层交给通用收缩的 K 分块 EX 路径，GEMV 用不上。改动三处，只在“有 GEMV 且 K 超过原限制”时生效：`KernelMatcher::gemvHolds`（K 只受 x 的存放限制：打包 x 在 SPAD_A，int32 x 在 ACC scratch 的 bank 里）、`linearSchedule`（块大小只按 ACC scratch）、`expandLinear`（K 按 4080 分块，x 与权重取子视图，第一块写累加器，其余设 acc 累加；epilogue 在最后一块之后读）。
+- **黄金语料加入 GEMV 4 口的三个用例**（`qwen3_gemv4`、`smollm2_gemv4`、`stories_gemv4`，板上 `_gemv_np4` 的构建，2814 个 dispatch），用改动前的编译器录制，改动后 16 个用例 7046 个 dispatch 逐字节相同：已部署的 GEMV 模型不变。
+- **合成 Llama，K = 8192**（dim 256、FFN 8192，`run_tests.sh gemvk`）：down_proj 为 3 条 GEMV（4080 + 4080 + 32），decode 0 个主机 dispatch，与 torch W8A8 逐步 argmax 9/9、teacher-forced 40/40（相关 1.0000），prefill 与 decode-only 5/5 逐位一致。
+- **prefill 还剩两类主机回退**（不影响正确性，影响板上 prefill 速度，列入 WP6 / WP7）：① prefill 的 down_proj（`matmul_like_16x…x8192`，按行的 EX 路径没有 K 分块：“contraction not expanded”），整数运算所以仍逐位一致，但在 ARM 上算；② prefill 写 KV 的 scatter（`scatter_…x32x2x1xi8`）：没有 QK-norm 的模型（Llama）里 RoPE 的 swapneg gather 融进了写 cache 的 scatter（“more than two loops”）；Qwen3 有 QK-norm 隔开，不受影响。真实的 Llama-3.2-1B 两者都会遇到。
+
 ### 10.1 分块规则
 
 GEMV 描述符的 `row_bytes`（w2[63:48]）是 16 位、等于 K × 16，所以 K ≤ 4095；K 还必须是 16 的倍数，x 缓冲每 lane 4096 字节。因此安全上限为：
@@ -475,7 +481,7 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 7. ~~`tools: add quantization quality comparison pipeline`~~（`quality_eval.py`）
 8. `frontend: add Llama 3.2 tokenizer and RoPE coverage`（分词器完成）
 9. ~~`tools: add device memory manifest and preflight`~~（`mem_preflight.py`）
-10. `compiler: split GEMV K at aligned 4080-element boundary`
+10. ~~`compiler: split GEMV K at aligned 4080-element boundary`~~（decode）
 11. `tests: cover GEMV K split boundaries and overflow`
 12. `runtime: report per-dispatch host/device timing and fallback reason`
 13. `frontend: add Gemma 3 graph rewrites and short-context bring-up`

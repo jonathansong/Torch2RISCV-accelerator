@@ -128,7 +128,7 @@ struct KernelSchedule {
   int64_t chunkTiles = 0;
   bool loop = false;
 };
-KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int64_t d);
+KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int64_t d, int64_t gemvPorts = 0);
 
 class KernelMatcher {
  public:
@@ -141,6 +141,11 @@ class KernelMatcher {
   void matchAll(func::FuncOp f);
   // Each records its plan and the operations it covers (nothing else may use its buffers).
   bool matchLinear(linalg::GenericOp con);
+  // decode's K the GEMV unit holds beyond the EX schedule's (K blocks of at most
+  // 4080, expandLinear): x packed in SPAD_A, an int32 x in the ACC scratch's bank
+  bool gemvHolds(int64_t k) const {
+    return cfg.gemvPorts && k % d == 0 && k / d <= 2 * int64_t(lay.sbank) && lay.acc0 + k / d + 2 <= lay.cbank;
+  }
   bool matchAttention(linalg::BatchMatmulOp bmm);
   bool matchContraction(linalg::LinalgOp op);
 
