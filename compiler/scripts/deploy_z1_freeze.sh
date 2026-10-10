@@ -22,6 +22,9 @@
 #   c6p_stories  stories15M prefill (M = D, the overlay's array size) + decode       deploy_c6p.sh stories D
 #   c6p_smollm2  SmolLM2-135M prefill (M = D) + decode, qhf                         deploy_c6p.sh smollm2 D
 #   hfgen        SmolLM2-135M prefill (M = D) + decode, unmodified HF                deploy_hfgen.sh
+#   hfgen_w8a8   SmolLM2-135M from a compressed-tensors W8A8 checkpoint (llm-compressor,
+#                build/llm_cache/SmolLM2-135M-W8A8: compiler/frontend/llmc_w8a8.py), as hfgen
+#                (not in the default set)                                        deploy_hfgen.sh
 #   c6p_qwen3    Qwen3-0.6B prefill (M = D) + decode (KV260 only; not in the default set: name it;
 #                the board needs a 640 MB udmabuf: the 1280 MiB DT pool loaded at boot,
 #                boards/kv260/README.md "Accelerator memory pool")              deploy_c6p.sh qwen3 D
@@ -83,7 +86,7 @@ reuse() {                      # <test>: the test's directory from $R, with this
 }
 for t in "${TESTS[@]}"; do
   if [ -n "$REUSE" ]; then
-    case $t in c1|c3|c55|c6p_stories|c6p_smollm2|hfgen|c6p_qwen3) reuse "$t"; continue ;; esac
+    case $t in c1|c3|c55|c6p_stories|c6p_smollm2|hfgen|hfgen_w8a8|c6p_qwen3) reuse "$t"; continue ;; esac
   fi
   case $t in
     ddr)
@@ -107,8 +110,10 @@ for t in "${TESTS[@]}"; do
     c6p_stories) stage c6p_stories "$SA_REPO/build/deploy_c6p_stories_m$SA_D" "$SA_COMPILER/scripts/deploy_c6p.sh" stories "$SA_D" ;;
     c6p_smollm2) stage c6p_smollm2 "$SA_REPO/build/deploy_c6p_smollm2_m$SA_D" "$SA_COMPILER/scripts/deploy_c6p.sh" smollm2 "$SA_D" ;;
     hfgen)       stage hfgen "$SA_REPO/build/deploy_hfgen" "$SA_COMPILER/scripts/deploy_hfgen.sh" ;;
+    hfgen_w8a8)  stage hfgen_w8a8 "$SA_REPO/build/deploy_hfgen_w8a8" env HFGEN_MODEL=SmolLM2-135M-W8A8 HFGEN_TAG=w8a8 \
+                   "$SA_COMPILER/scripts/deploy_hfgen.sh" ;;
     c6p_qwen3)   stage c6p_qwen3 "$SA_REPO/build/deploy_c6p_qwen3_m$SA_D" "$SA_COMPILER/scripts/deploy_c6p.sh" qwen3 "$SA_D" ;;
-    *) echo "unknown test $t (${ALL[*]} c6p_qwen3)"; exit 2 ;;
+    *) echo "unknown test $t (${ALL[*]} hfgen_w8a8 c6p_qwen3)"; exit 2 ;;
   esac
 done
 cp "$SA_COMPILER/tests/board_regress.py" "$SA_COMPILER/tests/run_board.sh" "$Z/"

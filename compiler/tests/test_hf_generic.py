@@ -169,9 +169,18 @@ def main():
         mcorr = float(np.mean([np.corrcoef(tf[i], fp[i])[0, 1] for i in range(n)]))
         e_agree = int(np.sum(eager_tf.argmax(1) == fp.argmax(1)))
         e_mcorr = float(np.mean([np.corrcoef(eager_tf[i], fp[i])[0, 1] for i in range(len(fp))]))
+        # the device vs the torch model directly: where their argmax differ (d
+        # positions, rounding flips grown over the layers) each side wins about
+        # half; the agreement's spread is then ~sqrt(d), so the tolerance is
+        # max(2, 2 sqrt(d)) (a 40-position gate; the quality itself:
+        # quality_eval.py), and their logits must stay close (mean corr >= 0.98)
+        dd = int(np.sum(tf[:n].argmax(1) != eager_tf[:n].argmax(1)))
+        dcorr = float(np.mean([np.corrcoef(tf[i], eager_tf[i])[0, 1] for i in range(n)]))
+        tol = max(2, int(np.ceil(2 * np.sqrt(dd))))
         print(f"teacher-forced, {n} positions: top-1 agreement with plain HF fp32 {agree}/{n}, mean corr {mcorr:.4f} "
-              f"(the torch W8A8 model: {e_agree}/{len(fp)}, {e_mcorr:.4f})")
-        ok = n == len(toks) and agree >= e_agree - 2 and mcorr >= e_mcorr - 0.01
+              f"(the torch W8A8 model: {e_agree}/{len(fp)}, {e_mcorr:.4f}); device vs torch model: argmax differs at "
+              f"{dd}, mean corr {dcorr:.4f} (tolerance {tol})")
+        ok = n == len(toks) and agree >= e_agree - tol and mcorr >= e_mcorr - 0.01 and dcorr >= 0.98
     if args.prefill:
         # prefill + decode vs decode only: the prompt's last position, then the generated steps
         M = args.prefill

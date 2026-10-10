@@ -8,7 +8,7 @@ Accepted (anything else is refused with the layer, the field and what is
 supported; nothing falls back silently or is quantized again):
 - quant_method compressed-tensors, format int-quantized, status compressed;
 - weights: int, 8 bits, static, strategy channel, symmetric (a zero point, if
-  stored, all zeros), no groups / blocks / act-order;
+  stored, all zeros), no groups / blocks, act-order none or static (no g_idx);
 - input activations: int, 8 bits, dynamic, strategy token, symmetric (the
   device's per-token quantization: s_x = amax / 127, as vLLM's dynamic int8);
   no output activation or KV cache scheme;
@@ -56,12 +56,16 @@ def _check_args(group, kind, a, want):
 
 
 def _describe(want):
-    return ", ".join(f"{k} {'(unset)' if callable(v) else v}" for k, v in want.items())
+    return ", ".join(f"{k} {'(unset)' if v is _unset else '(unset or static)' if callable(v) else v}"
+                     for k, v in want.items())
 
 
 _unset = lambda v: v in (None, False, {})          # noqa: E731
+# actorder "static" (GPTQ's column order, per channel): only the order GPTQ
+# worked in, folded into the weights, no g_idx stored (checked per layer)
+_static = lambda v: _unset(v) or v == "static"   # noqa: E731
 WEIGHTS = {"type": "int", "num_bits": 8, "dynamic": False, "strategy": "channel", "symmetric": True,
-           "group_size": _unset, "block_structure": _unset, "actorder": _unset}
+           "group_size": _unset, "block_structure": _unset, "actorder": _static}
 INPUTS = {"type": "int", "num_bits": 8, "dynamic": True, "strategy": "token", "symmetric": True,
           "group_size": _unset, "block_structure": _unset}
 

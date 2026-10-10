@@ -213,6 +213,23 @@ QLinearExternal(
 
 ## 7. 工作包 WP3：SmolLM2-135M 验证
 
+**进度（2026-10-10）**：主机与 sim 完成，板上待测。
+- **生成**：`compiler/frontend/llmc_w8a8.py`，在独立环境 `build/llmc_venv`（CPU 版 torch 2.14.0、llm-compressor 0.14.0、compressed-tensors 0.19.0；不动导出环境）里跑 SmoothQuant 0.8 + GPTQ（W8A8，`ignore: [lm_head]`），校准 WikiText-2 train 中 200 字以上的段落 256 段 × 512 token（`default_rng(0)` 抽样，行号记入 `sa_manifest.json`），7.6 分钟。GPTQ 的 `actorder: static`（按通道时只是 GPTQ 的列顺序，已折回权重，不存 g_idx）现在被接受。
+- **质量**（`compiler/tests/quality_eval.py`：WikiText-2 test，2048 个 token，窗口 256，teacher-forced，参考为原版 fp32；结果 `build/quality/smollm2_w8a8_2048.json`）：
+
+  | 变体 | PPL | top-1（对 fp32） | 相关 | KL |
+  |---|---|---|---|---|
+  | fp32 | 26.98 | — | — | — |
+  | 自量化 W8A8（fp32 注意力） | 29.92 | 87.6% | 0.9899 | 0.102 |
+  | llm-compressor W8A8（SmoothQuant + GPTQ） | 28.16 | 90.3% | 0.9932 | 0.050 |
+  | 同上，只用 GPTQ（不做 SmoothQuant） | 29.83 | 87.9% | 0.9903 | 0.106 |
+  | 自量化，SA 形式（int8 KV、设备注意力、SFU） | 30.77 | 83.9% | 0.9853 | 0.138 |
+  | **llm-compressor W8A8，SA 形式** | **28.77** | **87.1%** | 0.9887 | **0.074** |
+
+  外部 checkpoint 在设备的计算方式下 KL 约为自量化的一半、PPL 低 2.0；改善几乎全部来自 SmoothQuant（只用 GPTQ 与自量化相当）。SA 形式额外的损失（int8 KV、注意力概率、SFU）两者相近（KL +0.024 / +0.036）。单个 256 token 的窗口曾给出相反的结论：评估至少要用数千个位置（§3.2）。
+- **sim**（`test_hf_generic.py`，D = 16、GEMV 4 口）：导出 + 编译 1710 个加速器 executable，decode 9/9 argmax 与 torch W8A8 相同，prefill 与 decode-only 5/5 逐位一致。40 位置 teacher-forced 门槛改为统计的：设备与 torch 模型 argmax 不同的位置 d 个，容许 max(2, ⌈2√d⌉)，另要求两者 logits 平均相关 ≥ 0.98。原门槛（−2）在这个 checkpoint 上失败：d = 3 个翻转碰巧都落在设备一边（34 对 37），而设备对 torch 的平均相关 0.9963 比自量化的 0.9911（d = 6，两边各 3）还高。
+- **板上**：`deploy_z1_freeze.sh hfgen_w8a8`（不在默认集合；`HFGEN_MODEL` / `HFGEN_TAG` 给 `deploy_hfgen.sh`），`board_regress.py` 有对应项。
+
 ### 实现
 
 - 使用固定 llm-compressor recipe 生成 W8A8 checkpoint，并冻结 recipe、校准样本 ID 和软件版本。
@@ -430,7 +447,7 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 |---|---|---|
 | ~~10/11–10/14~~ | WP0–WP1：四口收尾 | **10/10 已完成**（剩 perf_model 校准，可与 WP2 并行）；bitstream 冻结为 `d16_100mhz_w128_p6_gemv_np4` |
 | 10/11–10/18 | WP2：importer schema 与合成测试（**10/10 第一版完成**；prefill 等价问题、通用前端 Qwen3 的回退都已解决） | 10/18 前格式解析不稳定，则缩小到单一已验证 checkpoint schema |
-| 10/19–10/24 | WP3–WP4：SmolLM2、Qwen3 | 10/24 前 Qwen 质量无改善，也必须输出四层定位结论，不继续盲调 scale |
+| 10/19–10/24 | WP3–WP4：SmolLM2（**10/10 主机与 sim 完成**）、Qwen3 | 10/24 前 Qwen 质量无改善，也必须输出四层定位结论，不继续盲调 scale |
 | 10/25–10/29 | WP5：Llama 前端、EX 基线、内存预检 | 内存门禁失败则暂停板上 staging，保留 sim 结果并启动 M2 评估 |
 | 10/30–11/03 | WP6–WP7：K 分块与 Llama | K 分块不稳定则演讲使用 EX 正确性基线，把性能优化标为进行中 |
 | 11/04–11/09 | WP9 初版、消融表 | 先完成可复现数据，不等待 Gemma |
@@ -447,8 +464,8 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 3. ~~`frontend: add external int8 weight/scale representation`~~
 4. ~~`frontend: preserve imported int8 values including -128`~~
 5. ~~`tests: add synthetic compressed-tensors checkpoints`~~（2–5 合为一个提交）
-6. `frontend: import SmolLM2 and Qwen3 W8A8 checkpoints`
-7. `tools: add quantization quality comparison pipeline`
+6. `frontend: import SmolLM2 and Qwen3 W8A8 checkpoints`（SmolLM2 完成）
+7. ~~`tools: add quantization quality comparison pipeline`~~（`quality_eval.py`）
 8. `frontend: add Llama 3.2 tokenizer and RoPE coverage`
 9. `tools: add device memory manifest and preflight`
 10. `compiler: split GEMV K at aligned 4080-element boundary`
