@@ -153,6 +153,16 @@ W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 3. **双口比特流（`_gemv_np2`）**：同 1、2；bwtest 测试 7 应接近 32 B / 周期；decode token/s 与模型预测（Qwen3 ×1.85 → 约 4.1–4.3 token/s 设备时间，SmolLM2 ×1.76）比较，`board_profile.py` 的 decode profile 再喂给 `perf_model.py` 校准 GEMV 的代价。
    **时序**：第一次构建 WNS -0.576 ns（742 个端点）：m1 的 RVALID 从 PS 出来后，同一周期内经过 R 侧端口仲裁、队头选择、`lw_word` 的乘法和 GEMV / ACC 选择，到 ACC BRAM 地址（单口时仲裁是常数，被优化掉）。修复（3127e6a）：NPORTS > 1 时 `sa_ld` 每个口的 R 通道先过一个 2 项 skid buffer（valid / data / ready 都出自寄存器，吞吐不变，多 1 周期延迟）；重建后 WNS +0.138 ns，最差路径从 `q_rp` 寄存器出发（仍经 `lw_word` 乘法），LUT 96.3k / 82.2%（单口 +4.0k），BRAM 134，DSP 349。
    **步骤 1 结果（2026-10-10，`d16_100mhz_w128_p6_gemv_np2`，m1 接 HP3，`--reuse p6_red`）**：REGRESSION PASS（16 项），5 个 LLM 测试的 token 与单口逐字相同；bwtest GEMV 64 KB：x 驻留 2145 周期 = **30.55 B / 周期**（双口峰值的 95.5%，单口 15.64 的 1.95 倍），x 读入 2157 周期 / 30.38，结果正确，HP0 与 HP3 在 DDR 一侧没有明显争用；普通 LD / ST 仍约 15.7 B / 周期（R 侧每周期只写一个本地字），1 拍 burst 的短行 LD 3.04 → 5.48 B / 周期（两口的地址延迟重叠）。
+   **步骤 2 结果（2026-10-10，`_gemv_np2`，GEMV 2 口编译，`build/deploy_kv260_d16_100mhz_w128_p6_gemv_np2/results`）**：REGRESSION PASS（含 Qwen3，18 项）；所有 LLM 测试板上 logits 与仿真逐位相同，token 与 EX 路径（`p6_red`）逐字相同。decode 每步（板上实测，含主机开销）：
+
+   | 模型 | EX 路径（`p6_red`） | GEMV 2 口 | 提速 | 模型预测 |
+   |---|---|---|---|---|
+   | Qwen3-0.6B | 451.4 ms（2.22 tok/s） | 251.3 ms（**3.98 tok/s**） | ×1.80 | ×1.85 |
+   | SmolLM2-135M（c6p） | 129.6 ms（7.71） | 79.5 ms（**12.58**） | ×1.63 | ×1.76 |
+   | SmolLM2（hfgen，通用前端） | 131.2 ms（7.62） | 78.5 ms（12.73） | ×1.67 | — |
+   | stories15M | 16.2 ms（61.9） | 9.9 ms（100.8） | ×1.63 | — |
+
+   prefill 不变（Qwen3 15.45 → 15.76 tok/s，SmolLM2 38.4 → 38.8）。SmolLM2 比预测低一些：模型小，每步固定开销（非线性层、命令和 dispatch 开销）占比更大。
 4. **CAPS 检查**：rt_fw（RT_VERSION 2）把单元的 CAPS 写进邮箱 `0xD0`，运行时加载可执行文件时检查它要求的 bit 21–25；用 GEMV 编译的模型在没有 GEMV 的比特流上会直接报错，而不是跑出错误结果。仿真上用 `SA_SIM_CAPS=0x01E00010` 模拟没有 GEMV 的单元验证过（stories15M GEMV 版本加载即报 INCOMPATIBLE）。G1 的 Qwen3 也已通过：1262 个 dispatch、logits 与 EX 路径逐字节相同。
 
 **第二阶段（按需）**：P = 4（HP0 现在是 PicoRV32 的口，要把它挪到 HPC0 或 LPD；×2.6–3.2）；SPAD 子银行（LD 写 SPAD / ACC 也到 32 B / 周期，prefill ×1.07）；LD 命令流水（隐藏每条命令约 65 周期的延迟，+2–3%）。
