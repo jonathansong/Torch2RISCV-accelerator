@@ -54,10 +54,16 @@ ports. The driver reads the BRAM address and the clock from the `.hwh`
 
 The kernel of Ubuntu for Kria has `CONFIG_STRICT_DEVMEM=y`: `/dev/mem` maps
 the PL (BRAM, mailbox) but refuses RAM, even for root. The C runtime's DDR
-window therefore comes from the u-dma-buf module (`/dev/udmabuf0`, in CMA,
+window therefore comes from the u-dma-buf module (`/dev/udmabuf0`,
 `sync_mode` 2 = write-combined, uncached on the ARM side, so no cache
 maintenance; `SA_BOARD_MEM_DEV`); the Python tests keep `pynq.allocate` with
-the flush / invalidate protocol below.
+the flush / invalidate protocol below. Since 2026-10-10 (docs/kv260_upgrade_plan.md
+K5-M, step M1) `/dev/udmabuf0` is a dedicated 1280 MiB pool at
+`0x1000_0000`-`0x5FFF_FFFF` (a reusable `shared-dma-pool` in
+`/boot/firmware/user-override.dtb`, taken whole when u-dma-buf loads at boot);
+the global CMA (`pynq.allocate`, zocl) is 256 MiB (`cma=256M` through
+flash-kernel). Before, the window was carved from the 1000 MiB global CMA by
+an `insmod` right after boot.
 
 ## Coherency
 

@@ -23,7 +23,8 @@
 #   c6p_smollm2  SmolLM2-135M prefill (M = D) + decode, qhf                         deploy_c6p.sh smollm2 D
 #   hfgen        SmolLM2-135M prefill (M = D) + decode, unmodified HF                deploy_hfgen.sh
 #   c6p_qwen3    Qwen3-0.6B prefill (M = D) + decode (KV260 only; not in the default set: name it;
-#                the board needs a 640 MB udmabuf, insmod'ed right after boot)    deploy_c6p.sh qwen3 D
+#                the board needs a 640 MB udmabuf: the 1280 MiB DT pool loaded at boot,
+#                boards/kv260/README.md "Accelerator memory pool")              deploy_c6p.sh qwen3 D
 # D = SA_D (board_env.sh: from the overlay's configuration); at D != 8 the host builds go to
 # build/<test>/<model>_d<D> (the D = 8 ones feed the golden corpus)
 # Each deploy runs in a memory-capped scope (MEM, default 12G).

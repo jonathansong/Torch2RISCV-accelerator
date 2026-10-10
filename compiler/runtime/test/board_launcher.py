@@ -38,8 +38,9 @@ UDMABUF = os.environ.get("SA_UDMABUF", "/dev/udmabuf0")
 class UdmabufWindow:
     """The device window from the u-dma-buf module (KV260: arm64 kernels with
     CONFIG_STRICT_DEVMEM refuse /dev/mem on RAM, so the program cannot map a
-    PYNQ buffer). The module allocated a contiguous buffer at load
-    (`insmod u-dma-buf.ko udmabuf0=<bytes>`); opened with O_SYNC its mapping is
+    PYNQ buffer). The module allocated a contiguous buffer at load: since
+    K5-M M1 the 1280 MiB pool of its device-tree node, loaded at boot (before:
+    `insmod u-dma-buf.ko udmabuf0=<bytes>`); opened with O_SYNC its mapping is
     non-cached, as the program's. The first `mb` MB serve as the window; the
     program maps the same device (SA_BOARD_MEM_DEV)."""
 

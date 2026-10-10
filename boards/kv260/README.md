@@ -151,7 +151,8 @@ identical to the PYNQ-Z1 baselines. Device cycles within 0.03% of the Z1
 host): stories15M 18.27 tok/s (Z1 17.62), SmolLM2 qhf 2.27 tok/s (Z1 2.22),
 generic 1.88 tok/s (Z1 1.87); DMA 397 MB/s.
 
-Board setup the tests need (each boot):
+Board setup the tests need (each boot, until K5-M M1 below made the window a
+device-tree pool loaded at boot; since then only `run_board.sh`):
 
 ```sh
 # u-dma-buf (https://github.com/ikwzm/udmabuf, built on the board with the kernel headers):
@@ -229,7 +230,7 @@ Decode matvecs stream their weights from DMA straight into a GEMV unit (LD
 mode GEMV, `rtl/sysarray/sa_gemv.v`, docs/k2b_gemv_design.md): 16 int8 MACs
 per read port, no SPAD. The staging picks the compiler's
 `--iree-sa-gemv-ports` from the configuration's name (`_gemv` -> 1,
-`_gemv_np2` -> 2; build directories `_gemv` / `_gemv2`); the runtime refuses a
+`_gemv_np2` -> 2, `_gemv_np4` -> 4; build directories `_gemv` / `_gemv2` / `_gemv4`); the runtime refuses a
 GEMV executable on an overlay without the unit (CAPS bit 25, reported by
 rt_fw at mailbox `0xD0`). Prefill and attention stay on the array.
 
@@ -245,6 +246,14 @@ bit-exact with the sim and gives the EX path's tokens.
 | stories15M (c6p) | 61.9 | **100.8** (x1.63) |
 
 Prefill is unchanged (Qwen3 15.45 -> 15.76 tok/s).
+
+G5, four ports (`d16_100mhz_w128_p6_gemv_np4`, m2 on HP2, m3 on HPC0): the
+regression passes with the EX-path executables (tokens of `p6_red`); `bwtest`
+GEMV 64 KB **57.95 B/cycle** (90.5% of 64: the same ~100-cycle command overhead
+on half the transfer time, so close to 64 B/cycle in the steady state; no
+bottleneck from HPC0 through the CCI or from HP1 / HP2 sharing S4). The
+four-port GEMV executables are being staged (model: Qwen3 decode about 6.5-7
+tok/s).
 
 ## Accelerator memory pool (K5-M step M1, installed 2026-10-10)
 

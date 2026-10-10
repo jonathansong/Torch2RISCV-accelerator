@@ -438,7 +438,7 @@ decode 受带宽限制，提升 1.5–1.7 倍（不到 2 倍：VE 尾部、注�
 **结果（2026-10-09，提前在 K2a-1 的 `d16_100mhz_w128` 上完成，通过）**：
 - **编译器**（f2479cc）：D = 16、M = 16 时，Qwen3 有 29 个 prefill dispatch 因 ACC 放不下而退回主机（主机 fp 与器件不逐位一致，prefill 与 decode 对不上）。现在 sahl-tile 的按行分片支持秩 ≥ 2（三维的 RMSNorm 应用）；连 2 行都放不下时（`reduction_16x3072`，SwiGLU 后的量化），按 2 行分片并标记 `sahl.row_by_row`，lowering 逐行执行、每行释放临时缓冲。黄金语料不变。
 - **主机**：逐 dispatch 对拍 T = 16 / 80 / 256 各 1262 个 OK；sim 中 prefill + decode 与只用 decode 的 logits 5/5 行逐位一致。
-- **板上**（`c6p_qwen3`，opt-in；启动后立即 `insmod u-dma-buf udmabuf0=671088640`，CMA 还没被泄漏）：2049 个描述符列表全部在加速器上，主机 0 个 dispatch；logits 与 sim 25/25 步逐位一致，生成的 token 与主机参考相同；器件内存峰值 595.4 MB / 640 MB。
+- **板上**（`c6p_qwen3`，opt-in；启动后立即 `insmod u-dma-buf udmabuf0=671088640`，CMA 还没被泄漏；K5-M M1 之后由开机加载的 1280 MiB 设备树池代替）：2049 个描述符列表全部在加速器上，主机 0 个 dispatch；logits 与 sim 25/25 步逐位一致，生成的 token 与主机参考相同；器件内存峰值 595.4 MB / 640 MB。
 - **速度**（100 MHz、1.576 GB/s）：prefill 40 个 token 3500.9 ms（11.43 token/s，含首块加载）；**decode 468.5 ms/步（2.13 token/s）**。仅权重读取的下限约 0.6 GB ÷ 1.576 GB/s ≈ 380 ms，decode 已达到读权重上限的约 81%。
 - **prefill 耗时分解**（`c6p_qwen3_profile`，每个 16 token 的块约 89.9M 周期）：SwiGLU 段的 fp 运算占比最大：`reduction_16x3072`（逐行，16.4%）、`elementwise_16x3072`（14.8%），`matmul_like 16x384x16x1024`（15.2%）。逐行执行是 prefill 的首要优化点（K4b / KC）。
 
