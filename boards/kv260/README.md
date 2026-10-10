@@ -56,6 +56,7 @@ PYNQ (Kria-PYNQ, which installs the PYNQ venv and XRT setup under
 | **+ batched REDUCE** (`output/d16_100mhz_w128_p6_red`, commit `b10da84`) | 2026-10-09 | 88,250 (75.4%) | 60,823 | 347 | 130 / 144 | 0 / 64 | +0.123 / +0.010 ns | the EX-path overlay the GEMV ones are compared with |
 | **K2b: GEMV, one port** (`output/d16_100mhz_w128_p6_gemv`, commit `17efed9`) | 2026-10-09 | 92,329 (78.8%) | 61,566 | 349 | 132 / 144 | 0 / 64 | +0.274 / +0.010 ns | `sa_gemv` (16 int8 MACs per port, x buffer) |
 | **K2b: GEMV, two ports** (`output/d16_100mhz_w128_p6_gemv_np2`, commit `3127e6a`) | 2026-10-10 | 96,294 (82.2%) | 63,675 | 349 | 134 / 144 | 0 / 64 | +0.138 / +0.010 ns | m1 on HP3; the first build failed (-0.576 ns: PS RVALID -> R-side port arbitration -> `lw_word` DSP -> ACC address), fixed by a per-port R skid buffer in `sa_ld` |
+| **G5: GEMV, four ports** (`output/d16_100mhz_w128_p6_gemv_np4`, RTL `8855c70`) | 2026-10-10 | 101,878 (87.0%) | 67,688 | 349 | 138 / 144 | 0 / 64 | +0.168 / +0.010 ns | m2 on HP2, m3 on HPC0; the local write and the GEMV lane sum registered (more than 2 ports); worst path the RISC-V reset fanout into the array; bwtest GEMV 57.95 B/cycle |
 
 K1a: the worst setup path (10.5 ns data path, 14 levels including a DSP
 multiplier) runs from the DMA port's read data (`PS8_i/SAXIGP3RCLK`, HP1)

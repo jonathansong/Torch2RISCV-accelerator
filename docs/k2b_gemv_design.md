@@ -202,6 +202,8 @@ prefill 不变。4 口之后，decode 剩下的是 LD 命令的固定延迟（�
 
 **G5-1 实现（2026-10-10）**：`sa_unit` 加 `m3_axi`；`sa_ld` 在 NPORTS > 2 时把本地写（`lw_*`）寄存一级（4 选 1 仲裁和 `lw_word` 乘法止于寄存器；命令的 done 在最后一拍被取走后的下一周期，那时写已在寄存器里，同一时钟沿写入）；`sa_gemv` 在 NL > 2 时先寄存各 lane 之和，再加 ACC 原值（每个 strip 两个周期）；`build_bitstream -nports 4 [-m3_port hpc0|hp0]`，`kv260_bd.tcl` 按口列表（PicoRV32 的口、m0..m3 的口）配置 PS、连线、时钟、地址；`board_env.sh`：`_gemv_np4` → 4 口，构建后缀 `_gemv4`。验证：`make test / test16 / test128` 全过（新增 `tb_sa_dma` NP = 4、`tb_sa_unit` GEMV NP = 4），变异（去掉第 4 条 lane、去掉寄存的 lane 和、`lw_lane` 寄存值出错）均被发现；固件 bwtest / desc_run 联合仿真通过；stories 用 `gemv_ports = 4` 编译，逐 dispatch 检查与仿真 logits 逐位相同。
 
+**G5-2 / G5-3 结果（2026-10-10，`d16_100mhz_w128_p6_gemv_np4`，m2 HP2、m3 HPC0）**：WNS **+0.168 ns**（双口 +0.138；最差路径变成 PicoRV32 复位到阵列 PE 的扇出，97% 是布线，GEMV / LD 数据通路不再关键），LUT 101,878（87.0%），FF 67,688，BRAM 138 / 144（每条 lane 的 x 缓冲一个），DSP 349。板上 `--reuse p6_red`：REGRESSION PASS（14 项），5 个 LLM 测试的 token 与 `p6_red` 逐字相同；bwtest GEMV 64 KB：x 驻留 1131 周期 = **57.95 B / 周期**（64 的 90.5%），x 读入 1164 周期 / 56.30。比例低于双口（95.5%）是因为传输时间减半而每条命令约 100 周期的固定开销不变（双口 2145 = 2048 + 97，4 口 1131 = 1024 + 107）：稳态带宽接近 64 B / 周期，HPC0 经 CCI、HP1 / HP2 共用 S4 都没有看到瓶颈，不需要构建 `-m3_port hp0` 对比。普通 LD / ST 仍约 15.7 B / 周期，1 拍 burst 的短行 LD 5.48 → 7.61。
+
 **步骤**：G5-1 RTL / 测试平台 / BD 参数，仿真通过后 `-bd_only` 检查；G5-2 构建 `-nports 4`；G5-3 板上 `--reuse p6_red` 回归 + bwtest（测试 7 应接近 64 B / 周期）；G5-4 完整 GEMV 4 口 staging，板上 decode 与预测比较。
 
 ## 9. 资源与时序估计（P = 2）
