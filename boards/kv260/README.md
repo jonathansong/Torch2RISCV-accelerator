@@ -279,6 +279,10 @@ Installed on the board 2026-10-10 (`check` after the reboot): command line
 0x0000000010000000, size 1280 MiB`; the global CMA (256 MiB) at
 `0x65C0_0000`; u-dma-buf loaded at boot, `udmabuf0` at `0x10000000`, 1280 MiB,
 `sync_mode` 2; `CmaTotal` 1536 MiB.
+The dual-port GEMV regression on it (`results_m1`): every test passes, the
+windows (16-640 MB, Qwen3 without the insmod right after boot) at
+`0x10000000`, tokens and speed identical to the run before (Qwen3 decode 3.98
+tok/s, GEMV 30.55 B/cycle).
 
 A pool that overlaps a region in use at boot is rejected by the kernel (the
 system boots without it). A kernel update keeps `user-override.dtb` (the tree
