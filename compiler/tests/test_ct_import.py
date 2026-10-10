@@ -8,12 +8,12 @@ checkpoint's, byte for byte (the q / k rows permuted as the rewrite does),
 -128 kept, the dequantized fp32 weights q * s, and the embedding quantized once
 and shared with the tied classifier. With --e2e also end to end: Llama-shaped
 checkpoints (neg128, bf16-scale; dim 256, head_dim 64) through
-test_hf_generic.py --quant --rope --attn (export, compile, the sim against the
-torch W8A8 model step by step and teacher-forced), with the overlay's
-configuration (SA_D, SA_GEMV_PORTS from board_env.sh). Without --prefill: on
-random-weight models prefill + decode is not always bit-exact with decode only,
-self-quantized models alike (seeds 1-3: 0 / 4 / 4 of 5 rows), an open issue of
-the generic path that the import does not change.
+test_hf_generic.py --quant --rope --attn --prefill D (export, compile, the sim
+against the torch W8A8 model step by step and teacher-forced, prefill bit-exact
+with decode only), with the overlay's configuration (SA_D, SA_GEMV_PORTS from
+board_env.sh). Their K = 256 also guards prefill's chunk size against ACC
+(linearSchedule: a small K once gave a SwiGLU epilogue that did not fit, left
+to the host, whose exp / division made prefill differ from decode).
 
     python3 compiler/tests/test_ct_import.py [--out build/ct_synth] [--e2e]
 """
@@ -53,7 +53,8 @@ def e2e(out, variant):
     form still leaves dispatches to the host, so a Llama-shaped model."""
     d = synth(out, variant, "LlamaForCausalLM", 256, 768)
     r = subprocess.run([sys.executable, "-u", os.path.join(HERE, "test_hf_generic.py"), "--model", d,
-                        "--out", d + "_out", "--quant", "--rope", "--attn", "--mb", "200"], capture_output=True, text=True)
+                        "--out", d + "_out", "--quant", "--rope", "--attn", "--prefill", os.environ.get("SA_D", "8"),
+                        "--mb", "200"], capture_output=True, text=True)
     keep = ("compiled in", "steps vs", "teacher-forced", "prefill M", "hf_generic")
     for l in r.stdout.splitlines():
         if any(k in l for k in keep):

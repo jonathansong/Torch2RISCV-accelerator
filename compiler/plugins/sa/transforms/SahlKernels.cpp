@@ -262,20 +262,39 @@ KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int6
   KernelSchedule ks;
   auto wt = cast<MemRefType>(p.w.getType());
   const int64_t k = wt.getDimSize(1), nt = wt.getDimSize(0);
-  if (p.rows) {
-    // prefill's rows: at most 32 tiles per chunk (D x nc words per ACC buffer), a divisor of the tiles
-    int64_t nc = std::min<int64_t>(std::max<int64_t>(int64_t(lay.sbank) / k, 1), 32);
-    while (nc > 1 && nt % nc) --nc;
-    ks.chunkTiles = nc;
-    return ks;
-  }
-  // the epilogue's extra per-chunk inputs beyond s_w need scratch words (as C3: 1 or 2 per output word)
-  uint32_t extra = p.chunked.size() > 1 ? uint32_t(p.chunked.size()) - 1 : 0;
   uint32_t steps = 0;
   linalg::GenericOp epi = p.epi;
   if (epi)                                        // (none: the accumulator stored as it is)
     for (Operation &o : epi.getRegion().front().without_terminator())
       if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
+  if (p.rows) {
+    // prefill's rows: at most 32 tiles per chunk, a divisor of the tiles, its
+    // weights in one SPAD_B bank, and a row block's scope within ACC: each ACC
+    // bank above its scratch (LocalMemory, a buffer never spans two banks)
+    // holds buffers of D x nc words for the accumulator, the result, every
+    // chunked epilogue input and every epilogue operation's temporary (the
+    // generic lowering: one per operation), after the small ones (the two sets
+    // of per-column buffers, the per-row / scalar inputs and their broadcasts).
+    // A small K otherwise gives chunks whose epilogue does not fit: ACC full,
+    // the dispatch left to the host, whose exp / division are not the SFU's
+    int64_t ops = 0;
+    if (epi)
+      ops = int64_t(std::distance(epi.getRegion().front().begin(), epi.getRegion().front().end())) - 1;
+    const int64_t bufs = 2 + int64_t(p.chunked.size()) + ops;
+    const int64_t usable = int64_t(lay.cbank) - int64_t(lay.scr);
+    const int64_t small = int64_t(p.rowv.size() + p.whole.size()) * (p.rows + p.rows / d + 2);
+    auto fits = [&](int64_t nc) {
+      const int64_t w = d * nc, colw = 2 * int64_t(p.cols.size()) * nc;
+      // the small buffers in bank 0 (allocated first), the rest wherever they fit
+      return (usable - small - colw) / w + usable / w >= bufs;
+    };
+    int64_t nc = std::min<int64_t>(std::max<int64_t>(int64_t(lay.sbank) / k, 1), 32);
+    while (nc > 1 && (nt % nc || !fits(nc))) --nc;
+    ks.chunkTiles = nc;
+    return ks;
+  }
+  // the epilogue's extra per-chunk inputs beyond s_w need scratch words (as C3: 1 or 2 per output word)
+  uint32_t extra = p.chunked.size() > 1 ? uint32_t(p.chunked.size()) - 1 : 0;
   uint32_t scratchRows = std::max<uint32_t>(steps > 2 ? 2 : 1, 1 + extra);
   ks.chunkTiles = lay.chunkTiles(uint32_t(k), uint32_t(nt), scratchRows);
   ks.loop = ks.chunkTiles && nt / ks.chunkTiles > 4;
