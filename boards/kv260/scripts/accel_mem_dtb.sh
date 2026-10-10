@@ -8,8 +8,14 @@
 #                 clear of the kernel image, initrd and other reserved regions
 #                 (board_mem_inspect.sh lists them); SIZE a multiple of 1 MiB
 #     CMA_SIZE    new size of the global CMA (linux,cma node), hex; omitted: unchanged.
-#                 A cma= on the kernel command line overrides the node.
-#   e.g. sh accel_mem_dtb.sh 0x1FF00000 0x60000000 0x10000000   (1536 MiB up to 0x7FF00000, CMA 256 MiB)
+#                 A cma= on the kernel command line overrides the node: Ubuntu for
+#                 Kria sets cma=1000M in its boot script and has no linux,cma node, so
+#                 there the CMA size goes to /etc/default/flash-kernel instead
+#                 (accel_mem_install.sh)
+#   KV260 (Ubuntu 22.04, kernel 5.15.0-1080; board_mem_inspect.sh 2026-10-10): kernel up to
+#   0x0320_0000, a reserved page range at 0x0FFF_2000, the initrd at 0x75DA_E000-0x78FF_FFFF
+#   at boot (U-Boot puts it just below its own area at 0x7BF0_0000-), so
+#     sh accel_mem_dtb.sh 0x10000000 0x50000000     (1280 MiB, 0x1000_0000-0x5FFF_FFFF)
 #
 # The pool is a shared-dma-pool marked reusable (a per-device CMA area): u-dma-buf's
 # dma_alloc_coherent then takes any size. A no-map pool allocates in powers of two,
@@ -30,10 +36,15 @@ end=$((BASE + SIZE)); base_n=$((BASE))
 # overlaps with the regions in /proc/iomem other than plain System RAM
 # (kernel code / data, reserved, ...): a warning to look at, not a proof
 overlap=0
+# the global CMA (dmesg "cma: Reserved N MiB at 0x...") is placed anew at each boot: not a conflict
+cma_at=$(dmesg 2>/dev/null | sed -n 's/.*cma: Reserved \([0-9]*\) MiB at \(0x[0-9a-f]*\).*/\2 \1/p' | head -1)
+cma_lo=$(( ${cma_at%% *} + 0 )) 2>/dev/null || cma_lo=-1
+[ -n "$cma_at" ] && cma_hi=$((cma_lo + (${cma_at##* } << 20))) || { cma_lo=-1; cma_hi=-1; }
 while IFS= read -r line; do
     range=${line%% :*}; what=${line#*: }
     lo=$((0x${range%-*})); hi=$((0x${range#*-} + 1))
     case $what in "System RAM") continue ;; esac
+    [ "$lo" = "$cma_lo" ] && [ "$hi" = "$cma_hi" ] && { echo "(the global CMA at $(printf 0x%x $lo) moves at boot: ignored)"; continue; }
     if [ "$lo" -lt "$end" ] && [ "$hi" -gt "$base_n" ]; then
         echo "WARNING: pool overlaps $(printf '0x%08x-0x%08x' $lo $((hi - 1))) $what"; overlap=1
     fi

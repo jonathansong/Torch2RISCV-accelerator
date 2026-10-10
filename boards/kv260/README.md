@@ -245,32 +245,38 @@ bit-exact with the sim and gives the EX path's tokens.
 
 Prefill is unchanged (Qwen3 15.45 -> 15.76 tok/s).
 
-## Accelerator memory pool (K5-M step M1, in preparation)
+## Accelerator memory pool (K5-M step M1, ready to install)
 
 The runtime's window is `/dev/udmabuf0`, today allocated from the global CMA
-(1000 MiB at `0x3780_0000`) by `insmod u-dma-buf.ko udmabuf0=<bytes>` right
-after boot (later the CMA is fragmented). M1 gives the accelerator a dedicated
+(`cma=1000M` from the Kria boot script, at `0x3740_0000`) by `insmod
+u-dma-buf.ko udmabuf0=<bytes>` right after boot (later the CMA is taken by
+zocl / PYNQ buffers and movable pages). M1 gives the accelerator a dedicated
 pool in the device tree (docs/kv260_upgrade_plan.md K5-M): a reusable
-`shared-dma-pool` in the low 2 GB (e.g. 1536 MiB up to `0x7FF0_0000`) and a
-u-dma-buf node on it, the global CMA shrunk to about 256 MiB.
+`shared-dma-pool` of **1280 MiB at `0x1000_0000`-`0x5FFF_FFFF`** with a
+u-dma-buf node on it, and the global CMA cut to 256 MiB.
+
+What `board_mem_inspect.sh` found (2026-10-10, kernel 5.15.0-1080): kernel at
+`0x0021_0000`-`0x0319_FFFF`, a reserved range at `0x0FFF_2000`, the initrd at
+`0x75DA_E000`-`0x78FF_FFFF` during boot, U-Boot's area (with the DTB) at
+`0x7BF0_0000`-, PMU firmware at `0x7FF0_0000`; no `linux,cma` node (the CMA
+size comes from the command line); the boot script (flash-kernel
+`bootscr.zynqmp.kria`) loads `/boot/firmware/user-override.dtb` in place of the
+FIT's DTB when it exists.
 
 ```sh
-# 1. on the board, read-only: memory map, reserved regions, how the DTB is loaded
-sudo sh board_mem_inspect.sh                  # -> mem_inspect.txt (scp it back)
-# 2. a DTB from the running tree with the pool (installs nothing)
-sudo apt install device-tree-compiler
-sudo sh accel_mem_dtb.sh 0x1FF00000 0x60000000 0x10000000   # base, size, CMA size -> accel.dtb / .dts / .diff
-# 3. install: depends on how this image loads its DTB (step 1); keep the original for rollback
-# 4. load u-dma-buf at boot (no udmabuf0= parameter: the DT node sizes it)
-sudo cp ~/udmabuf/u-dma-buf.ko /lib/modules/$(uname -r)/extra/ && sudo depmod
-echo u-dma-buf | sudo tee /etc/modules-load.d/u-dma-buf.conf
-# check after reboot: size and address of the window, the new CMA size
-cat /sys/class/u-dma-buf/udmabuf0/size /sys/class/u-dma-buf/udmabuf0/phys_addr; grep Cma /proc/meminfo
+# on the board (scripts from boards/kv260/scripts, u-dma-buf built in ~/udmabuf)
+sudo sh board_mem_inspect.sh                     # read-only: memory map, boot setup -> mem_inspect.txt
+sh accel_mem_dtb.sh 0x10000000 0x50000000        # accel.dtb from the running tree (+ .dts, .diff); installs nothing
+sudo sh accel_mem_install.sh install             # user-override.dtb, cma=256M (flash-kernel), u-dma-buf at boot
+sudo reboot
+sudo sh accel_mem_install.sh check               # udmabuf0 at 0x10000000, 1280 MiB; CMA areas
+# no insmod any more; rollback: sudo sh accel_mem_install.sh uninstall && sudo reboot
+# (or delete user-override.dtb from the SD card's boot partition on a PC)
 ```
 
-If the pool overlaps a region the kernel already uses, the kernel rejects
-that reserved-memory node and boots without it (u-dma-buf then finds no
-pool); a DTB that does not boot is put back from the SD card on a PC.
+A pool that overlaps a region in use at boot is rejected by the kernel (the
+system boots without it). A kernel update keeps `user-override.dtb` (the tree
+stays this kernel's) and needs u-dma-buf rebuilt for the new kernel.
 
 ## To confirm on the board
 
