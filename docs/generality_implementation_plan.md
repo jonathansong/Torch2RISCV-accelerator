@@ -275,6 +275,13 @@ QLinearExternal(
 
 以实际 `config.json` 为准，当前预期结构为 16 层、hidden size 2048、FFN 8192、32/8 GQA、head_dim 64、vocab 128256、tied embedding，以及 Llama 3 RoPE scaling。公开的 W8A8 版本（RedHatAI）是 **Instruct** 模型：质量参考用 Instruct 的 bf16，按 chat template 构造输入；这类 checkpoint 通常 `ignore: [lm_head]`，嵌入 / 分类表由本项目量化（manifest 记录）。
 
+**预备工作（2026-10-11）**：
+- **checkpoint**：`RedHatAI/Llama-3.2-1B-Instruct-quantized.w8a8`（revision `9c406c48`，不需登录）下载到 `build/llm_cache/Llama-3.2-1B-Instruct-W8A8`（1.9 GB）。配置正好在 importer 范围内（int8 按通道对称、激活按 token 动态、`ignore: [lm_head]`、无 act-order）；recipe 为 SmoothQuant 0.7 + GPTQ（observer mse）。文件里 tied 的 `lm_head.weight` **又单独存了一份**（与嵌入逐位相同）：importer 现在检查二者相同，不同则拒绝（原来会把后读的一张写进共享张量，悄悄替换另一张）；合成变体 `lm-head-dup` / `lm-head-diff` 覆盖。
+- **原版参考**：`meta-llama/Llama-3.2-1B-Instruct` 需要登录并接受许可；用不受限的镜像 `unsloth/Llama-3.2-1B-Instruct`（revision `5a8abab4`，`build/llm_cache/Llama-3.2-1B-Instruct`，2.4 GB）。核对：其嵌入表与 RedHatAI 的逐位相同；对 SmoothQuant 不变的量（权重 × 前面 RMSNorm 的权重），RedHatAI 反量化结果与之相关 0.99987、误差中位数 0.26 个量化步长：同一个基础模型。
+- **分词器**：`hf_tokenizer.py` 原来用一个固定正则近似预分词，Llama 3 只有 114/305 段与 transformers 相同（数字 Llama 3 按 3 位一组）。现在按 tokenizer.json 的 normalizer（NFC）、pre-tokenizer（Split 正则 / Digits / ByteLevel 的 GPT-2 正则）、`ignore_merges` 执行，特殊 token 先整体匹配：Llama 3、SmolLM2、Qwen3 各 1009 段（含 chat template 的特殊 token、中文、全角、2 万字长文）与 transformers **完全相同**。需要 `regex` 模块（Unicode 类别）；没有时（板上的系统 Python：`sudo apt install python3-regex`）退回旧的近似。SmolLM2 / Qwen3 的校准文本与 prompt 的分词不变，已有模型的 KV scale 不受影响；Llama 的校准文本由 47 变 45 个 token。
+- **RoPE**：`RopeTable` 由 HF 的 rotary 模块生成整张 cos / sin 表，llama3 scaling 自然包含；`test_hf_generic` 的改写前后对比会在真实模型上验证。
+- **内存预检**：`compiler/tests/mem_preflight.py`（只读 safetensors 头部）。以板上实测校准：峰值 ≈ 打包参数 + KV + 几 MiB；各项之和比打包文件少 2.0%（Qwen3 570.5 对 582.4 MiB）/ 1.5%（SmolLM2），估算乘 1.025。Llama-3.2-1B：int8 线性层 928.0 + 嵌入 int8 250.5 + scale 等 ≈ 1210 MiB 打包，T = 256 的 KV 4 MiB，余量 32 MiB，合计 **1246 MiB / 1280 MiB，放得下（余 34 MiB）**；KV 最长 T ≈ 2400。注意：staging 现在按 “irpa × 1.1 + 24” 设运行时的堆（Llama 得 1323 MiB，超过池），上板前改为 “打包 + KV + 余量”。
+
 ### 9.2 前端实现
 
 - importer 先严格校验 compressed-tensors 配置是否属于 WP2 支持范围。
@@ -466,8 +473,8 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 5. ~~`tests: add synthetic compressed-tensors checkpoints`~~（2–5 合为一个提交）
 6. `frontend: import SmolLM2 and Qwen3 W8A8 checkpoints`（SmolLM2 完成）
 7. ~~`tools: add quantization quality comparison pipeline`~~（`quality_eval.py`）
-8. `frontend: add Llama 3.2 tokenizer and RoPE coverage`
-9. `tools: add device memory manifest and preflight`
+8. `frontend: add Llama 3.2 tokenizer and RoPE coverage`（分词器完成）
+9. ~~`tools: add device memory manifest and preflight`~~（`mem_preflight.py`）
 10. `compiler: split GEMV K at aligned 4080-element boundary`
 11. `tests: cover GEMV K split boundaries and overflow`
 12. `runtime: report per-dispatch host/device timing and fallback reason`

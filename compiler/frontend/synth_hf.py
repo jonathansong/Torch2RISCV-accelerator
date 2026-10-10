@@ -19,8 +19,8 @@ import shutil
 import numpy as np
 
 
-CT_OK = ("ok", "neg128", "bf16-scale")
-CT_BAD = ("group", "static-act", "asym", "int4", "fp8", "missing-scale", "bad-shape", "kv-scheme")
+CT_OK = ("ok", "neg128", "bf16-scale", "lm-head-dup")
+CT_BAD = ("group", "static-act", "asym", "int4", "fp8", "missing-scale", "bad-shape", "kv-scheme", "lm-head-diff")
 
 
 class BF16(np.ndarray):
@@ -148,6 +148,10 @@ def compress(t, cfg, variant, rng):
         del out[first]
     elif variant == "bad-shape":
         out[first] = out[first][:-1]
+    elif variant in ("lm-head-dup", "lm-head-diff"):
+        # the tied classifier also stored on its own (as RedHatAI's Llama-3.2-1B W8A8)
+        e = out["model.embed_tokens.weight"]
+        out["lm_head.weight"] = e.copy() if variant == "lm-head-dup" else e + np.float32(0.01)
     elif variant == "kv-scheme":
         qc["kv_cache_scheme"] = {"num_bits": 8, "type": "int", "symmetric": True, "strategy": "tensor"}
     cfg["quantization_config"] = qc

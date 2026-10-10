@@ -129,6 +129,9 @@ def main():
                 n += len(win)
         if ref is None:
             ref = refs
+        f = ctx = None                   # (the model freed before the next one loads: one at a time in memory)
+        import gc
+        gc.collect()
         P = len(wins) * (args.window - 1)
         res[name] = {"ppl": math.exp(nll / P), "seconds": round(time.time() - t0, 1)}
         if n:

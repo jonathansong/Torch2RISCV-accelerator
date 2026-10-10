@@ -36,7 +36,8 @@ import synth_hf  # noqa: E402
 
 # what each refused variant's message must name
 EXPECT = {"group": "strategy", "static-act": "dynamic", "asym": "symmetric", "int4": "num_bits",
-          "fp8": "format", "missing-scale": "missing", "bad-shape": "shape", "kv-scheme": "kv_cache_scheme"}
+          "fp8": "format", "missing-scale": "missing", "bad-shape": "shape", "kv-scheme": "kv_cache_scheme",
+          "lm-head-diff": "tied"}
 
 
 def synth(out, variant, arch="Qwen3ForCausalLM", dim=64, hidden=256):

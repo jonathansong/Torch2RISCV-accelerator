@@ -202,6 +202,16 @@ def load_model(model_dir, layers=None):
                     continue
                 raise UnsupportedCheckpoint(f"tensor {k}: not a parameter of the model")
             v = t.get(k)
+            if _tied(model, k):
+                # a tied classifier also stored on its own (RedHatAI's Llama-3.2-1B
+                # W8A8): it must be the embedding's table, else loading it into the
+                # shared tensor would silently replace one of the two
+                emb = next((e for e, p in params.items() if e != k and p is params[k]), None)
+                if emb is None or emb not in t or not torch.equal(v, t.get(emb)):
+                    raise UnsupportedCheckpoint(f"{k}: stored apart from the tied {emb} and different; supported: "
+                                                "the same table (or tie_word_embeddings false)")
+                done.add(k)
+                continue
             if not v.is_floating_point():
                 raise UnsupportedCheckpoint(f"{k}: dtype {v.dtype} in a layer the scheme does not quantize")
             if list(v.shape) != list(params[k].shape):
