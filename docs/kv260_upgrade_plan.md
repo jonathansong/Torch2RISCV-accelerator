@@ -473,9 +473,26 @@ decode 受带宽限制，提升 1.5–1.7 倍（不到 2 倍：VE 尾部、注�
 | 项 | 内容 | 收益 | 依赖 |
 |---|---|---|---|
 | int4 权重 | LD 通路上解包 int4；按组的 scale（每 64/128 个 K 一组），微内核按 K 组分段 EX、VE 缩放后累加 | 读取量减半，decode 约 2 倍上限 | 质量需配合 GPTQ / AWQ 一类方法；LD 解包位于 K2 的新入口上 |
-| 64 位 DDR 地址 | DMA 的 DDR 地址扩展到 64 位（描述符地址字段加宽，或一个高位段寄存器）、运行时 `uint64_t`。描述符列表与环形队列**继续放在低 2 GB**，PicoRV32 照常访问；它的地址空间高半部分已被 CSR（`0x8000_0000`）与 BRAM（`0xC000_0000`）占用，只有当 RISC-V 自己要读写高 2 GB 时，才需要加一个地址窗口 / 高位段寄存器 | 用满 4 GB：Qwen3-1.7B int8、3B–4B int4 | 改描述符格式（sa-desc 新版本） |
+| 用满 4 GB DDR | 见下面 **K5-M**：M1 设备树给加速器留出低 2 GB 的大部分；M2 在 `sa_unit` 的 AXI 出口把设备地址 bit 31 映射到高 2 GB（`0x8_0000_0000`），描述符仍是 32 位 | M1：窗口约 1 GB → 约 1.5 GB，且不再要求开机后马上 insmod；M2：约 3 GB 以上（Qwen3-1.7B int8、3B–4B int4） | M1 无；M2 改 BD、`sa_unit` 出口、运行时双窗口 |
 | RVV RISC-V 核 | 独立实验或替换 PicoRV32；评估 SiFive SKL、IREE 的 RISC-V 后端 | 不规则运算（采样、top-k、MoE 路由）、全 RISC-V 栈 | 资源、工具链 |
 | MoE | 专家权重打包、动态权重基址的线性层微内核（`LDPARAM` + 动态 DMA 地址） | Granite-1B-A400M 这类小 MoE | K4、可能 64 位地址 |
+
+
+#### K5-M：用满 4 GB DDR
+
+**现状**：KV260 的 4 GB 分两段，低 2 GB 在 `0x0`（实际 `0x0000_0000`–`0x7FEF_FFFF`），高 2 GB 在 `0x8_0000_0000`。加速器只能访问低 2 GB：描述符里的 DDR 地址是 32 位，BD 只映射了各口的 `HPx_DDR_LOW`。实际可用的是 u-dma-buf 从全局 CMA（1000 MiB，在 `0x3780_0000`）分出的窗口：Qwen3 的 640 MB 要开机后马上分配，否则 CMA 被 XRT / PYNQ 的分配和可移动页占用后会分不出连续的大块；分完只剩约 350 MB。
+
+**M1：设备树给加速器一个专用池（低 2 GB，不改硬件）**
+- `reserved-memory` 下加一个 `shared-dma-pool`、`reusable` 的专用池（例如 1536 MiB），只给 u-dma-buf 的设备节点用（`compatible = "ikwzm,u-dma-buf"`、`memory-region`、`sync-mode = <2>`）；全局 CMA 缩到约 256 MiB（PYNQ / XRT 的 `pynq.allocate`）。Linux 本身可以完全用高 2 GB。
+- 选 `reusable`（每设备的 CMA 区）而不是 `no-map`：内核的 `dma_alloc_coherent` 在 `no-map` 池上按 2 的幂分配，1536 MiB 的请求会向上取整到 2 GiB 而失败；`reusable` 走 `cma_alloc`，大小任意（按 1 MiB 对齐）。
+- u-dma-buf 开机自动加载（`/etc/modules-load.d`），设备一出现就分配整个池，之后不会被占用；`run_board.sh` 和 launcher 不用改（窗口仍是 `/dev/udmabuf0`）。
+- 池的位置要避开内核镜像、U-Boot 放 DTB / initrd 的地址和 PMU 固件区（`0x7FF0_0000` 以上）：先在板上运行 `boards/kv260/scripts/board_mem_inspect.sh` 收集 `/proc/iomem`、启动参数、现有 `reserved-memory` 和 DTB 的加载方式，再用 `accel_mem_dtb.sh` 从当前运行的设备树（`/sys/firmware/fdt`）生成新 DTB；安装方式按检查结果确定，保留原 DTB 以便回退（SD 卡在 PC 上也能改回）。
+
+**M2：加速器访问高 2 GB（设备地址重映射）**
+- `sa_unit` 的 AXI 出口：设备地址 bit 31 = 0 → 物理 `addr`（低 2 GB）；bit 31 = 1 → 物理 `0x8_0000_0000 + addr[30:0]`（高 2 GB）。加速器看到连续的 4 GB 设备地址空间，**描述符、编译器、固件格式不变**；AXI 地址加宽到 40 位，BD 给 m0–m3 再映射 `HPx_DDR_HIGH` / `HPC0_DDR_HIGH`。
+- PicoRV32 不变：环形队列和描述符列表留在低 2 GB（它的 `0x8000_0000` 以上是 CSR 和 BRAM）。
+- 软件：设备树给高 2 GB 留一段 `reserved-memory`（默认 CMA 只在 4 GB 以下的物理地址，高 2 GB 的物理地址在 32 GB 处），用 u-dma-buf 的 `memory-region` 映射成第二个窗口；`sa_transport_board.c` 支持两个窗口，物理地址 → 设备地址的换算（高窗口 `0x8_xxxx_xxxx` → `0x8000_0000 + 偏移`）；运行时把权重和 KV cache 放进高窗口。地址检查仍按 §2.4：64 位解析、整段检查后再转换。
+- 只在上 1.7B 及以上模型时需要；与 K2b / G5 的 4 口互不影响。
 
 ---
 

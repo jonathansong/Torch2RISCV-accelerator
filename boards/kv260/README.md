@@ -245,6 +245,33 @@ bit-exact with the sim and gives the EX path's tokens.
 
 Prefill is unchanged (Qwen3 15.45 -> 15.76 tok/s).
 
+## Accelerator memory pool (K5-M step M1, in preparation)
+
+The runtime's window is `/dev/udmabuf0`, today allocated from the global CMA
+(1000 MiB at `0x3780_0000`) by `insmod u-dma-buf.ko udmabuf0=<bytes>` right
+after boot (later the CMA is fragmented). M1 gives the accelerator a dedicated
+pool in the device tree (docs/kv260_upgrade_plan.md K5-M): a reusable
+`shared-dma-pool` in the low 2 GB (e.g. 1536 MiB up to `0x7FF0_0000`) and a
+u-dma-buf node on it, the global CMA shrunk to about 256 MiB.
+
+```sh
+# 1. on the board, read-only: memory map, reserved regions, how the DTB is loaded
+sudo sh board_mem_inspect.sh                  # -> mem_inspect.txt (scp it back)
+# 2. a DTB from the running tree with the pool (installs nothing)
+sudo apt install device-tree-compiler
+sudo sh accel_mem_dtb.sh 0x1FF00000 0x60000000 0x10000000   # base, size, CMA size -> accel.dtb / .dts / .diff
+# 3. install: depends on how this image loads its DTB (step 1); keep the original for rollback
+# 4. load u-dma-buf at boot (no udmabuf0= parameter: the DT node sizes it)
+sudo cp ~/udmabuf/u-dma-buf.ko /lib/modules/$(uname -r)/extra/ && sudo depmod
+echo u-dma-buf | sudo tee /etc/modules-load.d/u-dma-buf.conf
+# check after reboot: size and address of the window, the new CMA size
+cat /sys/class/u-dma-buf/udmabuf0/size /sys/class/u-dma-buf/udmabuf0/phys_addr; grep Cma /proc/meminfo
+```
+
+If the pool overlaps a region the kernel already uses, the kernel rejects
+that reserved-memory node and boots without it (u-dma-buf then finds no
+pool); a DTB that does not boot is put back from the SD card on a PC.
+
 ## To confirm on the board
 
 - The carrier's fan is controlled from the PL in AMD's reference designs;
