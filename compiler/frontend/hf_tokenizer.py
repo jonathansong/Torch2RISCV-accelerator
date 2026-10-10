@@ -27,14 +27,25 @@ class BpeTokenizer:
             self.added[a["content"]] = a["id"]
         self.ignore_merges = bool(m.get("ignore_merges"))
         norm = t.get("normalizer") or {}
-        self.nfc = norm.get("type") == "NFC" or any(n.get("type") == "NFC" for n in norm.get("normalizers", []))
+        self.norms = norm.get("normalizers", [norm] if norm else [])
+        for n in self.norms:
+            if n.get("type") not in ("NFC", "Replace", "Prepend"):
+                raise NotImplementedError(f"normalizer {n.get('type')}")
         pre = t.get("pre_tokenizer") or {}
         self.steps = pre.get("pretokenizers", [pre] if pre else [])
+        dec = t.get("decoder") or {}
+        # byte-level (GPT-2: SmolLM2, Qwen, Llama 3) or SentencePiece-style BPE on
+        # the characters with byte fallback (<0xNN>; Gemma)
+        self.byte_level = any(st.get("type") == "ByteLevel" for st in self.steps) or dec.get("type") == "ByteLevel" or \
+            any(x.get("type") == "ByteLevel" for x in dec.get("decoders", []))
+        self.byte_fallback = bool(m.get("byte_fallback"))
+        self.unk = self.vocab.get(m.get("unk_token")) if m.get("unk_token") else None
         try:
             import regex
-            self.re = regex
-        except ImportError:
-            self.re = None
+            self.re, self.exact = regex, True
+        except ImportError:                      # (the standard re: no \p{L} / \p{N})
+            import re
+            self.re, self.exact = re, False
         merges = [tuple(x.split(" ")) if isinstance(x, str) else tuple(x) for x in m["merges"]]
         self.ranks = {p: i for i, p in enumerate(merges)}
         bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -49,14 +60,40 @@ class BpeTokenizer:
         self.u2b = {chr(c): b for b, c in zip(bs, cs)}
 
     def _bpe(self, word):
-        parts = list(word)
-        while len(parts) > 1:
-            pairs = [(self.ranks.get((parts[i], parts[i + 1]), 1 << 30), i) for i in range(len(parts) - 1)]
-            r, i = min(pairs)
-            if r == 1 << 30:
-                break
-            parts[i:i + 2] = [parts[i] + parts[i + 1]]
-        return parts
+        """The merges by rank (lowest first; equal ranks left to right), with a
+        heap over the adjacent pairs and a linked list of the symbols: n log n."""
+        import heapq
+        sym = list(word)
+        n = len(sym)
+        if n < 2:
+            return sym
+        nxt, prv, alive = list(range(1, n + 1)), list(range(-1, n - 1)), [True] * n
+        heap = []
+        for i in range(n - 1):
+            r = self.ranks.get((sym[i], sym[i + 1]))
+            if r is not None:
+                heap.append((r, i, sym[i], sym[i + 1]))
+        heapq.heapify(heap)
+        while heap:
+            r, i, a, b = heapq.heappop(heap)
+            j = nxt[i] if i < n and alive[i] else n
+            if not alive[i] or j >= n or sym[i] != a or sym[j] != b:
+                continue                             # (stale: one side merged since)
+            sym[i] = a + b
+            alive[j] = False
+            nxt[i] = nxt[j]
+            if nxt[i] < n:
+                prv[nxt[i]] = i
+            p, q = prv[i], nxt[i]
+            if p >= 0:
+                rr = self.ranks.get((sym[p], sym[i]))
+                if rr is not None:
+                    heapq.heappush(heap, (rr, p, sym[p], sym[i]))
+            if q < n:
+                rr = self.ranks.get((sym[i], sym[q]))
+                if rr is not None:
+                    heapq.heappush(heap, (rr, i, sym[i], sym[q]))
+        return [sym[i] for i in range(n) if alive[i]]
 
     def _split(self, pieces, pattern):
         """Split, behavior Isolated: each match and each stretch between matches a piece."""
@@ -74,7 +111,7 @@ class BpeTokenizer:
         return out
 
     def _pieces(self, text):
-        if self.re is None:                     # (no Unicode classes: the old approximation)
+        if not self.exact and self.byte_level:  # (no Unicode classes: the old approximation)
             import re
             return re.findall(r" ?[A-Za-z]+| ?[0-9]| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+", text)
         pieces = [text]
@@ -82,9 +119,22 @@ class BpeTokenizer:
             ty = st.get("type")
             if ty == "Split":
                 pat = st["pattern"].get("Regex") or self.re.escape(st["pattern"]["String"])
-                if st.get("behavior", "Isolated") != "Isolated" or st.get("invert"):
-                    raise NotImplementedError(f"Split behavior {st.get('behavior')} / invert")
-                pieces = self._split(pieces, pat)
+                beh = st.get("behavior", "Isolated")
+                if beh not in ("Isolated", "MergedWithPrevious") or st.get("invert"):
+                    raise NotImplementedError(f"Split behavior {beh} / invert")
+                if beh == "Isolated":
+                    pieces = self._split(pieces, pat)
+                else:                               # each match ends the piece before it
+                    out = []
+                    for s_ in pieces:
+                        pos = 0
+                        for mt in self.re.finditer(pat, s_):
+                            if mt.end() > pos:
+                                out.append(s_[pos:mt.end()])
+                                pos = mt.end()
+                        if pos < len(s_):
+                            out.append(s_[pos:])
+                    pieces = out
             elif ty == "Digits":
                 pieces = self._split(pieces, r"\p{N}" if st.get("individual_digits") else r"\p{N}+")
             elif ty == "ByteLevel":
@@ -118,16 +168,38 @@ class BpeTokenizer:
             if isinstance(c, int):
                 ids.append(c)
                 continue
-            if self.nfc:
-                c = unicodedata.normalize("NFC", c)
+            for n in self.norms:
+                ty = n.get("type")
+                if ty == "NFC":
+                    c = unicodedata.normalize("NFC", c)
+                elif ty == "Replace":
+                    pat = n["pattern"]
+                    c = c.replace(pat["String"], n["content"]) if "String" in pat else self.re.sub(pat["Regex"], n["content"], c)
+                elif ty == "Prepend":
+                    c = n["prepend"] + c
             for piece in self._pieces(c):
-                u = "".join(self.b2u[b] for b in piece.encode("utf-8"))
+                u = "".join(self.b2u[b] for b in piece.encode("utf-8")) if self.byte_level else piece
                 if self.ignore_merges and u in self.vocab:
                     ids.append(self.vocab[u])
                     continue
-                ids += [self.vocab[p] for p in self._bpe(u)]
+                for p in self._bpe(u):
+                    if p in self.vocab:
+                        ids.append(self.vocab[p])
+                    elif self.byte_fallback:
+                        ids += [self.vocab[f"<0x{b:02X}>"] for b in p.encode("utf-8")]
+                    else:
+                        ids.append(self.unk)
         return ids
 
     def decode(self, ids):
+        if not self.byte_level:                  # ▁ -> space, <0xNN> -> its byte
+            out = bytearray()
+            for i in ids:
+                t = self.inv.get(i, "")
+                if len(t) == 6 and t.startswith("<0x") and t.endswith(">"):
+                    out.append(int(t[3:5], 16))
+                else:
+                    out += t.replace("\u2581", " ").encode("utf-8")
+            return out.decode("utf-8", errors="replace")
         s = "".join(self.inv.get(i, "") for i in ids)
         return bytes(self.u2b.get(ch, 32) for ch in s).decode("utf-8", errors="replace")

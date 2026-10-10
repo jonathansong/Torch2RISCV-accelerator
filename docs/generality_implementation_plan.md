@@ -391,6 +391,13 @@ K_BLOCK_MAX = floor(4095 / 16) * 16 = 4080
 
 ## 12. 工作包 WP8：Gemma-3-270M 短上下文 bring-up
 
+**预备工作（2026-10-11）**：
+- **模型**：`google/gemma-3-270m` 需要登录；用不受限的镜像 `unsloth/gemma-3-270m`（base，revision `edcf1fe3`，`build/llm_cache/gemma-3-270m`，0.5 GB）。结构：18 层，hidden 640，4 / 1 GQA，head_dim 256，词表 262144，FFN 2048，GELU-tanh，滑窗 512（每 6 层 5 层滑窗），RoPE 局部 base 1e4、全局 1e6，`query_pre_attn_scalar` 256，无 logit softcap。内存预检：T = 512 时约 300 MiB，宽裕。
+- **eager 逐项对比**（原版 HF fp32 为参考，24 个 token）发现并修了四处，都只在 Gemma 这类结构上生效：① 包装后的 decoder 与原版就不一致（相关 0.73）：HF 按第 0 层的 cache 长度推算位置，Gemma 的第 0 层是滑窗层，计数器是 `cumulative_length_int`，原来没设（现在 `_at` 一并设置；导出时 sa 注意力不用 HF 的 mask）→ 逐位一致级别（7e-5）；② W8A8 后完全错（相关 0.13）：`Gemma3TextScaledWordEmbedding` 要乘 √640，`QEmbedding` 把它丢了；现在保留 `embed_scale`，反量化后再乘（不能折进 scale：分类层共用这张表而不乘），带自定义 forward 又没有 `embed_scale` 的嵌入子类明确报错；③ `RopeTable` 报错：Gemma 只有一个 rotary 模块、调用时传 `layer_type`，现在每种类型一张表；④ RMSNorm 的增益是 `1 + w`：`SaRMSNorm` 用全 1 向量探测模块实际的增益，判定为 `w` 或 `1 + w`，其他形式报错。另外：`sa_attention` 的分数缩放改用模块自己的 `scaling`（与 1/√head_dim 相同时仍用原来的算法，现有模型逐位不变）；cache 长度超过滑窗时明确报错（设备注意力不做滑窗，T ≤ 512 时语义相同）。
+  结果：包装与 RoPE / norm 改写后与原版一致（7e-5，argmax 24/24），W8A8 相关 0.992，SA 形式（int8 KV、设备注意力、SFU 近似）相关 0.9906、argmax 23/24。SmolLM2 与 Qwen3（截 2 层）的导出与改动前逐字节相同。
+- **分词器**：Gemma 是 SentencePiece 风格的 BPE（normalizer 把空格换成 `▁`、直接对字符做 BPE、byte fallback `<0xNN>`）。`hf_tokenizer.py` 加入这种模式（normalizer Replace / Prepend、`MergedWithPrevious` 的 Split、byte fallback 与对应解码），BPE 改为堆 + 链表（n log n；Gemma 整段文本是一个“词”）。Gemma、Llama 3、SmolLM2、Qwen3 各 1009 段与 transformers 完全相同，解码可还原；Gemma 不需要 `regex` 模块，板上的系统 Python 也是精确的。
+- **还没做**（WP8 正式阶段）：导出与编译（GELU-tanh 在设备上的形式、head_dim 256 的注意力微内核与 SPAD 容量）、`synth_hf.py` 的 Gemma3 结构。
+
 ### 12.1 第一阶段范围
 
 - 以 sim 为主，允许少量 host fallback。

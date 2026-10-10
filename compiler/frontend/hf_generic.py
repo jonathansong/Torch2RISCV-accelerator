@@ -47,6 +47,20 @@ class PositionedCache(StaticCache):
             layer.update = types.MethodType(make_update(i), layer)
 
 
+def _at(layer, pos):
+    """The cache layer's position counters set to the input position: a full
+    layer's cumulative_length, and a sliding-window layer's python int (HF
+    builds the masks' cache positions from layer 0's: Gemma 3 starts with a
+    sliding layer). In an export the int stays (the sa attention does not use
+    HF's mask)."""
+    layer.cumulative_length = pos
+    if hasattr(layer, "cumulative_length_int"):
+        try:
+            layer.cumulative_length_int = int(pos)
+        except Exception:                        # (symbolic in torch.export)
+            pass
+
+
 class HFDecoder(torch.nn.Module):
     """decode(input_ids[1, 1], position_ids[1, 1]) -> logits; the KV cache as buffers."""
     def __init__(self, model, max_len):
@@ -67,7 +81,7 @@ class HFDecoder(torch.nn.Module):
         chunks before the last: prefill_kv) the last row's hidden state."""
         self.cache.positions = position_ids[0]
         for layer in self.cache.layers:
-            layer.cumulative_length = position_ids.reshape(-1)[0]
+            _at(layer, position_ids.reshape(-1)[0])
         if logits:
             return self.model(input_ids=input_ids, position_ids=position_ids, past_key_values=self.cache,
                               use_cache=True, logits_to_keep=1).logits
@@ -80,7 +94,7 @@ class HFDecoder(torch.nn.Module):
         # HF builds the causal mask from the cache's own length (the positions
         # seen so far): here the input position, set (not mutated) each step
         for layer in self.cache.layers:
-            layer.cumulative_length = position_ids.reshape(-1)[0]
+            _at(layer, position_ids.reshape(-1)[0])
         return self.model(input_ids=input_ids, position_ids=position_ids, past_key_values=self.cache,
                           use_cache=True).logits
 
@@ -117,6 +131,10 @@ class SaCache(StaticCache):
         self.inv_sk = [_f32c(1.0 / np.float32(x)) for x in kv[:, 0]]
         self.inv_sv = [_f32c(1.0 / np.float32(x)) for x in kv[:, 1]]
         self.a_k = [_f32c(float(x) / np.sqrt(hd)) for x in kv[:, 0]]
+        # the score scale when the attention's own is not 1 / sqrt(head_dim)
+        # (Gemma: query_pre_attn_scalar^-1/2); per layer, from sa_attention's scaling
+        self.kv_k = [float(x) for x in kv[:, 0]]
+        self.hd = hd
         self.a_v = [_f32c(float(x) / 127.0) for x in kv[:, 1]]
         cache, T = self, max_cache_len
 
@@ -157,7 +175,10 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
     for m in range(M):
         qq, s_q = _quant_act(qr[m].reshape(Hk, G, hd))                           # (Hk, G, hd), (Hk, G, 1)
         sc = torch.matmul(qq.to(torch.int32), kh)                                # (Hk, G, T) int32
-        sc = (sc.to(torch.float32) * s_q) * cache.a_k[l]
+        a_k = cache.a_k[l]
+        if scaling is not None and abs(scaling * np.sqrt(cache.hd) - 1.0) > 1e-9:
+            a_k = _f32c(cache.kv_k[l] * float(scaling))
+        sc = (sc.to(torch.float32) * s_q) * a_k
         mask = torch.arange(T) <= cache.positions[m:m + 1]
         mx = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
         e = torch.where(mask, torch.exp(sc - mx), torch.tensor(0.0))
@@ -222,6 +243,11 @@ class SaDecoder(HFDecoder):
     """HFDecoder with the sa KV cache and attention (F4)."""
     def __init__(self, model, max_len, kv_scales):
         torch.nn.Module.__init__(self)
+        # the sa attention is causal over the whole cache: a sliding window
+        # (Gemma 3's local layers) is the same only while the cache fits in it
+        win = getattr(model.config, "sliding_window", None)
+        if win and "sliding_attention" in (getattr(model.config, "layer_types", None) or []) and max_len > win:
+            raise NotImplementedError(f"max_len {max_len} beyond the sliding window {win} (plan C6.5)")
         from transformers import AttentionInterface
         AttentionInterface.register("sa", sa_attention)
         self.model = model
@@ -340,12 +366,18 @@ class QLinear(torch.nn.Module):
 
 
 class QEmbedding(torch.nn.Module):
-    """int8 embedding rows with a per-row scale: e[t] = q[t] * s[t]."""
+    """int8 embedding rows with a per-row scale: e[t] = q[t] * s[t], times the
+    module's embed_scale if it has one (Gemma: sqrt(hidden); not folded into s,
+    which a tied classifier shares)."""
     def __init__(self, emb, qs=None):
         super().__init__()
         q, s = qs if qs is not None else _quantize_rows(emb.weight)
         self.q = torch.nn.Parameter(q, requires_grad=False)
         self.s = torch.nn.Parameter(s, requires_grad=False)
+        scale = getattr(emb, "embed_scale", None)
+        if scale is None and type(emb).forward is not torch.nn.Embedding.forward:
+            raise NotImplementedError(f"{type(emb).__name__}: an embedding with its own forward and no embed_scale")
+        self.mul = None if scale is None else _f32c(float(scale))
 
     def forward(self, ids):
         # row by row, each an index_select by one id: the sa backend's row gather
@@ -353,7 +385,8 @@ class QEmbedding(torch.nn.Module):
         flat = ids.reshape(-1)
         e = torch.cat([torch.index_select(self.q, 0, flat[m:m + 1]).to(torch.float32) *
                        torch.index_select(self.s, 0, flat[m:m + 1]).unsqueeze(-1) for m in range(flat.shape[0])])
-        return e.reshape(tuple(ids.shape) + (self.q.shape[-1],))
+        e = e.reshape(tuple(ids.shape) + (self.q.shape[-1],))
+        return e if self.mul is None else e * self.mul
 
 
 # RoPE (F3): the rotary module's cos / sin as tables, and rotate_half as the
@@ -365,20 +398,30 @@ class RopeTable(torch.nn.Module):
     def __init__(self, rotary, max_len, head_dim, perm=None):
         super().__init__()
         x = torch.zeros(1, 1, head_dim)
-        cos, sin = rotary(x, torch.arange(max_len)[None])
-        cos, sin = cos[0].float(), sin[0].float()
-        if perm is not None:
-            cos, sin = cos[:, perm], sin[:, perm]
-        self.cos_t = torch.nn.Parameter(cos.contiguous(), requires_grad=False)
-        self.sin_t = torch.nn.Parameter(sin.contiguous(), requires_grad=False)
+        # a rotary module per layer type (Gemma 3: a local and a global base): a table each
+        self.types = sorted(getattr(rotary, "layer_types", None) or []) or [None]
+        for ty in self.types:
+            cos, sin = rotary(x, torch.arange(max_len)[None], *([ty] if ty else []))
+            cos, sin = cos[0].float(), sin[0].float()
+            if perm is not None:
+                cos, sin = cos[:, perm], sin[:, perm]
+            sfx = "" if ty is None else "_" + ty
+            setattr(self, "cos_t" + sfx, torch.nn.Parameter(cos.contiguous(), requires_grad=False))
+            setattr(self, "sin_t" + sfx, torch.nn.Parameter(sin.contiguous(), requires_grad=False))
 
-    def forward(self, x, position_ids):
+    def forward(self, x, position_ids, layer_type=None):
+        if self.types != [None]:
+            sfx = "_" + layer_type
+            return self._rows(getattr(self, "cos_t" + sfx), getattr(self, "sin_t" + sfx), x, position_ids)
+        return self._rows(self.cos_t, self.sin_t, x, position_ids)
+
+    def _rows(self, cos_t, sin_t, x, position_ids):
         # row by row, each an index_select by one position: the sa backend's
         # row gather with a scalar index (prefill's M positions: M gathers)
-        shape = tuple(position_ids.shape) + (self.cos_t.shape[-1],)
+        shape = tuple(position_ids.shape) + (cos_t.shape[-1],)
         pos = position_ids.reshape(-1)
         rows = lambda t: torch.cat([torch.index_select(t, 0, pos[m:m + 1]) for m in range(pos.shape[0])])
-        return rows(self.cos_t).reshape(shape).to(x.dtype), rows(self.sin_t).reshape(shape).to(x.dtype)
+        return rows(cos_t).reshape(shape).to(x.dtype), rows(sin_t).reshape(shape).to(x.dtype)
 
 
 def swapneg(v):
@@ -445,9 +488,19 @@ class SaRMSNorm(torch.nn.Module):
     constant 1 / n instead of mean() (a division), then rsqrt; the same weight."""
     def __init__(self, norm):
         super().__init__()
-        self.weight = norm.weight
         eps = getattr(norm, "variance_epsilon", None)
         self.eps = _f32c(eps if eps is not None else norm.eps)
+        # the gain the module applies: its weight, or 1 + weight (Gemma), found by
+        # running it on ones (any other form is refused, not guessed)
+        with torch.no_grad():
+            w = norm.weight.detach().float()
+            g = norm(torch.ones(1, w.shape[-1])).float()[0] * float(np.sqrt(np.float32(1.0) + np.float32(self.eps)))
+        if torch.allclose(g, w, rtol=1e-5, atol=1e-6):
+            self.weight = norm.weight
+        elif torch.allclose(g, 1.0 + w, rtol=1e-5, atol=1e-6):
+            self.weight = torch.nn.Parameter(1.0 + w, requires_grad=False)
+        else:
+            raise NotImplementedError(f"{type(norm).__name__}: an RMSNorm gain other than w or 1 + w")
 
     def forward(self, x):
         ss = torch.sum(x * x, dim=-1, keepdim=True)
