@@ -310,6 +310,29 @@ importer 由 test_ct_import 覆盖；ct 权重比自量化高约 3 个点，设�
 - KV 修好后，q+probs+sfu 合计约 6 个点（91.7% → 97.9%），属次要项。
 - 按门禁，下一步评估 KV 的按头（或 K 按通道）scale，再复测 ct-sa；在此之前不改硬件或数据格式。
 
+KV scale 改进（不改硬件和数据格式）：K 按通道（`kch`，scale 折进 q，int8 点积不变）、V 按通道（`vch`，PV 结果按输出通道缩放），KV 用 WikiText-2 **train** 前 1024 token 校准（按 max_len 窗口、取各窗口最大值；原来是约 45 token 的 `export_hf.CALIB`）。复现：
+
+    compiler/tests/quality_eval.py --model build/llm_cache/Qwen3-0.6B --ct build/llm_cache/Qwen3-0.6B-W8A8 --tokens 2048 --window 256 \
+        --variants fp32,ct-sa:kch,ct-sa:kch+vch --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024 --out build/quality/qwen3_kvch_2048.json
+
+| 变体 | 校准 | tokens | PPL | top-1 | corr | KL |
+|---|---|---|---|---|---|---|
+| ct-sa（按层） | CALIB | 2048 | 53.50 | 71.5% | 0.9485 | 0.411 |
+| ct-sa（按层） | train 1024 | 512 | 44.15* | 68.8% | 0.9306 | 0.500 |
+| ct-sa:kch | CALIB | 512 | 33.32* | 81.1% | 0.9797 | 0.129 |
+| ct-sa:kch | train 1024 | 2048 | **39.14** | **87.4%** | 0.9907 | 0.054 |
+| ct-sa:kch+vch | train 1024 | 2048 | 39.12 | 87.1% | 0.9919 | **0.046** |
+| （参考）ct-sa:act+kv | — | 512 | 30.56* | 92.0% | 0.9959 | 0.021 |
+
+\* 512 token 的 fp32 PPL 为 31.16（2048 token 为 39.21），PPL 只能同 token 数比较。512 token 数据见 build/quality/qwen3_kvch_512.json、qwen3_kvcal_512.json。
+
+结论：
+
+- 主因是 K 的通道离群值（每通道 max/中位数 7–120 倍）。按层 scale 换更多校准数据没有用（68.8%），K 按通道 + 充分校准两者一起才有效：top-1 71.5% → 87.4%，KL 降 7.6 倍，PPL 与 fp32 持平。
+- V 按通道在 2048 token 上与只做 K 基本相同（KL 略好、top-1 略差）。**默认选 `--kv-channel k`**：V 侧不多一次按通道乘法。
+- 距 checkpoint 自身（ct-w8a8 92.3%）还差约 5 个点，其中约 4 个点是剩余的 KV 量化误差（对照 act+kv 的 92.0%）。备选：百分位裁剪校准。
+- llm-compressor 0.14 / compressed-tensors 0.19 的 `kv_cache_scheme` 可以产出 int8 静态 KV scale（RoPE 之后观察），但只支持 `tensor`、`attn_head` 两种粒度，`channel` 对 attention 明确报错；因此它能作为 importer 的一个输入来源，不能替代 K 按通道校准。
+
 ## 9. 工作包 WP5：Llama-3.2-1B 前端与内存预检
 
 ### 9.1 模型约束
