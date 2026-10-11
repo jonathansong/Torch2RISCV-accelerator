@@ -231,6 +231,7 @@ QLinearExternal(
 - **板上**：`deploy_z1_freeze.sh hfgen_w8a8`（不在默认集合；`HFGEN_MODEL` / `HFGEN_TAG` 给 `deploy_hfgen.sh`），`board_regress.py` 有对应项。
 - **板上第一次（2026-10-11，4 口）**：hfgen_w8a8 PASS（17/17 与 sim 逐位相同），**hfgen FAIL（0/17）**。两者都有 1440 个主机 dispatch：16e5e5d 的逐行 prefill 在没有 QK-norm 的模型（SmolLM2、Llama）上，把每行的 RoPE + int8 量化融进了写 KV 的 scatter（6 维、带置换 gather，`more than two loops`），每块 480 个在主机上算；ARM 与 x86 在这些运算上的结果偶有一个 ulp 之差，经 int8 量化成 KV 的 ±1（w8a8 碰巧没翻）。staging 的检查只统计了 decode 的回退，漏掉了。用 qemu 跑 aarch64 的 `sa-llm-run`、设备仍是 x86 的 sim，复现了板上的结果（x86 3/3，aarch64 0/3）。
   修复：逐行 prefill 里每行的 cos / sin 改为按该行的标量位置从 RoPE 表查（decode 一步的做法），不再从整块的表切片；这样每行的计算图与 decode 相同，RoPE + 量化是单独的二维 dispatch（pair swap gather 编译器支持），scatter 只搬数据。SmolLM2 / Qwen3（截 2 层）的 prefill 0 个主机 dispatch；q / k / v 投影仍对 M 行一起算。新增 `compiler/scripts/check_bundle_aarch64.sh`：qemu 里的 aarch64 运行时对测试包逐位比较（旧包：hfgen 0/3、hfgen_w8a8 3/3，与板上一致），`deploy_hfgen.sh` 结束时自动执行。
+- **板上验收（2026-10-11，4 口，staging `3e6cc5d`，`results_wp3b`）**：REGRESSION PASS。hfgen（自量化）与 hfgen_w8a8（llm-compressor W8A8）都是 17/17 步与 sim 逐位相同、token 相同、0 个主机 dispatch（上一次 1440）；编译 2206 个 executable 全在加速器上，staging 的 aarch64 检查 3/3。速度：**prefill 27.18 tok/s**（逐行注意力之前 14.20，×1.91；每次运行的 descriptor list 从 1465 降到 37），decode 17.12 tok/s（不变；两种权重相同，计算量一样）。
 
 ### 实现
 
@@ -469,7 +470,7 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 |---|---|---|
 | ~~10/11–10/14~~ | WP0–WP1：四口收尾 | **10/10 已完成**（剩 perf_model 校准，可与 WP2 并行）；bitstream 冻结为 `d16_100mhz_w128_p6_gemv_np4` |
 | 10/11–10/18 | WP2：importer schema 与合成测试（**10/10 第一版完成**；prefill 等价问题、通用前端 Qwen3 的回退都已解决） | 10/18 前格式解析不稳定，则缩小到单一已验证 checkpoint schema |
-| 10/19–10/24 | WP3–WP4：SmolLM2（**10/10 主机与 sim 完成**）、Qwen3 | 10/24 前 Qwen 质量无改善，也必须输出四层定位结论，不继续盲调 scale |
+| 10/19–10/24 | WP3–WP4：SmolLM2（**10/11 板上验收**）、Qwen3 | 10/24 前 Qwen 质量无改善，也必须输出四层定位结论，不继续盲调 scale |
 | 10/25–10/29 | WP5：Llama 前端、EX 基线、内存预检 | 内存门禁失败则暂停板上 staging，保留 sim 结果并启动 M2 评估 |
 | 10/30–11/03 | WP6–WP7：K 分块与 Llama | K 分块不稳定则演讲使用 EX 正确性基线，把性能优化标为进行中 |
 | 11/04–11/09 | WP9 初版、消融表 | 先完成可复现数据，不等待 Gemma |
