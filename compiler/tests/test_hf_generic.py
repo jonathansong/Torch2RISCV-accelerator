@@ -8,6 +8,7 @@ the split between the accelerator and the host (SA_STATS).
     python3 compiler/tests/test_hf_generic.py --model build/llm_cache/SmolLM2-135M --out build/hfgen/smollm2_raw [--skip-export] [--mb 1100]
 """
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -236,7 +237,19 @@ def stage(args, prompt, run):
     shutil.copy(os.path.join(COMPILER, "frontend", "hf_tokenizer.py"), os.path.join(dst, "hf_tokenizer.py"))
     with open(os.path.join(dst, "sa_args.txt"), "w") as f:
         f.write(f"--abi=hf --prefill={args.prefill}\n")
-    mb = int(os.path.getsize(os.path.join(args.out, "sa_packed.irpa")) / 2**20 * 1.1) + 24
+    # the window: the runtime's peak is the packed parameters + the int8 KV
+    # cache + a few MiB (calibrated on the board, compiler/tests/mem_preflight.py);
+    # the 4-port overlay's pool is 1280 MiB (K5-M M1)
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(args.model)
+    cfg = getattr(cfg, "text_config", cfg)
+    if args.layers:
+        cfg.num_hidden_layers = args.layers
+    hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+    kv = 2 * cfg.num_hidden_layers * 256 * cfg.num_key_value_heads * hd       # (H.load's max_len)
+    mb = math.ceil((os.path.getsize(os.path.join(args.out, "sa_packed.irpa")) + kv) / 2**20) + 16
+    if mb > 1280:
+        raise SystemExit(f"board bundle: window {mb} MB beyond the 1280 MiB pool")
     with open(os.path.join(dst, "board.txt"), "w") as f:
         f.write(f"the functional simulator (decode only) {mb}\n")
     print(f"board bundle: {dst} ({len(prompt)} prompt tokens, {args.board_generate} generated, window {mb} MB)")
