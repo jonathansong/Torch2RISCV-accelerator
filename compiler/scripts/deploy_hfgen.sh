@@ -24,6 +24,8 @@ rm -rf "$D" && mkdir -p "$D"
 "$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/$MODEL" --out "$O" \
   $SKIP --quant --rope --attn --prefill "$SA_D" --mb 400 --board-bundle "$D"
 stage_runtime "$D"
+# the board's ARM runs the dispatches left to the host: bit-exact with the sim there too (qemu)
+"$SA_COMPILER/scripts/check_bundle_aarch64.sh" "$D" 2 "$SA_D"
 cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/runtime/test/board_launcher.py" \
    "$SA_REPO/driver/pynq_matmul.py" "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"
 stage_overlay "$D"

@@ -229,6 +229,8 @@ QLinearExternal(
   外部 checkpoint 在设备的计算方式下 KL 约为自量化的一半、PPL 低 2.0；改善几乎全部来自 SmoothQuant（只用 GPTQ 与自量化相当）。SA 形式额外的损失（int8 KV、注意力概率、SFU）两者相近（KL +0.024 / +0.036）。单个 256 token 的窗口曾给出相反的结论：评估至少要用数千个位置（§3.2）。
 - **sim**（`test_hf_generic.py`，D = 16、GEMV 4 口）：导出 + 编译 1710 个加速器 executable，decode 9/9 argmax 与 torch W8A8 相同，prefill 与 decode-only 5/5 逐位一致。40 位置 teacher-forced 门槛改为统计的：设备与 torch 模型 argmax 不同的位置 d 个，容许 max(2, ⌈2√d⌉)，另要求两者 logits 平均相关 ≥ 0.98。原门槛（−2）在这个 checkpoint 上失败：d = 3 个翻转碰巧都落在设备一边（34 对 37），而设备对 torch 的平均相关 0.9963 比自量化的 0.9911（d = 6，两边各 3）还高。
 - **板上**：`deploy_z1_freeze.sh hfgen_w8a8`（不在默认集合；`HFGEN_MODEL` / `HFGEN_TAG` 给 `deploy_hfgen.sh`），`board_regress.py` 有对应项。
+- **板上第一次（2026-10-11，4 口）**：hfgen_w8a8 PASS（17/17 与 sim 逐位相同），**hfgen FAIL（0/17）**。两者都有 1440 个主机 dispatch：16e5e5d 的逐行 prefill 在没有 QK-norm 的模型（SmolLM2、Llama）上，把每行的 RoPE + int8 量化融进了写 KV 的 scatter（6 维、带置换 gather，`more than two loops`），每块 480 个在主机上算；ARM 与 x86 在这些运算上的结果偶有一个 ulp 之差，经 int8 量化成 KV 的 ±1（w8a8 碰巧没翻）。staging 的检查只统计了 decode 的回退，漏掉了。用 qemu 跑 aarch64 的 `sa-llm-run`、设备仍是 x86 的 sim，复现了板上的结果（x86 3/3，aarch64 0/3）。
+  修复：逐行 prefill 里每行的 cos / sin 改为按该行的标量位置从 RoPE 表查（decode 一步的做法），不再从整块的表切片；这样每行的计算图与 decode 相同，RoPE + 量化是单独的二维 dispatch（pair swap gather 编译器支持），scatter 只搬数据。SmolLM2 / Qwen3（截 2 层）的 prefill 0 个主机 dispatch；q / k / v 投影仍对 M 行一起算。新增 `compiler/scripts/check_bundle_aarch64.sh`：qemu 里的 aarch64 运行时对测试包逐位比较（旧包：hfgen 0/3、hfgen_w8a8 3/3，与板上一致），`deploy_hfgen.sh` 结束时自动执行。
 
 ### 实现
 

@@ -204,11 +204,16 @@ def _attention_rows(forward):
     exactly as a decode step's (as qhf.prefill): the q / k / v projections of
     the M rows computed together first (the linear layers are what gain from
     the rows), then the module's forward on each row with those projections
-    given (QK-norm, RoPE, the KV row, the sa attention at the row's scalar
-    position), and o_proj on the M rows together. In one piece the chunk's
-    QK-norm / RoPE / attention inputs are M x heads x head_dim tensors that do
-    not fit ACC (left to the host: not bit-exact with decode), and their row
-    slices strided views. Decode (M = 1): the forward unchanged."""
+    given and the row's cos / sin looked up at its scalar position in the RoPE
+    table (sa_rope, as a decode step does: QK-norm, RoPE, the KV row, the sa
+    attention at the row's position), and o_proj on the M rows together. In one
+    piece the chunk's QK-norm / RoPE / attention inputs are M x heads x head_dim
+    tensors that do not fit ACC (left to the host: not bit-exact with decode),
+    and their row slices strided views. With the chunk's RoPE rows sliced
+    instead of looked up, a model without QK-norm (Llama, SmolLM2) had each
+    row's RoPE + int8 quantization fused into the KV scatter, which went to the
+    host, whose arithmetic differs between the ARM and the x86 sim (the board
+    off by an int8 step). Decode (M = 1): the forward unchanged."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
 
     def rows(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kw):
@@ -228,8 +233,14 @@ def _attention_rows(forward):
                 for n in names[:3]:
                     setattr(self, n, _Given(proj[n][:, m:m + 1]))
                 cache.positions = positions[m:m + 1]
-                o, _ = forward(self, hidden_states[:, m:m + 1], (cos[:, m:m + 1], sin[:, m:m + 1]),
-                               None, past_key_values, **kw)
+                rope = getattr(self, "sa_rope", None)
+                if rope is not None:             # (the table lookup of a decode step)
+                    ty = getattr(self, "layer_type", None)
+                    emb = rope(hidden_states[:, m:m + 1], positions[m:m + 1][None],
+                               *([ty] if ty is not None and rope.types != [None] else []))
+                else:
+                    emb = (cos[:, m:m + 1], sin[:, m:m + 1])
+                o, _ = forward(self, hidden_states[:, m:m + 1], emb, None, past_key_values, **kw)
                 outs.append(o)
         finally:
             for n, v in saved.items():
@@ -263,6 +274,9 @@ class SaDecoder(HFDecoder):
         for mod in model.modules():
             if hasattr(mod, "layer_idx") and hasattr(mod, "q_proj"):
                 mod.sa_cache = self.cache
+                rope = next((x for x in model.modules() if isinstance(x, RopeTable)), None)
+                if rope is not None:
+                    object.__setattr__(mod, "sa_rope", rope)          # (not a submodule: no second copy)
                 mod.forward = types.MethodType(_attention_rows(type(mod).forward), mod)
         model.set_attn_implementation("sa")
 
