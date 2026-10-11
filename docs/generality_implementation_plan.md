@@ -430,6 +430,23 @@ K_BLOCK_MAX = floor(4095 / 16) * 16 = 4080
 - 报告 decode、prefill、质量、内存峰值和覆盖率。
 - 性能数字区分估算、sim 和板上实测。
 
+### 结果（2026-10-11，板上 PASS）
+
+Llama-3.2-1B-Instruct-W8A8（compressed-tensors，16 层，GQA 32/8，K=8192 的 down_proj），四口 overlay d16_100mhz_w128_p6_gemv_np4：
+
+    compiler/tests/test_hf_generic.py --model build/llm_cache/Llama-3.2-1B-Instruct-W8A8 --out build/hfgen/llama1b \
+        --quant --rope --attn --prefill 16 --mb 1400 --board-bundle build/hfgen/llama1b_bundle     # (MemoryMax=10G)
+    HFGEN_TAG=llama1b HFGEN_BUNDLE=build/hfgen/llama1b_bundle compiler/scripts/deploy_hfgen.sh   # -> build/deploy_hfgen_llama1b
+
+- 编译：971 个 executable 全在加速器上，host 0；导出 273 s，编译 253 s。
+- 内存：mem_preflight 估 1246.2 MiB / 1280 MiB pool；实际 sa_packed.irpa 1182.5 MiB，窗口 1203 MB。
+- sim：prefill（M=16，40 token）与只 decode 的 logits 5/5 行逐位一致；teacher-forced 40 位置 top-1 vs fp32 30/40（torch W8A8 32/40，容差 5），设备 vs torch 平均 corr 0.9924。
+- aarch64（qemu）vs sim：3/3 行逐位一致。
+- 板上：17/17 步 logits 与 sim 逐位一致，生成 token 相同，0 个 host dispatch；**prefill 9.38 tok/s（40 token 4264 ms，含首块加载），decode 3.50 tok/s（286 ms/步）**。
+- decode 与带宽模型一致：约 1.18 GB 参数 / 57.95 B/cycle（100 MHz）≈ 214 ms，加上固定开销约 70 ms。
+- 默认 prompt 是 SmolLM2 的 token id，对 Llama 无意义，生成文本只用于逐位比对，不代表质量；质量以 teacher-forced 指标为准。
+- 测试内存：同一时间只保留一个 fp32 模型（关 autograd、del 后 gc.collect），峰值 7.1 GB。
+
 ## 12. 工作包 WP8：Gemma-3-270M 短上下文 bring-up
 
 **预备工作（2026-10-11）**：
