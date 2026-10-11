@@ -288,7 +288,7 @@ KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int6
       // the small buffers in bank 0 (allocated first), the rest wherever they fit
       return (usable - small - colw) / w + usable / w >= bufs;
     };
-    int64_t nc = std::min<int64_t>(std::max<int64_t>(int64_t(lay.sbank) / k, 1), 32);
+    int64_t nc = std::min<int64_t>(std::max<int64_t>(int64_t(lay.sbank) / rowsKBlock(k, lay, d), 1), 32);
     while (nc > 1 && (nt % nc || !fits(nc))) --nc;
     ks.chunkTiles = nc;
     return ks;
@@ -306,6 +306,15 @@ KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int6
   }
   ks.loop = ks.chunkTiles && nt / ks.chunkTiles > 4;
   return ks;
+}
+
+int64_t rowsKBlock(int64_t k, const ::sa::Layout &lay, int64_t d) {
+  const int64_t kmax = std::min<int64_t>(int64_t(lay.sbank), 65535 / d / d * d);
+  if (k <= kmax) return k;
+  if (k % d) return 0;
+  for (int64_t kc = kmax / d * d; kc >= d; kc -= d)
+    if (k % kc == 0) return kc;
+  return 0;
 }
 
 sahl::LoadOp loadInto(Value local) {
@@ -685,7 +694,8 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
   if (p.store) {                                   // the accumulator stored as it is (no epilogue)
     if (p.epi) return false;
     const int64_t kk = cast<MemRefType>(p.w.getType()).getDimSize(1);
-    if ((kk * d > 65535 && (rows4 || !gemvHolds(kk))) || (p.rows / d) * kk > 2 * int64_t(lay.sbank)) return false;
+    if ((kk * d > 65535 && !rows4 && !gemvHolds(kk)) || (p.rows / d) * kk > 2 * int64_t(lay.sbank)) return false;
+    if (rows4 && !rowsKBlock(kk, lay, d)) return false;
     // decode's form: the K its schedule holds (as below)
     if (!rows4 && !gemvHolds(kk) &&
         (kk > int64_t(lay.sbank) || kk + kk / d > 2 * int64_t(lay.sbank) || lay.acc0 + kk / d + 2 > lay.cbank))
@@ -735,13 +745,15 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
     }
     cover.push_back(l);
   }
-  // a K the micro-kernel's schedule cannot hold (one weight tile per SPAD_B bank,
-  // x and its strip in SPAD_A, x in the ACC scratch): the generic lowering (K blocks)
+  // decode: a K the micro-kernel's schedule cannot hold (one weight tile per
+  // SPAD_B bank, x and its strip in SPAD_A, x in the ACC scratch): the generic
+  // lowering (K blocks). Prefill's rows: the strips of all row blocks in SPAD_A,
+  // a longer K in blocks (rowsKBlock, expandLinearRows)
   const int64_t k = cast<MemRefType>(p.w.getType()).getDimSize(1);
-  if ((rows4 || !gemvHolds(k)) && (k > int64_t(lay.sbank) || k * d > 65535 || k + k / d > 2 * int64_t(lay.sbank) ||
-                                   lay.acc0 + k / d + 2 > lay.cbank))
+  if (!rows4 && !gemvHolds(k) && (k > int64_t(lay.sbank) || k * d > 65535 || k + k / d > 2 * int64_t(lay.sbank) ||
+                                  lay.acc0 + k / d + 2 > lay.cbank))
     return false;
-  if (rows4 && (p.rows / d) * k > 2 * int64_t(lay.sbank)) return false;   // the strips of all row blocks
+  if (rows4 && ((p.rows / d) * k > 2 * int64_t(lay.sbank) || !rowsKBlock(k, lay, d))) return false;
   record(con, cover);
   linears[con.getOperation()] = p;
   return true;

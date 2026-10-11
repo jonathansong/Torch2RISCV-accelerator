@@ -129,6 +129,10 @@ struct KernelSchedule {
   bool loop = false;
 };
 KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int64_t d, int64_t gemvPorts = 0);
+// Prefill's K block (expandLinearRows): K when one tile's K rows fit a SPAD_B
+// bank and one EX (K x D <= 65535 bytes), else the largest multiple of D that
+// divides K and fits (equal blocks: the tiles' buffers one shape); 0 if none.
+int64_t rowsKBlock(int64_t k, const ::sa::Layout &lay, int64_t d);
 
 class KernelMatcher {
  public:

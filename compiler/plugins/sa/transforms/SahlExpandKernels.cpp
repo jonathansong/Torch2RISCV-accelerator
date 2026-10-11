@@ -15,6 +15,11 @@
 //   - per chunk and row block, a sahl.scope (its local memory released after
 //     it): the EX (sahl.mma), the epilogue as a generic over the chunk
 //     [D rows, nc tiles, D] of the local buffers, the store.
+//   A K beyond one tile's (rowsKBlock: SPAD_B bank, K x D <= 65535; Llama's
+//   down projection, K = 8192) in equal blocks (docs/generality_implementation_plan.md
+//   WP6): a strip per row block and block, the tiles of each (chunk, row
+//   block, block) loaded in turn into alternating banks, one EX per block
+//   (the first writes the accumulator, the others add).
 // Decode's linear layer (one row of x), as the micro-kernel of C3 / C4:
 //   - x loaded, then copied over the D rows into the A strip (sahl.strip of
 //     a local vector), the scalar epilogue inputs put in the broadcast layout;
@@ -175,13 +180,14 @@ void eraseKernel(sahl::KernelOp k) {
 
 // Prefill's linear layer (LinearPlan with rows): false when it has a form the
 // expansion does not write out (the kernel then stays for the lowering).
-bool expandLinearRows(sahl::KernelOp k, LinearPlan p, int64_t d) {
+bool expandLinearRows(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64_t d) {
   auto nca = k->getAttrOfType<IntegerAttr>("chunk_tiles");
   if (!nca) return false;
   auto wt = cast<MemRefType>(p.w.getType());
   const int64_t K = wt.getDimSize(1), nt = wt.getDimSize(0), M = p.rows, nb = M / d, nc = nca.getInt();
-  if (nc <= 0 || nt % nc) return false;
-  const int64_t nch = nt / nc;
+  const int64_t kc = rowsKBlock(K, lay, d);
+  if (nc <= 0 || nt % nc || !kc) return false;
+  const int64_t nch = nt / nc, nk = K / kc;
   if (!cast<MemRefType>(p.acc.getType()).getElementType().isInteger(32)) return false;
   linalg::GenericOp epi = p.epi;
   llvm::DenseMap<int, int> kindOf;                  // epilogue input -> 1 chunked, 2 column, 3 row, 4 scalar
@@ -196,13 +202,14 @@ bool expandLinearRows(sahl::KernelOp k, LinearPlan p, int64_t d) {
   Expander e{OpBuilder(k), k.getLoc(), d};
   MLIRContext *ctx = k.getContext();
   Type f32 = Float32Type::get(ctx), i8 = IntegerType::get(ctx, 8), i32 = IntegerType::get(ctx, 32);
-  // the A strips of the row blocks
-  SmallVector<Value> strips;
-  for (int64_t rb = 0; rb < nb; ++rb) {
-    Value s = e.alloc({d, K}, i8, "spad_a", "strip");
-    sahl::StripOp::create(e.b, e.loc, e.sub(p.x, {rb * d, 0}, {d, K}), s);
-    strips.push_back(s);
-  }
+  // the A strips of the row blocks (per K block)
+  SmallVector<SmallVector<Value>> strips(nb);
+  for (int64_t rb = 0; rb < nb; ++rb)
+    for (int64_t kb = 0; kb < nk; ++kb) {
+      Value s = e.alloc({d, kc}, i8, "spad_a", "strip");
+      sahl::StripOp::create(e.b, e.loc, e.sub(p.x, {rb * d, kb * kc}, {d, kc}), s);
+      strips[rb].push_back(s);
+    }
   // per-row and scalar inputs: loaded once, in the broadcast layout
   llvm::DenseMap<int, Value> bc;
   for (auto &[i, s] : p.rowv) {
@@ -229,16 +236,23 @@ bool expandLinearRows(sahl::KernelOp k, LinearPlan p, int64_t d) {
     }
   Value tiles[2];
   for (int bank = 0; bank < 2; ++bank) {
-    tiles[bank] = e.alloc({nc, K, d}, i8, "spad_b", "");
+    tiles[bank] = e.alloc({nc, kc, d}, i8, "spad_b", "");
     tiles[bank].getDefiningOp()->setAttr("sa.bank", e.b.getI64IntegerAttr(bank));
   }
-  auto loadChunk = [&](int64_t ci) {
+  // K block kb of chunk ci's tiles into a bank; a chunk's first block with its per-column inputs
+  auto loadTiles = [&](int64_t ci, int64_t kb, int bank, bool withCols = true) {
     int64_t c0 = ci * nc;
-    sahl::LoadOp::create(e.b, e.loc, e.sub(p.w, {c0, 0, 0}, {nc, K, d}), tiles[ci & 1]);
-    for (size_t m = 0; m < p.cols.size(); ++m)
-      sahl::LoadOp::create(e.b, e.loc, e.sub(p.cols[m].second, {c0, 0}, {nc, d}), cols[ci & 1][m]);
+    sahl::LoadOp::create(e.b, e.loc, e.sub(p.w, {c0, kb * kc, 0}, {nc, kc, d}), tiles[bank]);
+    if (kb == 0 && withCols)
+      for (size_t m = 0; m < p.cols.size(); ++m)
+        sahl::LoadOp::create(e.b, e.loc, e.sub(p.cols[m].second, {c0, 0}, {nc, d}), cols[ci & 1][m]);
   };
-  loadChunk(0);
+  // one K block: the tiles of chunk ci serve all its row blocks (bank ci & 1).
+  // K blocks: the tiles of each (chunk, row block, block) in turn, the banks
+  // alternating per load (the next load after the current EX), the blocks
+  // accumulated (int32, |sum| <= K x 2^14)
+  int bank = 0;
+  loadTiles(0, 0, 0);
   Value y = p.store.getDst();
   for (int64_t ci = 0; ci < nch; ++ci) {
     const int64_t c0 = ci * nc;
@@ -247,8 +261,18 @@ bool expandLinearRows(sahl::KernelOp k, LinearPlan p, int64_t d) {
       OpBuilder::InsertionGuard guard(e.b);
       e.b.setInsertionPointToEnd(&scope.getBody().emplaceBlock());
       Value acc = e.alloc({d, nc, d}, i32, "acc", "packed");
-      sahl::MmaOp::create(e.b, e.loc, strips[rb], tiles[ci & 1], acc, false);
-      if (rb == 0 && ci + 1 < nch) loadChunk(ci + 1);   // the prefetch into the other bank
+      if (nk == 1) {
+        sahl::MmaOp::create(e.b, e.loc, strips[rb][0], tiles[ci & 1], acc, false);
+        if (rb == 0 && ci + 1 < nch) loadTiles(ci + 1, 0, int((ci + 1) & 1));   // the prefetch into the other bank
+      } else {
+        for (int64_t kb = 0; kb < nk; ++kb) {
+          sahl::MmaOp::create(e.b, e.loc, strips[rb][kb], tiles[bank], acc, kb > 0);
+          bank ^= 1;
+          if (kb + 1 < nk) loadTiles(ci, kb + 1, bank);
+          else if (rb + 1 < nb) loadTiles(ci, 0, bank, /*withCols=*/false);   // (this chunk's, still in use)
+          else if (ci + 1 < nch) loadTiles(ci + 1, 0, bank);
+        }
+      }
       Value ys = e.rowsTiles(y, rb * d, c0, nc);
       if (!epi) {
         sahl::StoreOp::create(e.b, e.loc, acc, ys);
@@ -1000,7 +1024,7 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
         KernelMatcher km(cfg);
         if (!km.matchLinear(g)) break;
         LinearPlan p = km.linears[g.getOperation()];
-        if (p.rows) expandLinearRows(k, p, cfg.d);
+        if (p.rows) expandLinearRows(k, p, lay, cfg.d);
         else expandLinear(k, p, lay, cfg.d, cfg.gemvPorts);
         break;
       }
