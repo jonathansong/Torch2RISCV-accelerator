@@ -232,6 +232,7 @@ QLinearExternal(
 - **板上第一次（2026-10-11，4 口）**：hfgen_w8a8 PASS（17/17 与 sim 逐位相同），**hfgen FAIL（0/17）**。两者都有 1440 个主机 dispatch：16e5e5d 的逐行 prefill 在没有 QK-norm 的模型（SmolLM2、Llama）上，把每行的 RoPE + int8 量化融进了写 KV 的 scatter（6 维、带置换 gather，`more than two loops`），每块 480 个在主机上算；ARM 与 x86 在这些运算上的结果偶有一个 ulp 之差，经 int8 量化成 KV 的 ±1（w8a8 碰巧没翻）。staging 的检查只统计了 decode 的回退，漏掉了。用 qemu 跑 aarch64 的 `sa-llm-run`、设备仍是 x86 的 sim，复现了板上的结果（x86 3/3，aarch64 0/3）。
   修复：逐行 prefill 里每行的 cos / sin 改为按该行的标量位置从 RoPE 表查（decode 一步的做法），不再从整块的表切片；这样每行的计算图与 decode 相同，RoPE + 量化是单独的二维 dispatch（pair swap gather 编译器支持），scatter 只搬数据。SmolLM2 / Qwen3（截 2 层）的 prefill 0 个主机 dispatch；q / k / v 投影仍对 M 行一起算。新增 `compiler/scripts/check_bundle_aarch64.sh`：qemu 里的 aarch64 运行时对测试包逐位比较（旧包：hfgen 0/3、hfgen_w8a8 3/3，与板上一致），`deploy_hfgen.sh` 结束时自动执行。
 - **板上验收（2026-10-11，4 口，staging `3e6cc5d`，`results_wp3b`）**：REGRESSION PASS。hfgen（自量化）与 hfgen_w8a8（llm-compressor W8A8）都是 17/17 步与 sim 逐位相同、token 相同、0 个主机 dispatch（上一次 1440）；编译 2206 个 executable 全在加速器上，staging 的 aarch64 检查 3/3。速度：**prefill 27.18 tok/s**（逐行注意力之前 14.20，×1.91；每次运行的 descriptor list 从 1465 降到 37），decode 17.12 tok/s（不变；两种权重相同，计算量一样）。
+  **prefill 为什么变快**：不是加速器算得快了（board_profile 的 prefill 设备周期 20.9M → 20.0M），而是没有了主机回退。改动前批量的 prefill 每块有 60 个主机 dispatch（每层 2 个：M × heads × head_dim 的张量放不进 ACC 或形状不受支持，如 Qwen3 上看到的 RoPE gather、Q 转置），共 180 个；运行时每遇到一个就要先提交已排队的命令并等加速器跑完、再在 ARM 上用 VMVX 解释执行、再开新的 list（211 个 list）。逐行注意力后 0 个主机 dispatch，一块 prefill 是一两个连续的 list（共 37 个），省下的是同步往返与 ARM 上的解释执行。（第一次上板的 1440 个主机 scatter 时为 19.96 tok/s：它们连续出现，切出的 list 较少。）
 
 ### 实现
 
