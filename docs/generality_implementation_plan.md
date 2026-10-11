@@ -273,6 +273,43 @@ QLinearExternal(
 - 输出四层质量表和误差归因结论。
 - 40 位置 top-1、正式 top-1、相关系数/KL、PPL 的数据和脚本可复现。
 
+### 结果（2026-10-11）
+
+Qwen3-0.6B，WikiText-2 test 前 2048 token，窗口 256；checkpoint 为 llm-compressor 生成的 W8A8（ct）。top-1/corr/KL 均相对 fp32 的逐位置 logits。复现：
+
+    compiler/tests/quality_eval.py --model build/llm_cache/Qwen3-0.6B --ct build/llm_cache/Qwen3-0.6B-W8A8 --tokens 2048 --window 256 \
+        --variants fp32,w8a8,ct-w8a8,sa:act,ct-sa:act --out build/quality/qwen3_w8a8_2048.json
+    同上 --variants fp32,ct-sa,ct-sa:act+kv,ct-sa:act+q,ct-sa:act+probs,ct-sa:act+sfu,ct-sa:act+kv+q+probs+sfu --out build/quality/qwen3_attr.json
+
+四层质量表：
+
+| 层级 | 变体 | PPL | top-1 | corr | KL |
+|---|---|---|---|---|---|
+| 原版 | fp32 | 39.21 | — | — | — |
+| checkpoint 标准语义 | ct-w8a8 | 40.05 | 92.3% | 0.9957 | 0.022 |
+| 自量化（对照） | w8a8 | 41.05 | 89.1% | 0.9928 | 0.039 |
+| SA 端到端（ct 权重） | ct-sa | 53.50 | 71.5% | 0.9485 | 0.411 |
+
+importer 由 test_ct_import 覆盖；ct 权重比自量化高约 3 个点，设为默认演示权重。
+
+归因（`act+X`：线性层激活与 X 保持 fp32，其余按 SA 计算，基线为 ct-sa:act）：
+
+| 变体 | PPL | top-1 | KL |
+|---|---|---|---|
+| ct-sa:act | 52.91 | 74.3% | 0.394 |
+| + kv | **38.60** | **91.7%** | **0.025** |
+| + q | 53.30 | 73.4% | 0.391 |
+| + probs | 53.41 | 75.2% | 0.382 |
+| + sfu | 53.00 | 73.6% | 0.396 |
+| + kv+q+probs+sfu | 39.27 | 97.9% | 0.0016 |
+
+结论：
+
+- SA 的额外损失几乎全部来自 int8 KV cache：单独把 KV 换回 fp32，top-1 从 74.3% 回到 91.7%，KL 降约 15 倍。q、probs、SFU 近似单独切换都在 ±1 个点内。
+- 线性层的激活量化（ct-sa → ct-sa:act）只占约 3 个点。
+- KV 修好后，q+probs+sfu 合计约 6 个点（91.7% → 97.9%），属次要项。
+- 按门禁，下一步评估 KV 的按头（或 K 按通道）scale，再复测 ct-sa；在此之前不改硬件或数据格式。
+
 ## 9. 工作包 WP5：Llama-3.2-1B 前端与内存预检
 
 ### 9.1 模型约束
