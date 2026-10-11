@@ -12,6 +12,8 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/PassManager.h"
 
+#include <thread>
+
 namespace mlir::iree_compiler::sa {
 namespace {
 
@@ -47,8 +49,16 @@ struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL
     buildSahlPipeline(pm, cfg);
     bool ok;
     {
-      ScopedDiagnosticHandler h(func.getContext(), [&](Diagnostic &dg) {
-        // the first error with a message (multithreaded, notes / empty ones can come first)
+      // the executables compile in parallel, each with a handler on the shared
+      // context: a handler takes only its own thread's diagnostics (the
+      // pipeline on the one-function module runs on this thread), the others
+      // go on to their own (taken by another thread's handler, an "ACC full"
+      // left `why` empty: no retry with smaller pieces, the dispatch on the
+      // host at random)
+      std::thread::id self = std::this_thread::get_id();
+      ScopedDiagnosticHandler h(func.getContext(), [&](Diagnostic &dg) -> LogicalResult {
+        if (std::this_thread::get_id() != self) return failure();
+        // the first error with a message (notes / empty ones can come first)
         if (why.empty() && dg.getSeverity() == DiagnosticSeverity::Error && !dg.str().empty()) why = dg.str();
         return success();
       });
