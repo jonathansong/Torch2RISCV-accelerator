@@ -368,6 +368,7 @@ class SaDecoder(HFDecoder):
         hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
         kv_dim = cfg.num_key_value_heads * hd
         self.cache = SaCache(cfg, max_len, self, kv_scales)
+        self.kv_scales = np.asarray(kv_scales, np.float32)     # (as calibrated: reused by quality_eval)
         # K and V start with different contents (see SaCache; the rows are only
         # read after they are written: the attention masks later positions)
         L = len(self.cache.layers)
@@ -383,21 +384,33 @@ class SaDecoder(HFDecoder):
         model.set_attn_implementation("sa")
 
 
+def kv_calib_arg(v, default_tokens=1024):
+    """--kv-calib FILE[:TOKENS] -> (file, tokens) or None"""
+    if not v:
+        return None
+    f, _, n = v.rpartition(":") if ":" in v else (v, "", "")
+    return (f, int(n) if n else default_tokens)
+
+
 def calibrate_kv(model, tokens, max_len, channel=""):
     """Static KV scales: amax / 127 over the fp32 model on the tokens, per layer
     [L, 2] (qhf.calibrate_kv), or with channel "k" / "v" / "kv" those parts per
     cache channel [L, 2, kv_heads * hd] (the others' rows a layer's single value).
     Per channel K: a few channels' amax is 10-100x the median one's (Qwen3: the
     RoPE pairs of low frequency), so one scale a layer leaves most channels a
-    handful of int8 steps."""
-    obs = HFDecoder(model, max_len)
-    obs.cache = ObservedCache(model.config, max_len, obs)
+    handful of int8 steps. Tokens beyond max_len: windows of max_len, each from
+    position 0 (a fresh cache), the max over them (per channel scales need
+    more text than the 45-token CALIB: each channel's amax is from fewer values)."""
     hd = getattr(model.config, "head_dim", None) or model.config.hidden_size // model.config.num_attention_heads
-    obs.cache.early_initialization(batch_size=1, num_heads=model.config.num_key_value_heads, head_dim=hd,
-                                   dtype=torch.float32, device=torch.device("cpu"))
-    for pos, t in enumerate(tokens[:max_len]):
-        obs(torch.tensor([[t]]), torch.tensor([[pos]]))
-    a = obs.cache.amax                                                         # [L, 2, C]
+    a = None
+    for w in range(0, max(len(tokens), 1), max_len):
+        obs = HFDecoder(model, max_len)
+        obs.cache = ObservedCache(model.config, max_len, obs)
+        obs.cache.early_initialization(batch_size=1, num_heads=model.config.num_key_value_heads, head_dim=hd,
+                                       dtype=torch.float32, device=torch.device("cpu"))
+        for pos, t in enumerate(tokens[w:w + max_len]):
+            obs(torch.tensor([[t]]), torch.tensor([[pos]]))
+        a = obs.cache.amax if a is None else np.maximum(a, obs.cache.amax)  # [L, 2, C]
     if not channel:
         return (np.maximum(a.max(-1), 1e-8) / 127.0).astype(np.float32)
     out = np.repeat(a.max(-1, keepdims=True), a.shape[-1], -1)
@@ -426,20 +439,27 @@ def hf_model(model_dir, layers=None):
                                                 attn_implementation="sdpa").eval()
 
 
-def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=None, layers=None, kv_channel=""):
+def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=None, layers=None, kv_channel="",
+         kv_calib=None):
     torch.set_grad_enabled(False)
     m = hf_model(model_dir, layers)
     if rope:
         print("  rope_rewrite:", rope_rewrite(m, max_len))
         print("  norm_rewrite:", norm_rewrite(m))
     kv = None
-    if attn and kv_scales is not None:    # given (e.g. qhf's, for a bit-exact comparison)
-        kv = np.load(kv_scales).astype(np.float32)
+    if attn and kv_scales is not None:    # given (e.g. qhf's, for a bit-exact comparison): a .npy or an array
+        kv = (np.load(kv_scales) if isinstance(kv_scales, str) else np.asarray(kv_scales)).astype(np.float32)
     elif attn:                            # KV scales from the fp32 model (after the RoPE / norm rewrites)
         import export_hf
         from hf_tokenizer import BpeTokenizer
-        kv = calibrate_kv(m, BpeTokenizer(model_dir).encode(export_hf.CALIB), max_len, kv_channel)
-        print(f"  calibrate_kv: {len(kv)} layers" + (f", per channel: {kv_channel}" if kv_channel else ""))
+        # kv_calib: (text file, tokens) to calibrate on instead of CALIB
+        toks = BpeTokenizer(model_dir).encode(export_hf.CALIB)
+        if kv_calib:
+            with open(kv_calib[0]) as f:
+                toks = BpeTokenizer(model_dir).encode(f.read(16 * kv_calib[1]))[:kv_calib[1]]
+        kv = calibrate_kv(m, toks, max_len, kv_channel)
+        print(f"  calibrate_kv: {len(kv)} layers on {len(toks)} tokens" +
+              (f", per channel: {kv_channel}" if kv_channel else ""))
     if quant:
         print("  quantize:", quantize(m))
     return SaDecoder(m, max_len, kv) if attn else HFDecoder(m, max_len)
@@ -774,8 +794,10 @@ def main():
     ap.add_argument("--prefill", type=int, default=0, help="also prefill / prefill_kv of this many tokens (needs --attn)")
     ap.add_argument("--layers", type=int, help="only the first layers (a truncated model, for tests)")
     ap.add_argument("--kv-channel", default="", help="k / v / kv: those KV scales per cache channel (calibrate_kv)")
+    ap.add_argument("--kv-calib", help="FILE[:TOKENS] text to calibrate the KV scales on (default: export_hf.CALIB)")
     args = ap.parse_args()
-    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales, args.layers, args.kv_channel), args.out,
+    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales, args.layers, args.kv_channel,
+                kv_calib_arg(args.kv_calib)), args.out,
            args.prefill)
 
 

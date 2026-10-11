@@ -92,12 +92,16 @@ def build(name, args):
         if bad:
             raise SystemExit(f"unknown fp32 parts {bad}")
 
+        kv = []                          # (the KV scales calibrated on the first window's load, then reused)
+
         def run(ids):
             H.SA_FP32.clear()
             H.SA_FP32.update(keep - {"sfu"})
             try:
                 dec = H.load(src, max_len=args.window, quant=True, rope=True, attn=True,     # (a fresh cache per window)
-                             kv_channel=kv_channel)
+                             kv_scales=kv[0] if kv else None, kv_channel=kv_channel,
+                             kv_calib=H.kv_calib_arg(args.kv_calib))
+                kv[:] = [dec.kv_scales]
                 return logits_steps(dec, ids)
             finally:
                 H.SA_FP32.clear()
@@ -114,6 +118,7 @@ def main():
     ap.add_argument("--window", type=int, default=256)
     ap.add_argument("--skip", type=int, default=0, help="first token of the evaluated span")
     ap.add_argument("--out", help="results (JSON)")
+    ap.add_argument("--kv-calib", help="FILE[:TOKENS] text for the sa variants' KV scales (default: export_hf.CALIB)")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     names = (args.variants or "fp32,w8a8,sa" + (",ct-w8a8,ct-sa" if args.ct else "")).split(",")

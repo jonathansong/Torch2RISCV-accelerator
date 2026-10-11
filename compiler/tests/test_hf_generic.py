@@ -64,6 +64,7 @@ def main():
     ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (F4)")
     ap.add_argument("--kv-scales", help="KV scales (.npy) instead of calibrating (F4)")
     ap.add_argument("--kv-channel", default="", help="k / v / kv: those KV scales per cache channel (F4)")
+    ap.add_argument("--kv-calib", help="FILE[:TOKENS] text to calibrate the KV scales on (F4)")
     ap.add_argument("--prefill", type=int, default=0, help="also export prefill of M tokens (needs --attn); the "
                     "sim run with prefill + decode must be bit-exact with decode only (plan §8.17)")
     ap.add_argument("--min-corr", type=float, default=0.999)
@@ -105,7 +106,7 @@ def main():
         print(f"rope rewrite vs the original model (fp32, torch): max |diff| {d:.3g}")
     if not args.skip_export:
         w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers,
-                   kv_channel=args.kv_channel)
+                   kv_channel=args.kv_channel, kv_calib=H.kv_calib_arg(args.kv_calib))
         H.export(w, args.out, args.prefill)
         del w                            # (freed before the compile and the reload below)
         gc.collect()
@@ -123,7 +124,7 @@ def main():
     import contextlib
     with device_sfu() if args.quant else contextlib.nullcontext():
         w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers,
-                   kv_channel=args.kv_channel)   # (fresh state)
+                   kv_channel=args.kv_channel, kv_calib=H.kv_calib_arg(args.kv_calib))   # (fresh state)
         for pos in range(len(prompt) + args.generate):
             tok = prompt[pos] if pos < len(prompt) else tok
             lg = w(torch.tensor([[tok]]), torch.tensor([[pos]]))[0, -1].numpy()
