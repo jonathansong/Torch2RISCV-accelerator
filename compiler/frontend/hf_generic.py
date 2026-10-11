@@ -109,17 +109,19 @@ class HFDecoder(torch.nn.Module):
 
 # ------------------------------------------------------------------ KV cache and attention (F4)
 class ObservedCache(PositionedCache):
-    """Calibration: the running max |k|, |v| per layer (after RoPE / QK-norm, as
-    they are written into the cache)."""
+    """Calibration: the running max |k|, |v| per layer and cache channel
+    [layers, 2, kv_heads * head_dim] (after RoPE / QK-norm, as they are written
+    into the cache)."""
     def __init__(self, config, max_cache_len, owner):
         super().__init__(config, max_cache_len, owner)
-        self.amax = np.zeros((len(self.layers), 2), np.float32)
+        hd = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        self.amax = np.zeros((len(self.layers), 2, config.num_key_value_heads * hd), np.float32)
         for i, layer in enumerate(self.layers):
             upd = layer.update
 
             def observed(key_states, value_states, *a, _i=i, _upd=upd, **k):
-                self.amax[_i, 0] = max(self.amax[_i, 0], float(key_states.abs().max()))
-                self.amax[_i, 1] = max(self.amax[_i, 1], float(value_states.abs().max()))
+                for j, x in enumerate((key_states, value_states)):        # [1, kv_heads, M, hd]
+                    self.amax[_i, j] = np.maximum(self.amax[_i, j], x[0].abs().amax(1).reshape(-1).numpy())
                 return _upd(key_states, value_states, *a, **k)
             layer.update = observed
 
@@ -136,15 +138,43 @@ class SaCache(StaticCache):
         self.max_len = max_cache_len
         kv = np.asarray(kv_scales, np.float32)
         hd = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        self.inv_sk = [_f32c(1.0 / np.float32(x)) for x in kv[:, 0]]
-        self.inv_sv = [_f32c(1.0 / np.float32(x)) for x in kv[:, 1]]
-        self.a_k = [_f32c(float(x) / np.sqrt(hd)) for x in kv[:, 0]]
+        Hk = config.num_key_value_heads
+        G = config.num_attention_heads // Hk
+        # per layer [L, 2] (one K and one V scale a layer), or per cache channel
+        # [L, 2, kv_heads * hd] (calibrate_kv(channel=...)); a layer's row with a
+        # single value is a per-layer scale (the same export as [L, 2])
+        if kv.ndim == 3:
+            ch = [[not np.all(kv[i, j] == kv[i, j, 0]) for j in (0, 1)] for i in range(len(kv))]
+            kv1 = kv[:, :, 0]
+        else:
+            ch, kv1 = [[False, False]] * len(kv), kv
+        self.k_ch = [c[0] for c in ch]
+        self.v_ch = [c[1] for c in ch]
+
+        def vec(x, shape):
+            # (per head: [Hk, G, hd], repeated over the G query heads of a KV
+            # head, an operand indexed as the query rows, not broadcast)
+            v = torch.from_numpy(np.ascontiguousarray(x, np.float32)).reshape(shape)
+            return v.expand(Hk, G, hd).contiguous() if len(shape) == 3 else v
+        # K per channel: the scale folded into the query, q * s_k per head
+        # channel before its quantization (sum_d q_d s_d k_d = (q * s) . k), the
+        # scores then scaled by 1 / sqrt(hd) only (kv_k = 1); V per channel: the
+        # P V products scaled per output channel
+        self.inv_sk = [vec(np.float32(1.0) / kv[i, 0], (-1,)) if self.k_ch[i] else _f32c(1.0 / np.float32(x))
+                       for i, x in enumerate(kv1[:, 0])]
+        self.inv_sv = [vec(np.float32(1.0) / kv[i, 1], (-1,)) if self.v_ch[i] else _f32c(1.0 / np.float32(x))
+                       for i, x in enumerate(kv1[:, 1])]
+        self.sk = [vec(kv[i, 0], (Hk, 1, hd)) if self.k_ch[i] else None for i in range(len(kv1))]
+        self.a_k = [_f32c(1.0 / np.sqrt(hd)) if self.k_ch[i] else _f32c(float(x) / np.sqrt(hd))
+                    for i, x in enumerate(kv1[:, 0])]
         # the score scale when the attention's own is not 1 / sqrt(head_dim)
         # (Gemma: query_pre_attn_scalar^-1/2); per layer, from sa_attention's scaling
-        self.kv_k = [float(x) for x in kv[:, 0]]
-        self.kv_v = [float(x) for x in kv[:, 1]]      # (the dequantization scales: SA_FP32 attribution)
+        self.kv_k = [1.0 if self.k_ch[i] else float(x) for i, x in enumerate(kv1[:, 0])]
+        # (the dequantization scales: SA_FP32 attribution; per channel [Hk, G, hd])
+        self.kv_v = [vec(kv[i, 1], (Hk, 1, hd)) if self.v_ch[i] else float(x) for i, x in enumerate(kv1[:, 1])]
         self.hd = hd
-        self.a_v = [_f32c(float(x) / 127.0) for x in kv[:, 1]]
+        self.a_v = [vec(kv[i, 1] * np.float32(1.0 / 127.0), (Hk, 1, hd)) if self.v_ch[i] else _f32c(float(x) / 127.0)
+                    for i, x in enumerate(kv1[:, 1])]
         cache, T = self, max_cache_len
 
         def make_update(i):
@@ -192,7 +222,10 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
     qr = query[0].transpose(0, 1)
     outs = []
     for m in range(M):
-        qq, s_q = _quant_act(qr[m].reshape(Hk, G, hd))                           # (Hk, G, hd), (Hk, G, 1)
+        q = qr[m].reshape(Hk, G, hd)
+        if cache.k_ch[l]:                                                        # (K per channel)
+            q = q * cache.sk[l]
+        qq, s_q = _quant_act(q)                                                  # (Hk, G, hd), (Hk, G, 1)
         sc = torch.matmul(qq.to(torch.int32), kh)                                # (Hk, G, T) int32
         a_k = cache.a_k[l]
         if scaling is not None and abs(scaling * np.sqrt(cache.hd) - 1.0) > 1e-9:
@@ -207,7 +240,7 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
         r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
         pq = _to_i8((e * r) * 127.0).to(torch.int32).reshape(Hk, G, T)
         att = torch.matmul(pq, vh)                                               # (Hk, G, hd) int32
-        outs.append((att.to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd))
+        outs.append((att.to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd))      # (a_v: a scalar or [Hk, G, hd])
     return (outs[0] if M == 1 else torch.cat(outs, dim=1)), None
 
 
@@ -298,10 +331,11 @@ def _sa_attention_fp32(module, query, key, value, scaling):
         q = qr[m].reshape(Hk, G, hd)
         if "q" in SA_FP32 or kv32:
             qf = q if "q" in SA_FP32 else (lambda t: t[0].to(torch.float32) * t[1])(_quant_act(q))
-            kf = kh if kv32 else kh.to(torch.float32) * _f32c(cache.kv_k[l])
+            sk = cache.sk[l][:, :1].transpose(1, 2) if cache.k_ch[l] else _f32c(cache.kv_k[l])     # ([Hk, hd, 1])
+            kf = kh if kv32 else kh.to(torch.float32) * sk
             sc = torch.matmul(qf, kf) * scale
         else:
-            qq, s_q = _quant_act(q)
+            qq, s_q = _quant_act(q * cache.sk[l] if cache.k_ch[l] else q)
             sc = (torch.matmul(qq.to(torch.int32), kh).to(torch.float32) * s_q) * a_k
         mask = torch.arange(T) <= cache.positions[m:m + 1]
         mx = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
@@ -309,7 +343,8 @@ def _sa_attention_fp32(module, query, key, value, scaling):
         r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
         if "probs" in SA_FP32 or kv32:
             p = e * r if "probs" in SA_FP32 else _to_i8((e * r) * 127.0).to(torch.float32) * _f32c(1.0 / 127.0)
-            vf = vh if kv32 else vh.to(torch.float32) * _f32c(cache.kv_v[l])
+            sv = cache.kv_v[l][:, :1] if cache.v_ch[l] else _f32c(cache.kv_v[l])
+            vf = vh if kv32 else vh.to(torch.float32) * sv
             outs.append(torch.matmul(p, vf).reshape(1, 1, H, hd))
         else:
             pq = _to_i8((e * r) * 127.0).to(torch.int32)
@@ -348,9 +383,13 @@ class SaDecoder(HFDecoder):
         model.set_attn_implementation("sa")
 
 
-def calibrate_kv(model, tokens, max_len):
-    """Static per-layer KV scales: amax / 127 over the fp32 model on the tokens
-    (qhf.calibrate_kv)."""
+def calibrate_kv(model, tokens, max_len, channel=""):
+    """Static KV scales: amax / 127 over the fp32 model on the tokens, per layer
+    [L, 2] (qhf.calibrate_kv), or with channel "k" / "v" / "kv" those parts per
+    cache channel [L, 2, kv_heads * hd] (the others' rows a layer's single value).
+    Per channel K: a few channels' amax is 10-100x the median one's (Qwen3: the
+    RoPE pairs of low frequency), so one scale a layer leaves most channels a
+    handful of int8 steps."""
     obs = HFDecoder(model, max_len)
     obs.cache = ObservedCache(model.config, max_len, obs)
     hd = getattr(model.config, "head_dim", None) or model.config.hidden_size // model.config.num_attention_heads
@@ -358,7 +397,14 @@ def calibrate_kv(model, tokens, max_len):
                                    dtype=torch.float32, device=torch.device("cpu"))
     for pos, t in enumerate(tokens[:max_len]):
         obs(torch.tensor([[t]]), torch.tensor([[pos]]))
-    return (np.maximum(obs.cache.amax, 1e-8) / 127.0).astype(np.float32)
+    a = obs.cache.amax                                                         # [L, 2, C]
+    if not channel:
+        return (np.maximum(a.max(-1), 1e-8) / 127.0).astype(np.float32)
+    out = np.repeat(a.max(-1, keepdims=True), a.shape[-1], -1)
+    for j, part in enumerate("kv"):
+        if part in channel:
+            out[:, j] = a[:, j]
+    return (np.maximum(out, 1e-8) / 127.0).astype(np.float32)
 
 
 def hf_model(model_dir, layers=None):
@@ -380,7 +426,7 @@ def hf_model(model_dir, layers=None):
                                                 attn_implementation="sdpa").eval()
 
 
-def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=None, layers=None):
+def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=None, layers=None, kv_channel=""):
     torch.set_grad_enabled(False)
     m = hf_model(model_dir, layers)
     if rope:
@@ -392,8 +438,8 @@ def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=
     elif attn:                            # KV scales from the fp32 model (after the RoPE / norm rewrites)
         import export_hf
         from hf_tokenizer import BpeTokenizer
-        kv = calibrate_kv(m, BpeTokenizer(model_dir).encode(export_hf.CALIB), max_len)
-        print(f"  calibrate_kv: {len(kv)} layers")
+        kv = calibrate_kv(m, BpeTokenizer(model_dir).encode(export_hf.CALIB), max_len, kv_channel)
+        print(f"  calibrate_kv: {len(kv)} layers" + (f", per channel: {kv_channel}" if kv_channel else ""))
     if quant:
         print("  quantize:", quantize(m))
     return SaDecoder(m, max_len, kv) if attn else HFDecoder(m, max_len)
@@ -727,8 +773,9 @@ def main():
     ap.add_argument("--kv-scales", help="KV scales (.npy [layers, 2]) instead of calibrating")
     ap.add_argument("--prefill", type=int, default=0, help="also prefill / prefill_kv of this many tokens (needs --attn)")
     ap.add_argument("--layers", type=int, help="only the first layers (a truncated model, for tests)")
+    ap.add_argument("--kv-channel", default="", help="k / v / kv: those KV scales per cache channel (calibrate_kv)")
     args = ap.parse_args()
-    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales, args.layers), args.out,
+    export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales, args.layers, args.kv_channel), args.out,
            args.prefill)
 
 

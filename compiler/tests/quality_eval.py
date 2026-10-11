@@ -20,7 +20,8 @@ Variants (names on the command line, --variants):
             error's attribution (hf_generic.SA_FP32): act (linear layers on
             fp32 activations), kv (an fp32 KV cache), q (the attention's query),
             probs (the attention probabilities), sfu (exact exp / recip / rsqrt
-            instead of the device's); the parts not named compute exactly as sa
+            instead of the device's); the parts not named compute exactly as sa;
+            kch / vch: the KV cache's K / V scales per channel (hf_generic.calibrate_kv)
 
     python3 compiler/tests/quality_eval.py --model build/llm_cache/SmolLM2-135M \\
         --ct build/llm_cache/SmolLM2-135M-W8A8 [--tokens 1024 --window 256] [--out results.json]
@@ -85,6 +86,8 @@ def build(name, args):
     if base in ("sa", "ct-sa"):
         src = args.model if base == "sa" else args.ct
         keep = set(o for o in opts.split("+") if o)
+        kv_channel = "".join(p for p in "kv" if f"{p}ch" in keep)
+        keep -= {"kch", "vch"}
         bad = keep - {"act", "kv", "q", "probs", "sfu"}
         if bad:
             raise SystemExit(f"unknown fp32 parts {bad}")
@@ -93,7 +96,8 @@ def build(name, args):
             H.SA_FP32.clear()
             H.SA_FP32.update(keep - {"sfu"})
             try:
-                dec = H.load(src, max_len=args.window, quant=True, rope=True, attn=True)    # (a fresh cache per window)
+                dec = H.load(src, max_len=args.window, quant=True, rope=True, attn=True,     # (a fresh cache per window)
+                             kv_channel=kv_channel)
                 return logits_steps(dec, ids)
             finally:
                 H.SA_FP32.clear()
