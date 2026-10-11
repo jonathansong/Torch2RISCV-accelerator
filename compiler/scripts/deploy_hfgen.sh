@@ -10,6 +10,9 @@
 #   build/deploy_hfgen_<tag>; docs/generality_implementation_plan.md WP3)
 #   (a build dir with sa.vmfb is reused as it is: the export and compile of a
 #   passing test_hf_generic.py run; otherwise exported and compiled here)
+#   HFGEN_BUNDLE=<dir>: the --board-bundle of a passing test_hf_generic.py run, staged as it
+#   is (no sim rerun: Llama-3.2-1B's takes ~1.5 h), e.g.
+#     HFGEN_TAG=llama1b HFGEN_BUNDLE=build/hfgen/llama1b_bundle compiler/scripts/deploy_hfgen.sh
 #   board: python3 board_llm.py
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
@@ -21,8 +24,12 @@ O=${1:-$SA_REPO/build/hfgen/smollm2${TAG}_p$SA_D$( [ "$SA_GEMV_PORTS" = 0 ] || e
 SKIP=$([ -f "$O/sa.vmfb" ] && echo --skip-export || true)
 D=$SA_REPO/build/deploy_hfgen$TAG
 rm -rf "$D" && mkdir -p "$D"
-"$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/$MODEL" --out "$O" \
-  $SKIP --quant --rope --attn --prefill "$SA_D" --mb 400 --board-bundle "$D"
+if [ -n "${HFGEN_BUNDLE:-}" ]; then
+  cp -a "$HFGEN_BUNDLE"/. "$D/"
+else
+  "$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/$MODEL" --out "$O" \
+    $SKIP --quant --rope --attn --prefill "$SA_D" --mb 400 --board-bundle "$D"
+fi
 stage_runtime "$D"
 # the board's ARM runs the dispatches left to the host: bit-exact with the sim there too (qemu)
 "$SA_COMPILER/scripts/check_bundle_aarch64.sh" "$D" 2 "$SA_D"
