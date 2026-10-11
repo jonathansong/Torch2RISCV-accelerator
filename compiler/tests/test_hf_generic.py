@@ -8,6 +8,7 @@ the split between the accelerator and the host (SA_STATS).
     python3 compiler/tests/test_hf_generic.py --model build/llm_cache/SmolLM2-135M --out build/hfgen/smollm2_raw [--skip-export] [--mb 1100]
 """
 import argparse
+import gc
 import math
 import os
 import subprocess
@@ -69,6 +70,7 @@ def main():
     ap.add_argument("--board-bundle", help="with --prefill: stage the board test here (board_llm.py)")
     ap.add_argument("--board-generate", type=int, default=16)
     args = ap.parse_args()
+    torch.set_grad_enabled(False)        # (an autograd graph would keep each fp32 model alive past its del)
     # the wrapper (static cache at the input positions) vs plain HF on the whole prompt
     pr = [int(t) for t in args.prompt.split(",")]
     plain = H.hf_model(args.model, args.layers)
@@ -87,18 +89,24 @@ def main():
         print("hf_generic FAIL (the wrapper)")
         return 1
     del plain, wr
+    gc.collect()                         # (HF modules hold reference cycles: freed only by the collector)
     if args.rope:                        # the rewrite keeps the fp32 model's logits (checked here)
         base = H.load(args.model, layers=args.layers)
         pr = [int(t) for t in args.prompt.split(",")]
         a = [base(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] for i, t in enumerate(pr)]
+        del base                         # (one fp32 model at a time: Llama-1B's is ~5 GB)
+        gc.collect()
         rw = H.load(args.model, rope=True, layers=args.layers)
         b = [rw(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] for i, t in enumerate(pr)]
+        del rw
+        gc.collect()
         d = max(float((x - y).abs().max()) for x, y in zip(a, b))
         print(f"rope rewrite vs the original model (fp32, torch): max |diff| {d:.3g}")
-        del base, rw
-    w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers)
     if not args.skip_export:
+        w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers)
         H.export(w, args.out, args.prefill)
+        del w                            # (freed before the compile and the reload below)
+        gc.collect()
         t0 = time.time()
         log = subprocess.run([os.path.join(COMPILER, "scripts", "compile_sa.sh"), args.out],
                              capture_output=True, text=True, env=dict(os.environ, SA_COMPILE_FLAGS="--iree-sa-codegen-report"))
