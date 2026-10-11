@@ -70,7 +70,11 @@ struct Decider {
         if (!shapeOk(fl.getDpsInits()[0])) return std::nullopt;
       } else if (auto g = dyn_cast<linalg::GenericOp>(&op)) {
         Block &b = g.getRegion().front();
-        if (!b.getOps<linalg::IndexOp>().empty() || !b.getOps<sahl::GatherOp>().empty()) return std::nullopt;
+        // (an index of the inner dimensions, e.g. the attention's prefix mask
+        // over T, is the same in every piece; one of the rows' is not)
+        if (llvm::any_of(b.getOps<linalg::IndexOp>(), [](linalg::IndexOp ix) { return ix.getDim() == 0; }) ||
+            !b.getOps<sahl::GatherOp>().empty())
+          return std::nullopt;
         auto iters = g.getIteratorTypesArray();
         auto maps = g.getIndexingMapsArray();
         if (iters.size() == rank) {

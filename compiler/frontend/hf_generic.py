@@ -198,11 +198,14 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
         if scaling is not None and abs(scaling * np.sqrt(cache.hd) - 1.0) > 1e-9:
             a_k = _f32c(cache.kv_k[l] * float(scaling))
         sc = (sc.to(torch.float32) * s_q) * a_k
+        # the softmax over [H, T] rows (one per head: the device's row pieces,
+        # sahl-tile; Llama's 8 x 4 heads beyond what one piece holds)
+        sc = sc.reshape(H, T)
         mask = torch.arange(T) <= cache.positions[m:m + 1]
         mx = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
         e = torch.where(mask, torch.exp(sc - mx), torch.tensor(0.0))
         r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
-        pq = _to_i8((e * r) * 127.0).to(torch.int32)                             # (Hk, G, T)
+        pq = _to_i8((e * r) * 127.0).to(torch.int32).reshape(Hk, G, T)
         att = torch.matmul(pq, vh)                                               # (Hk, G, hd) int32
         outs.append((att.to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd))
     return (outs[0] if M == 1 else torch.cat(outs, dim=1)), None

@@ -41,16 +41,42 @@ std::optional<Val> Lowerer::packedRowGather(linalg::GenericOp g, sahl::GatherOp 
   ve({ones.la}, std::nullopt, p0.la, ::sa::VT_F32, 2 * d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
      ::sa::RED_NONE, 0, 1, {{::sa::DYN_VE_VALID, pV0, false}});
   ve({p1.la}, Opd{p0.la}, oh.la, ::sa::VT_F32, 2 * d, ::sa::VOP_SUB);
-  // the tile, lane l of each word (one nonzero lane: the sum is exact), packed
-  LocalBuf tile = newLocal(::sa::VT_I8, K * d);
-  auto lt = sahw::LdOp::create(bb, loc, src->base, src->off, int64_t(tile.la), 1, K * d, K * d, 0,
-                               ValueRange{pT});
-  lt.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
-  lt.setDynAdd(ArrayRef<bool>{true});
-  LocalBuf red = newLocal(::sa::VT_F32, K, /*bcast=*/true);
-  ve({tile.la, ::sa::VT_I8}, Opd{oh.la + 1, ::sa::VT_F32, ::sa::IDX_MOD, 1}, red.la, ::sa::VT_F32, K * d,
-     ::sa::VOP_MUL, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_SUM, 1);
-  LocalBuf row = packBcast(red);
+  // the tile, lane l of each word (one nonzero lane: the sum is exact), packed;
+  // a K beyond 1024 (Llama-3.2-1B's 2048: its broadcast row would not fit an
+  // ACC bank) in blocks, each packed into its words of the row
+  int64_t kb = K;
+  if (K > 1024) {
+    if (K % d) return fail("packed gather: K not a multiple of D"), std::nullopt;
+    for (kb = 1024 / d * d; K % kb; kb -= d) {
+    }
+  }
+  LocalBuf row;
+  if (kb == K) {
+    LocalBuf tile = newLocal(::sa::VT_I8, K * d);
+    auto lt = sahw::LdOp::create(bb, loc, src->base, src->off, int64_t(tile.la), 1, K * d, K * d, 0,
+                                 ValueRange{pT});
+    lt.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
+    lt.setDynAdd(ArrayRef<bool>{true});
+    LocalBuf red = newLocal(::sa::VT_F32, K, /*bcast=*/true);
+    ve({tile.la, ::sa::VT_I8}, Opd{oh.la + 1, ::sa::VT_F32, ::sa::IDX_MOD, 1}, red.la, ::sa::VT_F32, K * d,
+       ::sa::VOP_MUL, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_SUM, 1);
+    row = packBcast(red);
+  } else {
+    row = newLocal(::sa::VT_F32, (K / d + d - 1) * d);
+    row.n = K;
+    LocalBuf tile = newLocal(::sa::VT_I8, kb * d), red = newLocal(::sa::VT_F32, kb, /*bcast=*/true);
+    for (int64_t k0 = 0; k0 < K; k0 += kb) {
+      auto lt = sahw::LdOp::create(bb, loc, src->base, src->off + k0 * d, int64_t(tile.la), 1, kb * d, kb * d, 0,
+                                   ValueRange{pT});
+      lt.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
+      lt.setDynAdd(ArrayRef<bool>{true});
+      ve({tile.la, ::sa::VT_I8}, Opd{oh.la + 1, ::sa::VT_F32, ::sa::IDX_MOD, 1}, red.la, ::sa::VT_F32, kb * d,
+         ::sa::VOP_MUL, 1.0f, NEG0, ::sa::FUNC_NONE, ::sa::RED_SUM, 1);
+      for (int64_t k = 0; k < kb / d; ++k)
+        sahw::TransposeOp::create(bb, loc, int64_t(red.la + k * d), int64_t(row.la + k0 / d + k), int64_t(d * d),
+                                  int64_t(::sa::vtypes(::sa::VT_F32, ::sa::VT_F32)), 1, ValueRange{});
+    }
+  }
   Val e;
   e.kind = Val::Mem;
   e.o = {row.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
@@ -217,7 +243,7 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
   // dynamic LEN, and VALID for a mask)
   if ((dynInner || maskRows || tightRows) && !sel) {
     int64_t H = nloops == 2 ? ranges[0] : 1;
-    if (H > 16) return fail("more than 16 rows of a dynamic length or with a mask");
+    if (H > 64) return fail("more than 64 rows of a dynamic length or with a mask");
     if (dynInner) {
       curLen = paramFor(*dynInner);
       curLenStatic = (cfg.maxDynamic + d - 1) / d * d;
