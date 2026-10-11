@@ -47,6 +47,14 @@ class PositionedCache(StaticCache):
             layer.update = types.MethodType(make_update(i), layer)
 
 
+# Error attribution (docs/generality_implementation_plan.md WP4; quality_eval.py):
+# the device forms to keep in fp32 in eager runs. Empty in exports: the graphs
+# do not change. "act": linear layers on fp32 activations (weights int8);
+# "kv": the KV cache in fp32; "q": the attention's query not quantized; "probs":
+# the attention probabilities not quantized to int8.
+SA_FP32 = set()
+
+
 def _at(layer, pos):
     """The cache layer's position counters set to the input position: a full
     layer's cumulative_length, and a sliding-window layer's python int (HF
@@ -134,6 +142,7 @@ class SaCache(StaticCache):
         # the score scale when the attention's own is not 1 / sqrt(head_dim)
         # (Gemma: query_pre_attn_scalar^-1/2); per layer, from sa_attention's scaling
         self.kv_k = [float(x) for x in kv[:, 0]]
+        self.kv_v = [float(x) for x in kv[:, 1]]      # (the dequantization scales: SA_FP32 attribution)
         self.hd = hd
         self.a_v = [_f32c(float(x) / 127.0) for x in kv[:, 1]]
         cache, T = self, max_cache_len
@@ -142,6 +151,14 @@ class SaCache(StaticCache):
             def update(layer, key_states, value_states, *a, **k):
                 kr = key_states[0].transpose(0, 1).reshape(key_states.shape[2], -1)     # (M, kv_heads * hd)
                 vr = value_states[0].transpose(0, 1).reshape(value_states.shape[2], -1)
+                if "kv" in SA_FP32:                   # (attribution: an fp32 cache beside the int8 one)
+                    kf = owner.__dict__.setdefault("_kf", torch.zeros(owner.kc.shape, dtype=torch.float32))
+                    vf = owner.__dict__.setdefault("_vf", torch.zeros(owner.vc.shape, dtype=torch.float32))
+                    for m in range(kr.shape[0]):
+                        row = cache.positions[m:m + 1] + i * T
+                        kf.index_copy_(0, row, kr[m:m + 1].float())
+                        vf.index_copy_(0, row, vr[m:m + 1].float())
+                    return kf[i * T:(i + 1) * T], vf[i * T:(i + 1) * T]
                 kq, vq = _to_i8(kr * cache.inv_sk[i]), _to_i8(vr * cache.inv_sv[i])
                 for m in range(kr.shape[0]):          # row by row: a scalar position each (a decode step's write)
                     row = cache.positions[m:m + 1] + i * T
@@ -163,6 +180,8 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
     probabilities, int32 P V."""
     cache = module.sa_cache
     l = module.layer_idx
+    if SA_FP32 & {"kv", "q", "probs"}:
+        return _sa_attention_fp32(module, query, key, value, scaling)
     H, M, hd = query.shape[1], query.shape[2], query.shape[3]
     T = key.shape[0]
     Hk = key.shape[1] // hd
@@ -248,6 +267,51 @@ def _attention_rows(forward):
             cache.positions = positions
         return saved["o_proj"](torch.cat(outs, dim=1)), None
     return rows
+
+
+def _sa_attention_fp32(module, query, key, value, scaling):
+    """sa_attention with some of its quantizations kept in fp32 (SA_FP32;
+    attribution only); what is not switched computes exactly as sa_attention
+    (int32 products, the same scale order), so a difference is the switch's."""
+    cache, l = module.sa_cache, module.layer_idx
+    H, M, hd = query.shape[1], query.shape[2], query.shape[3]
+    T = key.shape[0]
+    Hk = key.shape[1] // hd
+    G = H // Hk
+    kv32 = key.is_floating_point()               # ("kv": the fp32 cache)
+    a_k = cache.a_k[l]
+    if scaling is not None and abs(scaling * np.sqrt(cache.hd) - 1.0) > 1e-9:
+        a_k = _f32c(cache.kv_k[l] * float(scaling))
+    scale = float(scaling) if scaling is not None else 1.0 / np.sqrt(hd)
+    if kv32:
+        kh = key.float().reshape(T, Hk, hd).permute(1, 2, 0)
+        vh = value.float().reshape(T, Hk, hd).permute(1, 0, 2)
+    else:
+        kh = key.to(torch.int32).reshape(T, Hk, hd).permute(1, 2, 0)
+        vh = value.to(torch.int32).reshape(T, Hk, hd).permute(1, 0, 2)
+    qr = query[0].transpose(0, 1)
+    outs = []
+    for m in range(M):
+        q = qr[m].reshape(Hk, G, hd)
+        if "q" in SA_FP32 or kv32:
+            qf = q if "q" in SA_FP32 else (lambda t: t[0].to(torch.float32) * t[1])(_quant_act(q))
+            kf = kh if kv32 else kh.to(torch.float32) * _f32c(cache.kv_k[l])
+            sc = torch.matmul(qf, kf) * scale
+        else:
+            qq, s_q = _quant_act(q)
+            sc = (torch.matmul(qq.to(torch.int32), kh).to(torch.float32) * s_q) * a_k
+        mask = torch.arange(T) <= cache.positions[m:m + 1]
+        mx = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
+        e = torch.where(mask, torch.exp(sc - mx), torch.tensor(0.0))
+        r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
+        if "probs" in SA_FP32 or kv32:
+            p = e * r if "probs" in SA_FP32 else _to_i8((e * r) * 127.0).to(torch.float32) * _f32c(1.0 / 127.0)
+            vf = vh if kv32 else vh.to(torch.float32) * _f32c(cache.kv_v[l])
+            outs.append(torch.matmul(p, vf).reshape(1, 1, H, hd))
+        else:
+            pq = _to_i8((e * r) * 127.0).to(torch.int32)
+            outs.append((torch.matmul(pq, vh).to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd))
+    return (outs[0] if M == 1 else torch.cat(outs, dim=1)), None
 
 
 class SaDecoder(HFDecoder):
@@ -369,6 +433,9 @@ class QLinear(torch.nn.Module):
         self.bias = None if lin.bias is None else torch.nn.Parameter(lin.bias.detach().float(), requires_grad=False)
 
     def forward(self, x):
+        if "act" in SA_FP32:                     # (attribution: weight-only int8)
+            y = torch.matmul(x, (self.wq.to(torch.float32) * self.s_w[:, None]).t())
+            return y if self.bias is None else y + self.bias
         xq, s_x = _quant_act(x)
         # on rows [tokens, in] (qhf's form): a 3-D int32 matmul is exported as a
         # batch_matmul accumulating in i64, which the sa backend leaves to the host

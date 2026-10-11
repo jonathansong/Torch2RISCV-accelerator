@@ -16,6 +16,11 @@ Variants (names on the command line, --variants):
             scales, per-token int8 activations, fp32 attention (the
             checkpoint's own semantics, as vLLM runs it)
   ct-sa     the checkpoint on the sa form (as sa above)
+  sa:X+Y / ct-sa:X+Y   the sa form with some of its parts kept in fp32, for the
+            error's attribution (hf_generic.SA_FP32): act (linear layers on
+            fp32 activations), kv (an fp32 KV cache), q (the attention's query),
+            probs (the attention probabilities), sfu (exact exp / recip / rsqrt
+            instead of the device's); the parts not named compute exactly as sa
 
     python3 compiler/tests/quality_eval.py --model build/llm_cache/SmolLM2-135M \\
         --ct build/llm_cache/SmolLM2-135M-W8A8 [--tokens 1024 --window 256] [--out results.json]
@@ -76,13 +81,23 @@ def build(name, args):
         m = H.hf_model(args.model if name == "w8a8" else args.ct)
         H.quantize(m)
         return lambda ids: logits_full(m, ids), contextlib.nullcontext
-    if name in ("sa", "ct-sa"):
-        src = args.model if name == "sa" else args.ct
+    base, _, opts = name.partition(":")
+    if base in ("sa", "ct-sa"):
+        src = args.model if base == "sa" else args.ct
+        keep = set(o for o in opts.split("+") if o)
+        bad = keep - {"act", "kv", "q", "probs", "sfu"}
+        if bad:
+            raise SystemExit(f"unknown fp32 parts {bad}")
 
         def run(ids):
-            dec = H.load(src, max_len=args.window, quant=True, rope=True, attn=True)    # (a fresh cache per window)
-            return logits_steps(dec, ids)
-        return run, TH.device_sfu
+            H.SA_FP32.clear()
+            H.SA_FP32.update(keep - {"sfu"})
+            try:
+                dec = H.load(src, max_len=args.window, quant=True, rope=True, attn=True)    # (a fresh cache per window)
+                return logits_steps(dec, ids)
+            finally:
+                H.SA_FP32.clear()
+        return run, (contextlib.nullcontext if "sfu" in keep else TH.device_sfu)
     raise SystemExit(f"unknown variant {name}")
 
 
@@ -105,7 +120,7 @@ def main():
     # the reference first (its logits kept), then each variant window by window.
     # sa's RoPE rewrite changes rotate_half in transformers for the whole
     # process, so the fp32 / w8a8 forms run before any sa one
-    order = sorted(names, key=lambda n: n.endswith("sa"))
+    order = sorted(names, key=lambda n: "sa" in n.partition(":")[0].split("-"))
     ref, res = None, {}
     for name in order:
         t0 = time.time()
