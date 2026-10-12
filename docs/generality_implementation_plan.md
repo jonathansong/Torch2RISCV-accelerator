@@ -456,6 +456,14 @@ K_BLOCK_MAX = floor(4095 / 16) * 16 = 4080
 | 8192 最坏情况 | x = w = −128：2²⁷，逐位一致 | x = −127、w = −128，逐位一致 |
 
 - **数值约定**：激活的 int8 是 [−127, 127]（各前端的 `to_i8` 对称饱和）。EX 路径的 x 经过 VE 的 int8 转换，会把 −128 变成 −127；GEMV 单元原样读打包字节，−128 也精确。所以 EX 的最坏情况用 −127 × −128；超出约定的输入（x = −128）只在 GEMV 上精确。
+- **板上消融（2026-10-12，Llama-3.2-1B，`deploy_hfgen_llama1b_dyn` / `_nosplit`，同一份导出与参数，只差 `--iree-sa-gemv-k-split`）**：两者都 17/17 与 sim 逐位一致、0 个主机 dispatch，logits 相同（关的 qemu 检查直接对开的 sim 参考通过）。
+
+  | | K 分块关（down_proj 走 EX） | K 分块开（4080 + 4080 + 32） |
+  |---|---:|---:|
+  | down_proj 每次（16 次 / 步） | 3.20M 周期，5.3 B/cycle | 0.275M 周期，61 B/cycle（×11.6） |
+  | decode 设备 / 每步 | 711.8 ms / 716.3 ms（1.40 tok/s） | 243.6 ms / 248.1 ms（**4.03 tok/s，×2.89**） |
+  | prefill（batched，每 16-token 块） | 1066 ms | 1066 ms（prefill 的行形式不用 GEMV，不受影响） |
+
 - **顺带发现**：K ≤ 4096 时 decode 线性层的 chunk 仍按 SPAD_B 一个 bank 的容量取（`sbank / K`：K = 4096 每 chunk 1 个 tile，Qwen3 的 K = 1024 每 chunk 4 个），而 GEMV 的权重是流式读入、不进 SPAD_B；按 ACC scratch 取 chunk 可减少每层的 chunk 数（待评估）。
 
 ### 验收
@@ -493,6 +501,7 @@ Llama-3.2-1B-Instruct-W8A8（compressed-tensors，16 层，GQA 32/8，K=8192 的
 - aarch64（qemu）vs sim：3/3 行逐位一致。
 - 板上：17/17 步 logits 与 sim 逐位一致，生成 token 相同，0 个 host dispatch；**prefill 9.38 tok/s（40 token 4264 ms，含首块加载），decode 3.50 tok/s（286 ms/步）**。
 - decode 与带宽模型一致：约 1.18 GB 参数 / 57.95 B/cycle（100 MHz）≈ 214 ms，加上固定开销约 70 ms。
+- **之后（2026-10-12，V 投影走 GEMV `14f5612` + attention 按实际长度 `1860823`）**：板上 17/17 逐位一致，**decode 4.03 tok/s（248.1 ms/步，设备 243.6 ms，GEMV 226 ms = 92.6%，54.7 B/cycle）**，prefill 12.62 tok/s（`board_llm.py`，含首块加载；batched 每块 1066 ms，15.21 tok/s，prefill 中 matmul 占 73%）。K 分块开 / 关的对比见 §10。
 - 默认 prompt 是 SmolLM2 的 token id，对 Llama 无意义，生成文本只用于逐位比对，不代表质量；质量以 teacher-forced 指标为准。
 - 测试内存：同一时间只保留一个 fp32 模型（关 autograd、del 后 gc.collect），峰值 7.1 GB。
 
@@ -590,7 +599,7 @@ decode 现在 GEMV 占设备时间的 80%（111.4 ms，峰值的 93%）；通用
 |---|---|---|---|---|---:|---:|---:|---:|
 | Qwen3-0.6B | 外部 W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 39.62（fp32 39.21），top-1 86.9% | 100% / 100% / 100% | 6.88 tok/s | 20.53 tok/s | GEMV 93%（decode 4.37 GB/s 平均） | 590 / 613 MB |
 | SmolLM2-135M | llm-compressor | | | | | | | |
-| Llama-3.2-1B | RedHatAI W8A8 | | | | | | | |
+| Llama-3.2-1B | RedHatAI W8A8（ct） | 板上 17/17 逐位一致 | （主机 2048-token 评估待跑） | 100% / 100% / 100% | 4.03 tok/s | 15.21 tok/s | GEMV 94%（decode 5.08 GB/s 平均） | 1190 / 1203 MB |
 | Gemma-3-270M | 自量化 / llm-compressor | | | | | | | |
 
 ### 13.3 两张消融表
