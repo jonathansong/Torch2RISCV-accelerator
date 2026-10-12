@@ -12,6 +12,7 @@ import gc
 import math
 import os
 import subprocess
+import re
 import sys
 import time
 
@@ -19,6 +20,26 @@ import numpy as np
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def overlay_env():
+    """SA_D / SA_GEMV_PORTS (compile_sa.sh's --iree-sa-d / --iree-sa-gemv-ports) from
+    SA_KV260_CONFIG as compiler/scripts/board_env.sh derives them; set
+    explicitly they must agree with it (a D = 8 compile for the D = 16 overlay
+    passes in the sim and fails only on the device)."""
+    cfg = os.environ.get("SA_KV260_CONFIG", "")
+    m = re.match(r"d(\d+)_", cfg)
+    if not m:
+        return
+    want = {"SA_D": m.group(1),
+            "SA_GEMV_PORTS": "4" if "_gemv_np4" in cfg else "2" if "_gemv_np2" in cfg else "1" if "_gemv" in cfg else "0"}
+    for k, v in want.items():
+        if os.environ.get(k, v) != v:
+            sys.exit(f"{k}={os.environ[k]} but SA_KV260_CONFIG={cfg} means {k}={v}")
+        os.environ[k] = v
+
+
+overlay_env()
 D = int(os.environ.get("SA_D", "8"))   # the array size (the overlay's; compile_sa.sh passes --iree-sa-d)
 COMPILER = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
@@ -67,6 +88,8 @@ def main():
     ap.add_argument("--kv-calib", help="FILE[:TOKENS] text to calibrate the KV scales on (F4)")
     ap.add_argument("--prefill", type=int, default=0, help="also export prefill of M tokens (needs --attn); the "
                     "sim run with prefill + decode must be bit-exact with decode only (plan §8.17)")
+    ap.add_argument("--prefill-all", action="store_true", help="with --prefill: also export prefill_all and check "
+                    "its logits of every prompt position (sa-llm-run --prefill_all_out) against decode only")
     ap.add_argument("--min-corr", type=float, default=0.999)
     ap.add_argument("--layers", type=int, help="only the first layers (a truncated model)")
     ap.add_argument("--board-bundle", help="with --prefill: stage the board test here (board_llm.py)")
@@ -107,7 +130,7 @@ def main():
     if not args.skip_export:
         w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers,
                    kv_channel=args.kv_channel, kv_calib=H.kv_calib_arg(args.kv_calib))
-        H.export(w, args.out, args.prefill)
+        H.export(w, args.out, args.prefill, args.prefill_all)
         del w                            # (freed before the compile and the reload below)
         gc.collect()
         t0 = time.time()
@@ -198,7 +221,7 @@ def main():
         # prefill + decode vs decode only: the prompt's last position, then the generated steps
         M = args.prefill
         pp = prompt if len(prompt) >= 2 * M else [int(v) for v in np.resize(np.array(prompt), 2 * M + M // 2)]
-        def run(pre, generate=args.generate):
+        def run(pre, generate=args.generate, extra=()):
             srv = subprocess.Popen([T.PY, os.path.join(COMPILER, "sim", "sa_sim_server.py"), "--d", str(D), "--mb",
                                     str(args.mb), "--socket", sock, "--once"], stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL)
@@ -207,7 +230,7 @@ def main():
             r2 = subprocess.run([T.RUN, "--device=sa", f"--module={args.out}/sa.vmfb",
                                  f"--parameters=model={args.out}/sa_packed.irpa", "--abi=hf",
                                  "--tokens=" + ",".join(map(str, pp)), f"--generate={generate}",
-                                 f"--logits_out={lp}"] + ([f"--prefill={pre}"] if pre else []),
+                                 f"--logits_out={lp}"] + ([f"--prefill={pre}"] if pre else []) + list(extra),
                                 capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
             srv.wait(timeout=120)
             if r2.returncode:
@@ -223,6 +246,15 @@ def main():
         print(f"prefill M = {M}, a {len(pp)}-token prompt: logits bit-exact with decode only in {sum(exact)}/"
               f"{len(exact)} rows, tokens {'identical' if same else 'DIFFERENT'}; {pline[0] if pline else ''}")
         ok &= len(exact) == args.generate + 1 and all(exact) and same
+        if args.prefill_all:
+            # every prompt position's logits (prefill_all) vs decode only's rows
+            ap_ = os.path.join(args.out, "logits_all.f32")
+            _, al, _ = run(M, 0, [f"--prefill_all_out={ap_}"])
+            rows = np.fromfile(ap_, np.float32).reshape(-1, ref.shape[1])
+            ex = [rows[i].tobytes() == dl[i].tobytes() for i in range(min(len(rows), len(pp)))]
+            print(f"prefill_all: {len(rows)} prompt positions, bit-exact with decode only in {sum(ex)}/{len(ex)}; "
+                  f"the last one's row as prefill's: {al[0].tobytes() == pl[0].tobytes()}")
+            ok &= len(rows) == len(pp) and all(ex) and al[0].tobytes() == pl[0].tobytes()
         if args.board_bundle and ok:
             stage(args, pp, run)
     print("hf_generic PASS" if ok else "hf_generic FAIL")

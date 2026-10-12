@@ -85,14 +85,15 @@ class HFDecoder(torch.nn.Module):
 
     def prefill(self, input_ids, position_ids, logits=True):
         """A chunk of M prompt tokens at position_ids[1, M] (given by the caller):
-        their KV rows written; the last one's logits, or (logits=False, the
-        chunks before the last: prefill_kv) the last row's hidden state."""
+        their KV rows written; the last one's logits, (logits="all":
+        prefill_all) every row's [1, M, vocab], or (logits=False, the chunks
+        before the last: prefill_kv) the last row's hidden state."""
         self.cache.positions = position_ids[0]
         for layer in self.cache.layers:
             _at(layer, position_ids.reshape(-1)[0])
         if logits:
             return self.model(input_ids=input_ids, position_ids=position_ids, past_key_values=self.cache,
-                              use_cache=True, logits_to_keep=1).logits
+                              use_cache=True, logits_to_keep=0 if logits == "all" else 1).logits
         h = self.model.model(input_ids=input_ids, position_ids=position_ids, past_key_values=self.cache,
                              use_cache=True).last_hidden_state
         return h[:, -1]
@@ -736,7 +737,7 @@ GRAPH_PASSES = [square_pow]
 
 
 class _Fn(torch.nn.Module):
-    """One function of the module (decode, prefill, prefill_kv) as a module to export."""
+    """One function of the module (decode, prefill, prefill_kv, prefill_all) as a module to export."""
     def __init__(self, w, kind):
         super().__init__()
         self.w, self.kind = w, kind
@@ -744,17 +745,21 @@ class _Fn(torch.nn.Module):
     def forward(self, input_ids, position_ids):
         if self.kind == "main":
             return self.w(input_ids, position_ids)
-        return self.w.prefill(input_ids, position_ids, logits=self.kind == "prefill")
+        return self.w.prefill(input_ids, position_ids,
+                              logits={"prefill": True, "prefill_all": "all"}.get(self.kind, False))
 
 
-def export(w, out, prefill=0):
+def export(w, out, prefill=0, prefill_all=False):
     """main (decode); with prefill = M also prefill / prefill_kv of M tokens, the
-    three sharing the parameters and the KV cache (plan §8.13, §8.17)."""
+    three sharing the parameters and the KV cache (plan §8.13, §8.17);
+    prefill_all: also prefill_all (the logits of all M positions: teacher
+    forcing on the board, generality plan §13.1)."""
     from iree.turbine import aot
     from iree.turbine.aot import decompositions
     os.makedirs(out, exist_ok=True)
     t0 = time.time()
-    progs = {"main": 1} | ({"prefill": prefill, "prefill_kv": prefill} if prefill else {})
+    progs = {"main": 1} | ({"prefill": prefill, "prefill_kv": prefill} if prefill else {}) \
+        | ({"prefill_all": prefill} if prefill and prefill_all else {})
     eps = {}
     for name, M in progs.items():
         args = {"input_ids": torch.ones(1, M, dtype=torch.int64), "position_ids": torch.arange(M)[None]}
@@ -792,13 +797,14 @@ def main():
     ap.add_argument("--attn", action="store_true", help="int8 KV cache and the sa attention (SaCache, sa_attention)")
     ap.add_argument("--kv-scales", help="KV scales (.npy [layers, 2]) instead of calibrating")
     ap.add_argument("--prefill", type=int, default=0, help="also prefill / prefill_kv of this many tokens (needs --attn)")
+    ap.add_argument("--prefill-all", action="store_true", help="with --prefill: also prefill_all (every position's logits)")
     ap.add_argument("--layers", type=int, help="only the first layers (a truncated model, for tests)")
     ap.add_argument("--kv-channel", default="", help="k / v / kv: those KV scales per cache channel (calibrate_kv)")
     ap.add_argument("--kv-calib", help="FILE[:TOKENS] text to calibrate the KV scales on (default: export_hf.CALIB)")
     args = ap.parse_args()
     export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales, args.layers, args.kv_channel,
                 kv_calib_arg(args.kv_calib)), args.out,
-           args.prefill)
+           args.prefill, args.prefill_all)
 
 
 if __name__ == "__main__":

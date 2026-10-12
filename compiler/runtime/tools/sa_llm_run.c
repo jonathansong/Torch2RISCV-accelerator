@@ -39,6 +39,10 @@ IREE_FLAG(string, abi, "sa",
 IREE_FLAG(int32_t, prefill, 0,
           "Prefill chunk M: a prompt of >= M tokens through the module's prefill(tokens[M], positions[M], valid) "
           "in chunks at 0, M, 2M, ... and P - M, then decode (plan §8.13).");
+IREE_FLAG(string, prefill_all_out, "",
+          "With --prefill: every chunk through the module's prefill_all (the logits of all M positions) and the "
+          "logits of every prompt position written here (float32 [P, vocab]): teacher forcing on the device "
+          "(generality plan §13.1).");
 
 // The device clock for cycles -> ms: SA_DEVICE_HZ (the launcher passes the
 // overlay's, e.g. 100 MHz on the KV260's K1b), else the PYNQ-Z1's 50 MHz.
@@ -172,6 +176,16 @@ static iree_status_t run(iree_allocator_t host) {
         pkv = pf;
       }
     }
+    // --prefill_all_out: prefill_all for every chunk, the new positions' rows written
+    FILE* af = NULL;
+    int written = 0;
+    if (iree_status_is_ok(status) && FLAG_prefill_all_out[0]) {
+      status = iree_vm_module_lookup_function_by_name(main_module, IREE_VM_FUNCTION_LINKAGE_EXPORT,
+                                                      IREE_SV("prefill_all"), &pf);
+      pkv = pf;
+      if (iree_status_is_ok(status) && !(af = fopen(FLAG_prefill_all_out, "wb")))
+        status = iree_make_status(IREE_STATUS_UNAVAILABLE, "cannot open %s", FLAG_prefill_all_out);
+    }
     float* kv_out = NULL;
     iree_host_size_t kv_n = 0;
     int64_t* pos_buf = malloc((size_t)M * sizeof(int64_t));
@@ -182,11 +196,20 @@ static iree_status_t run(iree_allocator_t host) {
       iree_host_size_t vlen = FLAG_pad > 0 ? (iree_host_size_t)(((s + M - 1) / FLAG_pad + 1) * FLAG_pad)
                                            : (iree_host_size_t)FLAG_valid_len;
       double t0 = now();
-      if (s + M >= ntok)
+      if (s + M >= ntok || af)
         status = call3(context, pf, device, allocator, host, toks + s, M, pos_buf, M, valid, vlen, &logits, &vocab);
       else
         status = call3(context, pkv, device, allocator, host, toks + s, M, pos_buf, M, valid, vlen, &kv_out, &kv_n);
       prefill_time += now() - t0;
+      if (af && iree_status_is_ok(status)) {     // [M, V]: the rows not written yet; the last row stays
+        iree_host_size_t V = vocab / (iree_host_size_t)M;
+        for (int i = written - s; i < M; ++i) fwrite(logits + (iree_host_size_t)i * V, sizeof(float), V, af);
+        written = s + M;
+        if (s + M >= ntok) {
+          memmove(logits, logits + (iree_host_size_t)(M - 1) * V, V * sizeof(float));
+          vocab = V;
+        }
+      }
       ++chunks;
       if (chunks == 1) sa_context_profile_reset();   // the first chunk includes loading
       if (s + M >= ntok) break;
@@ -194,6 +217,7 @@ static iree_status_t run(iree_allocator_t host) {
     }
     free(pos_buf);
     free(kv_out);
+    if (af) fclose(af);
     if (iree_status_is_ok(status) && chunks > 1 && getenv("SA_PROFILE")) {
       uint64_t nd, cyc, ns;
       sa_context_profile_totals(&nd, &cyc, &ns);
@@ -202,7 +226,7 @@ static iree_status_t run(iree_allocator_t host) {
              chunks - 1, M, nd / (double)(chunks - 1), strcmp(getenv("SA_PROFILE"), "batch") ? "dispatches" : "lists",
              cyc / (chunks - 1) / (sa_device_hz() / 1e3), cyc / (double)(chunks - 1), sa_device_hz() / 1e6,
              ns / 1e6 / (chunks - 1));
-      sa_context_profile_report(stdout, chunks - 1);
+      sa_context_profile_report(stdout, chunks - 1, "prefill");
     }
     if (iree_status_is_ok(status)) {
       if (lf) fwrite(logits, sizeof(float), vocab, lf);
@@ -310,7 +334,7 @@ static iree_status_t run(iree_allocator_t host) {
              "their FENCE %.1f\n",
              sc->batch_barriers / (double)steps, sc->batch_fences / (double)steps, sc->batch_hosted / (double)steps,
              sc->batch_hoisted / (double)steps);
-    sa_context_profile_report(stdout, np);
+    sa_context_profile_report(stdout, np, "decode");
   }
   if (lf) fclose(lf);
   free(valid);
