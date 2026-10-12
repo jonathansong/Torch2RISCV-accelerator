@@ -35,7 +35,9 @@ IREE_FLAG(string, logits_out, "", "File the float32 logits of every step are app
 IREE_FLAG(int32_t, stop_token, -1, "Stop generating after this token (an end-of-sequence id; -1: none).");
 IREE_FLAG(string, abi, "sa",
           "Calling convention of main: \"sa\" main(token[1], pos[1], valid) (the frontend's QLlama / QModel), "
-          "\"hf\" main(input_ids[1,1], position_ids[1,1]) (an unmodified HuggingFace decoder, plan §8.16).");
+          "\"hf\" main(input_ids[1,1], position_ids[1,1]) (an unmodified HuggingFace decoder, plan §8.16), "
+          "\"hfv\" main(input_ids[1,1], position_ids[1,1], valid) (the same with the attention over valid's "
+          "length, --pad: hf_generic --dyn-len).");
 IREE_FLAG(int32_t, prefill, 0,
           "Prefill chunk M: a prompt of >= M tokens through the module's prefill(tokens[M], positions[M], valid) "
           "in chunks at 0, M, 2M, ... and P - M, then decode (plan §8.13).");
@@ -52,11 +54,14 @@ static double sa_device_hz(void) {
   return hz > 0.0 ? hz : 50e6;
 }
 
+// --abi=hf / hfv: ids and positions as [1, n]; hf: no valid
+static bool abi_hf_ids(void) { return strncmp(FLAG_abi, "hf", 2) == 0; }
+static bool abi_valid(void) { return strcmp(FLAG_abi, "hf") != 0; }
+
 static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* allocator, const void* data,
                                iree_host_size_t n, iree_hal_element_type_t type, iree_hal_buffer_view_t** out) {
   iree_hal_dim_t shape[2] = {n, 1};
-  // --abi=hf: ids / positions as [1, n]
-  iree_host_size_t rank = (strcmp(FLAG_abi, "hf") == 0 && type == IREE_HAL_ELEMENT_TYPE_INT_64) ? 2 : 1;
+  iree_host_size_t rank = (abi_hf_ids() && type == IREE_HAL_ELEMENT_TYPE_INT_64) ? 2 : 1;
   if (rank == 2) shape[0] = 1, shape[1] = n;
   iree_hal_buffer_params_t params = {
       .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
@@ -68,7 +73,7 @@ static iree_status_t make_view(iree_hal_device_t* device, iree_hal_allocator_t* 
 }
 
 // f(a[na]: i64, b[nb]: i64, valid[nv]: f32) -> logits (f32, copied to *logits);
-// --abi=hf: f(a[1, na], b[1, nb])
+// --abi=hf: f(a[1, na], b[1, nb]); hfv: f(a[1, na], b[1, nb], valid[nv])
 static iree_status_t call3(iree_vm_context_t* context, iree_vm_function_t function, iree_hal_device_t* device,
                            iree_hal_allocator_t* allocator, iree_allocator_t host, const int64_t* a, int na,
                            const int64_t* b, int nb, const float* valid, iree_host_size_t nv, float** logits,
@@ -76,7 +81,7 @@ static iree_status_t call3(iree_vm_context_t* context, iree_vm_function_t functi
   iree_vm_list_t *inputs = NULL, *outputs = NULL;
   iree_hal_buffer_view_t *ba = NULL, *bbv = NULL, *bv = NULL;
   iree_status_t status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 3, host, &inputs);
-  bool hf = strcmp(FLAG_abi, "hf") == 0;             // (a[1, na], b[1, nb]): no valid
+  bool hf = !abi_valid();
   if (iree_status_is_ok(status)) status = make_view(device, allocator, a, na, IREE_HAL_ELEMENT_TYPE_INT_64, &ba);
   if (iree_status_is_ok(status)) status = make_view(device, allocator, b, nb, IREE_HAL_ELEMENT_TYPE_INT_64, &bbv);
   if (iree_status_is_ok(status) && !hf)
@@ -251,7 +256,7 @@ static iree_status_t run(iree_allocator_t host) {
     if (iree_status_is_ok(status)) status = make_view(device, allocator, &token, 1, IREE_HAL_ELEMENT_TYPE_INT_64, &bt);
     if (iree_status_is_ok(status)) status = make_view(device, allocator, &pos64, 1, IREE_HAL_ELEMENT_TYPE_INT_64, &bp);
     iree_host_size_t vlen = FLAG_pad > 0 ? (iree_host_size_t)((pos / FLAG_pad + 1) * FLAG_pad) : (iree_host_size_t)FLAG_valid_len;
-    bool hf = strcmp(FLAG_abi, "hf") == 0;
+    bool hf = !abi_valid();
     if (iree_status_is_ok(status) && !hf)
       status = make_view(device, allocator, valid, vlen, IREE_HAL_ELEMENT_TYPE_FLOAT_32, &bv);
     if (iree_status_is_ok(status)) {

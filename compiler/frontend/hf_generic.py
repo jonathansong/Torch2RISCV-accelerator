@@ -10,7 +10,7 @@ device, instead of a hand-rewritten model (qhf.py).
 - export: torch.export (non-strict) -> functional ATen (run_decompositions) ->
   the graph rewrites (GRAPH_PASSES) -> iree-turbine, the weights externalized
   (<out>/qllama.mlir, <out>/qllama.irpa: what compile_sa.sh expects);
-- the program runs with sa-llm-run --abi=hf; what the sa backend does not
+- the program runs with sa-llm-run --abi=hfv --pad=D (--attn; --static-len or no --attn: --abi=hf); what the sa backend does not
   compile runs on the host (the VMVX fallback, §8.15).
 
     python3 compiler/frontend/hf_generic.py --model build/llm_cache/SmolLM2-135M --out build/hfgen/smollm2_raw
@@ -137,6 +137,9 @@ class SaCache(StaticCache):
         super().__init__(config=config, max_cache_len=max_cache_len)
         self.positions = None
         self.max_len = max_cache_len
+        # the attention's length (export --dyn-len: valid's, a dynamic dimension;
+        # None: the whole cache, max_len)
+        self.T = None
         kv = np.asarray(kv_scales, np.float32)
         hd = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         Hk = config.num_key_value_heads
@@ -189,13 +192,15 @@ class SaCache(StaticCache):
                         row = cache.positions[m:m + 1] + i * T
                         kf.index_copy_(0, row, kr[m:m + 1].float())
                         vf.index_copy_(0, row, vr[m:m + 1].float())
-                    return kf[i * T:(i + 1) * T], vf[i * T:(i + 1) * T]
+                    n = T if cache.T is None else cache.T
+                    return kf[i * T:i * T + n], vf[i * T:i * T + n]
                 kq, vq = _to_i8(kr * cache.inv_sk[i]), _to_i8(vr * cache.inv_sv[i])
                 for m in range(kr.shape[0]):          # row by row: a scalar position each (a decode step's write)
                     row = cache.positions[m:m + 1] + i * T
                     owner.kc.index_copy_(0, row, kq[m:m + 1])
                     owner.vc.index_copy_(0, row, vq[m:m + 1])
-                return owner.kc[i * T:(i + 1) * T], owner.vc[i * T:(i + 1) * T]
+                n = T if cache.T is None else cache.T    # (the first n rows: the positions attended)
+                return owner.kc[i * T:i * T + n], owner.vc[i * T:i * T + n]
             return update
         for i, layer in enumerate(self.layers):
             layer.update = types.MethodType(make_update(i), layer)
@@ -742,28 +747,46 @@ class _Fn(torch.nn.Module):
         super().__init__()
         self.w, self.kind = w, kind
 
-    def forward(self, input_ids, position_ids):
-        if self.kind == "main":
-            return self.w(input_ids, position_ids)
-        return self.w.prefill(input_ids, position_ids,
-                              logits={"prefill": True, "prefill_all": "all"}.get(self.kind, False))
+    def forward(self, input_ids, position_ids, valid=None):
+        # --dyn-len: the attention over valid's length (the caller's: the last
+        # position + 1 rounded up to the array size) instead of the whole cache
+        self.w.cache.T = None if valid is None else valid.shape[0]
+        try:
+            if self.kind == "main":
+                return self.w(input_ids, position_ids)
+            return self.w.prefill(input_ids, position_ids,
+                                  logits={"prefill": True, "prefill_all": "all"}.get(self.kind, False))
+        finally:
+            self.w.cache.T = None
 
 
-def export(w, out, prefill=0, prefill_all=False):
+def export(w, out, prefill=0, prefill_all=False, dyn_len=None):
     """main (decode); with prefill = M also prefill / prefill_kv of M tokens, the
     three sharing the parameters and the KV cache (plan §8.13, §8.17);
     prefill_all: also prefill_all (the logits of all M positions: teacher
-    forcing on the board, generality plan §13.1)."""
+    forcing on the board, generality plan §13.1); dyn_len: each function also
+    takes valid[T] (T dynamic, at most the cache's length) and attends to the
+    first T cache rows only (sa-llm-run --abi=hfv --pad=D), not the whole cache;
+    None (the default): with the sa KV cache (--attn), dyn_len."""
     from iree.turbine import aot
     from iree.turbine.aot import decompositions
     os.makedirs(out, exist_ok=True)
+    if dyn_len is None:
+        dyn_len = isinstance(w.cache, SaCache)
     t0 = time.time()
     progs = {"main": 1} | ({"prefill": prefill, "prefill_kv": prefill} if prefill else {}) \
         | ({"prefill_all": prefill} if prefill and prefill_all else {})
     eps = {}
     for name, M in progs.items():
         args = {"input_ids": torch.ones(1, M, dtype=torch.int64), "position_ids": torch.arange(M)[None]}
-        ep = torch.export.export(_Fn(w, name), (), args, strict=False)
+        dyn = None
+        if dyn_len:
+            if not isinstance(w.cache, SaCache):
+                raise ValueError("--dyn-len needs --attn (the sa KV cache)")
+            args["valid"] = torch.zeros(max(M, 16), dtype=torch.float32)   # (not 1: no specialization)
+            dyn = {"input_ids": None, "position_ids": None,
+                   "valid": {0: torch.export.Dim("T", min=1, max=w.cache.max_len)}}
+        ep = torch.export.export(_Fn(w, name), (), args, dynamic_shapes=dyn, strict=False)
         # functional ATen (the cache writes as buffer mutations), with iree-turbine's
         # decomposition table (as aot.export(module) does: the frontend's usual op forms)
         ep = ep.run_decompositions(decompositions.current_aot_decompositions())
@@ -782,6 +805,8 @@ def export(w, out, prefill=0, prefill_all=False):
     mlir, irpa = os.path.join(out, "qllama.mlir"), os.path.join(out, "qllama.irpa")
     exp.save_mlir(mlir)
     aot.save_module_parameters(irpa, w)
+    with open(os.path.join(out, "abi.txt"), "w") as f:      # (sa-llm-run --abi: test_hf_generic --skip-export)
+        f.write("hfv\n" if dyn_len else "hf\n")
     print(f"exported in {time.time() - t0:.0f} s: {mlir} ({os.path.getsize(mlir) / 1e6:.1f} MB), "
           f"{irpa} ({os.path.getsize(irpa) / 1e6:.1f} MB)")
     return mlir, irpa
@@ -801,10 +826,13 @@ def main():
     ap.add_argument("--layers", type=int, help="only the first layers (a truncated model, for tests)")
     ap.add_argument("--kv-channel", default="", help="k / v / kv: those KV scales per cache channel (calibrate_kv)")
     ap.add_argument("--kv-calib", help="FILE[:TOKENS] text to calibrate the KV scales on (default: export_hf.CALIB)")
+    ap.add_argument("--static-len", action="store_true", help="the attention over the whole cache (default with "
+                    "--attn: over valid[T], T dynamic; sa-llm-run --abi=hfv --pad=D)")
+    ap.add_argument("--dyn-len", action="store_true", help=argparse.SUPPRESS)      # (the default)
     args = ap.parse_args()
     export(load(args.model, args.max_len, args.quant, args.rope, args.attn, args.kv_scales, args.layers, args.kv_channel,
                 kv_calib_arg(args.kv_calib)), args.out,
-           args.prefill, args.prefill_all)
+           args.prefill, args.prefill_all, False if args.static_len else None)
 
 
 if __name__ == "__main__":

@@ -94,7 +94,16 @@ def main():
     ap.add_argument("--layers", type=int, help="only the first layers (a truncated model)")
     ap.add_argument("--board-bundle", help="with --prefill: stage the board test here (board_llm.py)")
     ap.add_argument("--board-generate", type=int, default=16)
+    ap.add_argument("--static-len", action="store_true", help="export the attention over the whole cache (default "
+                    "with --attn: over valid[T], T dynamic; sa-llm-run --abi=hfv --pad=D)")
+    ap.add_argument("--dyn-len", action="store_true", help=argparse.SUPPRESS)      # (the default)
     args = ap.parse_args()
+    global ABI
+    args.dyn_len = args.attn and not args.static_len
+    abi_file = os.path.join(args.out, "abi.txt")
+    if args.skip_export:                 # (the export's: a build before --dyn-len became the default has none: hf)
+        args.dyn_len = os.path.exists(abi_file) and open(abi_file).read().strip() == "hfv"
+    ABI = ["--abi=hfv", f"--pad={D}"] if args.dyn_len else ["--abi=hf"]
     torch.set_grad_enabled(False)        # (an autograd graph would keep each fp32 model alive past its del)
     # the wrapper (static cache at the input positions) vs plain HF on the whole prompt
     pr = [int(t) for t in args.prompt.split(",")]
@@ -130,7 +139,7 @@ def main():
     if not args.skip_export:
         w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers,
                    kv_channel=args.kv_channel, kv_calib=H.kv_calib_arg(args.kv_calib))
-        H.export(w, args.out, args.prefill, args.prefill_all)
+        H.export(w, args.out, args.prefill, args.prefill_all, args.dyn_len)
         del w                            # (freed before the compile and the reload below)
         gc.collect()
         t0 = time.time()
@@ -164,7 +173,7 @@ def main():
     time.sleep(3)
     lp = os.path.join(args.out, "logits_hf.f32")
     r = subprocess.run([T.RUN, "--device=sa", f"--module={args.out}/sa.vmfb",
-                        f"--parameters=model={args.out}/sa_packed.irpa", "--abi=hf", "--tokens=" + args.prompt,
+                        f"--parameters=model={args.out}/sa_packed.irpa", *ABI, "--tokens=" + args.prompt,
                         f"--generate={args.generate}", f"--logits_out={lp}"],
                        capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock, SA_STATS="1"))
     if r.returncode:
@@ -195,7 +204,7 @@ def main():
         time.sleep(3)
         tq = os.path.join(args.out, "logits_tf.f32")
         subprocess.run([T.RUN, "--device=sa", f"--module={args.out}/sa.vmfb",
-                        f"--parameters=model={args.out}/sa_packed.irpa", "--abi=hf",
+                        f"--parameters=model={args.out}/sa_packed.irpa", *ABI,
                         "--tokens=" + ",".join(map(str, toks)), "--generate=0", f"--logits_out={tq}"],
                        capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
         srv.wait(timeout=120)
@@ -228,7 +237,7 @@ def main():
             time.sleep(3)
             lp = os.path.join(args.out, f"logits_p{pre}.f32")
             r2 = subprocess.run([T.RUN, "--device=sa", f"--module={args.out}/sa.vmfb",
-                                 f"--parameters=model={args.out}/sa_packed.irpa", "--abi=hf",
+                                 f"--parameters=model={args.out}/sa_packed.irpa", *ABI,
                                  "--tokens=" + ",".join(map(str, pp)), f"--generate={generate}",
                                  f"--logits_out={lp}"] + ([f"--prefill={pre}"] if pre else []) + list(extra),
                                 capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
@@ -265,7 +274,7 @@ def stage(args, prompt, run):
     """The board bundle (board_llm.py): module, packed parameters, the sim's
     decode-only run over the prompt and --board-generate tokens (the board runs
     prefill + decode: compared with the rows from the prompt's last position),
-    the tokenizer, sa_args.txt (--abi=hf --prefill=M), board.txt (the
+    the tokenizer, sa_args.txt (--abi=hf[v] [--pad=D] --prefill=M), board.txt (the
     reference, the window in MB)."""
     import shutil
     dst = args.board_bundle
@@ -280,7 +289,7 @@ def stage(args, prompt, run):
     shutil.copy(os.path.join(args.model, "tokenizer.json"), os.path.join(dst, "tokenizer.json"))
     shutil.copy(os.path.join(COMPILER, "frontend", "hf_tokenizer.py"), os.path.join(dst, "hf_tokenizer.py"))
     with open(os.path.join(dst, "sa_args.txt"), "w") as f:
-        f.write(f"--abi=hf --prefill={args.prefill}\n")
+        f.write(" ".join(ABI) + f" --prefill={args.prefill}\n")
     # the window: the runtime's peak is the packed parameters + the int8 KV
     # cache + a few MiB (calibrated on the board, compiler/tests/mem_preflight.py);
     # the 4-port overlay's pool is 1280 MiB (K5-M M1)

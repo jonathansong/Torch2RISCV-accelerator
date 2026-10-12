@@ -5,6 +5,9 @@
 #   compiler/scripts/compile_sa.sh <dir with qllama.mlir / .irpa> [extra iree-compile flags]
 # -> <dir>/sa.vmfb, <dir>/sa_packed.irpa, <dir>/sa_sources/ (dispatch sources)
 # Aggressive dispatch fusion is on (C4: 242 -> 200 dispatches per token).
+# Assertions stripped: a dynamic attention length (hf_generic --dyn-len) otherwise
+# leaves a "mismatching contracting dimension" check per layer, each a split of
+# the command buffer (SmolLM2 2 layers: 3 lists a step instead of 1).
 # SA_COMPILE_FLAGS: extra iree-compile flags. SA_D: the array size (--iree-sa-d; default 8).
 # SA_GEMV_PORTS: the overlay's GEMV unit (--iree-sa-gemv-ports; default 0 = none).
 # SA_HOST_FALLBACK=0: no host fallback (default 1: every dispatch also gets a
@@ -20,6 +23,7 @@ mkdir -p "$dir/sa_sources"
   --iree-parameter-import=model="$dir/qllama.irpa" --iree-parameter-import-maximum-size=4294967295 \
   --iree-parameter-export=model="$dir/sa_packed.irpa" --iree-parameter-export-minimum-size=256 \
   --iree-dispatch-creation-enable-aggressive-fusion \
+  --iree-opt-strip-assertions \
   $( [ "${SA_HOST_FALLBACK:-1}" = 1 ] && echo --iree-sa-host-fallback --iree-hal-link-executables=false ) \
   $( [ -n "${SA_D:-}" ] && [ "$SA_D" != 8 ] && echo --iree-sa-d="$SA_D" ) \
   $( [ "${SA_GEMV_PORTS:-0}" != 0 ] && echo --iree-sa-gemv-ports="$SA_GEMV_PORTS" ) \
