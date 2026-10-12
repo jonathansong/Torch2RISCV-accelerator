@@ -1,7 +1,7 @@
 # 4 口 GEMV 之后：通用性与量化质量实现方案
 
-状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）  
-日期：2026-10-10  
+状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；Qwen3 decode 5.60 tok/s）；WP6 decode K 分块已接入编译器  
+日期：2026-10-10（2026-10-12 更新）  
 基线：`main@b42fec6`（四口验收 `fb01909`）  
 目标节点：2026-11-15 演讲内容冻结；2026-11-25 IREE 社区会议  
 
@@ -341,6 +341,7 @@ KV scale 改进（不改硬件和数据格式）：K 按通道（`kch`，scale �
 
 - 编译 1138 个 executable 全在加速器上，host 0；sim decode 9/9 argmax 与 torch W8A8 相同，prefill 与 decode-only 5/5 逐位一致；qemu aarch64 3/3。
 - 板上：17/17 步 logits 与 sim 逐位一致，0 个 host dispatch；**prefill 9.33 tok/s，decode 4.73 tok/s（211 ms/步）**，窗口 613 MB。
+- **之后（2026-10-12，§13.1）**：decode 的 v 投影改走 GEMV（`14f5612`），同一配置 decode **5.60 tok/s（178.4 ms/步）**；板上 teacher forcing 质量 PPL 39.62、top-1 86.9%（主机 39.14 / 87.4%）。
 - 与 WP1 的 6.28 tok/s 不可直接比较：那是手写导出路径（export_hf），这里是通用前端（逐行注意力等）加 K 按通道；两者各占多少未分开（需要一个通用前端、按层 KV 的 Qwen3 全模型板上点）。
 - 注意：`test_hf_generic.py` 的 D 只读 `SA_D`（默认 8），不从 `SA_KV260_CONFIG` 推导；第一次就按 D = 8 编译、sim 也通过，由 qemu 检查拦下。
 - llm-compressor 0.14 / compressed-tensors 0.19 的 `kv_cache_scheme` 可以产出 int8 静态 KV scale（RoPE 之后观察），但只支持 `tensor`、`attn_head` 两种粒度，`channel` 对 attention 明确报错；因此它能作为 importer 的一个输入来源，不能替代 K 按通道校准。
@@ -614,7 +615,7 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 
 | 观测结果 | 优先项 |
 |---|---|
-| decode 每步的固定部分占比高（四口实测：Qwen3 约 42%、SmolLM2 约 65%） | H2 乱序发射 + LD 命令流水 + 减少 dispatch 数与主机开销；按 WP9 的分类计时先找最大项 |
+| decode 每步的固定部分占比高（四口实测：Qwen3 约 42%、SmolLM2 约 65%） | H2 乱序发射 + LD 命令流水 + 减少 dispatch 数与主机开销；按 WP9 的分类计时先找最大项。**WP9 实测（2026-10-12，Qwen3 通用路径）**：主机 / runtime 只占 3.4 ms，固定部分在设备上；v 投影修复后 attention（静态 T = 256）46.5 ms、其余小算子 18.7 ms、GEMV 111 ms（峰值的 93%）；下一项：attention 按实际长度 |
 | decode 大部分时间为权重流量，四口接近端口上限 | W4A8（只缩短 GEMV 部分）；先做质量可行性实验，再做硬件解包 |
 | 多模型仍受 100 MHz 算术/控制周期限制，且时序修复路径明确 | K2a-2 200 MHz |
 | LD 命令气泡在多个模型中稳定超过约 8–10% | H2 + LD 命令流水 |

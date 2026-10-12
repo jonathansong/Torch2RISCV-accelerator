@@ -1342,6 +1342,7 @@ C5.5 的模型（§8.9 的第一步）：
 
   decode 的大线性层现在都在各自的读权重下限附近。与手写路径（约 450 ms/步）还差约 19%：手写路径把 q / k / v、gate / up 各合成一个线性层（少了重复的激活量化与每个线性层的固定开销）；v 投影每次 29k（下限的 2 倍，每步约 0.9M）；gate 177k 里约 58k 是 SFU 的 SiLU。
 - **改法的方向**（之后，第 2 项）：让线性层微内核接受任意逐元素尾部（与通用 contraction 一样，按 chunk 把累加结果交给 `generic` 的尾部 lowering；输出 fp32 / int32 / int8，逐元素输入 fp32 / int32），没有尾部时直接存 int32 累加。这正好是第 2 项（微内核在 `sahl` 层展开）要做的：调度与尾部分开表达以后，线性层的调度可以套在任意尾部上。
+  **int8 结果的最后一块（2026-10-12，`14f5612`）**：decode 的线性层原先只接受 fp32 结果（int8 只给 prefill 的行形式），直接量化进 KV cache 的 v 投影因此落到通用 contraction（权重经 SPAD_B、EX，不用 GEMV）：Qwen3 每层 136k 周期，同形状的 k 投影 17.6k。现在 decode 形式也接受 int8 结果（放在 SPAD_A；LOOP_END 只有两个步长，int8 的 DDR 步长是第三个，所以这种线性层的 chunk 展开写出）。Qwen3 板上 decode 211.1 → 178.4 ms/步（5.60 tok/s），逐位一致。
 
 **剩下**：通用路径 decode 的线性层走微内核（见上）；prefill 里 Q 的 RoPE 两个主机 dispatch（IREE 把 swap 后的 q 物化成按头在外的布局，gather 带了转置；改前端 swap 的写法反而让 31 个落到主机，没采用）；主机退路改用原生 ARM 代码（`llvm-cpu`，替代 VMVX 解释器，需要重建编译器）。
 

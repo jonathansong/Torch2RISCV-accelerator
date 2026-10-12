@@ -215,6 +215,8 @@ prefill 不变。4 口之后，decode 剩下的是 LD 命令的固定延迟（�
 
 prefill 不变（Qwen3 15.90 tok/s，SmolLM2 39.0）。低于预测的原因：设每步 = 固定部分 F + 与口数成反比的 GEMV 部分 G，由 2 口 / 4 口两点解出 Qwen3 G ≈ 184 ms（2 口时）、**F ≈ 67 ms**，SmolLM2 G ≈ 42 ms、**F ≈ 38 ms**；4 口时固定部分已占 Qwen3 每步的 42%、SmolLM2 的 65%（attention 的 EX、VE / SFU、LD 命令延迟、dispatch 与主机开销），GEMV 本身已接近线性加速。继续提高 decode 要削减 F（H2 乱序发射、LD 命令流水、减少 dispatch 数和主机开销），而不是更多的口；int4 权重只缩小 G。
 
+**F 的实测分解（2026-10-12，WP9，`generality_implementation_plan.md` §13.1）**：Qwen3 通用路径逐 dispatch 计时（`dispatch_stats.py`）：batched 一步设备 175.0 ms、runtime 其余 3.4 ms，主机开销可以忽略；GEMV 线性层 111 ms（598 MB，53.7 B / 周期 = 4 口峰值的 93%），attention（静态 T = 256）46.5 ms，归一化 / RoPE / softmax / 量化 18.7 ms。在此之前 v 投影（int8 结果直接进 KV cache）没有走 GEMV，每步多 33 ms（`14f5612` 修复，211.1 → 178.4 ms/步）。
+
 **步骤**：G5-1 RTL / 测试平台 / BD 参数，仿真通过后 `-bd_only` 检查；G5-2 构建 `-nports 4`；G5-3 板上 `--reuse p6_red` 回归 + bwtest（测试 7 应接近 64 B / 周期）；G5-4 完整 GEMV 4 口 staging，板上 decode 与预测比较。
 
 ## 9. 资源与时序估计（P = 2）
