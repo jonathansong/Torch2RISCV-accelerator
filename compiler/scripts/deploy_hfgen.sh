@@ -25,7 +25,7 @@ SKIP=$([ -f "$O/sa.vmfb" ] && echo --skip-export || true)
 D=$SA_REPO/build/deploy_hfgen$TAG
 rm -rf "$D" && mkdir -p "$D"
 if [ -n "${HFGEN_BUNDLE:-}" ]; then
-  cp -a "$HFGEN_BUNDLE"/. "$D/"
+  cp -al "$HFGEN_BUNDLE"/. "$D/" 2>/dev/null || cp -a "$HFGEN_BUNDLE"/. "$D/"   # (hard links: the bundle's files are not changed)
 else
   "$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/$MODEL" --out "$O" \
     $SKIP --quant --rope --attn --prefill "$SA_D" --mb 400 --board-bundle "$D"
