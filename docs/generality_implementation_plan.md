@@ -1,6 +1,6 @@
 # 4 口 GEMV 之后：通用性与量化质量实现方案
 
-状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；Qwen3 decode 5.60 tok/s）；WP6 decode K 分块已接入编译器  
+状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；V 投影走 GEMV、attention 按实际长度后 Qwen3 decode 6.88 tok/s、prefill 20.5 tok/s）；WP6 开关与边界测试完成；WP6 decode K 分块已接入编译器  
 日期：2026-10-10（2026-10-12 更新）  
 基线：`main@b42fec6`（四口验收 `fb01909`）  
 目标节点：2026-11-15 演讲内容冻结；2026-11-25 IREE 社区会议  
@@ -571,11 +571,24 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 - prefill 每 16-token chunk 1.44 s（11.15 tok/s，batched 142.8M 周期）：逐行 attention（batch_matmul，56 个 export × 16 行）51.7%，matmul 27.9%，reduction 12.5%。**prefill 的下一步是 attention，不是 GEMM。**
 - 下一步候选（§16 决策用）：decode attention 按实际长度而非静态 T（≤46 ms）；prefill attention 按块而非逐行；GEMV 已接近带宽上限。
 
+**attention 按实际长度（2026-10-12，`1860823`，通用前端默认）**：导出时每个函数多一个 `valid[T]`（T 动态，≤ cache 长度），cache 只取前 T 行；`sa-llm-run --abi=hfv --pad=16` 按位置取 T（位置 + 1 向上取整到 16）。动态 T 让 torch-mlir 在每层 matmul 前留一个 “mismatching contracting dimension” 断言，每个都切断 command buffer（SmolLM2 2 层每步 3 个 list）；`compile_sa.sh` 加 `--iree-opt-strip-assertions` 后恢复每步 1 个（Qwen3 2 个，与静态相同）。Qwen3 板上（位置 32–48）：
+
+| | 静态 T = 256 | 按实际长度 |
+|---|---:|---:|
+| decode ms/步（tok/s） | 178.4（5.60） | **145.4（6.88）** |
+| 　设备 / runtime 其余 | 175.0 / 3.4 ms | 136.9 / 6.9 ms |
+| 　attention（batch_matmul） | 46.5 ms | 11.8 ms |
+| prefill 每 16-token chunk（batched） | 1428 ms（11.15 tok/s） | **773 ms（20.53 tok/s）** |
+| 　逐行 attention | 744.7 ms | 145.4 ms |
+| teacher forcing（2048 位置） | PPL 39.624 | 39.624，argmax / NLL / top-64 逐位相同 |
+
+decode 现在 GEMV 占设备时间的 80%（111.4 ms，峰值的 93%）；通用路径超过了手写路径（WP1 的 6.28 tok/s）。runtime 其余从 3.4 增到 6.9 ms（动态形状在主机上的计算，待查）。`dispatch_stats.py` 对动态维（名字里的 `D`）不计 MAC，attention 的 MAC 未计入覆盖率。
+
 ### 13.2 最终主表
 
 | 模型 | 权重来源 | 正确性 | 质量 | 动态/时间/MAC覆盖率 | decode | prefill | 带宽利用率 | 内存峰值 |
 |---|---|---|---|---|---:|---:|---:|---:|
-| Qwen3-0.6B | 外部 W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 39.62（fp32 39.21），top-1 86.9% | 100% / 100% / 100% | 5.60 tok/s | 11.15 tok/s | GEMV 93%（decode 3.50 GB/s 平均） | 590 / 613 MB |
+| Qwen3-0.6B | 外部 W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 39.62（fp32 39.21），top-1 86.9% | 100% / 100% / 100% | 6.88 tok/s | 20.53 tok/s | GEMV 93%（decode 4.37 GB/s 平均） | 590 / 613 MB |
 | SmolLM2-135M | llm-compressor | | | | | | | |
 | Llama-3.2-1B | RedHatAI W8A8 | | | | | | | |
 | Gemma-3-270M | 自量化 / llm-compressor | | | | | | | |

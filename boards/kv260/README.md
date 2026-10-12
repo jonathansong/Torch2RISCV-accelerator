@@ -264,7 +264,9 @@ device and 3.4 ms in the rest of the runtime, so the fixed part is on the device
 GEMV linear layers 111 ms (53.7 B/cycle, 93% of the four-port peak), attention over the
 static T = 256 cache 46.5 ms, norms / RoPE / softmax / quantization 18.7 ms. With the V
 projection on the GEMV unit (`14f5612`; it went through EX before) decode is 178.4 ms/step,
-5.60 tok/s.
+5.60 tok/s; with the attention over the positions attended instead of the whole 256-row
+cache (`1860823`) 145.4 ms/step, **6.88 tok/s** (attention 46.5 -> 11.8 ms), and a prefill
+chunk of 16 tokens 1428 -> 773 ms (20.5 tok/s), logits unchanged bit for bit.
 
 ## Accelerator memory pool (K5-M step M1, installed 2026-10-10)
 
