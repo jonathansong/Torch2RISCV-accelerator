@@ -74,6 +74,7 @@ class Arch:
     gemv_bpc: float = 0.0       # H4: decode GEMV unit, weight bytes per cycle (0: none)
     ooo: bool = False           # H2: a blocked command does not block later independent ones (per-engine windows)
     gemv_ports: int = 2         # LD mode GEMV (K2b streaming unit): 16 B / cycle per read port
+    gemv_wscale: float = 1.0    # GEMV weight bytes scale (W4A8: 1 / 2)
 
 
 def field(x, lo, n):
@@ -232,8 +233,8 @@ def conflict(a, b):
 
 def cost(arch, c, gemv=False):
     if c.op == OP_LD and c.gemv:                       # streamed into the unit; strips written back
-        return arch.ld_lat + max(c.beats / max(arch.gemv_ports, 1), arch.c_burst * c.bursts / max(arch.gemv_ports, 1)) \
-            + 2 * c.steps
+        n = max(arch.gemv_ports, 1)
+        return arch.ld_lat + arch.gemv_wscale * max(c.beats / n, arch.c_burst * c.bursts / n) + 2 * c.steps
     if c.op == OP_LD:
         bpc = arch.ld_bpc / 16.0                       # (ports: bursts dealt round-robin, issue per port)
         return arch.ld_lat + max(c.beats / bpc, arch.c_burst * c.bursts / bpc)
@@ -505,24 +506,45 @@ SCENARIOS = [
 ]
 
 
+# the next step from the 4-port GEMV overlay (d16_100mhz_w128_p6_gemv_np4, --gemv-ports 4); at 200 MHz the DDR
+# latency stays in ns (LD / ST latency in cycles x 2) and 4 ports x 16 B x 200 MHz = 12.8 GB/s (KV260 DDR4: 19.2 peak)
+SCENARIOS_NEXT = [
+    ("baseline (4-port GEMV, 100 MHz)", {}, False),
+    ("200 MHz", dict(mhz=200.0, ld_lat=130.0, st_lat=140.0), False),
+    ("W4A8 decode weights (GEMV bytes / 2)", dict(gemv_wscale=0.5), False),
+    ("6 GEMV ports (HP0-3 + HPC0-1)", dict(gemv_ports=6), False),
+    ("LD commands pipelined", dict(ld_overlap=True), False),
+    ("H2 out-of-order + range checks", dict(ooo=True), False),
+    ("descriptor fetch 4 cyc + list overhead / 2", dict(f_desc=4.0, list_ovh=-0.5), False),
+    ("D = 32 array (EX steps / 2)", dict(ex_scale=0.5), False),
+    ("W4A8 + H2 + pipelined LD", dict(gemv_wscale=0.5, ooo=True, ld_overlap=True), False),
+    ("200 MHz + W4A8", dict(mhz=200.0, ld_lat=130.0, st_lat=140.0, gemv_wscale=0.5), False),
+    ("200 MHz + W4A8 + H2 + pipelined LD", dict(mhz=200.0, ld_lat=130.0, st_lat=140.0, gemv_wscale=0.5, ooo=True,
+                                                ld_overlap=True), False),
+]
+
+
 def total(arch, seg, gemv_names=()):
     m = model_seg(arch, seg, gemv_names)
     return sum(v for _, v in m.values())
 
 
-def whatif(arch, pre, dec, ndec):
+def whatif(arch, pre, dec, ndec, scenarios=SCENARIOS):
     dec_names = {n for n, _ in dec}
     base = None
-    print("== what-if (100 MHz; cycles per prefill chunk of 16 tokens / per decode step)")
+    print("== what-if (cycles per prefill chunk of 16 tokens / per decode step; speedups in time)")
     print(f"{'scenario':48s} {'prefill':>9s} {'tok/s':>7s} {'decode':>9s} {'tok/s':>6s}  {'dec LD':>7s} {'dec EX':>7s} {'dec VE':>7s}")
-    for label, ch, gemv in SCENARIOS:
+    for label, ch, gemv in scenarios:
+        ch = dict(ch)
+        if ch.get("list_ovh", 0) < 0:                  # negative: a scale of the calibrated value
+            ch["list_ovh"] = arch.list_ovh * -ch["list_ovh"]
         a = dataclasses.replace(arch, **ch)
         tp = total(a, pre)
         td = total(a, dec, dec_names if gemv else ()) / ndec
         if base is None:
-            base = (tp[0], td[0])
+            base = (tp[0] / a.mhz, td[0] / a.mhz)
         print(f"{label:48s} {tp[0] / 1e6:8.2f}M {16 * a.mhz * 1e6 / tp[0]:7.2f} {td[0] / 1e6:8.2f}M {a.mhz * 1e6 / td[0]:6.2f}  "
-              f"{td[1] / 1e6:6.2f}M {td[3] / 1e6:6.2f}M {td[4] / 1e6:6.2f}M   x{base[0] / tp[0]:.2f} / x{base[1] / td[0]:.2f}")
+              f"{td[1] / 1e6:6.2f}M {td[3] / 1e6:6.2f}M {td[4] / 1e6:6.2f}M   x{base[0] * a.mhz / tp[0]:.2f} / x{base[1] * a.mhz / td[0]:.2f}")
 
 
 def main():
@@ -534,8 +556,11 @@ def main():
     ap.add_argument("--logits", default=r"matvec_like_\d{4,}x", help="the vocabulary projection (left out of the prefill chunk)")
     ap.add_argument("--cal", help="load the calibration (VE, front end) from this json instead of fitting")
     ap.add_argument("--save-cal", help="write the fitted calibration here")
+    ap.add_argument("--gemv-ports", type=int, help="the overlay's GEMV read ports (default: Arch's)")
+    ap.add_argument("--whatif", choices=("k2b", "next"), default="k2b",
+                    help="k2b: the K2b study from d16_100mhz_w128_p6_red; next: the next step from the 4-port overlay")
     args = ap.parse_args()
-    arch = Arch()
+    arch = Arch() if args.gemv_ports is None else Arch(gemv_ports=args.gemv_ports)
     segs = segments(decode_trace(args.trace, arch))
     print("steps in trace:", [(len(s), s[0][0][:40]) for s in segs])
     pre = segs[args.prefill_seg]
@@ -557,7 +582,7 @@ def main():
     ndec = len(segs) - args.prefill_seg - 1
     compare(arch, pre, bp, "prefill chunk", top=args.top)
     compare(arch, dec, bd, "decode step", per_step=nd, top=args.top)
-    whatif(arch, pre_chunk, dec, ndec)
+    whatif(arch, pre_chunk, dec, ndec, SCENARIOS_NEXT if args.whatif == "next" else SCENARIOS)
 
 
 if __name__ == "__main__":

@@ -217,6 +217,23 @@ prefill 不变（Qwen3 15.90 tok/s，SmolLM2 39.0）。低于预测的原因：�
 
 **F 的实测分解（2026-10-12，WP9，`generality_implementation_plan.md` §13.1）**：Qwen3 通用路径逐 dispatch 计时（`dispatch_stats.py`）：batched 一步设备 175.0 ms、runtime 其余 3.4 ms，主机开销可以忽略；GEMV 线性层 111 ms（598 MB，53.7 B / 周期 = 4 口峰值的 93%），attention（静态 T = 256）46.5 ms，归一化 / RoPE / softmax / 量化 18.7 ms。在此之前 v 投影（int8 结果直接进 KV cache）没有走 GEMV，每步多 33 ms（`14f5612` 修复，211.1 → 178.4 ms/步）；attention 再按实际长度（`1860823`）后 145.4 ms/步（6.88 tok/s），GEMV 占设备时间的 80%。
 
+**4 口模型校准与下一步 what-if（2026-10-12，Qwen3 通用路径 `deploy_hfgen_qwen3_dyn`，动态 attention 长度）**：`DEPLOY=build MODEL=deploy_hfgen_qwen3_dyn OUT=qwen3_dyn MB=640 compiler/scripts/perf_trace.sh` 取轨迹，`perf_model.py --trace build/perfmodel/qwen3_dyn.trace --board build/deploy_hfgen_qwen3_dyn/prof3.csv --gemv-ports 4 [--whatif next]`。重新拟合 VE / 前端（f_desc 24 周期 / 描述符），模型对板上 prefill 一块 80.46M / 78.68M 周期（**+2.3%**），decode 一步 14.38M / 13.88M（**+3.6%**，最大的 GEMV 线性层 +2–10%）。以 4 口为基线的 what-if（时间加速比；200 MHz 时 DDR 延迟按 ns 不变、LD / ST 延迟周期 ×2，4 口 × 16 B × 200 MHz = 12.8 GB/s 仍低于 DDR4 峰值 19.2）：
+
+| 方案 | prefill tok/s | decode tok/s | prefill / decode |
+|---|---|---|---|
+| 基线（4 口 GEMV，100 MHz） | 20.61 | 6.95 | ×1.00 / ×1.00 |
+| 200 MHz | 38.66 | 12.48 | ×1.88 / ×1.79 |
+| W4A8（decode 权重字节减半） | 20.61 | 10.28 | ×1.00 / ×1.48 |
+| 6 个 GEMV 口（HP0–3 + HPC0–1） | 20.61 | 8.87 | ×1.00 / ×1.28 |
+| LD 命令流水 | 20.92 | 7.21 | ×1.01 / ×1.04 |
+| H2 乱序发射 | 22.07 | 7.33 | ×1.07 / ×1.05 |
+| D = 32 阵列 | 21.82 | 7.07 | ×1.06 / ×1.02 |
+| W4A8 + H2 + LD 流水 | 22.24 | 13.14 | ×1.08 / ×1.89 |
+| 200 MHz + W4A8 | 38.66 | 17.58 | ×1.88 / ×2.53 |
+| 200 MHz + W4A8 + H2 + LD 流水 | 42.92 | 25.01 | ×2.08 / ×3.60 |
+
+模型只含设备时间（不含 runtime 的 3–7 ms / 步），URAM（SPAD 容量）改变的是编译器的分块，轨迹固定时无法评估。结论见 `generality_implementation_plan.md` §17 问题 6。
+
 **步骤**：G5-1 RTL / 测试平台 / BD 参数，仿真通过后 `-bd_only` 检查；G5-2 构建 `-nports 4`；G5-3 板上 `--reuse p6_red` 回归 + bwtest（测试 7 应接近 64 B / 周期）；G5-4 完整 GEMV 4 口 staging，板上 decode 与预测比较。
 
 ## 9. 资源与时序估计（P = 2）
