@@ -1,6 +1,6 @@
 # 4 口 GEMV 之后：通用性与量化质量实现方案
 
-状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；V 投影走 GEMV、attention 按实际长度后 Qwen3 decode 6.88 tok/s、prefill 20.5 tok/s）；WP6 开关与边界测试完成；WP6 decode K 分块已接入编译器；SmolLM2 KV 按通道评估完成（kch 28.82 / 87.7%），全模型 kch + 按实际长度 sim PASS、已部署待上板（§7）  
+状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；V 投影走 GEMV、attention 按实际长度后 Qwen3 decode 6.88 tok/s、prefill 20.5 tok/s）；WP6 开关与边界测试完成；WP6 decode K 分块已接入编译器；SmolLM2 KV 按通道评估完成（kch 28.82 / 87.7%），SmolLM2 全模型 kch + 按实际长度板上验收（decode 22.17、prefill 60.09 tok/s，板上 PPL 28.55，§7）  
 日期：2026-10-10（2026-10-12 更新）  
 基线：`main@b42fec6`（四口验收 `fb01909`）  
 目标节点：2026-11-15 演讲内容冻结；2026-11-25 IREE 社区会议  
@@ -229,6 +229,8 @@ QLinearExternal(
   外部 checkpoint 在设备的计算方式下 KL 约为自量化的一半、PPL 低 2.0；改善几乎全部来自 SmoothQuant（只用 GPTQ 与自量化相当）。SA 形式额外的损失（int8 KV、注意力概率、SFU）两者相近（KL +0.024 / +0.036）。单个 256 token 的窗口曾给出相反的结论：评估至少要用数千个位置（§3.2）。
 - **KV scale（2026-10-12，WP4 的做法用到 SmolLM2）**：同一 checkpoint、KV 用 WikiText-2 train 前 1024 token 校准（`build/quality/smollm2_kvch_2048.json`）：ct-sa（按层）PPL 28.86、top-1 86.7%、KL 0.074；**ct-sa:kch 28.82、87.7%、0.072**；kch+vch 28.83、86.6%、0.076。SmolLM2 的 K 没有 Qwen3 那样的通道离群值，三者差别在噪声内（原 CALIB 按层为 28.77 / 87.1%）。为与 Qwen3 / Llama 一致，全模型构建用 `--kv-channel k`。
 - **全模型 + K 按通道 + 按实际长度（2026-10-12，sim PASS）**：`test_hf_generic.py --model build/llm_cache/SmolLM2-135M-W8A8 --out build/hfgen/smollm2_kch_dyn --quant --rope --attn --prefill 16 --prefill-all --kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024`（SA_D=16、GEMV 4 口）：导出 812 s，编译 700 s，1220 个 executable 全在加速器上；prefill 与 decode-only 5/5、prefill_all 40/40 逐位相同；teacher forcing 40 位置设备对 fp32 34/40（torch W8A8 35/40）、设备对 torch 平均相关 0.9957、argmax 不同 6 处，按量化模型的判据通过。自由生成的 9 步比较只有 2/9（最小相关 0.47，生成的 token 一旦不同、后面输入就不同；静态 T、按层 KV 的旧构建为 9/9、0.9995）。定位：两层 + kch 与 torch 一致到 1.5e-5（9/9，TF 0 处不同），两层按层 KV 同样一致；全模型逐位置相关在第 0 位 0.9999、其后 0.983–0.998 平滑分布，在 T 的 16 / 32 边界没有跳变：是 30 层的 int8 取整（设备与 torch 的运算次序）累积，不是错误；K 按通道的 scale 把 q 放大，对取整更敏感。真实质量以板上 2048 位置 teacher forcing 为准。
+- **上板（2026-10-12，PASS，`build/deploy_hfgen_smollm2_kch_dyn`）**：17/17 步 logits 与 sim 逐位一致、token 相同、0 个主机 dispatch。board_llm：prefill 45.34 tok/s（40 token，含加载），decode 21.90 tok/s（45.7 ms/步）。batched（位置 32–40）：decode 45.1 ms/步（**22.17 tok/s**），其中设备 38.64 ms、runtime 其余 6.45 ms；prefill 每 16-token chunk 266.3 ms（**60.09 tok/s**，26.6M 周期，7 个 list）；设备内存峰值 134.7 / 149.9 MB。逐 dispatch（prof3.csv → stats_decode.json）：decode 设备时间的 70.8% 是 GEMV（28.6 ms，LD 135.7 MB，47.4 B/周期，四口峰值 57.95 的 82%；lm_head 一项 54.6 B/周期、94%，层内 576 宽的小矩阵效率较低），reduction 10.0%、attention（batch_matmul）9.8%；prefill 一块中 matmul 47.8%、reduction 20.7%、逐行 attention 18.3%。覆盖率时间 / MAC 都是 100%。板上 teacher forcing（8 × 256，WikiText-2 test）：**PPL 28.545（fp32 26.978）、top-1 86.5%、KL 0.055**；主机 ct-sa:kch 为 28.82 / 87.7% / 0.072（主机用 torch 的计算次序，板上是设备实际的取整，二者在噪声内）。
+  与 WP3 验收时（静态 T、按层 KV，`results_wp3b`）比：decode 17.12 → 22.17 tok/s（×1.29），prefill（同为 board_llm 口径）27.18 → 45.34 tok/s（×1.67）；应主要来自 attention 按实际长度与 V 投影走 GEMV（未单独拆分）。
 - **sim**（`test_hf_generic.py`，D = 16、GEMV 4 口）：导出 + 编译 1710 个加速器 executable，decode 9/9 argmax 与 torch W8A8 相同，prefill 与 decode-only 5/5 逐位一致。40 位置 teacher-forced 门槛改为统计的：设备与 torch 模型 argmax 不同的位置 d 个，容许 max(2, ⌈2√d⌉)，另要求两者 logits 平均相关 ≥ 0.98。原门槛（−2）在这个 checkpoint 上失败：d = 3 个翻转碰巧都落在设备一边（34 对 37），而设备对 torch 的平均相关 0.9963 比自量化的 0.9911（d = 6，两边各 3）还高。
 - **板上**：`deploy_z1_freeze.sh hfgen_w8a8`（不在默认集合；`HFGEN_MODEL` / `HFGEN_TAG` 给 `deploy_hfgen.sh`），`board_regress.py` 有对应项。
 - **板上第一次（2026-10-11，4 口）**：hfgen_w8a8 PASS（17/17 与 sim 逐位相同），**hfgen FAIL（0/17）**。两者都有 1440 个主机 dispatch：16e5e5d 的逐行 prefill 在没有 QK-norm 的模型（SmolLM2、Llama）上，把每行的 RoPE + int8 量化融进了写 KV 的 scatter（6 维、带置换 gather，`more than two loops`），每块 480 个在主机上算；ARM 与 x86 在这些运算上的结果偶有一个 ulp 之差，经 int8 量化成 KV 的 ±1（w8a8 碰巧没翻）。staging 的检查只统计了 decode 的回退，漏掉了。用 qemu 跑 aarch64 的 `sa-llm-run`、设备仍是 x86 的 sim，复现了板上的结果（x86 3/3，aarch64 0/3）。
@@ -600,7 +602,7 @@ decode 现在 GEMV 占设备时间的 80%（111.4 ms，峰值的 93%）；通用
 | 模型 | 权重来源 | 正确性 | 质量 | 动态/时间/MAC覆盖率 | decode | prefill | 带宽利用率 | 内存峰值 |
 |---|---|---|---|---|---:|---:|---:|---:|
 | Qwen3-0.6B | 外部 W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 39.62（fp32 39.21），top-1 86.9% | 100% / 100% / 100% | 6.88 tok/s | 20.53 tok/s | GEMV 93%（decode 4.37 GB/s 平均） | 590 / 613 MB |
-| SmolLM2-135M | llm-compressor | | | | | | | |
+| SmolLM2-135M | llm-compressor W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 28.55（fp32 26.98），top-1 86.5% | 100% / 100% / 100% | 22.17 tok/s | 60.09 tok/s | GEMV 82%（decode 3.58 GB/s 平均） | 135 / 150 MB |
 | Llama-3.2-1B | RedHatAI W8A8（ct） | 板上 17/17 逐位一致 | （主机 2048-token 评估待跑） | 100% / 100% / 100% | 4.03 tok/s | 15.21 tok/s | GEMV 94%（decode 5.08 GB/s 平均） | 1190 / 1203 MB |
 | Gemma-3-270M | 自量化 / llm-compressor | | | | | | | |
 
