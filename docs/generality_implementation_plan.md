@@ -331,6 +331,18 @@ KV scale 改进（不改硬件和数据格式）：K 按通道（`kch`，scale �
 - 主因是 K 的通道离群值（每通道 max/中位数 7–120 倍）。按层 scale 换更多校准数据没有用（68.8%），K 按通道 + 充分校准两者一起才有效：top-1 71.5% → 87.4%，KL 降 7.6 倍，PPL 与 fp32 持平。
 - V 按通道在 2048 token 上与只做 K 基本相同（KL 略好、top-1 略差）。**默认选 `--kv-channel k`**：V 侧不多一次按通道乘法。
 - 距 checkpoint 自身（ct-w8a8 92.3%）还差约 5 个点，其中约 4 个点是剩余的 KV 量化误差（对照 act+kv 的 92.0%）。备选：百分位裁剪校准。
+
+**上板（2026-10-12，PASS）**：Qwen3-0.6B-W8A8 全 28 层，通用前端，`--kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024`，四口 overlay d16_100mhz_w128_p6_gemv_np4：
+
+    SA_D=16 SA_GEMV_PORTS=4 compiler/tests/test_hf_generic.py --model build/llm_cache/Qwen3-0.6B-W8A8 --out build/hfgen/qwen3_kch \
+        --quant --rope --attn --prefill 16 --kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024 \
+        --board-bundle build/hfgen/qwen3_kch_bundle                                         # (MemoryMax=10G)
+    HFGEN_TAG=qwen3_kch HFGEN_BUNDLE=build/hfgen/qwen3_kch_bundle compiler/scripts/deploy_hfgen.sh   # -> build/deploy_hfgen_qwen3_kch
+
+- 编译 1138 个 executable 全在加速器上，host 0；sim decode 9/9 argmax 与 torch W8A8 相同，prefill 与 decode-only 5/5 逐位一致；qemu aarch64 3/3。
+- 板上：17/17 步 logits 与 sim 逐位一致，0 个 host dispatch；**prefill 9.33 tok/s，decode 4.73 tok/s（211 ms/步）**，窗口 613 MB。
+- 与 WP1 的 6.28 tok/s 不可直接比较：那是手写导出路径（export_hf），这里是通用前端（逐行注意力等）加 K 按通道；两者各占多少未分开（需要一个通用前端、按层 KV 的 Qwen3 全模型板上点）。
+- 注意：`test_hf_generic.py` 的 D 只读 `SA_D`（默认 8），不从 `SA_KV260_CONFIG` 推导；第一次就按 D = 8 编译、sim 也通过，由 qemu 检查拦下。
 - llm-compressor 0.14 / compressed-tensors 0.19 的 `kv_cache_scheme` 可以产出 int8 静态 KV scale（RoPE 之后观察），但只支持 `tensor`、`attn_head` 两种粒度，`channel` 对 attention 明确报错；因此它能作为 importer 的一个输入来源，不能替代 K 按通道校准。
 
 ## 9. 工作包 WP5：Llama-3.2-1B 前端与内存预检
