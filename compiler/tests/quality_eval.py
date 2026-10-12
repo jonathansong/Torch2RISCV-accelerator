@@ -118,6 +118,8 @@ def main():
     ap.add_argument("--window", type=int, default=256)
     ap.add_argument("--skip", type=int, default=0, help="first token of the evaluated span")
     ap.add_argument("--out", help="results (JSON)")
+    ap.add_argument("--ref-cache", help="the fp32 reference's logits (.npy): loaded if present, else saved, so that "
+                    "each variant can run in a process of its own (Llama-1B: fp32 and an sa form do not fit in 10 GB together)")
     ap.add_argument("--kv-calib", help="FILE[:TOKENS] text for the sa variants' KV scales (default: export_hf.CALIB)")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
@@ -131,6 +133,11 @@ def main():
     # process, so the fp32 / w8a8 forms run before any sa one
     order = sorted(names, key=lambda n: "sa" in n.partition(":")[0].split("-"))
     ref, res = None, {}
+    if args.ref_cache and os.path.exists(args.ref_cache):
+        a = np.load(args.ref_cache, mmap_mode="r")
+        assert a.shape[:2] == (len(wins), args.window), (a.shape, len(wins), args.window)
+        ref = [torch.from_numpy(np.array(a[w])) for w in range(len(wins))]
+        order = [n for n in order if n != "fp32"]
     for name in order:
         t0 = time.time()
         f, ctx = build(name, args)
@@ -153,6 +160,8 @@ def main():
                 n += len(win)
         if ref is None:
             ref = refs
+            if args.ref_cache:
+                np.save(args.ref_cache, torch.stack(ref).numpy())
         f = ctx = None                   # (the model freed before the next one loads: one at a time in memory)
         import gc
         gc.collect()
