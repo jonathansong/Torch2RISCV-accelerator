@@ -39,6 +39,8 @@ declare -A cmd=(
   [ctimport]="$SA_PY -u $T/test_ct_import.py --e2e"
   # WP6: decode GEMV in K blocks (a synthetic Llama with K = 8192: blocks 4080 + 4080 + 32), with the 4-port GEMV unit
   [gemvk]="$SA_PY compiler/frontend/synth_hf.py --out build/ct_synth/k8k --tokenizer build/llm_cache/SmolLM2-135M --arch LlamaForCausalLM --dim 256 --hidden 8192 --layers 2 --heads 4 --kv-heads 2 && SA_D=16 SA_GEMV_PORTS=4 $SA_PY -u $T/test_hf_generic.py --model build/ct_synth/k8k --out build/ct_synth/k8k_out --quant --rope --attn --prefill 16 --mb 200"
+  # WP6 boundaries: one decode linear layer at K = 4080 / 4096 / 4112 / 8192 and the worst case, K split on / off
+  [gemvks]="$SA_PY -u $T/test_gemv_ksplit.py"
   [c3]="$SA_PY -u $T/test_c3.py --skip-export --out build/c4/fuse"
   [c5]="$SA_PY -u $T/test_c5.py"
   [c5cfg]="$SA_PY -u $T/test_c5.py --configs"

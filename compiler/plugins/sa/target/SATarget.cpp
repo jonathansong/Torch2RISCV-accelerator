@@ -61,6 +61,8 @@ struct SAOptions {
   std::string hostDispatches;
   // K2b: the streaming GEMV unit (docs/k2b_gemv_design.md) with this many read ports (0: none).
   int gemvPorts = 0;
+  // WP6: decode's GEMV over K > 4080 in K blocks (off: those layers on EX, the ablation's baseline).
+  bool gemvKSplit = true;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -83,6 +85,8 @@ struct SAOptions {
                                            "comma-separated) on the host (testing)."));
     binder.opt<int>("iree-sa-gemv-ports", gemvPorts, llvm::cl::cat(category),
                     llvm::cl::desc("Read ports of the streaming GEMV unit (K2b; 0: none): decode's linear layers use it."));
+    binder.opt<bool>("iree-sa-gemv-k-split", gemvKSplit, llvm::cl::cat(category),
+                     llvm::cl::desc("Decode's GEMV over a K beyond 4080 in K blocks (WP6; false: such layers on EX)."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -98,6 +102,7 @@ getSAExecutableTarget(MLIRContext *context, const SAOptions &options) {
   tc.spadBytes = int64_t(options.spadKB) << 10;
   tc.accBytes = int64_t(options.accKB) << 10;
   tc.gemvPorts = options.gemvPorts;
+  tc.gemvKSplit = options.gemvKSplit;
   tc.addTo(b, config);
   return b.getAttr<IREE::HAL::ExecutableTargetAttr>(
       b.getStringAttr("sa"), b.getStringAttr("sa-desc-v1"),

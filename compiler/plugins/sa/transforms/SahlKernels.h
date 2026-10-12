@@ -148,7 +148,8 @@ class KernelMatcher {
   // decode's K the GEMV unit holds beyond the EX schedule's (K blocks of at most
   // 4080, expandLinear): x packed in SPAD_A, an int32 x in the ACC scratch's bank
   bool gemvHolds(int64_t k) const {
-    return cfg.gemvPorts && k % d == 0 && k / d <= 2 * int64_t(lay.sbank) && lay.acc0 + k / d + 2 <= lay.cbank;
+    return cfg.gemvPorts && cfg.gemvKSplit && k % d == 0 && k / d <= 2 * int64_t(lay.sbank) &&
+           lay.acc0 + k / d + 2 <= lay.cbank;
   }
   bool matchAttention(linalg::BatchMatmulOp bmm);
   bool matchContraction(linalg::LinalgOp op);
