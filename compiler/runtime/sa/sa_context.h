@@ -153,8 +153,10 @@ iree_status_t sa_context_batch_flush(sa_context_t* context);
 void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, uint32_t cycles, uint64_t host_ns,
                                const sa_completion_t* done);
 // Prints the profile (sorted by device cycles) to |f| (a FILE*); per_step
-// divides the totals (e.g. by the number of tokens). No-op without SA_PROFILE.
-void sa_context_profile_report(void* f, double per_step);
+// divides the totals (e.g. by the number of tokens); |label| names the section
+// of the SA_PROFILE_PERF csv. No-op without SA_PROFILE. Host fallbacks are
+// recorded as "host:<export>" (no cycles; host_ns their time on the CPU).
+void sa_context_profile_report(void* f, double per_step, const char* label);
 // Totals since the last reset: dispatches, device cycles, host ns.
 void sa_context_profile_totals(uint64_t* dispatches, uint64_t* cycles, uint64_t* host_ns);
 void sa_context_profile_reset(void);

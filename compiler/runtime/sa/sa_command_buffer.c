@@ -215,11 +215,22 @@ static iree_status_t sa_command_buffer_dispatch_host(sa_command_buffer_t* cb, ir
   if (local_size) {
     IREE_RETURN_IF_ERROR(iree_allocator_malloc(cb->host_allocator, local_size, (void**)&local_memory.data));
   }
+  uint64_t t0 = iree_time_now();
   iree_fpu_state_t fpu = iree_fpu_state_push(IREE_FPU_STATE_FLAG_FLUSH_DENORMALS_TO_ZERO);
   iree_status_t status = iree_hal_local_executable_issue_dispatch_inline(le, ordinal, &state, 0, local_memory);
   iree_fpu_state_pop(fpu);
+  uint64_t host_ns = (uint64_t)(iree_time_now() - t0);
   if (local_memory.data) iree_allocator_free(cb->host_allocator, local_memory.data);
   cb->context->host_dispatches++;
+  if (iree_status_is_ok(status)) {     // the profile row: "host:<export>"
+    iree_hal_executable_export_info_t info;
+    memset(&info, 0, sizeof(info));
+    iree_status_ignore(iree_hal_executable_export_info(executable, ordinal, &info));
+    char name[96] = "host:";
+    size_t n = info.name.size < sizeof(name) - 6 ? info.name.size : sizeof(name) - 6;
+    memcpy(name + 5, info.name.data, n);
+    sa_context_profile_record(cb->context, iree_make_string_view(name, 5 + n), 0, host_ns, NULL);
+  }
   return status;
 }
 

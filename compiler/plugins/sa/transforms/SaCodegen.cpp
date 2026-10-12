@@ -17,6 +17,13 @@
 namespace mlir::iree_compiler::sa {
 namespace {
 
+// One line of --iree-sa-codegen-report, written at once: executables compile
+// in parallel and llvm::errs() is unbuffered (piecewise << interleaves lines).
+void reportLine(StringRef name, const std::string& what) {
+  std::string line = ("sa codegen: " + name + ": " + what + "\n").str();
+  llvm::errs() << line;
+}
+
 struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL::ExecutableVariantOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SaCodegenPass)
   explicit SaCodegenPass(bool allowUnsupported = false, std::string ukernels = "all", bool report = false,
@@ -118,10 +125,10 @@ struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL
         if (!ok && !why2.empty()) why = why2;
       }
       if (ok) {
-        if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": ok\n";
+        if (report) reportLine(exportOp.getSymName(), "ok");
         continue;
       }
-      if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": failed (" << why << ")\n";
+      if (report) reportLine(exportOp.getSymName(), "failed (" + why + ")");
       if (hostFallback) {
         // the runtime takes the host (VMVX) variant: this one's condition is false
         if (!variant.getConditionOp()) {
@@ -131,7 +138,7 @@ struct SaCodegenPass : public PassWrapper<SaCodegenPass, OperationPass<IREE::HAL
           Value no = arith::ConstantIntOp::create(rb, variant.getLoc(), 0, 1);
           IREE::HAL::ReturnOp::create(rb, variant.getLoc(), ValueRange{no});
         }
-        if (report) llvm::errs() << "sa codegen: " << exportOp.getSymName() << ": on the host (" << why << ")\n";
+        if (report) reportLine(exportOp.getSymName(), "on the host (" + why + ")");
       } else if (!allowUnsupported) {
         auto diag = func.emitError() << "sa target: cannot compile dispatch '" << exportOp.getSymName()
                                      << "': " << why;

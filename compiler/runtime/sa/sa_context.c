@@ -515,7 +515,7 @@ static int sa_profile_cmp(const void* a, const void* b) {
   return x->cycles < y->cycles ? 1 : x->cycles > y->cycles ? -1 : 0;
 }
 
-void sa_context_profile_report(void* fp, double per_step) {
+void sa_context_profile_report(void* fp, double per_step, const char* label) {
   if (!sa_profile_enabled() || sa_profile_n <= 0) return;
   FILE* f = (FILE*)fp;
   qsort(sa_profile, (size_t)sa_profile_n, sizeof(sa_profile[0]), sa_profile_cmp);
@@ -529,13 +529,15 @@ void sa_context_profile_report(void* fp, double per_step) {
   }
   fprintf(f, "%-58s %8.1f %12.0f %8s %10.1f   (per step)\n", "total", n / per_step, cyc / per_step, "",
           ns / per_step / 1e3);
-  // SA_PROFILE_PERF=<file>: the raw sums (not divided) with the event counters,
-  // one section per report (prefill chunks, then decode steps)
+  // SA_PROFILE_PERF=<file>: the raw sums (not divided), with the event
+  // counters on the board, one section per report (prefill chunks, then
+  // decode steps; the label names it); host fallbacks are the "host:" rows
   const char* path = getenv("SA_PROFILE_PERF");
-  if (path && sa_profile_perf_n) {
+  if (path) {
     FILE* c = fopen(path, sa_profile_section++ ? "a" : "w");
     if (c) {
-      fprintf(c, "# section %d per_step %.3f\nexport,calls,cycles,host_ns", sa_profile_section - 1, per_step);
+      fprintf(c, "# section %d %s per_step %.3f\nexport,calls,cycles,host_ns", sa_profile_section - 1,
+              label ? label : "-", per_step);
       for (uint32_t k = 0; k < sa_profile_perf_n; ++k) fprintf(c, ",c%u", k);
       fprintf(c, "\n");
       for (int i = 0; i < sa_profile_n; ++i) {
