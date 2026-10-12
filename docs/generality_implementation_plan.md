@@ -610,6 +610,31 @@ decode 现在 GEMV 占设备时间的 80%（111.4 ms，峰值的 93%）；通用
 
 **编译器/模型消融**：自量化→外部 W8A8、K 分块关→开、prefill 逐行关→开、host fallback→accelerator；列质量、覆盖率、周期、token/s 和内存峰值。K 分块不重复填写相同硬件资源。
 
+**硬件消融（第一版，2026-10-12）**：同一套手写路径的测试（`c6p_*`、hfgen，staging 时的编译器），每个 overlay 自己的构建，板上 logits 都与 sim 逐位一致；decode 为 `board_llm.py` 每步墙钟（tok/s）。资源与时序来自 `boards/kv260/README.md` 的构建表，GEMV 带宽来自 bwtest（64 KB，x 驻留）。
+
+| overlay | Qwen3-0.6B | SmolLM2-135M | SmolLM2 hfgen | stories15M | GEMV B/cycle | LUT | FF | BRAM36 | DSP | WNS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| EX（`p6_red`） | 2.22 | 7.71 | 7.62 | 61.9 | —（LD 15.70） | 88,250（75.4%） | 60,823 | 130 | 347 | +0.123 |
+| GEMV 1 口（`_gemv`） | 2.28 | 8.21 | 8.34 | 68.07 | 15.60 | 92,329（78.8%） | 61,566 | 132 | 349 | +0.274 |
+| GEMV 2 口（`_gemv_np2`） | 3.98 | 12.58 | 12.73 | 100.8 | 30.55 | 96,294（82.2%） | 63,675 | 134 | 349 | +0.138 |
+| GEMV 4 口（`_gemv_np4`） | **6.28** | **17.04** | **17.19** | **131.65** | 57.95 | 101,878（87.0%） | 67,688 | 138 | 349 | +0.168 |
+
+- 1 口 GEMV 与 EX 的 LD 带宽相同（约 15.6 B/cycle），decode 只快 3–10%（省掉 SPAD_B 往返和 EX 的流水）；收益来自口数：2 口 ×1.8、4 口 ×2.8（Qwen3）。4 口的代价：比 EX 多 13.6k LUT、6.9k FF、8 个 BRAM36、2 个 DSP。
+- 其他 bitstream 特性（Qwen3，手写路径）：P6 批量 SFU prefill 11.4 → 14.0 tok/s；批量 REDUCE prefill → 15.45 tok/s（LUT 72.1% → 75.4%）；decode 不变（2.20–2.22）。
+
+**编译器 / 模型消融（第一版，2026-10-12）**：同一硬件（4 口 overlay）、同一模型，只改编译器或前端的一项；除质量外都是板上实测，逐位一致的项注明。
+
+| 项 | 模型 | 关 | 开 | 说明 |
+|---|---|---:|---:|---|
+| 自量化 → 外部 W8A8（llm-compressor） | SmolLM2（主机，SA 形式，2048 token） | PPL 30.77，top-1 83.9% | PPL 28.77，top-1 87.1% | §7；KL 0.138 → 0.074 |
+| KV 按层 → K 按通道（+1024 token 校准） | Qwen3（主机，2048 token） | PPL 53.50，top-1 71.5% | PPL 39.14，top-1 87.4% | §8；板上 39.62 / 86.9% |
+| 主机回退 → 加速器（prefill 逐行注意力） | SmolLM2 hfgen | prefill 14.20 tok/s，1440 个主机 dispatch | 27.18 tok/s，0 个 | §7；list 1465 → 37 |
+| K 分块（`--iree-sa-gemv-k-split`） | Llama-3.2-1B | decode 1.40 tok/s | **4.03 tok/s（×2.89）** | §10；logits 逐位相同 |
+| V 投影 int8 结果走 GEMV（`14f5612`） | Qwen3 | decode 4.74 tok/s | 5.60 tok/s | §13.1；逐位相同 |
+| attention 按实际长度（`1860823`） | Qwen3 | decode 5.60 / prefill 11.15 tok/s | **6.88 / 20.53 tok/s** | §13.1；2048 位置 teacher forcing 逐位相同 |
+
+通用前端的 Qwen3 decode（6.88 tok/s）现在高于手写路径在同一 overlay 上的 6.28。
+
 ## 14. 时间表与停止条件
 
 | 日期 | 目标 | 停止条件 / 降级动作 |
