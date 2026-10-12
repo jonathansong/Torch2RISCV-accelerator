@@ -508,6 +508,7 @@ Llama-3.2-1B-Instruct-W8A8（compressed-tensors，16 层，GQA 32/8，K=8192 的
 - 板上：17/17 步 logits 与 sim 逐位一致，生成 token 相同，0 个 host dispatch；**prefill 9.38 tok/s（40 token 4264 ms，含首块加载），decode 3.50 tok/s（286 ms/步）**。
 - decode 与带宽模型一致：约 1.18 GB 参数 / 57.95 B/cycle（100 MHz）≈ 214 ms，加上固定开销约 70 ms。
 - **之后（2026-10-12，V 投影走 GEMV `14f5612` + attention 按实际长度 `1860823`）**：板上 17/17 逐位一致，**decode 4.03 tok/s（248.1 ms/步，设备 243.6 ms，GEMV 226 ms = 92.6%，54.7 B/cycle）**，prefill 12.62 tok/s（`board_llm.py`，含首块加载；batched 每块 1066 ms，15.21 tok/s，prefill 中 matmul 占 73%）。K 分块开 / 关的对比见 §10。
+- **K per-channel KV 重建（2026-10-12/13，`build/hfgen/llama1b_kch` → `build/deploy_hfgen_llama1b_kch`）**：原板上构建用按层 KV、约 45 token 的 `CALIB` 校准，与 Qwen3 / SmolLM2 的 WP4 做法不一致；重建用 `--kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024`（导出 330 s，715 个 executable 全在加速器，`sa_packed.irpa` 1240 MB）。sim：teacher forcing 40 个位置与 fp32 top-1 一致 35/40（torch W8A8 也是 35/40），prefill 与只 decode 5/5 行逐位相同；qemu aarch64 3/3。板上 PASS：17/17 逐位一致、0 个主机 dispatch，board_llm decode 4.03 tok/s（248.4 ms/步）、prefill 12.58 tok/s（含加载）；batched decode 247.6 ms/步（**4.04 tok/s**，设备 243.9 ms、runtime 其余 3.6 ms），prefill 每块 1068.9 ms（**14.97 tok/s**），设备内存峰值 1189.8 / 1202.9 MB；逐 dispatch：decode GEMV 226.5 ms（92.5%，1238.8 MB，54.7 B/周期 = 94%），prefill matmul 72.5%、阵列 200 MAC/周期（78%）。速度与按层构建相同（只改 KV scale）。质量（主机 2048 token，`build/quality/llama1b_2048_*.json`，板上内存放不下 prefill_all）：fp32 PPL 22.77；**ct-sa:kch PPL 23.33、top-1 90.7%、相关 0.991、KL 0.036**。
 - 默认 prompt 是 SmolLM2 的 token id，对 Llama 无意义，生成文本只用于逐位比对，不代表质量；质量以 teacher-forced 指标为准。
 - 测试内存：同一时间只保留一个 fp32 模型（关 autograd、del 后 gc.collect），峰值 7.1 GB。
 
@@ -605,23 +606,23 @@ decode 现在 GEMV 占设备时间的 80%（111.4 ms，峰值的 93%）；通用
 |---|---|---|---|---|---:|---:|---:|---:|
 | Qwen3-0.6B | 外部 W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 39.62（fp32 39.21），top-1 86.9% | 100% / 100% / 100% | 6.88 tok/s | 20.53 tok/s | GEMV 93%（decode 4.37 GB/s 平均） | 590 / 613 MB |
 | SmolLM2-135M | llm-compressor W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 28.55（fp32 26.98），top-1 86.5% | 100% / 100% / 100% | 22.17 tok/s | 60.09 tok/s | GEMV 82%（decode 3.58 GB/s 平均） | 135 / 150 MB |
-| Llama-3.2-1B | RedHatAI W8A8（ct） | 板上 17/17 逐位一致 | （主机 2048-token 评估待跑） | 100% / 100% / 100% | 4.03 tok/s | 15.21 tok/s | GEMV 94%（decode 5.08 GB/s 平均） | 1190 / 1203 MB |
+| Llama-3.2-1B | RedHatAI W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 23.33（fp32 22.77），top-1 90.7%（主机 2048-token 评估；内存不够板上 prefill_all） | 100% / 100% / 100% | 4.04 tok/s | 14.97 tok/s | GEMV 94%（decode 5.08 GB/s 平均） | 1190 / 1203 MB |
 | Gemma-3-270M | 自量化 / llm-compressor | | | | | | | |
 
-**主表分项（2026-10-12，板上，四口 overlay）**：分类时间来自逐 dispatch 计时（`board_profile.py 40 --prompt 32 SA_PROFILE_PERF=...csv` → `dispatch_stats.py`，每个 dispatch 一个 list），每步总时间、设备时间、runtime 其余来自 batched 实测（`--batch`），两者设备时间差约 1%；逐 dispatch 模式的提交时间被放大（每步 90–270 ms），不列。数据：`build/deploy_hfgen_{qwen3_dyn,smollm2_kch_dyn,llama1b_dyn}/` 的 `stats_*.json` / `prof_llama_*.json`。
+**主表分项（2026-10-12，板上，四口 overlay）**：分类时间来自逐 dispatch 计时（`board_profile.py 40 --prompt 32 SA_PROFILE_PERF=...csv` → `dispatch_stats.py`，每个 dispatch 一个 list），每步总时间、设备时间、runtime 其余来自 batched 实测（`--batch`），两者设备时间差约 1%；逐 dispatch 模式的提交时间被放大（每步 90–270 ms），不列。数据：`build/deploy_hfgen_{qwen3_dyn,smollm2_kch_dyn,llama1b_kch}/` 的 `stats_*.json` / `prof_llama_*.json`。
 
 decode 每步：
 
 | | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B |
 |---|---:|---:|---:|
-| 每步（batched） | 145.4 ms | 45.1 ms | 248.1 ms |
-| 　设备 / runtime 其余 | 136.9 / 6.9 ms | 38.64 / 6.45 ms | 243.6 / 4.5 ms |
+| 每步（batched） | 145.4 ms | 45.1 ms | 247.6 ms |
+| 　设备 / runtime 其余 | 136.9 / 6.9 ms | 38.64 / 6.45 ms | 243.9 / 3.6 ms |
 | dispatch（主机） | 1046（0） | 1000（0） | 538（0） |
-| **GEMV**（matvec_like） | 111.4 ms（80%） | 28.6 ms（71%） | 226.4 ms（93%） |
+| **GEMV**（matvec_like） | 111.4 ms（80%） | 28.6 ms（71%） | 226.5 ms（93%） |
 | 　GEMV 带宽（峰值 57.95 B/周期） | 53.7（93%） | 47.4（82%） | 54.7（94%） |
 | attention（batch_matmul） | 11.8 ms（8%） | 4.0 ms（10%） | 6.9 ms（3%） |
-| reduction（norm、softmax） | 8.0 ms（6%） | 4.0 ms（10%） | 6.5 ms（3%） |
-| elementwise 类 | 7.4 ms（5%） | 3.6 ms（9%） | 4.5 ms（2%） |
+| reduction（norm、softmax） | 8.0 ms（6%） | 4.0 ms（10%） | 6.7 ms（3%） |
+| elementwise 类 | 7.4 ms（5%） | 3.6 ms（9%） | 4.6 ms（2%） |
 | scatter（写 KV） | 0.3 ms | 0.3 ms | 0.2 ms |
 | DDR 读 | 607 MB，4.37 GB/s | 138 MB，3.42 GB/s | 1243 MB，5.08 GB/s |
 
@@ -629,14 +630,14 @@ prefill 每 16-token chunk：
 
 | | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B |
 |---|---:|---:|---:|
-| 每块（batched） | 773 ms | 266.3 ms | 1066 ms |
+| 每块（batched） | 773 ms | 266.3 ms | 1068.9 ms |
 | dispatch（主机） | 6390（0） | 4924（0） | 2642（0） |
 | **GEMM**（matmul_like） | 402.0 ms（51%） | 132.1 ms（48%） | 779.0 ms（73%） |
 | 　阵列利用率（峰值 256 MAC/周期） | 175（68%） | 129（50%） | 200（78%） |
 | 逐行 attention（batch_matmul） | 145.4 ms（18%） | 50.7 ms（18%） | 88.7 ms（8%） |
-| reduction | 124.5 ms（16%） | 57.2 ms（21%） | 105.9 ms（10%） |
-| elementwise 类 | 81.2 ms（11%） | 26.3 ms（10%） | 49.4 ms（5%） |
-| GEMV（lm_head，最后一行） | 27.6 ms（4%） | 5.2 ms（2%） | 45.5 ms（4%） |
+| reduction | 124.5 ms（16%） | 57.2 ms（21%） | 108.3 ms（10%） |
+| elementwise 类 | 81.2 ms（11%） | 26.3 ms（10%） | 50.1 ms（5%） |
+| GEMV（lm_head，最后一行） | 27.6 ms（4%） | 5.2 ms（2%） | 45.6 ms（4%） |
 | scatter | 6.0 ms | 4.8 ms | 2.7 ms |
 
 - decode 基本是带宽受限的 GEMV（Llama 93%、Qwen3 80%），剩下的固定部分主要是 attention 与 norm；SmolLM2 层内矩阵只有 576 宽，GEMV 命令的固定开销占比高（82%）。
