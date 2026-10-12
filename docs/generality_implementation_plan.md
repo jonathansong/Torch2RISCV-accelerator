@@ -537,11 +537,31 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 
 若 host 与 accelerator 可能异步重叠，分别报告两侧时间，并额外使用端到端墙钟作为总时间；不直接相加。
 
+**实现（2026-10-12，d9fea48、f85482e、14f5612）**：
+
+- 运行时：host fallback 记为 `host:<export>` 行（CPU ns）；`SA_PROFILE_PERF` csv 按段（prefill / decode）输出，sim 上也写；profile 表 4096 个 export（Qwen3 prefill 约 2800 个，原 512 截断了逐行 attention）。
+- `compiler/tests/dispatch_stats.py`：按类别统计调用、周期、MAC（由 dispatch 名的循环范围）、LD/ST 字节，动态 / 时间 / MAC 覆盖率；`--report`（`--iree-sa-codegen-report`）给静态覆盖与回退原因分类（forced / 内存容量 / 硬件原语 / lowering）。
+- 板上 teacher forcing：导出 `prefill_all`（`--prefill-all`，每个位置的 logits，与仅 decode 逐位一致），`sa-llm-run --prefill_all_out`，`board_teacher.py`（板上）+ `board_quality.py prep / sim / score`（主机：fp32 参考、PPL、top-1、参考 top-64 上的 KL）。
+
+**Qwen3-0.6B 板上结果**（通用前端，W8A8 + K per-channel KV，4 口 overlay；1140 个可执行全部在加速器上）：
+
+- 质量（WikiText-2 test 8 窗口 × 256，teacher forcing）：板上 PPL 39.62（fp32 39.21），top-1 86.9%，KL 0.053（top-64 覆盖参考 87.8% 质量）；主机 ct-sa:kch 39.14 / 87.4% / 0.054，板上与主机模型一致。
+- decode 每步（batched）：设备 175.0 ms，runtime 其余 3.4 ms —— **固定开销在设备上，不在主机**。V 投影修复（14f5612：decode 的 V 投影直接量化进 KV cache，int8 结果原先不被 matchLinear 接受，落到 EX 通用路径，每层 136k 周期 vs 同形状 K 投影 17.6k）后 211.1 → 178.4 ms/step（4.74 → 5.60 tok/s），17/17 逐位一致。
+
+| decode 类别（修复后） | 周期占比 | ms/步 | 备注 |
+|---|---:|---:|---|
+| matvec（权重 GEMV，含 lm_head 27.6 ms） | 63.0% | 111.4 | 读 598 MB，53.7 B/cycle = GEMV 峰值 57.95 的 93%；带宽下限约 103 ms |
+| batch_matmul（attention） | 26.3% | 46.5 | 按静态 T=256 计算，与位置无关 |
+| reduction / elementwise / 其他 | 10.7% | 18.7 | RMSNorm、RoPE、softmax、量化 |
+
+- prefill 每 16-token chunk 1.44 s（11.15 tok/s，batched 142.8M 周期）：逐行 attention（batch_matmul，56 个 export × 16 行）51.7%，matmul 27.9%，reduction 12.5%。**prefill 的下一步是 attention，不是 GEMM。**
+- 下一步候选（§16 决策用）：decode attention 按实际长度而非静态 T（≤46 ms）；prefill attention 按块而非逐行；GEMV 已接近带宽上限。
+
 ### 13.2 最终主表
 
 | 模型 | 权重来源 | 正确性 | 质量 | 动态/时间/MAC覆盖率 | decode | prefill | 带宽利用率 | 内存峰值 |
 |---|---|---|---|---|---:|---:|---:|---:|
-| Qwen3-0.6B | 自量化 / 外部 W8A8 | | | | | | | |
+| Qwen3-0.6B | 外部 W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 39.62（fp32 39.21），top-1 86.9% | 100% / 100% / 100% | 5.60 tok/s | 11.15 tok/s | GEMV 93%（decode 3.50 GB/s 平均） | 590 / 613 MB |
 | SmolLM2-135M | llm-compressor | | | | | | | |
 | Llama-3.2-1B | RedHatAI W8A8 | | | | | | | |
 | Gemma-3-270M | 自量化 / llm-compressor | | | | | | | |
