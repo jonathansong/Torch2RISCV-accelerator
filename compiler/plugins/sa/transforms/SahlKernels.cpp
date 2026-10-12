@@ -718,9 +718,10 @@ bool KernelMatcher::matchLinear(linalg::GenericOp con) {
     if (auto s = dyn_cast<sahl::StoreOp>(u); s && s.getSrc() == out && !p.store) p.store = s;
     else if (!isa<memref::DeallocOp>(u)) return false;
   }
-  // the result: fp32, or (prefill's rows) int8 ending in to_i8 (the KV cache's rows)
+  // the result: fp32, or int8 ending in to_i8 (the KV cache's rows: prefill's,
+  // and decode's V projection quantized straight into the cache)
   Type oet = cast<MemRefType>(out.getType()).getElementType();
-  if (!p.store || !(oet.isF32() || (rows4 && oet.isInteger(8)))) return false;
+  if (!p.store || !(oet.isF32() || oet.isInteger(8))) return false;
   SmallVector<Operation *> cover = {con, fill, e, p.store, lx, lw};
   cover.append(xOps.begin(), xOps.end());
   for (int i = 0; i < e.getNumDpsInputs(); ++i) {

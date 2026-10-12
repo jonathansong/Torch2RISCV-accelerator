@@ -464,8 +464,11 @@ typedef struct sa_profile_entry_t {
 } sa_profile_entry_t;
 static uint32_t sa_profile_perf_n;         // counters seen (0: none)
 static int sa_profile_section;
-static sa_profile_entry_t sa_profile[512];
+// (Qwen3's prefill alone has ~2800 exports: the row attention's and the KV scatters)
+#define SA_PROFILE_MAX 4096
+static sa_profile_entry_t sa_profile[SA_PROFILE_MAX];
 static int sa_profile_n = -1;              // -1: not initialized, -2: disabled
+static uint64_t sa_profile_dropped;        // dispatches of exports beyond the table
 
 static int sa_profile_enabled(void) {
   if (sa_profile_n == -1) sa_profile_n = getenv("SA_PROFILE") ? 0 : -2;
@@ -480,7 +483,10 @@ void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, u
   for (; i < sa_profile_n; ++i)
     if (strlen(sa_profile[i].name) == name.size && !memcmp(sa_profile[i].name, name.data, name.size)) break;
   if (i == sa_profile_n) {
-    if (sa_profile_n == 512) return;
+    if (sa_profile_n == SA_PROFILE_MAX) {
+      sa_profile_dropped++;
+      return;
+    }
     size_t n = name.size < 95 ? name.size : 95;
     memcpy(sa_profile[i].name, name.data, n);
     sa_profile[i].name[n] = 0;
@@ -507,6 +513,7 @@ void sa_context_profile_reset(void) {
   if (sa_profile_n > 0) {
     memset(sa_profile, 0, sizeof(sa_profile));
     sa_profile_n = 0;
+    sa_profile_dropped = 0;
   }
 }
 
@@ -529,6 +536,9 @@ void sa_context_profile_report(void* fp, double per_step, const char* label) {
   }
   fprintf(f, "%-58s %8.1f %12.0f %8s %10.1f   (per step)\n", "total", n / per_step, cyc / per_step, "",
           ns / per_step / 1e3);
+  if (sa_profile_dropped)
+    fprintf(f, "(%llu dispatches of exports beyond the table's %d not counted)\n",
+            (unsigned long long)sa_profile_dropped, SA_PROFILE_MAX);
   // SA_PROFILE_PERF=<file>: the raw sums (not divided), with the event
   // counters on the board, one section per report (prefill chunks, then
   // decode steps; the label names it); host fallbacks are the "host:" rows

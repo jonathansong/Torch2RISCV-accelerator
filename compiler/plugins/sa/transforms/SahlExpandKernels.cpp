@@ -341,8 +341,12 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   const int64_t nch = nt / nc, cb = lay.cbank, oSw = d * nc, oY = d * nc + nc;
   const int64_t wbytes = nc * K * d, fbytes = 4 * nc * d;
   auto la = k->getAttrOfType<BoolAttr>("loop");
-  const bool useLoop = la && la.getValue();
   linalg::GenericOp epi = p.epi;
+  // an int8 result (to_i8 into the KV cache) in SPAD_A: its DDR stride per
+  // chunk (nc x D bytes) is a third one beside the weights' and the fp32
+  // inputs' (LOOP_END has two), so its chunks are written out
+  const bool i8Out = epi && cast<MemRefType>(epi.getDpsInits()[0].getType()).getElementType().isInteger(8);
+  const bool useLoop = la && la.getValue() && !i8Out;
   for (auto &[i, s] : p.whole)
     if (cast<MemRefType>(s.getType()).getRank() != 0) return false;
   if (epi)                                        // every epilogue input of a form written out below
@@ -405,7 +409,7 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   for (int bank = 0; bank < 2; ++bank) {
     const int64_t c = bank * cb;
     acc[bank] = placed({nc, d}, cast<MemRefType>(p.acc.getType()).getElementType(), c);
-    out[bank] = placed({nc, d}, f32, c + oY);
+    out[bank] = i8Out ? e.alloc({nc, d}, i8, "spad_a", "packed") : placed({nc, d}, f32, c + oY);
     for (size_t m = 0; m < p.chunked.size(); ++m) {
       Type et = cast<MemRefType>(epi.getDpsInputs()[p.chunked[m].first].getType()).getElementType();
       cols[bank].push_back(placed({nc, d}, et, c + slot(m)));
