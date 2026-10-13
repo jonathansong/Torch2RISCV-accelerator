@@ -16,7 +16,9 @@
 # from the runtime binaries and the overlay.
 #   stage_runtime <dir> [program ...]  build the runtime for the board, copy stripped programs
 #                                      (default sa-llm-run) into <dir>
-#   stage_overlay <dir>                copy picorv32.bit / .hwh into <dir>
+#   stage_overlay <dir>                copy picorv32.bit / .hwh into <dir>, then stage_version
+#   stage_version <dir>                write <dir>/VERSION: what the board results trace back to
+#                                      (generality plan WP0; board_run.py files the results by it)
 SA_BOARD=${SA_BOARD:-kv260}
 case "$SA_BOARD" in
   kv260)   SA_RT_ARCH=aarch64; SA_KV260_CONFIG=${SA_KV260_CONFIG:-d8_100mhz}
@@ -70,4 +72,31 @@ stage_overlay() {
     [ -f "$SA_BIT_DIR/$f" ] || { echo "$SA_BIT_DIR/$f missing ($SA_BOARD overlay)" >&2; exit 1; }
     cp "$SA_BIT_DIR/$f" "$d/"
   done
+  stage_version "$d"
+}
+
+# VERSION: commit (dirty: uncommitted changes under compiler / rtl / firmware / driver),
+# overlay (configuration, bitstream hash, its build_info.txt: commit, Vivado, WNS), the
+# compiler (IREE revision, D, GEMV ports), the model's build (a test_hf_generic bundle's
+# build_info.txt), the run parameters (prompt token IDs, sa_args.txt, board.txt). The
+# results directory: results/<commit>/<test>/<overlay configuration>/<mode>/ (board_run.py).
+stage_version() {
+  local d=$1 bi
+  {
+    echo "commit $(git -C "$SA_REPO" rev-parse HEAD)$(git -C "$SA_REPO" diff --quiet HEAD -- compiler rtl firmware driver || echo ' (dirty)')"
+    echo "staged $(date -Iseconds)"
+    echo "test $(basename "$d" | sed 's/^deploy_//')"
+    echo "bitstream $(sha256sum "$d/picorv32.bit" | cut -c1-16) (${SA_BIT_DIR#$SA_REPO/})"
+    echo "board $SA_BOARD (runtime $SA_RT_ARCH), D = $SA_D, GEMV ports $SA_GEMV_PORTS"
+    echo "iree $IREE_REV"
+    bi=$SA_BIT_DIR/build_info.txt
+    [ -f "$bi" ] && sed 's/^/overlay /' "$bi"
+    [ -f "$d/build_info.txt" ] && sed 's/^/model /' "$d/build_info.txt"
+    [ -f "$d/prompt.npy" ] && echo "prompt $("$SA_PY" -c 'import numpy, os, sys
+p = numpy.load(sys.argv[1] + "/prompt.npy"); e = sys.argv[1] + "/expected_tokens.npy"
+print(",".join(map(str, p)) + (f" (generate {len(numpy.load(e)) - len(p)})" if os.path.exists(e) else ""))' "$d")"
+    [ -f "$d/sa_args.txt" ] && echo "sa_args $(cat "$d/sa_args.txt")"
+    [ -f "$d/board.txt" ] && echo "window $(cat "$d/board.txt")"
+  } > "$d/VERSION"
+  cp "$SA_COMPILER/tests/board_run.py" "$d/"
 }

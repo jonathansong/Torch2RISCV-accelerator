@@ -225,6 +225,11 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   compiler/scripts/deploy_hfgen.sh                     # board bundle build/deploy_hfgen (board_llm.py)
   ```
 
+  Every bundle carries `VERSION` (commit, overlay, compiler, run parameters).
+  On the board, `python3 board_run.py llm|teacher|profile|generate [args]`
+  runs the script and files its log and outputs under
+  `results/<commit>/<test>/<overlay>/<mode>/` (docs/generality_implementation_plan.md §4).
+
 - **Host fallback done** (docs/iree_compiler_plan.md §8.15): a dispatch the
   sa backend cannot compile runs on the ARM host (IREE's VMVX, no LLVM
   toolchain needed), the rest on the accelerator, in one command buffer.

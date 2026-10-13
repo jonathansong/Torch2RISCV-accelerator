@@ -292,6 +292,12 @@ def stage(args, prompt, run):
     np.save(os.path.join(dst, "expected_logits.npy"), logits.astype(np.float32))
     shutil.copy(os.path.join(args.model, "tokenizer.json"), os.path.join(dst, "tokenizer.json"))
     shutil.copy(os.path.join(COMPILER, "frontend", "hf_tokenizer.py"), os.path.join(dst, "hf_tokenizer.py"))
+    with open(os.path.join(dst, "build_info.txt"), "w") as f:     # (stage_version's "model" lines: WP0)
+        git = lambda *a: subprocess.run(["git", "-C", COMPILER, *a], capture_output=True, text=True)   # noqa: E731
+        dirty = git("diff", "--quiet", "HEAD", "--", ".").returncode != 0
+        f.write(f"commit {git('rev-parse', 'HEAD').stdout.strip()}{' (dirty)' if dirty else ''}\n"
+                f"built {time.strftime('%Y-%m-%dT%H:%M:%S')}, SA_D={D} SA_GEMV_PORTS={os.environ.get('SA_GEMV_PORTS', '0')}\n"
+                f"command {' '.join(sys.argv[1:])}\n")
     with open(os.path.join(dst, "sa_args.txt"), "w") as f:
         f.write(" ".join(ABI) + f" --prefill={args.prefill}\n")
     # the window: the runtime's peak is the packed parameters + the int8 KV
