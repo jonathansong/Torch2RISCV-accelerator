@@ -13,7 +13,7 @@ the host side of board_teacher.py.
          sa-llm-run, x86), for a check before the board
 
     compiler/tests/board_quality.py prep --model build/llm_cache/Qwen3-0.6B --bundle <dir> [--tokens 2048 --window 256 --k 64]
-    compiler/tests/board_quality.py sim --bundle <dir> [--windows N]      (on the host: the sim)
+    compiler/tests/board_quality.py sim --bundle <dir> [--windows N] [--decode]   (on the host: the sim)
     compiler/tests/board_quality.py score --bundle <dir> [--json out.json]
 """
 import argparse
@@ -75,6 +75,8 @@ def sim(args):
     W, L = wins.shape
     mb = int(open(os.path.join(b, "board.txt")).read().split()[-1])
     extra = open(os.path.join(b, "sa_args.txt")).read().split()
+    decode = args.decode or not any(a.startswith("--prefill=") for a in extra)
+    from board_teacher import run_args
     d = os.environ.get("SA_D", "16")
     repo = os.path.abspath(os.path.join(HERE, "..", ".."))
     run = os.path.join(repo, "build/iree/build-sa-host/runtime/plugins/hal/drivers/sa/sa-llm-run")
@@ -89,8 +91,8 @@ def sim(args):
                                stderr=subprocess.DEVNULL)
         time.sleep(3)
         r = subprocess.run([run, "--device=sa", f"--module={b}/sa.vmfb", f"--parameters=model={b}/sa_packed.irpa",
-                            "--tokens=" + ",".join(map(str, wins[w])), "--generate=0", f"--prefill_all_out={out}"]
-                           + extra, capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
+                            "--tokens=" + ",".join(map(str, wins[w])), "--generate=0"]
+                           + run_args(extra, L, decode, out), capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
         srv.wait(timeout=120)
         if r.returncode:
             print(r.stderr[-3000:])
@@ -100,10 +102,11 @@ def sim(args):
         argmax[w] = lg.argmax(1)
         lp_k[w] = np.take_along_axis(lp, topk[w].astype(np.int64), 1)
         nll[w] = -lp[np.arange(L - 1), wins[w, 1:]]
-        print(f"window {w + 1}/{W} (sim)", flush=True)
+        print(f"window {w + 1}/{W} (sim{', decode' if decode else ''})", flush=True)
     os.remove(out)
-    np.savez(os.path.join(b, "tf_sim.npz"), argmax=argmax, nll=nll, lp_topk=lp_k)
-    print(f"-> {b}/tf_sim.npz (score --which sim)")
+    name = args.out or "tf_sim.npz"
+    np.savez(os.path.join(b, name), argmax=argmax, nll=nll, lp_topk=lp_k)
+    print(f"-> {b}/{name} (score --which {name[3:-4]})")
     return 0
 
 
@@ -141,6 +144,8 @@ def main():
     ap.add_argument("--layers", type=int, help="prep: a truncated reference (a --layers test model)")
     ap.add_argument("--windows", type=int, default=None, help="sim: only the first windows")
     ap.add_argument("--which", default="board", help="score: board / sim")
+    ap.add_argument("--decode", action="store_true", help="sim: token by token through decode (board_teacher.py --decode)")
+    ap.add_argument("--out", help="sim: the result's file name in the bundle (default tf_sim.npz)")
     ap.add_argument("--json")
     args = ap.parse_args()
     return {"prep": prep, "sim": sim, "score": score}[args.cmd](args)
