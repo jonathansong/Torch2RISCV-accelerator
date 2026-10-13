@@ -217,7 +217,29 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   SmolLM2-135M, Llama-3.2-1B and Gemma-3-270M run whole on the board through
   this path, 100% of the dispatches on the accelerator, bit-exact with the sim;
   the attention probabilities are quantized unnormalized and renormalized by
-  their int8 sum (qsum, §12.4: board KL -25..-31% at unchanged speed).
+  their int8 sum (qsum, §12.4: board KL -14..-31% at unchanged speed).
+  Board (four-port overlay `d16_100mhz_w128_p6_gemv_np4`), decode / prefill
+  tok/s and board teacher-forcing PPL (fp32): SmolLM2-135M 22.12 / 60.50,
+  28.26 (26.98); Gemma-3-270M 14.95 / 62.62, 142.83 (123.76); Qwen3-0.6B
+  6.96 / 20.79, 39.68 (39.21); Llama-3.2-1B 4.04 / 15.07, 23.20 (22.77).
+  Tools of the generality plan (all under `tests/` unless noted):
+  `test_hf_generic.py` (`--quant --rope --attn --prefill 16 [--prefill-all]
+  --kv-channel k --kv-calib FILE:1024 [--max-len T] [--layers N]
+  [--board-bundle DIR]`; needs `SA_D=16 SA_GEMV_PORTS=4`; `--skip-export`
+  also skips the compile, so large models are compiled with
+  `scripts/compile_sa.sh` on their own, which reads the export's
+  `compile_flags.txt`, e.g. `--iree-sa-max-dynamic=<T>` for `--max-len` above
+  256); `HFGEN_TAG=<tag> HFGEN_BUNDLE=<bundle> scripts/deploy_hfgen.sh`;
+  `frontend/ct_import.py` (compressed-tensors W8A8 checkpoints);
+  `quality_eval.py` (host quality, 2048 WikiText-2 tokens);
+  `board_quality.py prep / sim / score` with `board_teacher.py` on the board
+  (teacher forcing, prefill_all or `--decode` step by step when prefill_all
+  does not fit, Llama-1B); `dispatch_stats.py` (per-dispatch-class time and
+  MACs from a profile CSV); `mem_preflight.py [--t T] [--packed
+  sa_packed.irpa]` (device memory against the 1280 MiB pool);
+  `perf_model.py` (`--whatif`). Context length: the decode attention needs
+  T x head_dim in one SPAD_B bank (T <= 256 for Gemma, 512 for Qwen3, 1024
+  for Llama / SmolLM2) until C6.5 (docs/iree_compiler_plan.md §8.22).
 
   ```sh
   compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)

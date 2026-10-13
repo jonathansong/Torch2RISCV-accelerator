@@ -10,6 +10,12 @@
 > ports (K2b, 64 B/cycle at 100 MHz). Decode on the board, bit-exact with the
 > sim: Qwen3-0.6B 6.28 tok/s (prefill 15.9), SmolLM2-135M 17.0, stories15M
 > 131.7. The accelerator's buffers come from a 1280 MiB pool reserved at boot.
+> Unmodified HuggingFace models now compile whole through the generic path
+> ([generality plan](docs/generality_implementation_plan.md) §13.2), every
+> dispatch on the accelerator, bit-exact with the sim, decode / prefill tok/s:
+> SmolLM2-135M 22.1 / 60.5, Gemma-3-270M 15.0 / 62.6, Qwen3-0.6B 7.0 / 20.8,
+> Llama-3.2-1B 4.0 / 15.1 (public W8A8 checkpoints, int8 KV cache; board
+> perplexity within 1-16% of fp32).
 > The PYNQ-Z1 version is frozen at tag
 > [`v1.0-pynq-z1`](../../tree/v1.0-pynq-z1) (branch `pynq-z1`): stories15M at
 > 17.6 tok/s and SmolLM2-135M (prefill + decode, the hand-written and the
@@ -256,10 +262,10 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 | 3 | End-to-end closed loop, CSR path, hand-written firmware | ✅ board-verified | 522.6 cycles/job; `bitstreams/phase3` |
 | 4 | Custom instructions (PCPI, `.insn`) | ✅ board-verified | 311.9 cycles/job; `bitstreams/phase4` |
 | M1–M4 | Accelerator rebuild: double-buffered systolic array (table below) | ✅ board-verified | `rtl/sysarray`, `bitstreams/m1`–`m4` |
-| 5 | MLIR dialect + instruction-level lowering | ⏳ next | targets `firmware/include/sysarray_intrinsics.h` |
+| 5 | MLIR dialect + instruction-level lowering | ✅ superseded | done as the IREE compiler (`sahl` / `sahw` dialects → descriptor lists, [`compiler/`](compiler/README.md)) instead of `.insn` firmware |
 | 6 | Loose- vs tight-coupling benchmark | 🟡 partial | Phase 3 vs 4 board numbers exist; write-up pending |
 | 7 | Vector unit | ✅ done in M3 | fused int8 epilogue + standalone vector ops |
-| 8 | Auto-tiling + double buffering | 🟡 double buffering done (M1); compiler auto-tiling with Phase 5 | tiling is hand-written in `firmware/gemm` today |
+| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T next (C6.5, [plan §8.22](docs/iree_compiler_plan.md)) |
 | 9 | Documentation and write-up | 🟡 in progress | `docs/` (design doc, learning path) |
 
 The accelerator rebuild replaced the Phase 2–4 unit with a double-buffered

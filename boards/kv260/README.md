@@ -273,6 +273,13 @@ decodes at 143.6 ms/step (6.96 tok/s) and prefills a chunk in 769.7 ms (20.8 tok
 board teacher-forced KL 0.053 -> 0.038; the four-model table is in
 `docs/generality_implementation_plan.md` §13.2.
 
+Bundles staged since 2026-10-13 carry a `VERSION` file (commit, bitstream hash and
+overlay build info, compiler settings, run parameters). On the board,
+`python3 board_run.py llm|teacher|profile|generate [args]` runs a test and files its
+log, outputs and a snapshot of the board (kernel, device tree, u-dma-buf, PYNQ) under
+`results/<commit>/<test>/<overlay>/<mode>/`; `rsync -a ubuntu@<board>:<bundle>/results/
+build/results/` brings them back (generality plan §4).
+
 ## Accelerator memory pool (K5-M step M1, installed 2026-10-10)
 
 The runtime's window is `/dev/udmabuf0`, today allocated from the global CMA
