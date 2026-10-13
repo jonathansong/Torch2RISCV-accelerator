@@ -11,7 +11,7 @@ board_llm.py, plus those two (board_quality.py prep).
 --decode: the windows token by token through decode (sa-llm-run without
 --prefill, --logits_out: every step's logits), for a module without
 prefill_all (Llama-3.2-1B: its 1.2 GB of parameters leave no room in the
-window for it). Decode's logits are bit-exact with prefill_all's (the
+window for it; chosen automatically when the module has no prefill_all). Decode's logits are bit-exact with prefill_all's (the
 prefill_all checks of test_hf_generic.py), so the scores are the same; one
 step per position (Llama: 256 x 0.25 s per window). Also the default when
 sa_args.txt has no --prefill.
@@ -68,6 +68,13 @@ def main():
                    "--generate=0"] + run_args(extra, L, decode, out)
             t0 = time.time()
             r = subprocess.run(cmd, capture_output=True, text=True, env=dict(env, SA_STATS="1"))
+            if r.returncode and not decode and "no function `prefill_all`" in r.stderr:
+                # a prefill bundle without prefill_all (Llama-3.2-1B): decode step by step
+                print("the module has no prefill_all: teacher forcing through decode, step by step", flush=True)
+                decode = True
+                cmd = cmd[:cmd.index("--generate=0") + 1] + run_args(extra, L, decode, out)
+                t0 = time.time()
+                r = subprocess.run(cmd, capture_output=True, text=True, env=dict(env, SA_STATS="1"))
             if r.returncode:
                 print(f"window {w}: sa-llm-run failed ({r.returncode})\n{r.stdout[-2000:]}\n{r.stderr[-3000:]}")
                 return 1
