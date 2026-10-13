@@ -347,6 +347,7 @@ KV scale 改进（不改硬件和数据格式）：K 按通道（`kch`，scale �
 - 编译 1138 个 executable 全在加速器上，host 0；sim decode 9/9 argmax 与 torch W8A8 相同，prefill 与 decode-only 5/5 逐位一致；qemu aarch64 3/3。
 - 板上：17/17 步 logits 与 sim 逐位一致，0 个 host dispatch；**prefill 9.33 tok/s，decode 4.73 tok/s（211 ms/步）**，窗口 613 MB。
 - **之后（2026-10-12，§13.1）**：decode 的 v 投影改走 GEMV（`14f5612`），同一配置 decode **5.60 tok/s（178.4 ms/步）**；板上 teacher forcing 质量 PPL 39.62、top-1 86.9%（主机 39.14 / 87.4%）。
+- **qsum 重建（2026-10-13，`build/deploy_hfgen_qwen3_qs`，§12.4）**：注意力概率改为按量化后的和归一化，1139 个 executable 全在加速器，板上 17/17 逐位一致；teacher forcing PPL 39.62 → 39.68（持平）、top-1 86.9% → 88.1%、KL 0.053 → 0.038；decode 6.96 tok/s（143.6 ms/步）、prefill 20.79 tok/s。
 - 与 WP1 的 6.28 tok/s 不可直接比较：那是手写导出路径（export_hf），这里是通用前端（逐行注意力等）加 K 按通道；两者各占多少未分开（需要一个通用前端、按层 KV 的 Qwen3 全模型板上点）。
 - 注意：`test_hf_generic.py` 的 D 只读 `SA_D`（默认 8），不从 `SA_KV260_CONFIG` 推导；第一次就按 D = 8 编译、sim 也通过，由 qemu 检查拦下。
 - llm-compressor 0.14 / compressed-tensors 0.19 的 `kv_cache_scheme` 可以产出 int8 静态 KV scale（RoPE 之后观察），但只支持 `tensor`、`attn_head` 两种粒度，`channel` 对 attention 明确报错；因此它能作为 importer 的一个输入来源，不能替代 K 按通道校准。
@@ -727,8 +728,9 @@ prefill 每 16-token chunk：
 | K 分块（`--iree-sa-gemv-k-split`） | Llama-3.2-1B | decode 1.40 tok/s | **4.03 tok/s（×2.89）** | §10；logits 逐位相同 |
 | V 投影 int8 结果走 GEMV（`14f5612`） | Qwen3 | decode 4.74 tok/s | 5.60 tok/s | §13.1；逐位相同 |
 | attention 按实际长度（`1860823`） | Qwen3 | decode 5.60 / prefill 11.15 tok/s | **6.88 / 20.53 tok/s** | §13.1；2048 位置 teacher forcing 逐位相同 |
+| 注意力概率 `i8(p·127)` → qsum（`1a0ba3d`） | Gemma-3-270M（板上 8 × 256 teacher forcing） | PPL 158.54，top-1 76.0%，KL 0.209 | **PPL 142.83，top-1 80.3%，KL 0.157** | §12.4；SmolLM2 / Qwen3 KL −31% / −29%；速度不变 |
 
-通用前端的 Qwen3 decode（6.88 tok/s）现在高于手写路径在同一 overlay 上的 6.28。
+通用前端的 Qwen3 decode（6.88 tok/s，qsum 后 6.96）现在高于手写路径在同一 overlay 上的 6.28。
 
 ## 14. 时间表与停止条件
 

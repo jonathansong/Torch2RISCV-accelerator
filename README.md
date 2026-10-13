@@ -222,6 +222,9 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   accelerator's attention) put it on the accelerator, prefill and decode, with
   the quantized model's quality; its decode runs entirely on the accelerator,
   and Qwen3 compiles through the same path without code changes (sim).
+  Since then Qwen3-0.6B, SmolLM2-135M, Llama-3.2-1B and Gemma-3-270M run whole
+  on the KV260 through this path, every dispatch on the accelerator
+  ([generality plan (中文)](docs/generality_implementation_plan.md) §13.2).
   See [compiler/README.md](compiler/README.md)
 - [PYNQ-Z1 → Kria KV260 upgrade plan (中文)](docs/kv260_upgrade_plan.md) - the
   port in stages (platform at the same accelerator, clock, DMA and on-chip

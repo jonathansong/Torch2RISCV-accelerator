@@ -267,6 +267,11 @@ projection on the GEMV unit (`14f5612`; it went through EX before) decode is 178
 5.60 tok/s; with the attention over the positions attended instead of the whole 256-row
 cache (`1860823`) 145.4 ms/step, **6.88 tok/s** (attention 46.5 -> 11.8 ms), and a prefill
 chunk of 16 tokens 1428 -> 773 ms (20.5 tok/s), logits unchanged bit for bit.
+With the attention probabilities quantized unnormalized and renormalized by their int8
+sum (qsum, `1a0ba3d`, 2026-10-13; one more reduction dispatch per layer and row) Qwen3
+decodes at 143.6 ms/step (6.96 tok/s) and prefills a chunk in 769.7 ms (20.8 tok/s), with
+board teacher-forced KL 0.053 -> 0.038; the four-model table is in
+`docs/generality_implementation_plan.md` §13.2.
 
 ## Accelerator memory pool (K5-M step M1, installed 2026-10-10)
 

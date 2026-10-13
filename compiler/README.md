@@ -213,6 +213,11 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   quantization item of its own, C6.2). An IREE fix is applied from
   `compiler/patches/iree/` by `fetch_iree_sources.sh`. Next (plan §8.17):
   micro-kernels expanded at the sahl level, memory planning with lifetimes.
+  Since then (docs/generality_implementation_plan.md §13.2): Qwen3-0.6B,
+  SmolLM2-135M, Llama-3.2-1B and Gemma-3-270M run whole on the board through
+  this path, 100% of the dispatches on the accelerator, bit-exact with the sim;
+  the attention probabilities are quantized unnormalized and renormalized by
+  their int8 sum (qsum, §12.4: board KL -25..-31% at unchanged speed).
 
   ```sh
   compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)

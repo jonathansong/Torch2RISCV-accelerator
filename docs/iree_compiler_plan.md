@@ -1209,7 +1209,7 @@ C5.5 的模型（§8.9 的第一步）：
 
 **F4：int8 KV cache 与注意力（进行中，2026-09-29）**：
 - 做法：
-  - transformers 的 `AttentionInterface` 注册 `"sa"` 注意力（`sa_attention`，qhf 的算式：q 按头量化、int32 的分数、按位置掩码的 softmax、概率 int8、int32 的 P·V）；
+  - transformers 的 `AttentionInterface` 注册 `"sa"` 注意力（`sa_attention`，qhf 的算式：q 按头量化、int32 的分数、按位置掩码的 softmax、概率 int8、int32 的 P·V；2026-10-13 起概率改为量化未归一化的 `e = exp(s − max)`、按 Σ i8(e·127) 归一化（qsum，`generality_implementation_plan.md` §12.4））；
   - `SaCache`：一个 K、一个 V 的 int8 缓冲 `[层数 × T, kv_dim]`，按行写，每层静态 scale；
   - `calibrate_kv`：fp32 模型在 qhf 的校准文本上统计 max |K|、|V|（与 qhf 相同）。
 - **因此修了 sa 编译器的第二个错误**：带前缀掩码的多行静态 generic（静态 T 的 softmax，9 行 × 256）被合成一条 VE，VALID 只截了整个向量的前 pos + 1 个元素，第 1 行起全错；现在逐行降级（`RowSel::fixed`）。原有语料逐字节不变。
