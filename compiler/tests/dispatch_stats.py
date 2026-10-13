@@ -16,7 +16,12 @@ Inputs:
 
 MACs come from the dispatch names (IREE names a contraction by its loop
 ranges: matvec_like_128x16x1024 = 128 * 16 * 1024 MACs), so they are the
-model's work, not the padded work of the array.
+model's work, not the padded work of the array. A dynamic loop range (D in the
+name: the attention's length T with --abi=hfv) takes the length the profiled
+run used: sa-llm-run --pad=P passes T = (pos // P + 1) * P at decode position
+pos, and (s + M - 1) // P * P + P for a prefill chunk of M rows starting at s;
+--prompt / --chunk / --pad describe the run (board_profile.py 40 --prompt 32
+with a M = 16 bundle: the defaults), --dyn-len gives T directly.
 
     compiler/tests/dispatch_stats.py --csv prof.csv [--section decode] [--report compile.err] [--json out.json]
 """
@@ -49,7 +54,7 @@ def split_name(export):
     t = re.sub(r"^.*?\$async_dispatch_\d+_?", "", export.split(":", 1)[-1])
     words, dims = [], []
     for w in t.split("_"):
-        if re.fullmatch(r"\d+(x\d+)*", w) or re.fullmatch(r"D(x\w+)*", w):
+        if re.fullmatch(r"(\d+|D)(x(\d+|D))*", w):
             dims = [int(x) if x.isdigit() else None for x in w.split("x")] if not dims else dims
             break
         if re.fullmatch(r"[a-z]+", w) and not re.fullmatch(r"[if]\d+", w):
@@ -59,10 +64,27 @@ def split_name(export):
     return "_".join(words) or "other", dims
 
 
-def macs(cat, dims):
-    if not any(c in cat for c in CONTRACTIONS) or not dims or None in dims:
+def macs(cat, dims, dyn=None):
+    """a contraction's MACs; a dynamic loop range (None) counts as dyn (0 without it)"""
+    if not any(c in cat for c in CONTRACTIONS) or not dims or (None in dims and not dyn):
         return 0
-    return math.prod(dims)
+    return math.prod(dyn if d is None else d for d in dims)
+
+
+def dyn_len(label, per_step, prompt, chunk, pad):
+    """the mean attention length T of the profiled run (see the docstring)"""
+    n = int(round(per_step))
+    if label == "prefill":            # the chunks after the first (the profile is reset after it)
+        starts, s0 = [], 0
+        while True:
+            starts.append(prompt - chunk if s0 + chunk >= prompt else s0)
+            if s0 + chunk >= prompt:
+                break
+            s0 += chunk
+        ts = [(s + chunk - 1) // pad * pad + pad for s in starts[1:]][-n:]
+    else:                             # decode steps at positions prompt, prompt + 1, ...
+        ts = [(pos // pad + 1) * pad for pos in range(prompt, prompt + n)]
+    return sum(ts) / len(ts) if ts else None
 
 
 def reason_class(why):
@@ -103,7 +125,7 @@ def section_rows(path, section):
     return labels[i], per_step, rows
 
 
-def stats(rows, per_step, hz):
+def stats(rows, per_step, hz, dyn=None):
     if any(r["export"] == "(list of dispatches)" for r in rows):
         sys.exit("batched profile (SA_PROFILE=batch): per-dispatch statistics need SA_PROFILE=1")
     cats, tot = {}, dict(acc_calls=0, host_calls=0, cycles=0, host_ns=0, sub_ns=0, acc_macs=0, host_macs=0,
@@ -112,7 +134,7 @@ def stats(rows, per_step, hz):
     for r in rows:
         host = r["export"].startswith("host:")
         cat, dims = split_name(r["export"])
-        m = macs(cat, dims) * r["calls"]
+        m = macs(cat, dims, dyn) * r["calls"]
         c = cats.setdefault(cat, dict(acc_calls=0, host_calls=0, cycles=0, host_ns=0, acc_macs=0, host_macs=0,
                                       ld_bytes=0, st_bytes=0, exports=set()))
         c["exports"].add(r["export"])
@@ -170,6 +192,10 @@ def main():
     ap.add_argument("--report", help="codegen report (iree-compile --iree-sa-codegen-report stderr)")
     ap.add_argument("--hz", type=float, default=float(os.environ.get("SA_DEVICE_HZ", 100e6)))
     ap.add_argument("--json", help="write the statistics here")
+    ap.add_argument("--prompt", type=int, default=32, help="the run's prompt tokens (for the dynamic length T)")
+    ap.add_argument("--chunk", type=int, default=16, help="the prefill chunk M")
+    ap.add_argument("--pad", type=int, default=16, help="sa-llm-run --pad (T rounded up to it)")
+    ap.add_argument("--dyn-len", type=float, help="the dynamic length T itself (instead of --prompt / --chunk / --pad)")
     args = ap.parse_args()
     if not args.csv and not args.report:
         ap.error("--csv and / or --report")
@@ -191,7 +217,9 @@ def main():
                              host_reasons={cls: [dict(export=k, why=w) for k, w in v] for cls, v in by_class.items()})
     if args.csv:
         label, per_step, rows = section_rows(args.csv, args.section)
-        summary, table = stats(rows, per_step, args.hz)
+        dyn = args.dyn_len or dyn_len(label, per_step, args.prompt, args.chunk, args.pad)
+        summary, table = stats(rows, per_step, args.hz, dyn)
+        summary["dyn_len"] = dyn
         unit = "chunk" if label == "prefill" else "step"
         S = summary
         print(f"\n{label}, per {unit} ({per_step:g} {unit}s profiled):")
@@ -200,7 +228,8 @@ def main():
         print(f"  accelerator {S['acc_ms']:.2f} ms ({S['acc_cycles']:.0f} cycles at {args.hz / 1e6:g} MHz), "
               f"host fallback {S['host_ms']:.2f} ms  -> time coverage {pct(S['cov_time'])}"
               + ("" if S["acc_cycles"] else " (no device cycles: the sim)"))
-        print(f"  MACs {S['macs'] / 1e6:.1f}M, on the accelerator {S['acc_macs'] / 1e6:.1f}M  -> MAC coverage {pct(S['cov_macs'])}")
+        print(f"  MACs {S['macs'] / 1e6:.1f}M, on the accelerator {S['acc_macs'] / 1e6:.1f}M  -> MAC coverage {pct(S['cov_macs'])}"
+              f" (dynamic length T = {dyn:g})")
         print(f"  submissions (list build, ring, wait) {S['submit_ms']:.2f} ms")
         if S["have_perf"]:
             print(f"  DDR read {S['ld_mb']:.1f} MB, write {S['st_mb']:.2f} MB; read {S['ld_gbs']:.2f} GB/s over the device time")

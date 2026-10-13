@@ -649,7 +649,11 @@ If host and accelerator may overlap asynchronously, report the two sides' times 
 | 　row attention | 744.7 ms | 145.4 ms |
 | teacher forcing (2048 positions) | PPL 39.624 | 39.624, argmax / NLL / top-64 bit-identical |
 
-GEMV is now 80% of decode device time (111.4 ms, 93% of peak); the generic path is faster than the hand-written path (WP1's 6.28 tok/s). The rest of the runtime grew from 3.4 to 6.9 ms (dynamic-shape computation on the host, to be investigated). `dispatch_stats.py` does not count MACs for dynamic dimensions (`D` in the name), so attention's MACs are not in the coverage.
+GEMV is now 80% of decode device time (111.4 ms, 93% of peak); the generic path is faster than the hand-written path (WP1's 6.28 tok/s). The rest of the runtime grew from 3.4 to 6.9 ms: the dynamic length disables IREE's command-buffer memoization (below). `dispatch_stats.py` now counts the MACs of dynamic dimensions too (below).
+
+**Why the rest of the runtime doubled with the dynamic length (2026-10-13)**: the host time per step outside the submissions is proportional to the number of dispatches, not the vocabulary: 6.5 µs per dispatch with the dynamic length on all four models (SmolLM2 1030 dispatches 6.71 ms, Qwen3 1074 7.02 ms, Llama 554 3.74 ms; Gemma 8.1 µs with a 1 MB logits copy), against 3.25 µs per dispatch for Qwen3 with the static T. The VM modules show the cause: with a static T the step calls `hal.device.queue.execute.indirect` on a command buffer recorded once at initialization (IREE memoizes command buffers whose contents are invariant, replaying them with new buffer bindings); with the dynamic T the length enters push constants and buffer sizes, so the command buffer is not invariant and the step calls `hal.device.queue.execute` after re-recording it in the VM: `command_buffer.create`, one `command_buffer.dispatch` per dispatch (VM call marshalling, `iree_hal_buffer_map_range` per binding in the sa driver), `finalize`. Causal check on the host (sim, SmolLM2 truncated to 2 layers, prompt 32 + 8 decode steps, `SA_PROFILE=batch`): the rest of the runtime is 0.13 ms per step with the static T, 0.27 ms with the dynamic T, and 0.41 ms with the static T compiled with `--iree-hal-memoization=false`. Cost today: 2.5% of a Qwen3 decode step (3.6 of 143.6 ms), 7% for SmolLM2, 4% for Gemma, 0.8% for Llama. Options, not done: (a) compile the step for a few static T buckets (16 … 256), each memoized (more executables and compile time); (b) keep T out of the host program: static shapes at the maximum T with the attention's loop count read on the device (LDPARAM from a length in DDR), so the command buffer stays invariant (compiler work in the attention lowering); (c) cheaper re-recording (fewer dispatches through fusion, a lighter `dispatch` path in the sa driver).
+
+**MACs of dynamic dimensions (2026-10-13)**: `dispatch_stats.py` counts a dynamic loop range (`D` in the dispatch name, the attention length T) with the T the profiled run used, derived from `--prompt` / `--chunk` / `--pad` (defaults: `board_profile.py 40 --prompt 32` with M = 16, so decode T = 48, the second prefill chunk T = 32) or given with `--dyn-len`. With attention counted the MAC coverage stays 100% on all four models; attention is a small part of the MACs (Qwen3 decode 5.5 of 601.5 MMAC, prefill 58.7 of 7260.7 per chunk) but not of the time (12.2 ms of 136.6 in decode): the row-replicated attention runs at about 0.45 MAC/cycle.
 
 ### 13.2 Final main table
 
@@ -696,7 +700,7 @@ prefill per 16-token chunk:
 - decode is mostly bandwidth-bound GEMV (Llama 93%, Qwen3 80%); the remaining fixed part is mainly attention and norms; SmolLM2's matrices inside the layers are only 576 wide, so the fixed overhead of GEMV commands is a larger share (82%).
 - prefill is not only GEMM: the GEMM array utilization of the small models is only 50–68%, and row attention plus reduction take 30–40%.
 - Gemma's vocabulary of 262144 makes lm_head (168 MB int8) the largest single item of decode (60% of GEMV, 51% of device time); the layers are only 640 wide, prefill array utilization 55%.
-- The 100% MAC coverage excludes attention: `dispatch_stats.py` does not count MACs for dynamic dimensions (to be fixed).
+- The 100% MAC coverage includes attention (dynamic length counted since 2026-10-13, §13.1); attention is under 1% of the MACs but 3–20% of the device time.
 
 ### 13.3 Two ablation tables
 
@@ -839,7 +843,7 @@ Four models (Qwen3, SmolLM2 (a small model with the Llama structure), Llama 3.2,
 
 - decode: dominated by weight traffic; GEMV is Qwen3 80%, SmolLM2 71%, Llama 93%, Gemma 85% of device time (Gemma's lm_head alone 51%, vocabulary 262144), at 82–94% of the 4-port peak bandwidth; the rest is attention, norms and the fixed overhead of each command, a larger share on narrow models (SmolLM2 576, Gemma 640).
 - prefill: GEMM only 44–73%, array utilization 50–78% (lower for narrow models); row attention and reduction together 18–39%, the target of the next compiler-side steps (attention batching, norm fusion).
-- Not yet counted: attention's MACs (`dispatch_stats.py` does not count dynamic dimensions).
+- Attention's MACs are counted (dynamic length T, §13.1): under 1% of the MACs, while taking 3–10% of decode time and 9–20% of prefill time.
 
 ### 17.5 Question 5: gain, bandwidth utilization and cost of the four-port GEMV (2026-10-13)
 
