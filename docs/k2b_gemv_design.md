@@ -1,260 +1,259 @@
-# K2b / H4：2 口读入 + 流式 GEMV 单元的微结构
+# K2b / H4: microarchitecture of 2-port loading + a streaming GEMV unit
 
-> English version: [`k2b_gemv_design.en.md`](k2b_gemv_design.en.md) (translated 2026-10-13; this Chinese document is the authoritative one).
+(2026-10-09; **status 2026-10-10: G1–G5 all done, 4 ports accepted on the board, Qwen3 decode 6.28 token/s, SmolLM2 17.04**, see §8 / §8.1. Basis: the performance model of K2b step 1 in `kv260_upgrade_plan.md`, `compiler/tests/perf_model.py`.)
 
-（2026-10-09；**状态 2026-10-10：G1–G5 全部完成，4 口板上验收，Qwen3 decode 6.28 token/s、SmolLM2 17.04**，见 §8 / §8.1。依据：`kv260_upgrade_plan.md` K2b 第 1 步的性能模型，`compiler/tests/perf_model.py`。）
+## 1. Goal
 
-## 1. 目标
+Almost all of a decode step's time is in the linear layers' matvecs: Qwen3 reads 607.5 MB of weights per step, LD is busy 39.5M cycles and EX 38.5M (43.4M per step); both sides move 16 bytes per cycle and are **saturated at the same time**. The performance model gives:
 
-decode 每步的时间几乎全在线性层的 matvec 上：Qwen3 每步读 607.5 MB 权重，LD 忙碌 39.5M 周期、EX 38.5M（每步 43.4M），两边都是每周期 16 字节，**同时饱和**。性能模型给出：
-
-| 方案（100 MHz） | Qwen3 decode | SmolLM2 decode |
+| Option (100 MHz) | Qwen3 decode | SmolLM2 decode |
 |---|---|---|
-| 只加读入（32 B / 周期） | ×1.02 | ×1.03 |
-| 只加 GEMV 单元（32 B / 周期） | ×1.02 | ×1.05 |
-| 读入 32 + GEMV 32 | **×1.85**（2.31 → 4.26 token/s，设备时间） | **×1.76** |
-| 读入 64 + GEMV 64（4 口） | ×3.15 | ×2.74 |
+| Wider loading only (32 B / cycle) | ×1.02 | ×1.03 |
+| GEMV unit only (32 B / cycle) | ×1.02 | ×1.05 |
+| Loading 32 + GEMV 32 | **×1.85** (2.31 → 4.26 token/s, device time) | **×1.76** |
+| Loading 64 + GEMV 64 (4 ports) | ×3.15 | ×2.74 |
 
-第一阶段的目标是 **P = 2 个读口、每周期 32 字节的 decode matvec**，频率不变（100 MHz），与功能仿真器逐位一致；结构上能扩展到 P = 4。
+The goal of the first stage is a **decode matvec with P = 2 read ports at 32 bytes per cycle**, at the same clock (100 MHz), bit-exact with the functional simulator, and structurally extensible to P = 4.
 
-## 2. 关键观察：decode 的权重只用一次，不必进 SPAD
+## 2. Key observation: decode's weights are used once and need not go through the SPAD
 
-现在 decode 的线性层（`expandLinear`，`SahlExpandKernels.cpp`）每个 chunk 做：
+Today a decode linear layer (`expandLinear`, `SahlExpandKernels.cpp`) does per chunk:
 
 ```
-LD   weights (nc strips x K x 16 B) -> SPAD_B bank (ci & 1)      64 KB 一块（Qwen3）
-EX   a = A strip (x 复制到 16 行), b = SPAD_B, c = ACC, kt = K/16, rep = nc, cstep 1, crow nc
-VE   epilogue: 读 ACC 的第 0 行（word c .. c+nc-1），写 fp32 结果
-ST   结果
+LD   weights (nc strips x K x 16 B) -> SPAD_B bank (ci & 1)      64 KB per block (Qwen3)
+EX   a = A strip (x replicated to 16 rows), b = SPAD_B, c = ACC, kt = K/16, rep = nc, cstep 1, crow nc
+VE   epilogue: read row 0 of ACC (words c .. c+nc-1), write the fp32 result
+ST   the result
 ```
 
-板上轨迹（Qwen3 `matvec_like_64x16x2048`）：`LD rows 2 rb 32768` → `EX kt 128 rep 2 bstep 2048 cstep 1 crow 2`，epilogue 只读 word c、c+1（第 0 行）。
+Board trace (Qwen3 `matvec_like_64x16x2048`): `LD rows 2 rb 32768` → `EX kt 128 rep 2 bstep 2048 cstep 1 crow 2`; the epilogue only reads words c, c+1 (row 0).
 
-- 权重先写进 SPAD_B，再由 EX 读出一次，就再也不用了。SPAD_B 的写口和读口都被占满，却没有复用。
-- 阵列的 16 行里只有第 0 行有用（x 被复制到 16 行），乘累加的利用率是 1/16。
+- The weights are first written into SPAD_B, read once by EX, and never used again. SPAD_B's write and read ports are both fully occupied, without any reuse.
+- Only row 0 of the array's 16 rows is useful (x is replicated to 16 rows); multiply-accumulate utilization is 1/16.
 
-所以 H4 不经过 SPAD：**LD 引擎把权重直接流进 GEMV 单元**，每个 128 位 beat 就是一个 k 行的 16 个权重（与 SPAD_B 的字布局相同，DDR 里的打包格式不变），乘上 x[k] 累加到 16 个输出列。这样：
+So H4 bypasses the SPAD: **the LD engine streams the weights directly into the GEMV unit**. Each 128-bit beat is the 16 weights of one k row (the same word layout as SPAD_B; the packed format in DDR is unchanged), multiplied by x[k] and accumulated into 16 output columns. Then:
 
-- 每个读口对应一组 16 个乘累加，**读口之间互不争用本地存储**：2 口就是 32 B / 周期，不需要 SPAD 子银行，也就没有子银行对齐、按子银行查冲突这些编译器约束（原 K2b 方案 A 的大部分工作推迟到需要 prefill 带宽时再做）；
-- SPAD_B 在 decode 里空出来，EX 阵列空出来（decode 的注意力仍用阵列）；
-- 整数乘累加与顺序无关，结果与 EX 的第 0 行逐位相同。
+- each read port feeds its own group of 16 multiply-accumulates, and **the read ports do not compete for local memory**: 2 ports are 32 B / cycle without SPAD sub-banks, and so without the compiler constraints of sub-bank alignment and per-sub-bank conflict checks (most of the work of the original K2b option A is deferred until prefill needs the bandwidth);
+- SPAD_B is freed during decode, and so is the EX array (decode's attention still uses the array);
+- integer multiply-accumulate is order independent, so the result is bit-identical to EX's row 0.
 
-## 3. 总体结构
+## 3. Overall structure
 
 ```
             HP1 (m0)            HP2 (m1)
                |  AR/R            |  AR/R
         +------v------------------v------+
-        |  sa_ld   burst 队列 每口 QD = 8 |----> SPAD / ACC 写（每周期一个口，16 B，不变）
-        |  GEMV 模式：两口同周期各收一拍  |
+        |  sa_ld   burst queue QD = 8/port|----> SPAD / ACC write (one port per cycle, 16 B, unchanged)
+        |  GEMV mode: both ports take a   |
+        |  beat in the same cycle         |
         +------+------------------+------+
                | beat + (s, k)    | beat + (s, k)
         +------v------+    +------v------+
-        | lane grp 0  |    | lane grp 1  |    x 缓冲：每组一份（K_max = 4096 字节）
-        | 16 x int8   |    | 16 x int8   |    x[k] 每周期每组读一个字节
-        | MAC, acc[s] |    | MAC, acc[s] |    acc：每组 S_MAX x 16 x int32
+        | lane grp 0  |    | lane grp 1  |    x buffer: one per group (K_max = 4096 bytes)
+        | 16 x int8   |    | 16 x int8   |    each group reads one x[k] byte per cycle
+        | MAC, acc[s] |    | MAC, acc[s] |    acc: S_MAX x 16 x int32 per group
         +------+------+    +------+------+
                +--------+---------+
-                        v  写回：每个 strip 两组相加（可再加 ACC 原值）-> ACC 一个字（16 x int32）
-                     ACC side B（LD 的请求口）
+                        v  write-back: per strip the two groups are added (optionally plus the old ACC value) -> one ACC word (16 x int32)
+                     ACC side B (LD's request port)
 ```
 
-`sa_gemv.v` 是新模块，挂在 `sa_ld` 旁边，由 LD 引擎驱动；调度器把一条 GEMV 当作 LD 引擎的命令。
+`sa_gemv.v` is a new module next to `sa_ld`, driven by the LD engine; the scheduler treats a GEMV as an LD-engine command.
 
-## 4. 命令：LD 的 GEMV 模式
+## 4. Command: LD's GEMV mode
 
-不加新的引擎和操作码，用 LD 描述符的 `mode = 2`（现有 0 LINEAR、1 INTERLEAVE）：
+No new engine or opcode; it uses `mode = 2` of the LD descriptor (existing: 0 LINEAR, 1 INTERLEAVE):
 
-| 字段 | LD 描述符位置 | GEMV 含义 |
+| Field | Position in the LD descriptor | Meaning for GEMV |
 |---|---|---|
-| `ddr` | w1[31:0]（可重定位、动态字段 1） | strip 0 的权重起点（16 字节对齐） |
-| `laddr` | w2[31:0] | mem = ACC，word = C（结果的第一个字） |
-| `rows` | w2[47:32] | S：strip 数（1 .. S_MAX = 8） |
-| `row_bytes` | w2[63:48] | 每个 strip 的字节数 = K × 16（K ≤ 4095，16 的倍数） |
-| `pitch` | w3[31:0] | strip 之间的 DDR 间距（打包权重 = K × 16） |
+| `ddr` | w1[31:0] (relocatable, dynamic field 1) | Start of strip 0's weights (16-byte aligned) |
+| `laddr` | w2[31:0] | mem = ACC, word = C (the first word of the result) |
+| `rows` | w2[47:32] | S: number of strips (1 .. S_MAX = 8) |
+| `row_bytes` | w2[63:48] | Bytes per strip = K × 16 (K ≤ 4095, a multiple of 16) |
+| `pitch` | w3[31:0] | DDR distance between strips (packed weights = K × 16) |
 | `mode` | w3[33:32] | 2 = GEMV |
-| `xword` | w3[49:34]（新） | x 在 SPAD_A 的起始字（x 连续存放，K/16 个字） |
-| `cstep` | w3[57:50]（新） | strip s 的结果写到 word C + s × cstep |
-| `acc` | w3[58]（新） | 1：加到 ACC 原值上（K 分段时用） |
+| `xword` | w3[49:34] (new) | Start word of x in SPAD_A (x stored contiguously, K/16 words) |
+| `cstep` | w3[57:50] (new) | Strip s's result is written to word C + s × cstep |
+| `acc` | w3[58] (new) | 1: add to the old ACC value (used when K is split) |
 
-**语义**（功能仿真器按此实现）：对 s < S、j < 16
+**Semantics** (implemented this way by the functional simulator): for s < S, j < 16
 
 ```
-ACC[C + s*cstep][j] = (acc ? ACC[C + s*cstep][j] : 0) + Σ_{k<K} sx8(x[k]) * sx8(W_s[k][j])     (int32 回绕)
-x[k]    = SPAD_A 字 xword + k/16 的第 k%16 字节
+ACC[C + s*cstep][j] = (acc ? ACC[C + s*cstep][j] : 0) + Σ_{k<K} sx8(x[k]) * sx8(W_s[k][j])     (int32 wrap-around)
+x[k]    = byte k%16 of SPAD_A word xword + k/16
 W_s[k][j] = DDR[ddr + s*pitch + k*16 + j]
 ```
 
-只写每个 strip 的第 0 行（一个 ACC 字）。EX 版本还写了第 1..15 行（复制的 x 算出的相同值）；epilogue 只读第 0 行，所以对编译出的程序没有影响。
+Only row 0 of each strip (one ACC word) is written. The EX version also wrote rows 1..15 (the same values computed from the replicated x); the epilogue only reads row 0, so compiled programs are not affected.
 
-**调度器**（`sa_sched.v` d1 / d2 级）：GEMV 的读集 = SPAD_A [xword, xword + K/16)（acc = 1 时加上 ACC 的结果字），写集 = ACC [C, C + (S−1)·cstep]，引擎 = LD。现有的 bank 记分板直接适用：epilogue 的 VE 读 ACC → 等这条 GEMV 完成；下一条 GEMV 写另一个 ACC bank → 可以与 epilogue 并行（现在的双缓冲方式不变）。检查项：`row_bytes % 16 == 0`，`rows ≤ S_MAX`，范围不越界，`mem == ACC`。
+**Scheduler** (`sa_sched.v` stages d1 / d2): a GEMV's read set = SPAD_A [xword, xword + K/16) (plus the ACC result words when acc = 1), write set = ACC [C, C + (S−1)·cstep], engine = LD. The existing bank scoreboard applies directly: the epilogue's VE reads ACC → waits for this GEMV to finish; the next GEMV writes the other ACC bank → can run in parallel with the epilogue (today's double buffering is unchanged). Checks: `row_bytes % 16 == 0`, `rows ≤ S_MAX`, no out-of-range access, `mem == ACC`.
 
-## 5. 2 口读入（`sa_ld`）
+## 5. 2-port loading (`sa_ld`)
 
-现有的 `sa_ld` 已经有 `NPORTS` 参数：burst（≤ 16 拍、不跨 4 KB）轮流分给各口，每口 8 个在途，返回的 beat 按 burst 记下的本地位置写入。但 **R 侧每周期只接收一个口**（`r_sel`），本地写口也只有一个，所以多口不增加带宽。改动：
+The existing `sa_ld` already has an `NPORTS` parameter: bursts (≤ 16 beats, not crossing 4 KB) are distributed round robin over the ports, 8 in flight per port, and returning beats are written to the local position recorded with the burst. But **the R side accepts only one port per cycle** (`r_sel`) and there is only one local write port, so more ports do not add bandwidth. Changes:
 
-1. **AXI**：`NPORTS = 2`，m0 → `S_AXI_HP1_FPD`（不变，仍与描述符取指共用 AR / R，经 owner FIFO 区分），m1 → `S_AXI_HP2_FPD`（新增协议转换与地址映射；`build_bitstream.sh -nports 2`）。ST 也自动用两个口的写通道。
-2. **burst 队列多记两个字段**：GEMV 模式下每个 burst 记下 (strip s, 起始 k)。beat 到达时 k 逐拍加 1，跨 strip 时 s 加 1、k 归零（burst 最长 256 字节 = 16 个 k 行，strip 长度是 16 字节的倍数，所以一个 beat 不会跨 strip）。
-3. **R 侧**：GEMV 模式下每个口独立 `m_rready`，同一周期两个口各交一拍给自己的 lane 组；非 GEMV 模式保持现在的单口仲裁（写 SPAD / ACC 仍是 16 B / 周期，见 §8 第二阶段）。GEMV lane 组有 2–3 级流水，`rready` 直接为 1（没有反压，除非结果写回阶段）。
-4. **完成**：所有 beat 都进了 MAC 流水、写回结束后 `done`；`err` 规则不变（任何 beat 的 SLVERR / DECERR）。
+1. **AXI**: `NPORTS = 2`, m0 → `S_AXI_HP1_FPD` (unchanged; still shares AR / R with descriptor fetch, distinguished by an owner FIFO), m1 → `S_AXI_HP2_FPD` (new protocol conversion and address mapping; `build_bitstream.sh -nports 2`). ST automatically uses both ports' write channels as well.
+2. **Two more fields in the burst queue**: in GEMV mode each burst records (strip s, starting k). As beats arrive k increments by 1 per beat; at a strip boundary s increments and k resets to 0 (a burst is at most 256 bytes = 16 k rows and strip lengths are multiples of 16 bytes, so a beat never crosses a strip).
+3. **R side**: in GEMV mode each port has its own `m_rready`, and in the same cycle each port hands a beat to its own lane group; outside GEMV mode the current single-port arbitration stays (writes to SPAD / ACC remain 16 B / cycle, see stage two in §8). The GEMV lane groups have 2–3 pipeline stages and `rready` is simply 1 (no back-pressure, except during result write-back).
+4. **Completion**: `done` after all beats have entered the MAC pipeline and write-back has finished; the `err` rule is unchanged (SLVERR / DECERR on any beat).
 
-两个 HP 口到 DDR 控制器的路径不同，3.2 GB/s 远低于 KV260 DDR4 的峰值（约 19 GB/s），但两口并发的实际带宽要用 `bwtest` 新增的双口测试确认（并比较 HP1 + HP2 与 HP1 + HP3）。
+The two HP ports take different paths to the DDR controller, and 3.2 GB/s is far below the KV260 DDR4 peak (about 19 GB/s), but the actual concurrent two-port bandwidth must be confirmed with a new dual-port test in `bwtest` (also comparing HP1 + HP2 against HP1 + HP3).
 
-## 6. GEMV 单元（`sa_gemv.v`）
+## 6. GEMV unit (`sa_gemv.v`)
 
-每个 lane 组（每个读口一组）：
+Per lane group (one group per read port):
 
-- **x 缓冲**：K_MAX = 4096 字节，每组一份（两个读口同周期各读一个 x[k]）。用 RAMB18（4 KB × 8 位）或 LUTRAM。命令开始时由 LD 引擎从 SPAD_A 读 K/16 个字（经 SPAD_A side A 的 LD 请求口，一周期一字，K = 3072 时 192 周期，与第一拍的 DDR 延迟部分重叠）。**驻留标记** (xword, K, valid)：一个 matvec 的所有 chunk 用同一个 x，第二条起标记命中就不再读；任何写 SPAD_A 的 LD / VE 命令清除标记（保守，硬件里只需一个 OR）。
-- **乘累加**：一拍 = 16 个 int8 权重 × 同一个 x[k]。16 个乘法共享一个操作数，可以用 DSP48E2 的 int8 打包（两个权重共用 x，一个 DSP 两个乘法）：每组 8 个 DSP；或 LUT 乘法器。流水：beat → 读 x[k]（1 拍）→ 乘（1–2 拍）→ 累加。
-- **累加器**：acc[s][j]，S_MAX × 16 × 32 位触发器（每组 4096 位）。同一个 burst 的 16 拍都属于同一个 strip，累加是 32 位加法 + S_MAX 选一，一拍内完成（100 MHz 没有问题）。
-- **写回**：所有 beat 消化完以后，s = 0 .. S−1：两组的 acc[s] 相加（acc = 1 时再加 ACC 原值，经 ACC side B 的 LD 请求口读一拍），写 ACC 字 C + s·cstep（16 × int32，全部字节使能）。每个 strip 1–2 周期。
+- **x buffer**: K_MAX = 4096 bytes, one copy per group (the two read ports each read an x[k] in the same cycle). RAMB18 (4 KB × 8 bits) or LUTRAM. At the start of a command the LD engine reads K/16 words from SPAD_A (through the LD request port on SPAD_A side A, one word per cycle; 192 cycles for K = 3072, partly overlapped with the DDR latency of the first beat). **Residency tag** (xword, K, valid): all chunks of a matvec use the same x, so from the second command on a tag hit skips the read; any LD / VE command that writes SPAD_A clears the tag (conservative; in hardware just one OR).
+- **Multiply-accumulate**: one beat = 16 int8 weights × the same x[k]. The 16 multiplies share an operand, so the DSP48E2 int8 packing can be used (two weights share x, two multiplies per DSP): 8 DSPs per group; or LUT multipliers. Pipeline: beat → read x[k] (1 cycle) → multiply (1–2 cycles) → accumulate.
+- **Accumulators**: acc[s][j], S_MAX × 16 × 32-bit flip-flops (4096 bits per group). All 16 beats of a burst belong to the same strip; accumulation is a 32-bit add + an S_MAX-way select, done in one cycle (no problem at 100 MHz).
+- **Write-back**: after all beats are consumed, for s = 0 .. S−1: the two groups' acc[s] are added (plus the old ACC value when acc = 1, read in one beat through the LD request port on ACC side B) and written to ACC word C + s·cstep (16 × int32, all byte enables). 1–2 cycles per strip.
 
-吞吐：每口每周期 16 字节 → P = 2 时 32 B / 周期。Qwen3 一个 64 KB 的 chunk：65（延迟）+ 2048（数据）+ 2（写回）≈ 2115 周期，现在 LD 与 EX 各约 4160 周期。
+Throughput: 16 bytes per port per cycle → 32 B / cycle at P = 2. One 64 KB Qwen3 chunk: 65 (latency) + 2048 (data) + 2 (write-back) ≈ 2115 cycles; today LD and EX each take about 4160 cycles.
 
-## 7. 编译器与运行时
+## 7. Compiler and runtime
 
-- **目标配置**：`TargetConfig` 加 `gemv_ports`（0 = 没有 GEMV 单元；`--iree-sa-gemv-ports=N`，只支持 D = 16）；`.hwh` / 驱动报告 `NPORTS` 与是否有 GEMV。
-- **SAHL**：新 op `sahl.gemv(x, w, acc)`（x：SPAD_A 中连续的 int8 向量；w：DDR 中 nc 个 strip 的子视图；acc：ACC 的 nc × 16 块）。`expandLinear` 在目标有 GEMV 时：不再分配 A strip，每个 chunk 的 `sahl.load` 权重 + `sahl.mma` 换成 `sahl.gemv`（nc > 8 时分成每条 ≤ 8 个 strip 的几条）；SPAD_B 的两个权重 bank 不再需要。x 是 int8 时直接用；x 是 int32（在 ACC 里，stories / SmolLM2 / Qwen3 的 decode 都是）时用一条 `sahl.strip {sa.packed}` 转成 SPAD_A 中连续的 int8（与原来的 strip 同样的 VE 转换，只是不复制到 16 行）。epilogue、ACC 布局（`sa.word`）、`sahl.loop` 的 advance（ddr 每次加两个 chunk）都不变。
-- **约束**：K ≤ `gemv_kmax`（4095），nc ≤ S_MAX；不满足时退回现在的 LD + EX（正确但慢）。权重的打包格式与 irpa 不变。
-- **SAHW / 序列化**：LD 描述符的新字段（mode 2、xword、cstep、acc）；`DescList` 编码；动态字段只用到 ddr（字段 1）。
-- **功能仿真器 / oracle**：`sa_funcsim.ld` 实现 mode 2（§4 的语义，逐位）和 sched 的检查；`dispatch_check` 覆盖 decode 的所有 matvec；新目标配置建立自己的黄金语料基线（§5 第 3 条约束）。
-- **性能模型**：`perf_model.py` 加 GEMV-LD 的代价（延迟 + x 读入（未命中时）+ 字节 / (16 × P) + 写回），用编译出的新轨迹重新预测。
+- **Target configuration**: `TargetConfig` gains `gemv_ports` (0 = no GEMV unit; `--iree-sa-gemv-ports=N`, only D = 16 supported); the `.hwh` / driver report `NPORTS` and whether a GEMV unit is present.
+- **SAHL**: a new op `sahl.gemv(x, w, acc)` (x: a contiguous int8 vector in SPAD_A; w: a subview of nc strips in DDR; acc: an nc × 16 block of ACC). When the target has GEMV, `expandLinear` no longer allocates an A strip; each chunk's `sahl.load` of weights + `sahl.mma` is replaced by `sahl.gemv` (split into several of ≤ 8 strips each when nc > 8); the two SPAD_B weight banks are no longer needed. An int8 x is used directly; an int32 x (in ACC, as in the decode of stories / SmolLM2 / Qwen3) is converted by one `sahl.strip {sa.packed}` into contiguous int8 in SPAD_A (the same VE conversion as the old strip, just not replicated to 16 rows). The epilogue, the ACC layout (`sa.word`) and the `sahl.loop` advance (ddr advances by two chunks each time) are unchanged.
+- **Constraints**: K ≤ `gemv_kmax` (4095), nc ≤ S_MAX; otherwise fall back to today's LD + EX (correct but slow). The packed weight format and the irpa are unchanged.
+- **SAHW / serialization**: the LD descriptor's new fields (mode 2, xword, cstep, acc); `DescList` encoding; only ddr (field 1) is used as a dynamic field.
+- **Functional simulator / oracle**: `sa_funcsim.ld` implements mode 2 (the semantics of §4, bit for bit) and the sched checks; `dispatch_check` covers all decode matvecs; the new target configuration gets its own golden corpus baseline (constraint 3 of §5).
+- **Performance model**: `perf_model.py` adds the cost of a GEMV-LD (latency + x read (on a miss) + bytes / (16 × P) + write-back) and re-predicts from the newly compiled trace.
 
-## 8. 阶段
+## 8. Stages
 
-| 阶段 | 内容 | 验证 |
+| Stage | Content | Verification |
 |---|---|---|
-| **G1** | 功能仿真器 + 编译器（`sahl.gemv`、目标配置开关），不碰硬件 | Qwen3 / SmolLM2 / stories 的 decode 在 sim 上与现有路径逐位一致；`dispatch_check`；新基线 |
-| **G2** ✅（板上 ✅） | RTL：`sa_gemv` + `sa_ld` 的 GEMV 模式 + `sa_sched` 的检查与掩码，先 NPORTS = 1（功能正确，16 B / 周期） | `tb_sa_gemv`（随机 K / S / cstep / acc / 对齐，对照 funcsim）；`tb_sa_ld`；`tb_sa_unit`；固件系统仿真 `desc_run`；`make test / test16 / test128` |
-| **G3** 🔧 | NPORTS = 2：R 侧双口同时接收、BD 加第二个 HP 口（HP3）、`bwtest` 双口测试 | `tb_sa_dma GEN="NP=2 D=16 DMA_W=128"` 加 GEMV 模式；用户构建比特流；板上 bwtest |
-| **G4** | 板上验收 | REGRESSION PASS、逐位一致；decode 的 token/s 与模型预测（×1.76–1.85）对比 |
+| **G1** | Functional simulator + compiler (`sahl.gemv`, target configuration switch), no hardware | decode of Qwen3 / SmolLM2 / stories bit-exact on the sim with the existing path; `dispatch_check`; new baseline |
+| **G2** ✅ (board ✅) | RTL: `sa_gemv` + `sa_ld`'s GEMV mode + `sa_sched` checks and masks, NPORTS = 1 first (functionally correct, 16 B / cycle) | `tb_sa_gemv` (random K / S / cstep / acc / alignment, against funcsim); `tb_sa_ld`; `tb_sa_unit`; firmware system simulation `desc_run`; `make test / test16 / test128` |
+| **G3** 🔧 | NPORTS = 2: R side receives on both ports at once, a second HP port in the BD (HP3), `bwtest` dual-port test | `tb_sa_dma GEN="NP=2 D=16 DMA_W=128"` with GEMV mode; user builds the bitstream; board bwtest |
+| **G4** | Board acceptance | REGRESSION PASS, bit-exact; decode token/s compared with the model prediction (×1.76–1.85) |
 
-**G2 实现（2026-10-09）**：`rtl/sysarray/sa_gemv.v` + `sa_ld` / `sa_sched` / `sa_cmdfetch` / `sa_unit`（参数 `GEMV`，要求 D = 16、DMA_W = 128；CAPS bit 25；`build_bitstream.sh -gemv 1`，配置后缀 `_gemv`）。与 §5 / §6 的差别和细节：
+**G2 implementation (2026-10-09)**: `rtl/sysarray/sa_gemv.v` + `sa_ld` / `sa_sched` / `sa_cmdfetch` / `sa_unit` (parameter `GEMV`, requires D = 16, DMA_W = 128; CAPS bit 25; `build_bitstream.sh -gemv 1`, configuration suffix `_gemv`). Differences from §5 / §6 and details:
 
-- lane 数 = `NPORTS`，R 侧的 GEMV 路径从一开始就是每口独立接收（G3 只剩 BD 和带宽测试）；`tb_sa_dma` 在 NP = 1 / 2 / 3 下都测了多 lane 求和。
-- 累加器每 lane `acc[s]`（8 × 16 × int32），不清零：每个 strip 在该 lane 上的第一拍直接写入（touched 掩码），没碰到的 strip 写回时当 0。
-- x 读入期间 `rready` 拉低（AR 照发，返回的拍在互连里等），读入一个字一个周期；驻留标记在任何 SPAD_A 写（LD 写口或 VE 写）时清除。
-- 写回每个 strip 一个周期（acc = 1 时两个：先读 ACC 原值）。
-- 包格式：LD 包的 [148:133] x word、[156:149] C step、[157] acc（`pkt_ldg`）；mode 3 一律 SHAPE；没有 GEMV 单元时 mode 2 也是 SHAPE。
-- 记分板：GEMV 在 LD 的口上**读** SPAD_A，与 ST 的读同在 SPAD_A 的 A 侧；两个读者原来不算冲突，会在同一 bank 的同一侧撞口。现在 LD 与 ST 像 EX 与 VE 一样，任何共同 bank 都冲突（原有命令不受影响：普通 LD 只写）。性能模型同样处理。
-- 编译器在 `--iree-sa-gemv-ports` 非零时在可执行文件头的 required CAPS 里置 bit 25；运行时检查见 G4 第 4 条。
-- 测试：`tb_sa_dma GEN="NP=1|2|3 D=16 DMA_W=128"`（随机 K / strip / C step / acc / pitch、跨 4 KB、跨 bank、K = 4080、驻留命中与失效、SLVERR），`tb_sa_unit GEN="D=16 DMA_W=128 GEMV=1"`（描述符解码、记分板：VE 等 GEMV 写完、驻留、4 种错误、CAPS）；都加进了 `make test128`；固件系统仿真 `firmware/desc_run make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1`（PicoRV32 + RTL，Python `DescList.gemv` 编码：int32 x 经 VE 转 int8、4 + 2 个 strip、K 两半累加，对照功能仿真器与 NumPy）。
+- Number of lanes = `NPORTS`; the R-side GEMV path receives per port independently from the start (G3 only has the BD and the bandwidth test left); `tb_sa_dma` tested the multi-lane sum at NP = 1 / 2 / 3.
+- Per-lane accumulators `acc[s]` (8 × 16 × int32), not cleared: a strip's first beat on that lane writes directly (touched mask), and untouched strips count as 0 at write-back.
+- `rready` is held low while x is being read (AR still issues; returning beats wait in the interconnect), one word per cycle; the residency tag is cleared on any SPAD_A write (the LD write port or a VE write).
+- Write-back is one cycle per strip (two when acc = 1: the old ACC value is read first).
+- Packet format: [148:133] x word, [156:149] C step, [157] acc of the LD packet (`pkt_ldg`); mode 3 is always SHAPE; without a GEMV unit mode 2 is SHAPE too.
+- Scoreboard: GEMV **reads** SPAD_A on the LD port, on SPAD_A's A side just like ST's reads; two readers were not counted as a conflict and could collide on the same side of the same bank. Now LD and ST, like EX and VE, conflict on any shared bank (existing commands are unaffected: a plain LD only writes). The performance model does the same.
+- With `--iree-sa-gemv-ports` non-zero the compiler sets bit 25 in the required CAPS of the executable header; the runtime check is G4 item 4.
+- Tests: `tb_sa_dma GEN="NP=1|2|3 D=16 DMA_W=128"` (random K / strips / C step / acc / pitch, crossing 4 KB, crossing banks, K = 4080, residency hits and invalidations, SLVERR), `tb_sa_unit GEN="D=16 DMA_W=128 GEMV=1"` (descriptor decoding, scoreboard: VE waits for the GEMV's writes, residency, 4 kinds of errors, CAPS); all added to `make test128`; firmware system simulation `firmware/desc_run make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1` (PicoRV32 + RTL, Python `DescList.gemv` encoding: int32 x converted to int8 by VE, 4 + 2 strips, K accumulated in two halves, against the functional simulator and NumPy).
 
-**G3 实现（2026-10-09，RTL 与脚本；板上待测）**：
+**G3 implementation (2026-10-09, RTL and scripts; board pending)**:
 
-- RTL 的多口 GEMV 在 G2 已经完成，G3 只改了：性能计数器 LD_BEATS / ST_BEATS 原来每周期最多加 2（`ev2`），多口同周期的拍会少计；现在 `sa_ld` / `sa_st` 给出每周期的 8 字节 lane 数（`perf_lanes`，所有口合计），`sa_perf` 的 `evx` 是每个计数器的额外增量。单口时不变。
-- `tb_sa_unit` 的存储器模型改成每个口一个从机（`NP=2`），整个 unit 测试（GEMM、随机命令流、描述符、GEMV、计数器不变式按 `NP` 放宽）在双口下通过；加进 `make test128`。
-- BD：`build_bitstream.sh -nports 2`（后缀 `_np2`），m1_axi 默认接 **HP3**：UG1085 的 PS 互连里 HP1 与 HP2 共用 DDR 控制器的 S4 口，HP3 走 S5；`-m1_hp 2`（后缀 `_hp2`）用于对比。HP 口的位宽同 `-dma_w`，地址映射与 m0 相同（低 2 GB 恒等映射）。
-- bwtest：测试 6 / 7 是一条 64 KB 的 GEMV（8 个 strip，K = 512；6 含 x 读入，7 x 驻留 = 纯流式带宽），由 ARM 把描述符写进 DDR（`MBOX_DL_ADDR`），固件在 CAPS bit 25 时提交，结果存回 DDR 由驱动用 NumPy 校验；`m2_bw_test.py` 按 `NPORTS × 16 B` 计峰值。固件系统仿真 `firmware/bwtest make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1` 通过（单口 DDR 模型）。
+- Multi-port GEMV in the RTL was already done in G2; G3 only changed: the performance counters LD_BEATS / ST_BEATS added at most 2 per cycle (`ev2`), undercounting beats of several ports in the same cycle; now `sa_ld` / `sa_st` output the number of 8-byte lanes per cycle (`perf_lanes`, summed over all ports), and `sa_perf`'s `evx` is the extra increment per counter. Unchanged with a single port.
+- `tb_sa_unit`'s memory model now has one slave per port (`NP=2`); the whole unit test (GEMM, random command streams, descriptors, GEMV, counter invariants relaxed by `NP`) passes with two ports; added to `make test128`.
+- BD: `build_bitstream.sh -nports 2` (suffix `_np2`); m1_axi connects to **HP3** by default: in UG1085's PS interconnect HP1 and HP2 share the DDR controller's S4 port, while HP3 goes to S5; `-m1_hp 2` (suffix `_hp2`) for comparison. The HP port width follows `-dma_w`; the address map is the same as m0 (identity map of the low 2 GB).
+- bwtest: tests 6 / 7 are one 64 KB GEMV (8 strips, K = 512; 6 includes the x read, 7 has x resident = pure streaming bandwidth); the ARM writes the descriptors into DDR (`MBOX_DL_ADDR`), the firmware submits them when CAPS bit 25 is set, and the result is stored back to DDR and checked by the driver with NumPy; `m2_bw_test.py` computes the peak as `NPORTS × 16 B`. Firmware system simulation `firmware/bwtest make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1` passes (single-port DDR model).
 
-**G4 步骤（板上验收）**：
+**G4 steps (board acceptance)**:
 
-1. **单口比特流（`d16_100mhz_w128_p6_gemv`）上的原有路径**：`SA_KV260_CONFIG=d16_100mhz_w128_p6_gemv compiler/scripts/deploy_z1_freeze.sh --reuse d16_100mhz_w128_p6_red`（LLM 测试沿用 EX 路径的可执行文件，几分钟），板上 `run_board.sh`：REGRESSION PASS 说明加了 GEMV 单元不影响现有功能；bwtest 的测试 6 / 7 给出单口 GEMV 的流式带宽并校验结果。
-   **结果（2026-10-09，`d16_100mhz_w128_p6_gemv`，WNS +0.274 ns，LUT 92.3k / 78.8%（+4.1k），BRAM 132（+2），DSP 349）**：REGRESSION PASS（16 项），6 个 LLM 测试的 token 与 `p6_red` 逐字相同，速度不变（Qwen3 prefill 15.41 / decode 2.22 tok/s）；bwtest GEMV 64 KB：x 驻留 4190 周期 = **15.64 B / 周期**（单口峰值的 97.8%，普通 LD 15.70），x 读入多 15 周期，结果与 NumPy 一致。
-2. **GEMV 路径**：完整 staging（不加 `--reuse`）。`board_env.sh` 从配置名推出 `SA_GEMV_PORTS`（`_gemv` → 1，`_gemv_np2` → 2），`compile_sa.sh` 加 `--iree-sa-gemv-ports`，构建目录带 `_gemv`（2 口 `_gemv2`：描述符不同，不能共用；hfgen 遇到已有的 `sa.vmfb` 会跳过编译）后缀；每个 LLM 测试在主机上先过逐 dispatch 检查和仿真，板上 logits 与仿真逐位比较（与 EX 路径也逐位相同，G1 已在仿真上证明）。Qwen3 另外 `deploy_z1_freeze.sh c6p_qwen3`（640 MB udmabuf）。
-3. **双口比特流（`_gemv_np2`）**：同 1、2；bwtest 测试 7 应接近 32 B / 周期；decode token/s 与模型预测（Qwen3 ×1.85 → 约 4.1–4.3 token/s 设备时间，SmolLM2 ×1.76）比较，`board_profile.py` 的 decode profile 再喂给 `perf_model.py` 校准 GEMV 的代价。
-   **时序**：第一次构建 WNS -0.576 ns（742 个端点）：m1 的 RVALID 从 PS 出来后，同一周期内经过 R 侧端口仲裁、队头选择、`lw_word` 的乘法和 GEMV / ACC 选择，到 ACC BRAM 地址（单口时仲裁是常数，被优化掉）。修复（3127e6a）：NPORTS > 1 时 `sa_ld` 每个口的 R 通道先过一个 2 项 skid buffer（valid / data / ready 都出自寄存器，吞吐不变，多 1 周期延迟）；重建后 WNS +0.138 ns，最差路径从 `q_rp` 寄存器出发（仍经 `lw_word` 乘法），LUT 96.3k / 82.2%（单口 +4.0k），BRAM 134，DSP 349。
-   **步骤 1 结果（2026-10-10，`d16_100mhz_w128_p6_gemv_np2`，m1 接 HP3，`--reuse p6_red`）**：REGRESSION PASS（16 项），5 个 LLM 测试的 token 与单口逐字相同；bwtest GEMV 64 KB：x 驻留 2145 周期 = **30.55 B / 周期**（双口峰值的 95.5%，单口 15.64 的 1.95 倍），x 读入 2157 周期 / 30.38，结果正确，HP0 与 HP3 在 DDR 一侧没有明显争用；普通 LD / ST 仍约 15.7 B / 周期（R 侧每周期只写一个本地字），1 拍 burst 的短行 LD 3.04 → 5.48 B / 周期（两口的地址延迟重叠）。
-   **步骤 2 结果（2026-10-10，`_gemv_np2`，GEMV 2 口编译，`build/deploy_kv260_d16_100mhz_w128_p6_gemv_np2/results`）**：REGRESSION PASS（含 Qwen3，18 项）；所有 LLM 测试板上 logits 与仿真逐位相同，token 与 EX 路径（`p6_red`）逐字相同。decode 每步（板上实测，含主机开销）：
+1. **The existing path on the single-port bitstream (`d16_100mhz_w128_p6_gemv`)**: `SA_KV260_CONFIG=d16_100mhz_w128_p6_gemv compiler/scripts/deploy_z1_freeze.sh --reuse d16_100mhz_w128_p6_red` (the LLM tests reuse the EX-path executables; a few minutes), then `run_board.sh` on the board: REGRESSION PASS shows the added GEMV unit does not affect existing functions; bwtest tests 6 / 7 give the single-port GEMV streaming bandwidth and check the result.
+   **Result (2026-10-09, `d16_100mhz_w128_p6_gemv`, WNS +0.274 ns, LUT 92.3k / 78.8% (+4.1k), BRAM 132 (+2), DSP 349)**: REGRESSION PASS (16 items), the tokens of the 6 LLM tests identical to `p6_red`, speed unchanged (Qwen3 prefill 15.41 / decode 2.22 tok/s); bwtest GEMV 64 KB: x resident 4190 cycles = **15.64 B / cycle** (97.8% of the single-port peak; plain LD 15.70), x read adds 15 cycles, result matches NumPy.
+2. **GEMV path**: full staging (without `--reuse`). `board_env.sh` derives `SA_GEMV_PORTS` from the configuration name (`_gemv` → 1, `_gemv_np2` → 2), `compile_sa.sh` adds `--iree-sa-gemv-ports`, and build directories get the suffix `_gemv` (2 ports `_gemv2`: the descriptors differ and cannot be shared; hfgen skips compiling when a `sa.vmfb` exists); each LLM test first passes the per-dispatch checks and the simulation on the host, and on the board the logits are compared bit for bit with the simulation (also bit-identical to the EX path, proven on the sim in G1). Qwen3 additionally uses `deploy_z1_freeze.sh c6p_qwen3` (640 MB udmabuf).
+3. **Dual-port bitstream (`_gemv_np2`)**: as 1 and 2; bwtest test 7 should be close to 32 B / cycle; decode token/s compared with the model prediction (Qwen3 ×1.85 → about 4.1–4.3 token/s device time, SmolLM2 ×1.76), and the decode profile from `board_profile.py` fed back to `perf_model.py` to calibrate the GEMV cost.
+   **Timing**: the first build had WNS -0.576 ns (742 endpoints): m1's RVALID from the PS passes, in the same cycle, through R-side port arbitration, head-of-queue selection, the multiply in `lw_word` and the GEMV / ACC select to the ACC BRAM address (with one port the arbitration is a constant and optimized away). Fix (3127e6a): with NPORTS > 1 each port's R channel in `sa_ld` first passes a 2-entry skid buffer (valid / data / ready all from registers; same throughput, 1 more cycle of latency); after the rebuild WNS +0.138 ns, the worst path starts at the `q_rp` register (still through the `lw_word` multiply), LUT 96.3k / 82.2% (+4.0k over one port), BRAM 134, DSP 349.
+   **Step 1 result (2026-10-10, `d16_100mhz_w128_p6_gemv_np2`, m1 on HP3, `--reuse p6_red`)**: REGRESSION PASS (16 items), the tokens of 5 LLM tests identical to the single-port build; bwtest GEMV 64 KB: x resident 2145 cycles = **30.55 B / cycle** (95.5% of the dual-port peak, 1.95× the single port's 15.64), x read 2157 cycles / 30.38, result correct, no visible contention between HP0 and HP3 on the DDR side; plain LD / ST still about 15.7 B / cycle (the R side writes only one local word per cycle), short-row LD with 1-beat bursts 3.04 → 5.48 B / cycle (the address latencies of the two ports overlap).
+   **Step 2 result (2026-10-10, `_gemv_np2`, compiled for 2 GEMV ports, `build/deploy_kv260_d16_100mhz_w128_p6_gemv_np2/results`)**: REGRESSION PASS (including Qwen3, 18 items); for every LLM test the board logits are bit-identical to the simulation and the tokens identical to the EX path (`p6_red`). Decode per step (measured on the board, including host overhead):
 
-   | 模型 | EX 路径（`p6_red`） | GEMV 2 口 | 提速 | 模型预测 |
+   | Model | EX path (`p6_red`) | GEMV 2 ports | Speedup | Model prediction |
    |---|---|---|---|---|
-   | Qwen3-0.6B | 451.4 ms（2.22 tok/s） | 251.3 ms（**3.98 tok/s**） | ×1.80 | ×1.85 |
-   | SmolLM2-135M（c6p） | 129.6 ms（7.71） | 79.5 ms（**12.58**） | ×1.63 | ×1.76 |
-   | SmolLM2（hfgen，通用前端） | 131.2 ms（7.62） | 78.5 ms（12.73） | ×1.67 | — |
-   | stories15M | 16.2 ms（61.9） | 9.9 ms（100.8） | ×1.63 | — |
+   | Qwen3-0.6B | 451.4 ms (2.22 tok/s) | 251.3 ms (**3.98 tok/s**) | ×1.80 | ×1.85 |
+   | SmolLM2-135M (c6p) | 129.6 ms (7.71) | 79.5 ms (**12.58**) | ×1.63 | ×1.76 |
+   | SmolLM2 (hfgen, generic frontend) | 131.2 ms (7.62) | 78.5 ms (12.73) | ×1.67 | — |
+   | stories15M | 16.2 ms (61.9) | 9.9 ms (100.8) | ×1.63 | — |
 
-   prefill 不变（Qwen3 15.45 → 15.76 tok/s，SmolLM2 38.4 → 38.8）。SmolLM2 比预测低一些：模型小，每步固定开销（非线性层、命令和 dispatch 开销）占比更大。
-4. **CAPS 检查**：rt_fw（RT_VERSION 2）把单元的 CAPS 写进邮箱 `0xD0`，运行时加载可执行文件时检查它要求的 bit 21–25；用 GEMV 编译的模型在没有 GEMV 的比特流上会直接报错，而不是跑出错误结果。仿真上用 `SA_SIM_CAPS=0x01E00010` 模拟没有 GEMV 的单元验证过（stories15M GEMV 版本加载即报 INCOMPATIBLE）。G1 的 Qwen3 也已通过：1262 个 dispatch、logits 与 EX 路径逐字节相同。
+   prefill unchanged (Qwen3 15.45 → 15.76 tok/s, SmolLM2 38.4 → 38.8). SmolLM2 is somewhat below the prediction: the model is small, and the fixed per-step overhead (non-linear layers, command and dispatch overhead) is a larger share.
+4. **CAPS check**: rt_fw (RT_VERSION 2) writes the unit's CAPS into mailbox `0xD0`, and the runtime checks the bits 21–25 an executable requires when loading it; a model compiled for GEMV fails immediately on a bitstream without GEMV instead of producing wrong results. Verified on the sim by emulating a unit without GEMV with `SA_SIM_CAPS=0x01E00010` (the stories15M GEMV build reports INCOMPATIBLE on load). G1's Qwen3 has also passed: 1262 dispatches, logits byte-identical to the EX path.
 
-**第二阶段**：P = 4（§8.1）；SPAD 子银行（LD 写 SPAD / ACC 也到 32 B / 周期，prefill ×1.07）；LD 命令流水（隐藏每条命令约 65 周期的延迟，+2–3%）。
+**Stage two**: P = 4 (§8.1); SPAD sub-banks (LD writes to SPAD / ACC also at 32 B / cycle, prefill ×1.07); LD command pipelining (hides the ~65-cycle latency of each command, +2–3%).
 
-### 8.1 P = 4：4 个读口（G5）
+### 8.1 P = 4: 4 read ports (G5)
 
-decode 仍受读带宽限制（GEMV 单元按带宽消耗权重），4 口 = 64 B / 周期 = 6.4 GB/s（KV260 DDR4 峰值约 19 GB/s）。
+decode is still bound by read bandwidth (the GEMV unit consumes weights at the bandwidth's rate); 4 ports = 64 B / cycle = 6.4 GB/s (KV260 DDR4 peak about 19 GB/s).
 
-**性能模型**（100 MHz，设备时间，相对 EX 路径；括号内按双口实测 / 预测之比 0.97（Qwen3）、0.93（SmolLM2）折算）：
+**Performance model** (100 MHz, device time, relative to the EX path; in parentheses scaled by the dual-port measured / predicted ratios 0.97 (Qwen3), 0.93 (SmolLM2)):
 
 | | Qwen3 decode | SmolLM2 decode |
 |---|---|---|
-| 2 口（现在） | ×1.85（实测 ×1.80，3.98 tok/s） | ×1.76（实测 ×1.63） |
-| **4 口** | **×3.15**（约 6.5–7 tok/s；实测 ×2.83，6.28 tok/s） | **×2.74**（约 20 tok/s；实测 ×2.21，17.04） |
-| 4 口 + H2 + LD 命令流水 | ×3.46 | ×3.06 |
+| 2 ports (now) | ×1.85 (measured ×1.80, 3.98 tok/s) | ×1.76 (measured ×1.63) |
+| **4 ports** | **×3.15** (about 6.5–7 tok/s; measured ×2.83, 6.28 tok/s) | **×2.74** (about 20 tok/s; measured ×2.21, 17.04) |
+| 4 ports + H2 + LD command pipelining | ×3.46 | ×3.06 |
 
-prefill 不变。4 口之后，decode 剩下的是 LD 命令的固定延迟（约 1.6M 周期 / 步）、attention 的 EX、VE（2.65M）；PS 上也没有更多 HP 口。再往上的主要手段是 int4 权重（W4A8，字节减半），另行评估。
+prefill is unchanged. After 4 ports, what remains of decode is the fixed latency of LD commands (about 1.6M cycles / step), attention on EX, and VE (2.65M); the PS has no more HP ports either. The main lever beyond that is int4 weights (W4A8, half the bytes), evaluated separately.
 
-**口的分配**：PS 的 HP0 / HP1–HP2 / HP3 分别接 DDR 控制器的 S3 / S4 / S5，HPC0 / HPC1 经 CCI 到 S1 / S2。现在 HP0 = PicoRV32，HP1 = m0，HP3 = m1。
+**Port assignment**: the PS's HP0 / HP1–HP2 / HP3 connect to the DDR controller's S3 / S4 / S5, and HPC0 / HPC1 go through the CCI to S1 / S2. Today HP0 = PicoRV32, HP1 = m0, HP3 = m1.
 
-| 方案 | m2 | m3 | PicoRV32 | |
+| Option | m2 | m3 | PicoRV32 | |
 |---|---|---|---|---|
-| **A**（先做） | HP2 | HPC0（非一致性） | HP0 不动 | 改动最小；HPC0 经 CCI，延迟较大（每口 8 个 burst 在途，应能掩盖），与 APU 共用 S1 / S2 |
-| B | HP2 | HP0 | 挪到 HPC0 | 四个 DMA 口都在 HP 上；PicoRV32 只访问 ring，流量很小 |
+| **A** (first) | HP2 | HPC0 (non-coherent) | HP0 unchanged | Smallest change; HPC0 goes through the CCI with higher latency (8 bursts in flight per port should hide it), shares S1 / S2 with the APU |
+| B | HP2 | HP0 | moved to HPC0 | All four DMA ports on HP; PicoRV32 only accesses the ring, very little traffic |
 
-`build_bitstream -nports 4 [-m3_port hpc0|hp0]`（B 加后缀 `_m3hp0`）；先构建 A，bwtest 测试 7 明显低于 60 B / 周期再构建 B 对比。HP1 与 HP2 共用 S4 也由这个测试确认。
+`build_bitstream -nports 4 [-m3_port hpc0|hp0]` (B adds the suffix `_m3hp0`); build A first, and build B for comparison only if bwtest test 7 is clearly below 60 B / cycle. The same test also confirms that HP1 and HP2 share S4.
 
-**RTL**：
-- `sa_unit`：加 `m3_axi`（现在 m0..m2）；
-- `sa_ld`：本身支持任意口数（每口队列 + skid buffer）；R 侧仲裁变成 4 选 1，`lw_word`（乘法）→ ACC 地址的路径更长（双口时余量 +0.138 ns），必要时把 `lw_word` / `lw_lane` 提前一级（本地写多 1 周期延迟，吞吐不变）；
-- `sa_gemv`（NL = 4）：每条 lane 一份 x 缓冲（1 个 RAMB36）、累加器、16 个乘法；写回时每列 4 条 lane + ACC 原值相加，加一级流水；
-- 测试平台：`tb_sa_dma` NP = 4、`tb_sa_unit` 的内存从机到 4 个、Makefile 加 GEMV NP = 4。
+**RTL**:
+- `sa_unit`: add `m3_axi` (today m0..m2);
+- `sa_ld`: supports any number of ports already (per-port queue + skid buffer); R-side arbitration becomes 4-to-1 and the path `lw_word` (multiply) → ACC address gets longer (dual-port slack +0.138 ns); if needed move `lw_word` / `lw_lane` one stage earlier (one more cycle of latency on local writes, same throughput);
+- `sa_gemv` (NL = 4): one x buffer (1 RAMB36), accumulators and 16 multiplies per lane; at write-back each column adds 4 lanes + the old ACC value, with one more pipeline stage;
+- Testbenches: `tb_sa_dma` NP = 4, `tb_sa_unit` memory slaves up to 4, GEMV NP = 4 in the Makefile.
 
-**资源估计**：单口 → 双口 +4.0k LUT，4 口约 101–103k LUT（87–88%）、BRAM 136 / 144、DSP 349。LUT 是主要风险（布线拥挤，时序更难收敛）；放不下时把 GEMV 的乘法放到 DSP（还有约 900 个）或两条 lane 共用一个双读口 x 缓冲。
+**Resource estimate**: single → dual port +4.0k LUT; 4 ports about 101–103k LUT (87–88%), BRAM 136 / 144, DSP 349. LUT is the main risk (routing congestion, harder timing closure); if it does not fit, put the GEMV multiplies into DSPs (about 900 left) or let two lanes share one dual-read-port x buffer.
 
-**软件**：编译器已接受 `gemv_ports` 0..4；`board_env.sh` 加 `_gemv_np4` → `SA_GEMV_PORTS=4`（构建后缀 `_gemv4`）；bwtest 的 GEMV 峰值已按 NPORTS × 16 计算。
+**Software**: the compiler already accepts `gemv_ports` 0..4; `board_env.sh` adds `_gemv_np4` → `SA_GEMV_PORTS=4` (build suffix `_gemv4`); bwtest's GEMV peak is already computed as NPORTS × 16.
 
-**G5-1 实现（2026-10-10）**：`sa_unit` 加 `m3_axi`；`sa_ld` 在 NPORTS > 2 时把本地写（`lw_*`）寄存一级（4 选 1 仲裁和 `lw_word` 乘法止于寄存器；命令的 done 在最后一拍被取走后的下一周期，那时写已在寄存器里，同一时钟沿写入）；`sa_gemv` 在 NL > 2 时先寄存各 lane 之和，再加 ACC 原值（每个 strip 两个周期）；`build_bitstream -nports 4 [-m3_port hpc0|hp0]`，`kv260_bd.tcl` 按口列表（PicoRV32 的口、m0..m3 的口）配置 PS、连线、时钟、地址；`board_env.sh`：`_gemv_np4` → 4 口，构建后缀 `_gemv4`。验证：`make test / test16 / test128` 全过（新增 `tb_sa_dma` NP = 4、`tb_sa_unit` GEMV NP = 4），变异（去掉第 4 条 lane、去掉寄存的 lane 和、`lw_lane` 寄存值出错）均被发现；固件 bwtest / desc_run 联合仿真通过；stories 用 `gemv_ports = 4` 编译，逐 dispatch 检查与仿真 logits 逐位相同。
+**G5-1 implementation (2026-10-10)**: `sa_unit` adds `m3_axi`; with NPORTS > 2, `sa_ld` registers the local write (`lw_*`) one stage (the 4-to-1 arbitration and the `lw_word` multiply end at a register; a command's done comes in the cycle after its last beat is taken, when the write is already in the register and is written on the same clock edge); with NL > 2, `sa_gemv` first registers the sum of the lanes and then adds the old ACC value (two cycles per strip); `build_bitstream -nports 4 [-m3_port hpc0|hp0]`, `kv260_bd.tcl` configures the PS, wiring, clocks and addresses from a port list (PicoRV32's port, the ports of m0..m3); `board_env.sh`: `_gemv_np4` → 4 ports, build suffix `_gemv4`. Verification: `make test / test16 / test128` all pass (new `tb_sa_dma` NP = 4, `tb_sa_unit` GEMV NP = 4); mutations (removing the 4th lane, removing the registered lane sum, a wrong registered `lw_lane` value) are all caught; firmware bwtest / desc_run co-simulation passes; stories compiled with `gemv_ports = 4` has per-dispatch checks and simulation logits bit-identical.
 
-**G5-2 / G5-3 结果（2026-10-10，`d16_100mhz_w128_p6_gemv_np4`，m2 HP2、m3 HPC0）**：WNS **+0.168 ns**（双口 +0.138；最差路径变成 PicoRV32 复位到阵列 PE 的扇出，97% 是布线，GEMV / LD 数据通路不再关键），LUT 101,878（87.0%），FF 67,688，BRAM 138 / 144（每条 lane 的 x 缓冲一个），DSP 349。板上 `--reuse p6_red`：REGRESSION PASS（14 项），5 个 LLM 测试的 token 与 `p6_red` 逐字相同；bwtest GEMV 64 KB：x 驻留 1131 周期 = **57.95 B / 周期**（64 的 90.5%），x 读入 1164 周期 / 56.30。比例低于双口（95.5%）是因为传输时间减半而每条命令约 100 周期的固定开销不变（双口 2145 = 2048 + 97，4 口 1131 = 1024 + 107）：稳态带宽接近 64 B / 周期，HPC0 经 CCI、HP1 / HP2 共用 S4 都没有看到瓶颈，不需要构建 `-m3_port hp0` 对比。普通 LD / ST 仍约 15.7 B / 周期，1 拍 burst 的短行 LD 5.48 → 7.61。
+**G5-2 / G5-3 results (2026-10-10, `d16_100mhz_w128_p6_gemv_np4`, m2 HP2, m3 HPC0)**: WNS **+0.168 ns** (dual port +0.138; the worst path is now the fan-out of the PicoRV32 reset to the array PEs, 97% routing; the GEMV / LD data paths are no longer critical), LUT 101,878 (87.0%), FF 67,688, BRAM 138 / 144 (one x buffer per lane), DSP 349. On the board with `--reuse p6_red`: REGRESSION PASS (14 items), the tokens of 5 LLM tests identical to `p6_red`; bwtest GEMV 64 KB: x resident 1131 cycles = **57.95 B / cycle** (90.5% of 64), x read 1164 cycles / 56.30. The ratio is below the dual port's (95.5%) because the transfer time halves while the fixed overhead of about 100 cycles per command stays (dual port 2145 = 2048 + 97, 4 ports 1131 = 1024 + 107): the steady-state bandwidth is close to 64 B / cycle, and neither HPC0 through the CCI nor HP1 / HP2 sharing S4 shows a bottleneck, so no `-m3_port hp0` build is needed for comparison. Plain LD / ST still about 15.7 B / cycle; short-row LD with 1-beat bursts 5.48 → 7.61.
 
-**G5-4 结果（2026-10-10，`_gemv_np4`，GEMV 4 口编译，`build/deploy_kv260_d16_100mhz_w128_p6_gemv_np4/results`）**：主机上每个 LLM 测试的逐 dispatch 检查、仿真 logits 逐位相同（`sa.vmfb` 与 2 口版本不同，hfgen 重新编译到 `smollm2_p16_gemv4`）；板上 REGRESSION PASS（含 Qwen3，16 项），logits 与仿真逐位相同，token 与 2 口 / EX 路径逐字相同；bwtest GEMV 57.44–57.64 B / 周期。decode 每步（板上实测，含主机开销）：
+**G5-4 results (2026-10-10, `_gemv_np4`, compiled for 4 GEMV ports, `build/deploy_kv260_d16_100mhz_w128_p6_gemv_np4/results`)**: on the host every LLM test's per-dispatch checks pass and the simulation logits are bit-identical (`sa.vmfb` differs from the 2-port version; hfgen recompiled into `smollm2_p16_gemv4`); on the board REGRESSION PASS (including Qwen3, 16 items), logits bit-identical to the simulation, tokens identical to the 2-port / EX path; bwtest GEMV 57.44–57.64 B / cycle. Decode per step (measured on the board, including host overhead):
 
-| 模型 | EX 路径 | GEMV 2 口 | GEMV 4 口 | 4 口 / 2 口 | 4 口 / EX | 模型预测 |
+| Model | EX path | GEMV 2 ports | GEMV 4 ports | 4 ports / 2 ports | 4 ports / EX | Model prediction |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B | 451.4 ms（2.22） | 251.3 ms（3.98） | 159.2 ms（**6.28 tok/s**） | ×1.58 | ×2.83 | ×3.15 |
-| SmolLM2-135M（c6p） | 129.6 ms（7.71） | 79.5 ms（12.58） | 58.7 ms（**17.04**） | ×1.35 | ×2.21 | ×2.74 |
-| SmolLM2（hfgen） | 131.2 ms（7.62） | 78.5 ms（12.73） | 58.2 ms（17.19） | ×1.35 | ×2.25 | — |
-| stories15M | 16.2 ms（61.9） | 9.9 ms（100.8） | 7.6 ms（131.65） | ×1.31 | ×2.13 | — |
+| Qwen3-0.6B | 451.4 ms (2.22) | 251.3 ms (3.98) | 159.2 ms (**6.28 tok/s**) | ×1.58 | ×2.83 | ×3.15 |
+| SmolLM2-135M (c6p) | 129.6 ms (7.71) | 79.5 ms (12.58) | 58.7 ms (**17.04**) | ×1.35 | ×2.21 | ×2.74 |
+| SmolLM2 (hfgen) | 131.2 ms (7.62) | 78.5 ms (12.73) | 58.2 ms (17.19) | ×1.35 | ×2.25 | — |
+| stories15M | 16.2 ms (61.9) | 9.9 ms (100.8) | 7.6 ms (131.65) | ×1.31 | ×2.13 | — |
 
-prefill 不变（Qwen3 15.90 tok/s，SmolLM2 39.0）。低于预测的原因：设每步 = 固定部分 F + 与口数成反比的 GEMV 部分 G，由 2 口 / 4 口两点解出 Qwen3 G ≈ 184 ms（2 口时）、**F ≈ 67 ms**，SmolLM2 G ≈ 42 ms、**F ≈ 38 ms**；4 口时固定部分已占 Qwen3 每步的 42%、SmolLM2 的 65%（attention 的 EX、VE / SFU、LD 命令延迟、dispatch 与主机开销），GEMV 本身已接近线性加速。继续提高 decode 要削减 F（H2 乱序发射、LD 命令流水、减少 dispatch 数和主机开销），而不是更多的口；int4 权重只缩小 G。
+prefill unchanged (Qwen3 15.90 tok/s, SmolLM2 39.0). Why it is below the prediction: model each step as a fixed part F plus a GEMV part G inversely proportional to the number of ports; solving from the 2-port / 4-port points gives Qwen3 G ≈ 184 ms (at 2 ports), **F ≈ 67 ms**, and SmolLM2 G ≈ 42 ms, **F ≈ 38 ms**; at 4 ports the fixed part is already 42% of Qwen3's step and 65% of SmolLM2's (attention on EX, VE / SFU, LD command latency, dispatch and host overhead), while GEMV itself scales nearly linearly. Improving decode further means cutting F (H2 out-of-order issue, LD command pipelining, fewer dispatches and less host overhead), not more ports; int4 weights only shrink G.
 
-**F 的实测分解（2026-10-12，WP9，`generality_implementation_plan.md` §13.1）**：Qwen3 通用路径逐 dispatch 计时（`dispatch_stats.py`）：batched 一步设备 175.0 ms、runtime 其余 3.4 ms，主机开销可以忽略；GEMV 线性层 111 ms（598 MB，53.7 B / 周期 = 4 口峰值的 93%），attention（静态 T = 256）46.5 ms，归一化 / RoPE / softmax / 量化 18.7 ms。在此之前 v 投影（int8 结果直接进 KV cache）没有走 GEMV，每步多 33 ms（`14f5612` 修复，211.1 → 178.4 ms/步）；attention 再按实际长度（`1860823`）后 145.4 ms/步（6.88 tok/s），GEMV 占设备时间的 80%。
+**Measured breakdown of F (2026-10-12, WP9, `generality_implementation_plan.md` §13.1)**: per-dispatch timing of Qwen3's generic path (`dispatch_stats.py`): a batched step is 175.0 ms on the device and 3.4 ms in the rest of the runtime, so host overhead is negligible; GEMV linear layers 111 ms (598 MB, 53.7 B / cycle = 93% of the 4-port peak), attention (static T = 256) 46.5 ms, normalization / RoPE / softmax / quantization 18.7 ms. Before that the v projection (int8 result written directly into the KV cache) did not use GEMV and cost 33 ms more per step (fixed by `14f5612`, 211.1 → 178.4 ms/step); with the attention over the actual length (`1860823`) it is 145.4 ms/step (6.88 tok/s), GEMV being 80% of the device time.
 
-**4 口模型校准与下一步 what-if（2026-10-12，Qwen3 通用路径 `deploy_hfgen_qwen3_dyn`，动态 attention 长度）**：`DEPLOY=build MODEL=deploy_hfgen_qwen3_dyn OUT=qwen3_dyn MB=640 compiler/scripts/perf_trace.sh` 取轨迹，`perf_model.py --trace build/perfmodel/qwen3_dyn.trace --board build/deploy_hfgen_qwen3_dyn/prof3.csv --gemv-ports 4 [--whatif next]`。重新拟合 VE / 前端（f_desc 24 周期 / 描述符），模型对板上 prefill 一块 80.46M / 78.68M 周期（**+2.3%**），decode 一步 14.38M / 13.88M（**+3.6%**，最大的 GEMV 线性层 +2–10%）。以 4 口为基线的 what-if（时间加速比；200 MHz 时 DDR 延迟按 ns 不变、LD / ST 延迟周期 ×2，4 口 × 16 B × 200 MHz = 12.8 GB/s 仍低于 DDR4 峰值 19.2）：
+**4-port model calibration and next-step what-if (2026-10-12, Qwen3 generic path `deploy_hfgen_qwen3_dyn`, dynamic attention length)**: trace from `DEPLOY=build MODEL=deploy_hfgen_qwen3_dyn OUT=qwen3_dyn MB=640 compiler/scripts/perf_trace.sh`, then `perf_model.py --trace build/perfmodel/qwen3_dyn.trace --board build/deploy_hfgen_qwen3_dyn/prof3.csv --gemv-ports 4 [--whatif next]`. With VE / frontend refitted (f_desc 24 cycles / descriptor), the model versus the board is 80.46M / 78.68M cycles for a prefill chunk (**+2.3%**) and 14.38M / 13.88M for a decode step (**+3.6%**; the largest GEMV linear layers +2–10%). What-if with 4 ports as the baseline (time speedups; at 200 MHz the DDR latency is unchanged in ns, LD / ST latency cycles ×2, and 4 ports × 16 B × 200 MHz = 12.8 GB/s is still below the DDR4 peak of 19.2):
 
-| 方案 | prefill tok/s | decode tok/s | prefill / decode |
+| Option | prefill tok/s | decode tok/s | prefill / decode |
 |---|---|---|---|
-| 基线（4 口 GEMV，100 MHz） | 20.61 | 6.95 | ×1.00 / ×1.00 |
+| Baseline (4-port GEMV, 100 MHz) | 20.61 | 6.95 | ×1.00 / ×1.00 |
 | 200 MHz | 38.66 | 12.48 | ×1.88 / ×1.79 |
-| W4A8（decode 权重字节减半） | 20.61 | 10.28 | ×1.00 / ×1.48 |
-| 6 个 GEMV 口（HP0–3 + HPC0–1） | 20.61 | 8.87 | ×1.00 / ×1.28 |
-| LD 命令流水 | 20.92 | 7.21 | ×1.01 / ×1.04 |
-| H2 乱序发射 | 22.07 | 7.33 | ×1.07 / ×1.05 |
-| D = 32 阵列 | 21.82 | 7.07 | ×1.06 / ×1.02 |
-| W4A8 + H2 + LD 流水 | 22.24 | 13.14 | ×1.08 / ×1.89 |
+| W4A8 (half the decode weight bytes) | 20.61 | 10.28 | ×1.00 / ×1.48 |
+| 6 GEMV ports (HP0–3 + HPC0–1) | 20.61 | 8.87 | ×1.00 / ×1.28 |
+| LD command pipelining | 20.92 | 7.21 | ×1.01 / ×1.04 |
+| H2 out-of-order issue | 22.07 | 7.33 | ×1.07 / ×1.05 |
+| D = 32 array | 21.82 | 7.07 | ×1.06 / ×1.02 |
+| W4A8 + H2 + LD pipelining | 22.24 | 13.14 | ×1.08 / ×1.89 |
 | 200 MHz + W4A8 | 38.66 | 17.58 | ×1.88 / ×2.53 |
-| 200 MHz + W4A8 + H2 + LD 流水 | 42.92 | 25.01 | ×2.08 / ×3.60 |
+| 200 MHz + W4A8 + H2 + LD pipelining | 42.92 | 25.01 | ×2.08 / ×3.60 |
 
-模型只含设备时间（不含 runtime 的 3–7 ms / 步），URAM（SPAD 容量）改变的是编译器的分块，轨迹固定时无法评估。结论见 `generality_implementation_plan.md` §17 问题 6。
+The model covers device time only (not the runtime's 3–7 ms / step); URAM (SPAD capacity) changes the compiler's tiling and cannot be evaluated with a fixed trace. Conclusion in `generality_implementation_plan.md` §17 question 6.
 
-**步骤**：G5-1 RTL / 测试平台 / BD 参数，仿真通过后 `-bd_only` 检查；G5-2 构建 `-nports 4`；G5-3 板上 `--reuse p6_red` 回归 + bwtest（测试 7 应接近 64 B / 周期）；G5-4 完整 GEMV 4 口 staging，板上 decode 与预测比较。
+**Steps**: G5-1 RTL / testbenches / BD parameters, `-bd_only` check after the simulations pass; G5-2 build `-nports 4`; G5-3 board regression with `--reuse p6_red` + bwtest (test 7 should be close to 64 B / cycle); G5-4 full 4-port GEMV staging, board decode compared with the prediction.
 
-## 9. 资源与时序估计（P = 2）
+## 9. Resource and timing estimate (P = 2)
 
-| 部分 | LUT | FF | DSP | BRAM |
+| Part | LUT | FF | DSP | BRAM |
 |---|---|---|---|---|
-| `sa_gemv`：32 个 int8 乘（DSP 打包） | — | — | 16 | — |
-| 累加器 2 × 8 × 16 × 32 位 + 32 个 32 位加法 + 选择 | ~2k | ~8.5k | — | — |
-| 写回：16 个 32 位加法（两组 + ACC 原值） | ~0.6k | ~0.5k | — | — |
-| x 缓冲 2 份 | — | — | — | 1 RAMB36（两个 RAMB18） |
-| `sa_ld` R 侧双口 + burst 标签 | ~0.5k | ~0.3k | — | — |
-| BD：第二个 HP 口的协议转换 | ~1–2k | ~2k | — | — |
-| **合计** | **~4–5k** | ~11k | 16 | 1 |
+| `sa_gemv`: 32 int8 multiplies (DSP packing) | — | — | 16 | — |
+| Accumulators 2 × 8 × 16 × 32 bits + 32 32-bit adds + selects | ~2k | ~8.5k | — | — |
+| Write-back: 16 32-bit adds (two groups + old ACC value) | ~0.6k | ~0.5k | — | — |
+| 2 x buffers | — | — | — | 1 RAMB36 (two RAMB18) |
+| `sa_ld` dual-port R side + burst tags | ~0.5k | ~0.3k | — | — |
+| BD: protocol conversion for the second HP port | ~1–2k | ~2k | — | — |
+| **Total** | **~4–5k** | ~11k | 16 | 1 |
 
-现在 LUT 88.25k / 117k（75%）、FF 约 61k / 234k、DSP 347 / 1248、BRAM 130 / 144，都放得下（LUT 约 79%）。新路径都很短（一级 32 位加法、DSP 乘法），100 MHz 下不会成为关键路径。
+Today LUT 88.25k / 117k (75%), FF about 61k / 234k, DSP 347 / 1248, BRAM 130 / 144; everything fits (LUT about 79%). The new paths are all short (one level of 32-bit adds, DSP multiplies) and will not be critical at 100 MHz.
 
-## 10. 风险
+## 10. Risks
 
-- **两口并发的 DDR 带宽**：模型假设每口 16 B / 周期；用 G3 的 bwtest 双口测试确认，不足时先查 HP 口与 DDR 控制器端口的分配。
-- **m0 与描述符取指共用**：取指在 m0 上与权重 burst 交错；轮流分配时 m0 多一点负担。可以让 GEMV 的 burst 优先走 m1，或者把取指挪到 m1。
-- **x 驻留标记**：清除条件故意保守（任何写 SPAD_A 都清除）；功能仿真器同样实现标记并在 `dispatch_check` 中比较，标记错误会表现为结果不一致。
-- **只写第 0 行**：依赖 epilogue 只读第 0 行。编译器只在 `expandLinear` 生成 GEMV，那里的 epilogue 布局固定；funcsim 的结果比较会抓到任何读了第 1..15 行的情况。
+- **DDR bandwidth with two concurrent ports**: the model assumes 16 B / cycle per port; confirmed with G3's dual-port bwtest; if insufficient, first check the assignment of HP ports to DDR controller ports.
+- **m0 shared with descriptor fetch**: fetches interleave with weight bursts on m0; with round-robin assignment m0 carries a little more. GEMV bursts could prefer m1, or fetch could move to m1.
+- **x residency tag**: the clearing condition is deliberately conservative (any write to SPAD_A clears it); the functional simulator implements the tag too and `dispatch_check` compares it, so a wrong tag shows up as a result mismatch.
+- **Only row 0 is written**: relies on the epilogue reading only row 0. The compiler generates GEMV only in `expandLinear`, where the epilogue layout is fixed; funcsim's result comparison catches any read of rows 1..15.

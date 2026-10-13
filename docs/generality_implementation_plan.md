@@ -1,166 +1,164 @@
-# 4 口 GEMV 之后：通用性与量化质量实现方案
+# After the 4-port GEMV: implementation plan for generality and quantization quality
 
-> English version: [`generality_implementation_plan.en.md`](generality_implementation_plan.en.md) (translated 2026-10-13; this Chinese document is the authoritative one).
+Status: implementation draft (reviewed 2026-10-10 against the code and the four-port board results: WP0 and WP1 are basically done, WP5's EX baseline already exists, WP6 only lacks compiler integration). **Progress 2026-10-12**: WP2, WP3 (SmolLM2), WP7 (Llama-3.2-1B) accepted on the board; WP4 Qwen3 K per-channel accepted on the board; first version of WP9 done (§13.1: statistics, board teacher forcing, decode / prefill breakdown; with the V projection on GEMV and attention over the actual length, Qwen3 decode 6.88 tok/s, prefill 20.5 tok/s); WP6 switch and boundary tests done; WP6 decode K split integrated into the compiler; SmolLM2 per-channel KV evaluation done (kch 28.82 / 87.7%), SmolLM2 whole model with kch + actual length accepted on the board (decode 22.17, prefill 60.09 tok/s, board PPL 28.55, §7). **Progress 2026-10-13**: Llama-3.2-1B K per-channel rebuild accepted on the board (4.04 / 14.97 tok/s, §11); 4-port performance model recalibrated, §17.1 answers question 6 (next hardware investment W4A8); **WP8 Gemma-3-270M whole model accepted on the board** (790 executables all on the accelerator, 17/17 bit-exact, decode 14.96, prefill 62.5 tok/s, board PPL 158.5, §12.4), §13.2 main table has all four rows, §17.2 answers question 4; Gemma's quality loss traced to the int8 attention probabilities, changed to normalization by the quantized sum (qsum, 1a0ba3d): Gemma, SmolLM2, Qwen3 rebuilt and accepted on the board, board KL −25% / −31% / −29% (Gemma PPL 158.5 → 142.8), speed unchanged (§12.4); Llama being rebuilt  
+Date: 2026-10-10 (updated 2026-10-12)  
+Baseline: `main@b42fec6` (four-port acceptance `fb01909`)  
+Milestones: talk content freeze 2026-11-15; IREE community meeting 2026-11-25
 
-状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；V 投影走 GEMV、attention 按实际长度后 Qwen3 decode 6.88 tok/s、prefill 20.5 tok/s）；WP6 开关与边界测试完成；WP6 decode K 分块已接入编译器；SmolLM2 KV 按通道评估完成（kch 28.82 / 87.7%），SmolLM2 全模型 kch + 按实际长度板上验收（decode 22.17、prefill 60.09 tok/s，板上 PPL 28.55，§7）。**2026-10-13 进度**：Llama-3.2-1B K per-channel 重建板上验收（4.04 / 14.97 tok/s，§11）；4 口性能模型重新校准，§17.1 回答问题 6（下一项硬件投资 W4A8）；**WP8 Gemma-3-270M 全模型板上验收**（790 个 executable 全在加速器，17/17 逐位一致，decode 14.96、prefill 62.5 tok/s，板上 PPL 158.5，§12.4），§13.2 主表四行齐全，§17.2 回答问题 4；Gemma 质量损失定位到 int8 注意力概率，改为按量化后的和归一化（qsum，1a0ba3d）：Gemma、SmolLM2、Qwen3 重建后板上验收，板上 KL −25% / −31% / −29%（Gemma PPL 158.5 → 142.8），速度不变（§12.4）；Llama 重建中  
-日期：2026-10-10（2026-10-12 更新）  
-基线：`main@b42fec6`（四口验收 `fb01909`）  
-目标节点：2026-11-15 演讲内容冻结；2026-11-25 IREE 社区会议  
+## 1. Goals and scope
 
-## 1. 目标与边界
+After the G5 four-port GEMV, this stage addresses two problems first:
 
-本阶段在 G5 四口 GEMV 完成后，优先解决两个问题：
+1. **Generality**: one PyTorch / Hugging Face → IREE → SA descriptor flow covering four model structures: Qwen3, SmolLM2, Llama 3.2 and Gemma 3.
+2. **Quantization quality**: import ready-made compressed-tensors W8A8 weights, and measure "the checkpoint's own quantization loss" separately from "the extra numeric loss this project introduces".
 
-1. **通用性**：让同一套 PyTorch / Hugging Face → IREE → SA descriptor 流程覆盖 Qwen3、SmolLM2、Llama 3.2 和 Gemma 3 四类模型结构。
-2. **量化质量**：支持导入 compressed-tensors W8A8 成品权重，并把“checkpoint 本身的量化损失”和“本项目额外引入的数值损失”分离测量。
+High-risk hardware work such as 200 MHz, W4A8, SPAD sub-banks and K3 URAM is not started before the meeting. The only exceptions are the GEMV K split, whose hardware support is done and only needs compiler integration, and row-by-row prefill execution if time allows.
 
-会前不主动展开 200 MHz、W4A8、SPAD 子银行、K3 URAM 等高风险硬件工作。唯一例外是已经完成硬件支持、只需编译器接入的 GEMV K 分块，以及时间允许时的 prefill 逐行执行。
+### 1.1 Success criteria before the meeting
 
-### 1.1 会前成功标准
-
-| 级别 | 交付目标 |
+| Level | Deliverables |
 |---|---|
-| 必须完成 | ~~四口 GEMV 完整验收~~（2026-10-10 完成）；compressed-tensors W8A8 importer；SmolLM2 验证；Qwen3 质量复测；Llama 3.2 正确性路径与内存结论 |
-| 争取完成 | Llama down_proj 的 GEMV K 分块；Llama 板上端到端；第一版消融表 |
-| 进行中展示 | Gemma 3 sim 跑通、覆盖矩阵、主要回退原因 |
-| 会后决定 | 200 MHz、W4A8、H2/LD 流水、SPAD 子银行、T 分块与 URAM |
+| Must | ~~Full four-port GEMV acceptance~~ (done 2026-10-10); compressed-tensors W8A8 importer; SmolLM2 validation; Qwen3 quality re-measurement; Llama 3.2 correctness path and memory conclusion |
+| Should | GEMV K split for Llama's down_proj; Llama end to end on the board; first ablation tables |
+| Show as in progress | Gemma 3 running on the sim, coverage matrix, main fallback reasons |
+| Decide after the meeting | 200 MHz, W4A8, H2/LD pipelining, SPAD sub-banks, T tiling and URAM |
 
-### 1.2 非目标
+### 1.2 Non-goals
 
-- 不在第一版 importer 中支持 int4、FP8、非对称量化、静态激活量化、权重按组/按块量化。
-- 不要求 Gemma 第一版在 KV260 上完整跑通长上下文。
-- 不以 40 个位置的 top-1 作为最终质量结论；它只作为快速回归指标。
-- 不把主机墙钟时间与设备周期简单相加，除非运行时确认两者没有重叠。
+- The first importer does not support int4, FP8, asymmetric quantization, static activation quantization, or per-group/per-block weight quantization.
+- Gemma's first version is not required to run long contexts fully on the KV260.
+- top-1 over 40 positions is not taken as the final quality conclusion; it is only a fast regression metric.
+- Host wall-clock time and device cycles are not simply added, unless the runtime confirms they do not overlap.
 
-## 2. 总体执行顺序
+## 2. Overall order of execution
 
 ```text
-G5-4 收尾（已完成，只剩 perf_model 校准）
+G5-4 wrap-up (done; only perf_model calibration left)
   → compressed-tensors importer
-  → 合成 checkpoint + SmolLM2 验证
-  → Qwen3 质量定位
-  → Llama 前端、内存预检与 EX 基线
-  → GEMV K 分块
-  → Llama 完整 sim / 板上验收
-  → 消融初版
-  → Gemma 短上下文 sim 与覆盖矩阵
-  → 根据耗时分解决定下一项优化
+  → synthetic checkpoints + SmolLM2 validation
+  → Qwen3 quality attribution
+  → Llama frontend, memory preflight and EX baseline
+  → GEMV K split
+  → full Llama sim / board acceptance
+  → first ablations
+  → Gemma short-context sim and coverage matrix
+  → decide the next optimization from the time breakdown
 ```
 
-关键原则：Llama 先建立 EX 路径的正确性基线，再启用 K 分块。这样既降低调试耦合，也自然形成一组编译器消融实验。
+Key principle: Llama first establishes a correctness baseline on the EX path, and only then enables the K split. This lowers the coupling in debugging and naturally yields a set of compiler ablation experiments.
 
-## 3. 统一验收口径
+## 3. Common acceptance criteria
 
-### 3.1 正确性分层
+### 3.1 Layers of correctness
 
-每个模型依次通过以下层级：
+Each model passes the following layers in order:
 
-1. **Checkpoint reference**：compressed-tensors / Transformers 或 vLLM 可识别的原始 checkpoint 参考。动态激活量化的约定以 **vLLM 运行时语义**为准（按 token、`scale = amax / 127`，与设备和 `qllama` 相同）；llm-compressor 校准时的 fake-quant 可能用 `amax / 127.5` 并截到 [-128, 127]（待核实），不作为参考，否则这一层会混入与本项目无关的约定差异。
-2. **Importer eager reference**：项目 importer 构造的 PyTorch eager 模型。
-3. **SA oracle**：采用设备量化语义、近似函数和舍入规则的主机参考。
-4. **funcsim / dispatch_check**：每个 dispatch 的输入输出与 SA oracle 逐位一致。
-5. **板上执行**：logits 与 funcsim 逐位一致，生成 token 与 EX 路径一致。
+1. **Checkpoint reference**: the original checkpoint as recognized by compressed-tensors / Transformers or vLLM. The convention for dynamic activation quantization follows **vLLM's runtime semantics** (per token, `scale = amax / 127`, the same as the device and `qllama`); the fake-quant used by llm-compressor during calibration may use `amax / 127.5` and clamp to [-128, 127] (to be verified) and is not used as the reference, otherwise this layer would mix in convention differences unrelated to this project.
+2. **Importer eager reference**: the PyTorch eager model built by the project's importer.
+3. **SA oracle**: a host reference using the device's quantization semantics, approximate functions and rounding rules.
+4. **funcsim / dispatch_check**: every dispatch's inputs and outputs bit-exact with the SA oracle.
+5. **Board execution**: logits bit-exact with funcsim, generated tokens identical to the EX path.
 
-“逐位一致”只用于采用同一整数语义的 3–5 层，不要求量化模型与 bf16/fp32 模型逐位一致。
+"Bit-exact" only applies to layers 3–5, which use the same integer semantics; the quantized model is not required to be bit-exact with the bf16/fp32 model.
 
-### 3.2 质量指标
+### 3.2 Quality metrics
 
-| 指标 | 用途 | 最低数据量 |
+| Metric | Use | Minimum data |
 |---|---|---|
-| 固定 40 位置 top-1 | 快速回归、每日测试 | 40 个固定位置 |
-| top-1 agreement | 正式报告 | 至少数千个 token 位置 |
-| 平均相关系数 / cosine | 判断 logits 整体漂移 | 与 top-1 使用相同位置 |
-| KL divergence | 判断概率分布偏移 | 与 top-1 使用相同位置 |
-| WikiText-2 perplexity 或等价 PPL | 端到端语言建模质量 | 固定、可复现的数据切分 |
+| Fixed 40-position top-1 | Fast regression, daily tests | 40 fixed positions |
+| top-1 agreement | Formal reporting | At least several thousand token positions |
+| Mean correlation / cosine | Overall logit drift | Same positions as top-1 |
+| KL divergence | Shift of the probability distribution | Same positions as top-1 |
+| WikiText-2 perplexity or an equivalent PPL | End-to-end language-modeling quality | A fixed, reproducible data split |
 
-**在哪里跑**：功能仿真太慢（Qwen3 sim 上 4 步 decode 约 819 s），数千位置的正式指标不在 funcsim 上跑。两条路：① 主机上的 SA oracle（eager，设备量化语义），用于第 3 层；② 板上 prefill 做 teacher forcing（Qwen3 prefill 约 16 tok/s，4000 个位置约 4 分钟），用于第 5 层。② 需要运行时导出 prefill 每个位置的 logits（现在只导出最后一个位置），列入 WP9。
+**Where to run them**: the functional simulator is too slow (4 decode steps of Qwen3 take about 819 s on the sim), so the formal metrics over thousands of positions do not run on funcsim. Two ways: ① the SA oracle on the host (eager, device quantization semantics), for layer 3; ② teacher forcing with prefill on the board (Qwen3 prefill about 16 tok/s, 4000 positions in about 4 minutes), for layer 5. ② needs the runtime to export the logits of every prefill position (today only the last position), listed under WP9.
 
-校准集与质量测试集必须分离；各实现使用完全相同的 token ID、上下文长度、聊天模板和截断规则。
+Calibration sets and quality test sets must be separate; all implementations use exactly the same token IDs, context length, chat template and truncation rules.
 
-### 3.3 覆盖率指标
+### 3.3 Coverage metrics
 
-同时报告四类覆盖率，避免“dispatch 数量很高但热点仍在主机”的误导：
+Four kinds of coverage are reported together, to avoid the misleading "a high dispatch count but the hot spots still on the host":
 
-- 静态覆盖率：编译图中可下沉到加速器的 dispatch 类型占比。
-- 动态覆盖率：实际运行的加速器 dispatch 次数 / 总 dispatch 次数。
-- 时间覆盖率：加速器执行时间 / 端到端执行时间，以及主机回退墙钟占比。
-- 工作量覆盖率：加速器承担的估算 MAC 数和权重/激活字节占比。
+- Static coverage: the share of dispatch types in the compiled graph that can go to the accelerator.
+- Dynamic coverage: accelerator dispatches actually run / total dispatches.
+- Time coverage: accelerator execution time / end-to-end execution time, and the share of host-fallback wall clock.
+- Work coverage: the share of estimated MACs and weight/activation bytes carried by the accelerator.
 
-回退清单至少包含：dispatch 名称、算子类别、形状、调用次数、累计耗时、占比、回退原因。
+The fallback list contains at least: dispatch name, operator category, shape, call count, cumulative time, share, fallback reason.
 
-## 4. 工作包 WP0：基线冻结与文档同步
+## 4. Work package WP0: baseline freeze and documentation sync
 
-**状态（2026-10-10）**：文档同步已完成并推送（`b42fec6`）：根目录 README、`compiler/README.md`、`kv260_upgrade_plan.md`（K2b 写明 D = 16 + 流式 GEMV 2 / 4 口，不再以 D = 32 为前提）、`k2b_gemv_design.md`、`iree_compiler_plan.md`。板上结果目录的 `summary.txt` 已记录 commit、bitstream 哈希、overlay 配置与 WNS。剩下的是测试 prompt / 结果目录命名的统一。
+**Status (2026-10-10)**: documentation sync done and pushed (`b42fec6`): root README, `compiler/README.md`, `kv260_upgrade_plan.md` (K2b now states D = 16 + streaming GEMV with 2 / 4 ports, no longer premised on D = 32), `k2b_gemv_design.md`, `iree_compiler_plan.md`. The `summary.txt` of the board result directories records the commit, bitstream hash, overlay configuration and WNS. What remains is unifying the naming of test prompts / result directories.
 
-### 实现
+### Implementation
 
-- 记录 `main` commit、Vivado/Vitis 版本、IREE 版本、板卡固件、设备树和 u-dma-buf 布局。
-- 固定测试 prompts、token IDs、上下文长度和生成长度。
-- 为结果目录定义统一命名：`<commit>/<model>/<bitstream>/<mode>/`。
-- 立即修正根目录 README 中仍为 K1 的数字。
-- 将 `kv260_upgrade_plan.md` 的 K2b 更新为 100 MHz 流式 GEMV 2/4 口，移除 D=32 是 K2b 前提的旧描述；G4/G5 资源和状态按已验收结果填写。
+- Record the `main` commit, the Vivado/Vitis version, the IREE version, the board firmware, the device tree and the u-dma-buf layout.
+- Fix the test prompts, token IDs, context length and generation length.
+- Define a uniform naming for result directories: `<commit>/<model>/<bitstream>/<mode>/`.
+- Immediately fix the numbers in the root README that are still K1's.
+- Update K2b in `kv260_upgrade_plan.md` to the 100 MHz streaming GEMV with 2/4 ports, removing the old description of D=32 as K2b's premise; fill in G4/G5 resources and status from the accepted results.
 
-### 验收
+### Acceptance
 
-- 所有后续表格都能追溯到 commit、bitstream 和运行参数。
-- 文档不存在同时把 K2b 描述为 D=32、200–250 MHz 和 100 MHz 四口 GEMV 的冲突。
+- Every later table can be traced to a commit, a bitstream and run parameters.
+- No document describes K2b as D=32 at 200–250 MHz and as a 100 MHz four-port GEMV at the same time.
 
-## 5. 工作包 WP1：G5 四口 GEMV 收尾
+## 5. Work package WP1: G5 four-port GEMV wrap-up
 
-**状态（2026-10-10，`fb01909`）**：除 perf_model 校准外已完成。板上 REGRESSION PASS（含 Qwen3），logits 与 funcsim 逐位一致，token 与 EX / 2 口相同；bwtest GEMV 57.44–57.95 B / 周期。decode（tok/s，EX → 2 口 → 4 口）：Qwen3 2.22 → 3.98 → **6.28**（预测 ×3.15，实测 ×2.83），SmolLM2 7.71 → 12.58 → **17.04**，hfgen 7.62 → 12.73 → 17.19，stories 61.9 → 100.8 → 131.65；prefill 不变。由 2 口 / 4 口两点解出每步 = 固定部分 F + GEMV 部分：**F 约 67 ms（Qwen3，占 4 口每步的 42%）、约 38 ms（SmolLM2，65%）**，GEMV 部分已近线性随口数缩短。结果在 `k2b_gemv_design.md` §8.1（G5-4）与 `build/deploy_kv260_*_gemv{,_np2,_np4}/results`。
+**Status (2026-10-10, `fb01909`)**: done except the perf_model calibration. Board REGRESSION PASS (including Qwen3), logits bit-exact with funcsim, tokens identical to EX / 2 ports; bwtest GEMV 57.44–57.95 B / cycle. decode (tok/s, EX → 2 ports → 4 ports): Qwen3 2.22 → 3.98 → **6.28** (predicted ×3.15, measured ×2.83), SmolLM2 7.71 → 12.58 → **17.04**, hfgen 7.62 → 12.73 → 17.19, stories 61.9 → 100.8 → 131.65; prefill unchanged. Solving from the 2-port / 4-port points, each step = a fixed part F + a GEMV part: **F about 67 ms (Qwen3, 42% of the 4-port step), about 38 ms (SmolLM2, 65%)**; the GEMV part already shrinks nearly linearly with the number of ports. Results in `k2b_gemv_design.md` §8.1 (G5-4) and `build/deploy_kv260_*_gemv{,_np2,_np4}/results`.
 
-### 实现
+### Implementation
 
-- 使用 `--iree-sa-gemv-ports=4` 完成 Qwen3、SmolLM2、generic 和 stories 的 staging。
-- 保存 EX、GEMV 1/2/4 口的可执行文件、bitstream 标识和完整运行日志。
-- 用 `board_profile.py` 收集 decode 的设备周期、DDR 读字节、命令数量和各阶段耗时。
-- 将 profile 输入 `perf_model.py`，同时保存预测值、实测值和误差。
+- Staging of Qwen3, SmolLM2, generic and stories with `--iree-sa-gemv-ports=4`.
+- Keep the executables, bitstream identifiers and full run logs for EX and GEMV with 1/2/4 ports.
+- Collect decode device cycles, DDR read bytes, command counts and per-stage times with `board_profile.py`.
+- Feed the profile into `perf_model.py`, keeping predictions, measurements and errors.
 
-### 验收
+### Acceptance
 
-- 回归全集通过，包含 Qwen3。
-- 板上 logits 与 funcsim 逐位一致；token 序列与 EX 路径一致。
-- 四口带宽测试维持约 57.95 B/cycle，并记录实际波动范围。
-- Qwen3 decode 实测值与预测值同时入表；不把 6.5–7 token/s 估算写成实测。
+- The full regression passes, including Qwen3.
+- Board logits bit-exact with funcsim; token sequences identical to the EX path.
+- The four-port bandwidth test stays at about 57.95 B/cycle, with the actual range of variation recorded.
+- Qwen3 decode measured and predicted values both in the table; the 6.5–7 token/s estimate is not written as a measurement.
 
-### 输出
+### Output
 
-- 不另开 closeout 文档：结果已在 `k2b_gemv_design.md` §8.1；剩下的 perf_model 校准（预测 / 实测 / 误差，以及固定部分 F 的分类拆分）也写在那里。
-- 硬件消融表的 EX、1 口、2 口、4 口四行（1 口的 decode 板上数据尚未取回，可选）
+- No separate closeout document: the results are already in `k2b_gemv_design.md` §8.1; the remaining perf_model calibration (prediction / measurement / error, and the categorized breakdown of the fixed part F) also goes there.
+- The four rows EX, 1 port, 2 ports, 4 ports of the hardware ablation table (the board decode data for 1 port has not been retrieved; optional)
 
-## 6. 工作包 WP2：compressed-tensors W8A8 importer
+## 6. Work package WP2: compressed-tensors W8A8 importer
 
-**进度（2026-10-10）**：第一版完成，主机上验证。
-- `compiler/frontend/ct_import.py`：按 §6.1 检查 `quantization_config`（拒绝时给出 config group / 层名、字段与支持范围）；safetensors 按张量 mmap 读入（单文件或分片），每个量化线性层的 `(q int8, s fp32)` 挂在权重 Parameter 上（`_sa_qs`），权重本身为反量化的 `q * s`（fp32 参考与 KV 校准用）；`ignore` 的层与非 Linear 张量按原浮点载入。
-- `hf_generic.py`：`hf_model()` 遇到 `quantization_config` 走 importer；`rope_rewrite()` 同时置换 `_sa_qs` 的行与 scale；`quantize()` 有 `_sa_qs` 就原样使用（不经 `_quantize_rows`，-128 保留）。普通模型的导出与改动前逐字节相同（SmolLM2 截 2 层：irpa / mlir 相同）。
-- `synth_hf.py --ct VARIANT`：合成 checkpoint（scale = amax / 127.5、[-128, 127]，如 llm-compressor 的 minmax）；接受的 ok / neg128 / bf16-scale，拒绝的 group / static-act / asym / int4 / fp8 / missing-scale / bad-shape / kv-scheme。
-- `compiler/tests/test_ct_import.py [--e2e]`（`run_tests.sh ctimport`）：8 种拒绝都报出对应字段；3 种接受的 14 个线性层 int8 与 scale 与文件逐字节相同（q / k 按 RoPE 置换），-128 保留，嵌入与分类层一张共享表，反量化权重 = q × s；变异（`quantize()` 不用 `_sa_qs`、`rope_rewrite` 不置换 `_sa_qs`）都被发现。`--e2e`（D = 16、GEMV 4 口）：Llama 形状的 neg128 / bf16-scale 导出、编译（全部在加速器上）、sim 与 torch W8A8 逐步一致，teacher-forced 40/40 与 torch 相同。主机内存峰值 436 MB（小模型）。
-- `dispatch_check.py --full-i8`：int8 数据取 [-128, 127]（默认仍为 [-127, 127]，前端自量化的范围）。
+**Progress (2026-10-10)**: first version done, verified on the host.
+- `compiler/frontend/ct_import.py`: checks `quantization_config` according to §6.1 (a rejection names the config group / layer, the field and the supported range); safetensors read per tensor by mmap (single file or shards); each quantized linear layer's `(q int8, s fp32)` is attached to the weight Parameter (`_sa_qs`), the weight itself being the dequantized `q * s` (for the fp32 reference and KV calibration); `ignore`d layers and non-Linear tensors are loaded as floats.
+- `hf_generic.py`: `hf_model()` goes through the importer when it sees `quantization_config`; `rope_rewrite()` also permutes the rows and scales of `_sa_qs`; `quantize()` uses `_sa_qs` as is when present (not through `_quantize_rows`, -128 kept). The export of ordinary models is byte-identical to before the change (SmolLM2 truncated to 2 layers: same irpa / mlir).
+- `synth_hf.py --ct VARIANT`: synthetic checkpoints (scale = amax / 127.5, [-128, 127], like llm-compressor's minmax); accepted ok / neg128 / bf16-scale, rejected group / static-act / asym / int4 / fp8 / missing-scale / bad-shape / kv-scheme.
+- `compiler/tests/test_ct_import.py [--e2e]` (`run_tests.sh ctimport`): all 8 rejections report the right field; for the 3 accepted ones the int8 and scales of the 14 linear layers are byte-identical to the file (q / k permuted for RoPE), -128 kept, the embedding and classifier share one table, dequantized weights = q × s; mutations (`quantize()` not using `_sa_qs`, `rope_rewrite` not permuting `_sa_qs`) are all caught. `--e2e` (D = 16, 4 GEMV ports): the Llama-shaped neg128 / bf16-scale export, compile (everything on the accelerator), and sim match torch W8A8 step by step, teacher-forced 40/40 identical to torch. Host memory peak 436 MB (small models).
+- `dispatch_check.py --full-i8`: int8 data in [-128, 127] (the default remains [-127, 127], the range of the frontend's own quantization).
 
-**这一步发现的问题**（都不是 importer 引入的）：
-1. **嵌入的行 gather 经过 VE**，VE 的 int8 输出饱和到 ±127：表里的 -128 变成 -127（`dispatch_check --full-i8` 的 `elementwise_broadcast_*_i64xi8`）。自量化的表没有 -128；compressed-tensors 只量化 Linear，嵌入由本项目量化。只有“嵌入与一个被量化（不在 `ignore`）的分类层共用一张表”时会碰到，`quantize()` 现在明确拒绝这种情况。根治：gather 改用 LD（动态地址）而不是 VE 拷贝，另行评估。
-2. **通用前端的 Qwen3 形式（已解决，2026-10-10）**：真实 Qwen3-0.6B（截 2 层）走通用前端时 decode 已全部在加速器上，回退都在 prefill：QK-norm（`reduction_16x16x128` / `16x8x128`）、Q 的 RoPE 与转置、RoPE 表 gather（`elementwise_broadcast_32768`）、K 的置换加量化、注意力输出的反量化（`elementwise_16x2048`），都是 M × heads × head_dim 的张量（32768 个 fp32 = 2048 字，超过一个 ACC bank 的 1536 字），且 HF 在 norm 后的 `transpose(1, 2)` 融进同一 dispatch，现有按行分片不接受。修复两处：
-   - **前端**（`hf_generic._attention_rows`）：prefill（M > 1）时注意力模块的 forward 按行执行，与 qhf.prefill 相同的结构：q / k / v 投影对 M 行一起算（整数，与逐行相同），然后每行调用模块**原本的** forward（投影换成该行的结果、o_proj 暂时去掉；QK-norm、RoPE、写 KV、sa 注意力都与 decode 一步完全相同），最后 o_proj 对 M 行一起算。HF 的注意力代码原样复用，对 Llama / Qwen3 / Gemma 通用，prefill 与 decode 在构造上逐位一致。decode（M = 1）不变。
-   - **编译器**（`SaCodegen`）：lowering 报 `ACC full` 时以 `tileShrink` = 1、2、3 重试（sahl-tile 按 ACC / 2^n 规划分片）；第一次就能编译的 dispatch 不变（黄金语料逐字节相同）。`elementwise_16x2048` 由此上了加速器。另外报告只取第一条非空的 error 诊断（多线程编译时原来常打印 “failed ()”）。
-   结果：Qwen3（2 层）prefill + decode 0 个主机回退，prefill 与 decode-only 5/5 逐位一致，teacher-forced 22/40（torch W8A8 21/40）；SmolLM2（30 层）decode 的数字与改动前完全相同，prefill 5/5。代价：导出的计算图变大（SmolLM2 的 mlir 18.7 → 35.4 MB，导出 7.5 分钟 / 3.0 GB，编译 21 分钟 / 4.5 GB），板上 prefill 的速度待测（每行多出注意力部分的 dispatch）。剩下：head_dim = 64 且有 QK-norm 的模型（只在合成模型上）norm 权重 256 字节，被 IREE 内联成 dispatch 内的常量（`bufferization.to_buffer` 不支持）；目标模型（Qwen3 128、Gemma3 256、Llama 无 QK-norm）不受影响。
-3. **prefill + decode 与 decode-only 的逐位等价依赖数据（已定位并修复，2026-10-10）**：Llama 形状的随机权重模型（自量化、不经 importer）seed 1–3 为 0/5、4/5、4/5。定位过程：sim 结束时的 DDR 对比 → 只有第 1 层的 K / V 在第 18、28、36 个位置差 ±1（第 0 层相同）；torch eager 的 prefill 与 decode 的 KV 完全相同、sim 的 decode 与 eager 相同 → 偏离的是 sim 的 prefill；逐 dispatch 检查各 T / dirty 都通过，只剩 3 个 UNSUPPORTED，即**回退到主机的 dispatch**，其中 `prefill:161` 是第 0 层融合了 SwiGLU 的 gate 投影（`silu(g)·u`，含 exp 与除法）。它代码生成失败（`sahl-to-sahw: ACC full`），在主机上用 libm 的 exp / 除法计算，而 decode 的同一运算在设备 SFU 上（近似 exp / RECIP），偶尔差一个舍入单位，经第 1 层的激活量化变成 KV 的 ±1。根因：prefill 按行线性内核的块大小（`linearSchedule`，`chunk_tiles`）只按 SPAD_B 选，K = 256 时取 16 个 tile；而每个 ACC bank 在 scratch 之上只有 1536 个字、缓冲不跨 bank，scope 要放 15 个 D × nc 字的缓冲（累加、结果、up 的 int32 输入、epilogue 每步一个临时值）。真实模型的 K ≥ 576，块小，从未碰到。修复：块大小再按每个 bank 的可用空间与缓冲个数取上限（这里 16 → 12）；黄金语料 4232 个 dispatch 逐字节不变；seed 1–3 与 neg128 都 5/5，`test_ct_import --e2e` 恢复 `--prefill`。剩下：这类合成形状的 prefill 还有 2 个 dispatch 在主机上（`elementwise_broadcast_*`：pair swap 以外的固定下标 gather；`elementwise_transpose_4x16x64`：超过两层循环），都是数据搬移与乘加、目前逐位一致，但主机上的乘加若被收缩成 FMA 就会再出现同类问题，列为后续项；另外整体编译的 `--iree-sa-codegen-report` 在这种失败时只打印 “failed ()”（多线程编译时诊断没有传回），单独编译该 dispatch 才看到原因，待修。
-   **教训**：主机回退（VMVX）的 dispatch 若含 exp / 除法等 SFU 近似的运算，与设备上的同一运算不逐位一致；prefill 与 decode 只要有一方回退就会破坏等价性。回退清单（WP9）应标出这类 dispatch。
+**Problems found in this step** (none introduced by the importer):
+1. **The embedding's row gather goes through VE**, whose int8 output saturates to ±127: a -128 in the table becomes -127 (`elementwise_broadcast_*_i64xi8` in `dispatch_check --full-i8`). Self-quantized tables have no -128; compressed-tensors only quantizes Linear layers and the embedding is quantized by this project. This only arises when "the embedding shares a table with a quantized (not `ignore`d) classifier", which `quantize()` now explicitly rejects. Root fix: do the gather with LD (dynamic address) instead of a VE copy; evaluated separately.
+2. **The generic frontend's form of Qwen3 (solved, 2026-10-10)**: with real Qwen3-0.6B (truncated to 2 layers) through the generic frontend, decode was already entirely on the accelerator and the fallbacks were all in prefill: QK-norm (`reduction_16x16x128` / `16x8x128`), Q's RoPE and transpose, the RoPE table gather (`elementwise_broadcast_32768`), K's permutation plus quantization, dequantization of the attention output (`elementwise_16x2048`), all tensors of M × heads × head_dim (32768 fp32 = 2048 words, more than one ACC bank's 1536 words), and HF's `transpose(1, 2)` after the norm fused into the same dispatch, which the existing row tiling does not accept. Two fixes:
+   - **Frontend** (`hf_generic._attention_rows`): for prefill (M > 1) the attention module's forward runs row by row, the same structure as qhf.prefill: the q / k / v projections are computed for the M rows together (integer, identical to row by row), then the module's **original** forward is called for each row (projections replaced by that row's results, o_proj temporarily removed; QK-norm, RoPE, KV write and sa attention exactly as in one decode step), and finally o_proj is computed for the M rows together. HF's attention code is reused as is, generic for Llama / Qwen3 / Gemma, and prefill and decode are bit-exact by construction. decode (M = 1) is unchanged.
+   - **Compiler** (`SaCodegen`): when lowering reports `ACC full`, retry with `tileShrink` = 1, 2, 3 (sahl-tile plans tiles by ACC / 2^n); dispatches that compile the first time are unchanged (golden corpus byte-identical). `elementwise_16x2048` thereby moves to the accelerator. In addition, the report only takes the first non-empty error diagnostic (with multi-threaded compilation it used to print "failed ()").
+   Result: Qwen3 (2 layers) prefill + decode with 0 host fallbacks, prefill bit-exact with decode-only 5/5, teacher-forced 22/40 (torch W8A8 21/40); SmolLM2 (30 layers) decode numbers identical to before the change, prefill 5/5. Cost: the exported graph grows (SmolLM2's mlir 18.7 → 35.4 MB, export 7.5 minutes / 3.0 GB, compile 21 minutes / 4.5 GB), and the board prefill speed is to be measured (each row adds the attention dispatches). Remaining: for models with head_dim = 64 and QK-norm (only synthetic ones), the 256-byte norm weights are inlined by IREE as constants inside the dispatch (`bufferization.to_buffer` does not support it); the target models (Qwen3 128, Gemma3 256, Llama without QK-norm) are unaffected.
+3. **Bit-exactness between prefill + decode and decode-only depended on the data (located and fixed, 2026-10-10)**: Llama-shaped random-weight models (self-quantized, not through the importer) with seeds 1–3 gave 0/5, 4/5, 4/5. How it was located: comparing DDR at the end of the sim → only layer 1's K / V differ by ±1 at positions 18, 28, 36 (layer 0 identical); torch eager's prefill and decode KV are identical, and the sim's decode matches eager → the sim's prefill deviates; the per-dispatch checks pass for every T / dirty, leaving only 3 UNSUPPORTED, i.e. **dispatches that fall back to the host**, among them `prefill:161`, layer 0's gate projection fused with SwiGLU (`silu(g)·u`, with exp and division). Its code generation failed (`sahl-to-sahw: ACC full`) and it was computed on the host with libm's exp / division, while the same operation in decode runs on the device SFU (approximate exp / RECIP); they occasionally differ by one rounding unit, which layer 1's activation quantization turns into a KV ±1. Root cause: the block size of prefill's row-wise linear kernel (`linearSchedule`, `chunk_tiles`) was chosen only by SPAD_B, 16 tiles for K = 256, while each ACC bank has only 1536 words above the scratch, buffers do not cross banks, and the scope has to hold 15 buffers of D × nc words (accumulation, result, up's int32 input, one temporary per epilogue step). Real models have K ≥ 576 with small blocks and never hit it. Fix: the block size is also capped by the space available per bank and the number of buffers (here 16 → 12); the golden corpus of 4232 dispatches is byte-identical; seeds 1–3 and neg128 are all 5/5, and `test_ct_import --e2e` gets `--prefill` back. Remaining: in such synthetic shapes 2 prefill dispatches are still on the host (`elementwise_broadcast_*`: fixed-index gathers other than the pair swap; `elementwise_transpose_4x16x64`: more than two loop levels), all data movement and multiply-add, bit-exact for now, but if the host's multiply-add were contracted into an FMA the same kind of problem would reappear: listed as a follow-up; also, the whole-module `--iree-sa-codegen-report` only prints "failed ()" for such failures (the diagnostic is not passed back with multi-threaded compilation), and the reason only shows when compiling that dispatch alone: to be fixed.
+   **Lesson**: a host-fallback (VMVX) dispatch containing exp / division or other operations approximated by the SFU is not bit-exact with the same operation on the device; if either prefill or decode falls back, their equivalence breaks. The fallback list (WP9) should flag such dispatches.
 
-### 6.1 接受格式
+### 6.1 Accepted formats
 
-第一版只接受：
+The first version accepts only:
 
-- `format: int-quantized`，状态为 compressed。
-- 权重：int8、静态、按输出通道、对称、无 zero point、`group_size = null`。
-- 激活：int8、动态、按 token、对称。
-- `ignore` 列表允许包含 `lm_head` 等未量化层。
-- scale 可以为 bf16/fp16/fp32，载入后转换为 fp32，不改变 int8 权重。
+- `format: int-quantized`, state compressed.
+- Weights: int8, static, per output channel, symmetric, no zero point, `group_size = null`.
+- Activations: int8, dynamic, per token, symmetric.
+- The `ignore` list may contain unquantized layers such as `lm_head`.
+- scales may be bf16/fp16/fp32, converted to fp32 on load, without changing the int8 weights.
 
-其他格式必须给出包含层名、实际字段和支持范围的明确错误，不允许静默回退或重新量化。
+Any other format must produce an explicit error naming the layer, the actual field and the supported range; no silent fallback or requantization.
 
-### 6.2 内存安全的数据结构
+### 6.2 Memory-safe data structures
 
-禁止长期同时保存整模型的 int8 权重、scale 和 `q * s` 的 fp32 副本。实现外部量化线性层，例如：
+Keeping int8 weights, scales and a `q * s` fp32 copy of the whole model at the same time for long is forbidden. Implement an external quantized linear layer, e.g.:
 
 ```python
 QLinearExternal(
@@ -171,137 +169,137 @@ QLinearExternal(
 )
 ```
 
-实现要求：
+Requirements:
 
-- safetensors 使用 mmap / lazy load；以层为单位读取和释放。
-- 编译归档直接消费 `(qweight, scale)`，不经过 `_quantize_rows`。
-- eager reference 仅在当前层或当前算子需要时临时反量化，随后释放。
-- `rope_rewrite` 对 Q/K 投影执行行置换时，同时置换 qweight 的行和对应 scale；不创建完整 fp32 权重副本。
-- 对无法直接处理量化权重的校准逻辑提供分层临时反量化接口。
+- safetensors loaded with mmap / lazily; read and released layer by layer.
+- The compile archive consumes `(qweight, scale)` directly, not through `_quantize_rows`.
+- The eager reference dequantizes temporarily only when the current layer or operator needs it, then releases it.
+- When `rope_rewrite` permutes the rows of the Q/K projections, it permutes the qweight rows and the matching scales together, without creating a full fp32 weight copy.
+- Calibration logic that cannot handle quantized weights directly gets a per-layer temporary dequantization interface.
 
-### 6.3 数值与打包
+### 6.3 Numerics and packing
 
-- 导入的 int8 常量保留完整 `[-128, 127]` 范围。
-- 审核打包、funcsim、oracle 和 DMA 路径，移除任何“负值最小为 -127”的隐含假设。已知位置：前端 `hf_generic._to_i8` / `_quantize_rows`、`qllama` 的转换都截到 ±127（这是自量化的约定，导入路径不能经过它们）；硬件的 int8 乘法（`sx8`）与 funcsim 本身对 -128 没有问题。激活量化仍由设备做，保持 ±127。
-- 区分 importer 语义与本项目自量化语义；导入路径不调用 `_to_i8` 或 `_quantize_rows` 修改已有整数。
-- SmoothQuant 不需要 importer 做任何事：llm-compressor 已把平滑因子折进 norm 权重（norm→QKV、norm→gate/up）和 up_proj（→down_proj），checkpoint 里的权重就是最终值，原样读入即可。
+- Imported int8 constants keep the full `[-128, 127]` range.
+- Audit the packing, funcsim, oracle and DMA paths and remove any implicit assumption that "the minimum negative value is -127". Known places: the frontend's `hf_generic._to_i8` / `_quantize_rows` and `qllama`'s conversion all clamp to ±127 (the self-quantization convention; the import path must not go through them); the hardware's int8 multiply (`sx8`) and funcsim itself have no problem with -128. Activation quantization is still done by the device and stays ±127.
+- Keep the importer's semantics apart from this project's self-quantization semantics; the import path does not call `_to_i8` or `_quantize_rows` to modify existing integers.
+- SmoothQuant needs nothing from the importer: llm-compressor has already folded the smoothing factors into the norm weights (norm→QKV, norm→gate/up) and up_proj (→down_proj); the weights in the checkpoint are final values and are read as is.
 
-### 6.4 模型打包与 ignore
+### 6.4 Model packing and ignore
 
-- `ignore` 中的层按现有路径处理，但必须在 manifest 中记录“原始 bf16/fp16”还是“由本项目重新量化”。
-- tied embedding / lm_head 只保留一份设备端 int8 表，并验证权重共享没有被 importer 解开。
-- manifest 记录来源模型、revision、配置哈希、safetensors SHA256、许可证和转换参数。
+- Layers in `ignore` go through the existing path, but the manifest must record whether they are "original bf16/fp16" or "requantized by this project".
+- A tied embedding / lm_head keeps a single device-side int8 table, and it is verified that the importer did not untie the weight sharing.
+- The manifest records the source model, revision, configuration hash, safetensors SHA256, license and conversion parameters.
 
-### 6.5 测试
+### 6.5 Tests
 
-用 `synth_hf.py` 生成至少以下用例：
+Generate at least the following cases with `synth_hf.py`:
 
-1. 正常的 channel-wise W8A8。
-2. 权重包含 -128。
-3. bf16 scale。
-4. `ignore: [lm_head]` 且 embedding/lm_head tied。
-5. 按组权重 scale，应报错。
-6. 静态激活 scale，应报错。
-7. asymmetric / zero point，应报错。
-8. int4 和 FP8，应报错。
-9. 权重张量或 scale 缺失、形状不匹配，应报错。
+1. Normal channel-wise W8A8.
+2. Weights containing -128.
+3. bf16 scales.
+4. `ignore: [lm_head]` with a tied embedding/lm_head.
+5. Per-group weight scales: must be rejected.
+6. Static activation scales: must be rejected.
+7. Asymmetric / zero point: must be rejected.
+8. int4 and FP8: must be rejected.
+9. Missing weight tensor or scale, mismatched shapes: must be rejected.
 
-### 验收
+### Acceptance
 
-- 导入后的每个受支持线性层，整数权重与 safetensors 逐字节相同。
-- scale 转 fp32 后数值与原文件一致。
-- 合成模型经过 archive、funcsim 和 dispatch_check 后逐位一致。
-- importer 峰值主机内存有测量值，且不因构造全模型 fp32 副本出现数量级增长。
+- After import, the integer weights of every supported linear layer are byte-identical to the safetensors.
+- Scales converted to fp32 equal the values in the original file.
+- Synthetic models are bit-exact through the archive, funcsim and dispatch_check.
+- The importer's peak host memory is measured and does not grow by orders of magnitude from building a whole-model fp32 copy.
 
-## 7. 工作包 WP3：SmolLM2-135M 验证
+## 7. Work package WP3: SmolLM2-135M validation
 
-**进度（2026-10-10）**：主机与 sim 完成，板上待测。
-- **生成**：`compiler/frontend/llmc_w8a8.py`，在独立环境 `build/llmc_venv`（CPU 版 torch 2.14.0、llm-compressor 0.14.0、compressed-tensors 0.19.0；不动导出环境）里跑 SmoothQuant 0.8 + GPTQ（W8A8，`ignore: [lm_head]`），校准 WikiText-2 train 中 200 字以上的段落 256 段 × 512 token（`default_rng(0)` 抽样，行号记入 `sa_manifest.json`），7.6 分钟。GPTQ 的 `actorder: static`（按通道时只是 GPTQ 的列顺序，已折回权重，不存 g_idx）现在被接受。
-- **质量**（`compiler/tests/quality_eval.py`：WikiText-2 test，2048 个 token，窗口 256，teacher-forced，参考为原版 fp32；结果 `build/quality/smollm2_w8a8_2048.json`）：
+**Progress (2026-10-10)**: host and sim done, board pending.
+- **Generation**: `compiler/frontend/llmc_w8a8.py`, run in a separate environment `build/llmc_venv` (CPU torch 2.14.0, llm-compressor 0.14.0, compressed-tensors 0.19.0; the export environment is untouched): SmoothQuant 0.8 + GPTQ (W8A8, `ignore: [lm_head]`), calibrated on 256 passages × 512 tokens of 200+ characters from WikiText-2 train (sampled with `default_rng(0)`, line numbers recorded in `sa_manifest.json`), 7.6 minutes. GPTQ's `actorder: static` (with per-channel quantization only GPTQ's column order, already folded back into the weights, no g_idx stored) is now accepted.
+- **Quality** (`compiler/tests/quality_eval.py`: WikiText-2 test, 2048 tokens, window 256, teacher-forced, reference the original fp32; results in `build/quality/smollm2_w8a8_2048.json`):
 
-  | 变体 | PPL | top-1（对 fp32） | 相关 | KL |
+  | Variant | PPL | top-1 (vs fp32) | corr | KL |
   |---|---|---|---|---|
   | fp32 | 26.98 | — | — | — |
-  | 自量化 W8A8（fp32 注意力） | 29.92 | 87.6% | 0.9899 | 0.102 |
-  | llm-compressor W8A8（SmoothQuant + GPTQ） | 28.16 | 90.3% | 0.9932 | 0.050 |
-  | 同上，只用 GPTQ（不做 SmoothQuant） | 29.83 | 87.9% | 0.9903 | 0.106 |
-  | 自量化，SA 形式（int8 KV、设备注意力、SFU） | 30.77 | 83.9% | 0.9853 | 0.138 |
-  | **llm-compressor W8A8，SA 形式** | **28.77** | **87.1%** | 0.9887 | **0.074** |
+  | Self-quantized W8A8 (fp32 attention) | 29.92 | 87.6% | 0.9899 | 0.102 |
+  | llm-compressor W8A8 (SmoothQuant + GPTQ) | 28.16 | 90.3% | 0.9932 | 0.050 |
+  | Same, GPTQ only (no SmoothQuant) | 29.83 | 87.9% | 0.9903 | 0.106 |
+  | Self-quantized, SA form (int8 KV, device attention, SFU) | 30.77 | 83.9% | 0.9853 | 0.138 |
+  | **llm-compressor W8A8, SA form** | **28.77** | **87.1%** | 0.9887 | **0.074** |
 
-  外部 checkpoint 在设备的计算方式下 KL 约为自量化的一半、PPL 低 2.0；改善几乎全部来自 SmoothQuant（只用 GPTQ 与自量化相当）。SA 形式额外的损失（int8 KV、注意力概率、SFU）两者相近（KL +0.024 / +0.036）。单个 256 token 的窗口曾给出相反的结论：评估至少要用数千个位置（§3.2）。
-- **KV scale（2026-10-12，WP4 的做法用到 SmolLM2）**：同一 checkpoint、KV 用 WikiText-2 train 前 1024 token 校准（`build/quality/smollm2_kvch_2048.json`）：ct-sa（按层）PPL 28.86、top-1 86.7%、KL 0.074；**ct-sa:kch 28.82、87.7%、0.072**；kch+vch 28.83、86.6%、0.076。SmolLM2 的 K 没有 Qwen3 那样的通道离群值，三者差别在噪声内（原 CALIB 按层为 28.77 / 87.1%）。为与 Qwen3 / Llama 一致，全模型构建用 `--kv-channel k`。
-- **全模型 + K 按通道 + 按实际长度（2026-10-12，sim PASS）**：`test_hf_generic.py --model build/llm_cache/SmolLM2-135M-W8A8 --out build/hfgen/smollm2_kch_dyn --quant --rope --attn --prefill 16 --prefill-all --kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024`（SA_D=16、GEMV 4 口）：导出 812 s，编译 700 s，1220 个 executable 全在加速器上；prefill 与 decode-only 5/5、prefill_all 40/40 逐位相同；teacher forcing 40 位置设备对 fp32 34/40（torch W8A8 35/40）、设备对 torch 平均相关 0.9957、argmax 不同 6 处，按量化模型的判据通过。自由生成的 9 步比较只有 2/9（最小相关 0.47，生成的 token 一旦不同、后面输入就不同；静态 T、按层 KV 的旧构建为 9/9、0.9995）。定位：两层 + kch 与 torch 一致到 1.5e-5（9/9，TF 0 处不同），两层按层 KV 同样一致；全模型逐位置相关在第 0 位 0.9999、其后 0.983–0.998 平滑分布，在 T 的 16 / 32 边界没有跳变：是 30 层的 int8 取整（设备与 torch 的运算次序）累积，不是错误；K 按通道的 scale 把 q 放大，对取整更敏感。真实质量以板上 2048 位置 teacher forcing 为准。
-- **上板（2026-10-12，PASS，`build/deploy_hfgen_smollm2_kch_dyn`）**：17/17 步 logits 与 sim 逐位一致、token 相同、0 个主机 dispatch。board_llm：prefill 45.34 tok/s（40 token，含加载），decode 21.90 tok/s（45.7 ms/步）。batched（位置 32–40）：decode 45.1 ms/步（**22.17 tok/s**），其中设备 38.64 ms、runtime 其余 6.45 ms；prefill 每 16-token chunk 266.3 ms（**60.09 tok/s**，26.6M 周期，7 个 list）；设备内存峰值 134.7 / 149.9 MB。逐 dispatch（prof3.csv → stats_decode.json）：decode 设备时间的 70.8% 是 GEMV（28.6 ms，LD 135.7 MB，47.4 B/周期，四口峰值 57.95 的 82%；lm_head 一项 54.6 B/周期、94%，层内 576 宽的小矩阵效率较低），reduction 10.0%、attention（batch_matmul）9.8%；prefill 一块中 matmul 47.8%、reduction 20.7%、逐行 attention 18.3%。覆盖率时间 / MAC 都是 100%。板上 teacher forcing（8 × 256，WikiText-2 test）：**PPL 28.545（fp32 26.978）、top-1 86.5%、KL 0.055**；主机 ct-sa:kch 为 28.82 / 87.7% / 0.072（主机用 torch 的计算次序，板上是设备实际的取整，二者在噪声内）。
-  与 WP3 验收时（静态 T、按层 KV，`results_wp3b`）比：decode 17.12 → 22.17 tok/s（×1.29），prefill（同为 board_llm 口径）27.18 → 45.34 tok/s（×1.67）；应主要来自 attention 按实际长度与 V 投影走 GEMV（未单独拆分）。
-- **qsum 重建（2026-10-13，`build/deploy_hfgen_smollm2_qs`，§12.4）**：1221 个 executable 全在加速器；prefill 与 decode-only 5/5、prefill_all 40/40 逐位相同，qemu 3/3。板上 17/17 与 sim 逐位一致、0 个主机 dispatch；batched decode 45.2 ms/步（22.12 tok/s，设备 38.48、runtime 其余 6.71 ms），prefill 每块 264.5 ms（60.50 tok/s），峰值 134.7 MB。板上 teacher forcing **PPL 28.54 → 28.26、top-1 86.5% → 89.8%、KL 0.055 → 0.038**。
-- **sim**（`test_hf_generic.py`，D = 16、GEMV 4 口）：导出 + 编译 1710 个加速器 executable，decode 9/9 argmax 与 torch W8A8 相同，prefill 与 decode-only 5/5 逐位一致。40 位置 teacher-forced 门槛改为统计的：设备与 torch 模型 argmax 不同的位置 d 个，容许 max(2, ⌈2√d⌉)，另要求两者 logits 平均相关 ≥ 0.98。原门槛（−2）在这个 checkpoint 上失败：d = 3 个翻转碰巧都落在设备一边（34 对 37），而设备对 torch 的平均相关 0.9963 比自量化的 0.9911（d = 6，两边各 3）还高。
-- **板上**：`deploy_z1_freeze.sh hfgen_w8a8`（不在默认集合；`HFGEN_MODEL` / `HFGEN_TAG` 给 `deploy_hfgen.sh`），`board_regress.py` 有对应项。
-- **板上第一次（2026-10-11，4 口）**：hfgen_w8a8 PASS（17/17 与 sim 逐位相同），**hfgen FAIL（0/17）**。两者都有 1440 个主机 dispatch：16e5e5d 的逐行 prefill 在没有 QK-norm 的模型（SmolLM2、Llama）上，把每行的 RoPE + int8 量化融进了写 KV 的 scatter（6 维、带置换 gather，`more than two loops`），每块 480 个在主机上算；ARM 与 x86 在这些运算上的结果偶有一个 ulp 之差，经 int8 量化成 KV 的 ±1（w8a8 碰巧没翻）。staging 的检查只统计了 decode 的回退，漏掉了。用 qemu 跑 aarch64 的 `sa-llm-run`、设备仍是 x86 的 sim，复现了板上的结果（x86 3/3，aarch64 0/3）。
-  修复：逐行 prefill 里每行的 cos / sin 改为按该行的标量位置从 RoPE 表查（decode 一步的做法），不再从整块的表切片；这样每行的计算图与 decode 相同，RoPE + 量化是单独的二维 dispatch（pair swap gather 编译器支持），scatter 只搬数据。SmolLM2 / Qwen3（截 2 层）的 prefill 0 个主机 dispatch；q / k / v 投影仍对 M 行一起算。新增 `compiler/scripts/check_bundle_aarch64.sh`：qemu 里的 aarch64 运行时对测试包逐位比较（旧包：hfgen 0/3、hfgen_w8a8 3/3，与板上一致），`deploy_hfgen.sh` 结束时自动执行。
-- **板上验收（2026-10-11，4 口，staging `3e6cc5d`，`results_wp3b`）**：REGRESSION PASS。hfgen（自量化）与 hfgen_w8a8（llm-compressor W8A8）都是 17/17 步与 sim 逐位相同、token 相同、0 个主机 dispatch（上一次 1440）；编译 2206 个 executable 全在加速器上，staging 的 aarch64 检查 3/3。速度：**prefill 27.18 tok/s**（逐行注意力之前 14.20，×1.91；每次运行的 descriptor list 从 1465 降到 37），decode 17.12 tok/s（不变；两种权重相同，计算量一样）。
-  **prefill 为什么变快**：不是加速器算得快了（board_profile 的 prefill 设备周期 20.9M → 20.0M），而是没有了主机回退。改动前批量的 prefill 每块有 60 个主机 dispatch（每层 2 个：M × heads × head_dim 的张量放不进 ACC 或形状不受支持，如 Qwen3 上看到的 RoPE gather、Q 转置），共 180 个；运行时每遇到一个就要先提交已排队的命令并等加速器跑完、再在 ARM 上用 VMVX 解释执行、再开新的 list（211 个 list）。逐行注意力后 0 个主机 dispatch，一块 prefill 是一两个连续的 list（共 37 个），省下的是同步往返与 ARM 上的解释执行。（第一次上板的 1440 个主机 scatter 时为 19.96 tok/s：它们连续出现，切出的 list 较少。）
+  Under the device's way of computing, the external checkpoint has about half the KL of self-quantization and a PPL 2.0 lower; nearly all of the improvement comes from SmoothQuant (GPTQ alone is on par with self-quantization). The extra loss of the SA form (int8 KV, attention probabilities, SFU) is similar for both (KL +0.024 / +0.036). A single 256-token window once gave the opposite conclusion: evaluation needs at least thousands of positions (§3.2).
+- **KV scales (2026-10-12, WP4's approach applied to SmolLM2)**: same checkpoint, KV calibrated on the first 1024 tokens of WikiText-2 train (`build/quality/smollm2_kvch_2048.json`): ct-sa (per layer) PPL 28.86, top-1 86.7%, KL 0.074; **ct-sa:kch 28.82, 87.7%, 0.072**; kch+vch 28.83, 86.6%, 0.076. SmolLM2's K has no channel outliers like Qwen3's; the three differ within noise (the original CALIB per layer was 28.77 / 87.1%). For consistency with Qwen3 / Llama, whole-model builds use `--kv-channel k`.
+- **Whole model + K per channel + actual length (2026-10-12, sim PASS)**: `test_hf_generic.py --model build/llm_cache/SmolLM2-135M-W8A8 --out build/hfgen/smollm2_kch_dyn --quant --rope --attn --prefill 16 --prefill-all --kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024` (SA_D=16, 4 GEMV ports): export 812 s, compile 700 s, 1220 executables all on the accelerator; prefill vs decode-only 5/5 and prefill_all 40/40 bit-identical; teacher forcing over 40 positions device vs fp32 34/40 (torch W8A8 35/40), device vs torch mean correlation 0.9957, argmax differs at 6, passing the criterion for quantized models. The free-generation comparison over 9 steps is only 2/9 (minimum correlation 0.47: once a generated token differs, all later inputs differ; the old build with static T and per-layer KV was 9/9, 0.9995). Localization: 2 layers + kch match torch to 1.5e-5 (9/9, TF 0 differences), 2 layers with per-layer KV match too; the whole model's per-position correlation is 0.9999 at position 0 and then smoothly 0.983–0.998, with no jump at the T boundaries 16 / 32: it is the accumulation of int8 rounding over 30 layers (device vs torch order of operations), not an error; K per-channel scales enlarge q, making it more sensitive to rounding. Real quality is judged by board teacher forcing over 2048 positions.
+- **On the board (2026-10-12, PASS, `build/deploy_hfgen_smollm2_kch_dyn`)**: 17/17 steps of logits bit-exact with the sim, identical tokens, 0 host dispatches. board_llm: prefill 45.34 tok/s (40 tokens, including loading), decode 21.90 tok/s (45.7 ms/step). Batched (positions 32–40): decode 45.1 ms/step (**22.17 tok/s**), of which device 38.64 ms and rest of the runtime 6.45 ms; prefill 266.3 ms per 16-token chunk (**60.09 tok/s**, 26.6M cycles, 7 lists); device memory peak 134.7 / 149.9 MB. Per dispatch (prof3.csv → stats_decode.json): 70.8% of decode device time is GEMV (28.6 ms, LD 135.7 MB, 47.4 B/cycle, 82% of the four-port peak 57.95; lm_head alone 54.6 B/cycle, 94%; the 576-wide small matrices inside the layers are less efficient), reduction 10.0%, attention (batch_matmul) 9.8%; in a prefill chunk matmul 47.8%, reduction 20.7%, row attention 18.3%. Time / MAC coverage both 100%. Board teacher forcing (8 × 256, WikiText-2 test): **PPL 28.545 (fp32 26.978), top-1 86.5%, KL 0.055**; host ct-sa:kch 28.82 / 87.7% / 0.072 (the host uses torch's order of computation, the board the device's actual rounding; the two are within noise).
+  Compared with the WP3 acceptance (static T, per-layer KV, `results_wp3b`): decode 17.12 → 22.17 tok/s (×1.29), prefill (both as measured by board_llm) 27.18 → 45.34 tok/s (×1.67); presumably mainly from attention over the actual length and the V projection on GEMV (not separated).
+- **qsum rebuild (2026-10-13, `build/deploy_hfgen_smollm2_qs`, §12.4)**: 1221 executables all on the accelerator; prefill vs decode-only 5/5 and prefill_all 40/40 bit-identical, qemu 3/3. On the board 17/17 bit-exact with the sim, 0 host dispatches; batched decode 45.2 ms/step (22.12 tok/s, device 38.48, rest of the runtime 6.71 ms), prefill 264.5 ms per chunk (60.50 tok/s), peak 134.7 MB. Board teacher forcing **PPL 28.54 → 28.26, top-1 86.5% → 89.8%, KL 0.055 → 0.038**.
+- **sim** (`test_hf_generic.py`, D = 16, 4 GEMV ports): export + compile of 1710 accelerator executables, decode 9/9 argmax identical to torch W8A8, prefill vs decode-only 5/5 bit-exact. The 40-position teacher-forced gate became statistical: with d positions where the device and the torch model's argmax differ, max(2, ⌈2√d⌉) is tolerated, and the mean correlation of their logits must also be ≥ 0.98. The original gate (−2) failed on this checkpoint: the d = 3 flips happened to all fall on the device's side (34 vs 37), while the device's mean correlation to torch, 0.9963, was higher than self-quantization's 0.9911 (d = 6, 3 on each side).
+- **On the board**: `deploy_z1_freeze.sh hfgen_w8a8` (not in the default set; `HFGEN_MODEL` / `HFGEN_TAG` passed to `deploy_hfgen.sh`), with a matching entry in `board_regress.py`.
+- **First time on the board (2026-10-11, 4 ports)**: hfgen_w8a8 PASS (17/17 bit-identical to the sim), **hfgen FAIL (0/17)**. Both had 1440 host dispatches: 16e5e5d's row-by-row prefill, on models without QK-norm (SmolLM2, Llama), fused each row's RoPE + int8 quantization into the scatter that writes KV (6-D, with a permuting gather, `more than two loops`), 480 per chunk computed on the host; ARM and x86 occasionally differ by one ulp on these operations, which int8 quantization turns into a KV ±1 (w8a8 happened not to flip). Staging's check only counted decode's fallbacks and missed them. Running the aarch64 `sa-llm-run` in qemu with the device still the x86 sim reproduced the board result (x86 3/3, aarch64 0/3).
+  Fix: in row-by-row prefill each row's cos / sin are looked up in the RoPE table by that row's scalar position (as a decode step does) instead of slicing the whole block's table; each row's computation graph is then the same as decode's, RoPE + quantization is a separate 2-D dispatch (the compiler supports the pair-swap gather), and the scatter only moves data. SmolLM2 / Qwen3 (truncated to 2 layers) prefill with 0 host dispatches; the q / k / v projections are still computed for the M rows together. New `compiler/scripts/check_bundle_aarch64.sh`: compares the test bundle bit for bit with the aarch64 runtime in qemu (old bundles: hfgen 0/3, hfgen_w8a8 3/3, matching the board), run automatically at the end of `deploy_hfgen.sh`.
+- **Board acceptance (2026-10-11, 4 ports, staging `3e6cc5d`, `results_wp3b`)**: REGRESSION PASS. hfgen (self-quantized) and hfgen_w8a8 (llm-compressor W8A8) are both 17/17 steps bit-identical to the sim, identical tokens, 0 host dispatches (1440 the previous time); 2206 executables compiled, all on the accelerator, staging's aarch64 check 3/3. Speed: **prefill 27.18 tok/s** (14.20 before row attention, ×1.91; descriptor lists per run 1465 → 37), decode 17.12 tok/s (unchanged; both weights have the same amount of computation).
+  **Why prefill got faster**: not because the accelerator computes faster (board_profile's prefill device cycles 20.9M → 20.0M), but because the host fallbacks are gone. Before the change batched prefill had 60 host dispatches per chunk (2 per layer: tensors of M × heads × head_dim that do not fit in ACC or have unsupported shapes, like the RoPE gather and Q transpose seen on Qwen3), 180 in total; at each one the runtime has to submit the queued commands and wait for the accelerator to finish, interpret on the ARM with VMVX, and start a new list (211 lists). After row attention there are 0 host dispatches and a prefill chunk is one or two consecutive lists (37 in total); what is saved is the synchronization round trips and the interpretation on the ARM. (The first board run with 1440 host scatters reached 19.96 tok/s: they came in a row and cut fewer lists.)
 
-### 实现
+### Implementation
 
-- 使用固定 llm-compressor recipe 生成 W8A8 checkpoint，并冻结 recipe、校准样本 ID 和软件版本。
-- 依次完成 checkpoint reference、importer eager、SA oracle、funcsim、板上验证。
-- 与现有自量化路径使用相同 prompts/token IDs 做 A/B。
+- Generate the W8A8 checkpoint with a fixed llm-compressor recipe, freezing the recipe, the calibration sample IDs and the software versions.
+- Complete checkpoint reference, importer eager, SA oracle, funcsim and board validation in order.
+- A/B against the existing self-quantization path with the same prompts/token IDs.
 
-### 验收
+### Acceptance
 
-- 每个 dispatch 与 SA oracle 逐位一致，板上与 funcsim 逐位一致。
-- 40 位置 top-1 不低于现有自量化结果，作为快速门禁。
-- 同时记录至少数千 token 的 top-1、相关系数/KL 和 PPL；若不优于自量化，不阻塞 importer 合入，但必须定位损失发生在哪一层参考之间。
+- Every dispatch bit-exact with the SA oracle, the board bit-exact with funcsim.
+- 40-position top-1 no lower than the existing self-quantized result, as a fast gate.
+- Also record top-1, correlation/KL and PPL over at least thousands of tokens; if not better than self-quantization, this does not block merging the importer, but where the loss occurs between the reference layers must be located.
 
-## 8. 工作包 WP4：Qwen3-0.6B 质量复测与定位
+## 8. Work package WP4: Qwen3-0.6B quality re-measurement and attribution
 
-### 输入
+### Input
 
-优先评估现成 compressed-tensors W8A8 checkpoint（先确认 Qwen3-0.6B 是否有公开的 W8A8 版本；没有则用 WP3 的固定 recipe 自己用 llm-compressor 生成）；同时保留当前自量化模型作为对照。下载时固定 revision 与文件哈希，权重不入仓库。
+First evaluate a ready-made compressed-tensors W8A8 checkpoint (first check whether a public W8A8 version of Qwen3-0.6B exists; if not, generate one with llm-compressor using WP3's fixed recipe); keep the current self-quantized model as a control. Pin the revision and file hashes when downloading; weights are not checked into the repository.
 
-### 四层质量对比
+### Four-layer quality comparison
 
-| 层级 | 目的 |
+| Layer | Purpose |
 |---|---|
-| 原版 bf16/fp32 HF | 最终质量参考 |
-| 外部 W8A8 checkpoint 的标准运行时 | 测量 checkpoint 自身的量化损失 |
-| importer eager | 检查 importer、RoPE rewrite、权重共享和 tokenizer |
-| SA 端到端 | 测量 KV、注意力概率、近似函数和设备舍入的额外损失 |
+| Original bf16/fp32 HF | Final quality reference |
+| Standard runtime of the external W8A8 checkpoint | Measures the checkpoint's own quantization loss |
+| importer eager | Checks the importer, RoPE rewrite, weight sharing and tokenizer |
+| SA end to end | Measures the extra loss of KV, attention probabilities, approximate functions and device rounding |
 
-### 决策门禁
+### Decision gates
 
-- 若外部 W8A8 checkpoint 明显优于当前 25/40，且 importer eager 与其接近，则将外部权重设为默认演示路径。
-- 若标准运行时质量好、但 importer eager 明显下降，优先修 importer / tokenizer / rewrite。
-- 若 importer eager 良好、SA 明显下降，逐项切换为高精度定位：KV cache、QK logits、softmax/exp/recip、激活量化、最终分类层。
-- KV 被确认是主因后，再评估按头 scale；不得在定位前直接增加硬件或格式复杂度。
+- If the external W8A8 checkpoint is clearly better than today's 25/40 and the importer eager is close to it, make the external weights the default demo path.
+- If the standard runtime's quality is good but the importer eager drops clearly, fix the importer / tokenizer / rewrites first.
+- If the importer eager is good but SA drops clearly, switch items to high precision one at a time to locate the loss: KV cache, QK logits, softmax/exp/recip, activation quantization, final classifier.
+- Only once KV is confirmed as the main cause, evaluate per-head scales; no hardware or format complexity is added before the loss is located.
 
-### 验收
+### Acceptance
 
-- 输出四层质量表和误差归因结论。
-- 40 位置 top-1、正式 top-1、相关系数/KL、PPL 的数据和脚本可复现。
+- Output the four-layer quality table and the error-attribution conclusion.
+- The data and scripts for 40-position top-1, formal top-1, correlation/KL and PPL are reproducible.
 
-### 结果（2026-10-11）
+### Results (2026-10-11)
 
-Qwen3-0.6B，WikiText-2 test 前 2048 token，窗口 256；checkpoint 为 llm-compressor 生成的 W8A8（ct）。top-1/corr/KL 均相对 fp32 的逐位置 logits。复现：
+Qwen3-0.6B, the first 2048 tokens of WikiText-2 test, window 256; the checkpoint is a W8A8 (ct) generated with llm-compressor. top-1/corr/KL are all relative to fp32's per-position logits. To reproduce:
 
     compiler/tests/quality_eval.py --model build/llm_cache/Qwen3-0.6B --ct build/llm_cache/Qwen3-0.6B-W8A8 --tokens 2048 --window 256 \
         --variants fp32,w8a8,ct-w8a8,sa:act,ct-sa:act --out build/quality/qwen3_w8a8_2048.json
-    同上 --variants fp32,ct-sa,ct-sa:act+kv,ct-sa:act+q,ct-sa:act+probs,ct-sa:act+sfu,ct-sa:act+kv+q+probs+sfu --out build/quality/qwen3_attr.json
+    same with --variants fp32,ct-sa,ct-sa:act+kv,ct-sa:act+q,ct-sa:act+probs,ct-sa:act+sfu,ct-sa:act+kv+q+probs+sfu --out build/quality/qwen3_attr.json
 
-四层质量表：
+Four-layer quality table:
 
-| 层级 | 变体 | PPL | top-1 | corr | KL |
+| Layer | Variant | PPL | top-1 | corr | KL |
 |---|---|---|---|---|---|
-| 原版 | fp32 | 39.21 | — | — | — |
-| checkpoint 标准语义 | ct-w8a8 | 40.05 | 92.3% | 0.9957 | 0.022 |
-| 自量化（对照） | w8a8 | 41.05 | 89.1% | 0.9928 | 0.039 |
-| SA 端到端（ct 权重） | ct-sa | 53.50 | 71.5% | 0.9485 | 0.411 |
+| Original | fp32 | 39.21 | — | — | — |
+| Checkpoint standard semantics | ct-w8a8 | 40.05 | 92.3% | 0.9957 | 0.022 |
+| Self-quantized (control) | w8a8 | 41.05 | 89.1% | 0.9928 | 0.039 |
+| SA end to end (ct weights) | ct-sa | 53.50 | 71.5% | 0.9485 | 0.411 |
 
-importer 由 test_ct_import 覆盖；ct 权重比自量化高约 3 个点，设为默认演示权重。
+The importer is covered by test_ct_import; the ct weights are about 3 points better than self-quantization and become the default demo weights.
 
-归因（`act+X`：线性层激活与 X 保持 fp32，其余按 SA 计算，基线为 ct-sa:act）：
+Attribution (`act+X`: linear-layer activations and X kept in fp32, the rest computed as SA; baseline ct-sa:act):
 
-| 变体 | PPL | top-1 | KL |
+| Variant | PPL | top-1 | KL |
 |---|---|---|---|
 | ct-sa:act | 52.91 | 74.3% | 0.394 |
 | + kv | **38.60** | **91.7%** | **0.025** |
@@ -310,512 +308,511 @@ importer 由 test_ct_import 覆盖；ct 权重比自量化高约 3 个点，设�
 | + sfu | 53.00 | 73.6% | 0.396 |
 | + kv+q+probs+sfu | 39.27 | 97.9% | 0.0016 |
 
-结论：
+Conclusions:
 
-- SA 的额外损失几乎全部来自 int8 KV cache：单独把 KV 换回 fp32，top-1 从 74.3% 回到 91.7%，KL 降约 15 倍。q、probs、SFU 近似单独切换都在 ±1 个点内。
-- 线性层的激活量化（ct-sa → ct-sa:act）只占约 3 个点。
-- KV 修好后，q+probs+sfu 合计约 6 个点（91.7% → 97.9%），属次要项。
-- 按门禁，下一步评估 KV 的按头（或 K 按通道）scale，再复测 ct-sa；在此之前不改硬件或数据格式。
+- Nearly all of SA's extra loss comes from the int8 KV cache: switching KV alone back to fp32 brings top-1 from 74.3% back to 91.7% and lowers KL about 15×. q, probs and the SFU approximation, switched alone, are each within ±1 point.
+- Activation quantization of the linear layers (ct-sa → ct-sa:act) accounts for only about 3 points.
+- With KV fixed, q+probs+sfu together are about 6 points (91.7% → 97.9%), a secondary item.
+- Per the gates, next evaluate per-head (or K per-channel) KV scales and re-measure ct-sa; no hardware or data-format changes before that.
 
-KV scale 改进（不改硬件和数据格式）：K 按通道（`kch`，scale 折进 q，int8 点积不变）、V 按通道（`vch`，PV 结果按输出通道缩放），KV 用 WikiText-2 **train** 前 1024 token 校准（按 max_len 窗口、取各窗口最大值；原来是约 45 token 的 `export_hf.CALIB`）。复现：
+KV scale improvement (no hardware or data-format change): K per channel (`kch`, scales folded into q, the int8 dot product unchanged), V per channel (`vch`, the PV result scaled per output channel), KV calibrated on the first 1024 tokens of WikiText-2 **train** (in max_len windows, taking the maximum over windows; previously the ~45-token `export_hf.CALIB`). To reproduce:
 
     compiler/tests/quality_eval.py --model build/llm_cache/Qwen3-0.6B --ct build/llm_cache/Qwen3-0.6B-W8A8 --tokens 2048 --window 256 \
         --variants fp32,ct-sa:kch,ct-sa:kch+vch --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024 --out build/quality/qwen3_kvch_2048.json
 
-| 变体 | 校准 | tokens | PPL | top-1 | corr | KL |
+| Variant | Calibration | tokens | PPL | top-1 | corr | KL |
 |---|---|---|---|---|---|---|
-| ct-sa（按层） | CALIB | 2048 | 53.50 | 71.5% | 0.9485 | 0.411 |
-| ct-sa（按层） | train 1024 | 512 | 44.15* | 68.8% | 0.9306 | 0.500 |
+| ct-sa (per layer) | CALIB | 2048 | 53.50 | 71.5% | 0.9485 | 0.411 |
+| ct-sa (per layer) | train 1024 | 512 | 44.15* | 68.8% | 0.9306 | 0.500 |
 | ct-sa:kch | CALIB | 512 | 33.32* | 81.1% | 0.9797 | 0.129 |
 | ct-sa:kch | train 1024 | 2048 | **39.14** | **87.4%** | 0.9907 | 0.054 |
 | ct-sa:kch+vch | train 1024 | 2048 | 39.12 | 87.1% | 0.9919 | **0.046** |
-| （参考）ct-sa:act+kv | — | 512 | 30.56* | 92.0% | 0.9959 | 0.021 |
+| (reference) ct-sa:act+kv | — | 512 | 30.56* | 92.0% | 0.9959 | 0.021 |
 
-\* 512 token 的 fp32 PPL 为 31.16（2048 token 为 39.21），PPL 只能同 token 数比较。512 token 数据见 build/quality/qwen3_kvch_512.json、qwen3_kvcal_512.json。
+\* The fp32 PPL over 512 tokens is 31.16 (39.21 over 2048); PPL can only be compared at the same token count. 512-token data in build/quality/qwen3_kvch_512.json, qwen3_kvcal_512.json.
 
-结论：
+Conclusions:
 
-- 主因是 K 的通道离群值（每通道 max/中位数 7–120 倍）。按层 scale 换更多校准数据没有用（68.8%），K 按通道 + 充分校准两者一起才有效：top-1 71.5% → 87.4%，KL 降 7.6 倍，PPL 与 fp32 持平。
-- V 按通道在 2048 token 上与只做 K 基本相同（KL 略好、top-1 略差）。**默认选 `--kv-channel k`**：V 侧不多一次按通道乘法。
-- 距 checkpoint 自身（ct-w8a8 92.3%）还差约 5 个点，其中约 4 个点是剩余的 KV 量化误差（对照 act+kv 的 92.0%）。备选：百分位裁剪校准。
+- The main cause is K's channel outliers (per-channel max/median 7–120×). More calibration data with per-layer scales does not help (68.8%); only K per channel together with sufficient calibration works: top-1 71.5% → 87.4%, KL 7.6× lower, PPL on par with fp32.
+- V per channel over 2048 tokens is basically the same as K only (KL slightly better, top-1 slightly worse). **The default is `--kv-channel k`**: no extra per-channel multiply on the V side.
+- About 5 points remain to the checkpoint itself (ct-w8a8 92.3%), of which about 4 are the remaining KV quantization error (compare act+kv at 92.0%). Alternative: percentile-clipping calibration.
 
-**上板（2026-10-12，PASS）**：Qwen3-0.6B-W8A8 全 28 层，通用前端，`--kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024`，四口 overlay d16_100mhz_w128_p6_gemv_np4：
+**On the board (2026-10-12, PASS)**: Qwen3-0.6B-W8A8, all 28 layers, generic frontend, `--kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024`, four-port overlay d16_100mhz_w128_p6_gemv_np4:
 
     SA_D=16 SA_GEMV_PORTS=4 compiler/tests/test_hf_generic.py --model build/llm_cache/Qwen3-0.6B-W8A8 --out build/hfgen/qwen3_kch \
         --quant --rope --attn --prefill 16 --kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024 \
         --board-bundle build/hfgen/qwen3_kch_bundle                                         # (MemoryMax=10G)
     HFGEN_TAG=qwen3_kch HFGEN_BUNDLE=build/hfgen/qwen3_kch_bundle compiler/scripts/deploy_hfgen.sh   # -> build/deploy_hfgen_qwen3_kch
 
-- 编译 1138 个 executable 全在加速器上，host 0；sim decode 9/9 argmax 与 torch W8A8 相同，prefill 与 decode-only 5/5 逐位一致；qemu aarch64 3/3。
-- 板上：17/17 步 logits 与 sim 逐位一致，0 个 host dispatch；**prefill 9.33 tok/s，decode 4.73 tok/s（211 ms/步）**，窗口 613 MB。
-- **之后（2026-10-12，§13.1）**：decode 的 v 投影改走 GEMV（`14f5612`），同一配置 decode **5.60 tok/s（178.4 ms/步）**；板上 teacher forcing 质量 PPL 39.62、top-1 86.9%（主机 39.14 / 87.4%）。
-- **qsum 重建（2026-10-13，`build/deploy_hfgen_qwen3_qs`，§12.4）**：注意力概率改为按量化后的和归一化，1139 个 executable 全在加速器，板上 17/17 逐位一致；teacher forcing PPL 39.62 → 39.68（持平）、top-1 86.9% → 88.1%、KL 0.053 → 0.038；decode 6.96 tok/s（143.6 ms/步）、prefill 20.79 tok/s。
-- 与 WP1 的 6.28 tok/s 不可直接比较：那是手写导出路径（export_hf），这里是通用前端（逐行注意力等）加 K 按通道；两者各占多少未分开（需要一个通用前端、按层 KV 的 Qwen3 全模型板上点）。
-- 注意：`test_hf_generic.py` 的 D 只读 `SA_D`（默认 8），不从 `SA_KV260_CONFIG` 推导；第一次就按 D = 8 编译、sim 也通过，由 qemu 检查拦下。
-- llm-compressor 0.14 / compressed-tensors 0.19 的 `kv_cache_scheme` 可以产出 int8 静态 KV scale（RoPE 之后观察），但只支持 `tensor`、`attn_head` 两种粒度，`channel` 对 attention 明确报错；因此它能作为 importer 的一个输入来源，不能替代 K 按通道校准。
+- 1138 executables compiled, all on the accelerator, host 0; sim decode 9/9 argmax identical to torch W8A8, prefill vs decode-only 5/5 bit-exact; qemu aarch64 3/3.
+- On the board: 17/17 steps of logits bit-exact with the sim, 0 host dispatches; **prefill 9.33 tok/s, decode 4.73 tok/s (211 ms/step)**, window 613 MB.
+- **Later (2026-10-12, §13.1)**: with decode's v projection moved to GEMV (`14f5612`), the same configuration decodes at **5.60 tok/s (178.4 ms/step)**; board teacher-forcing quality PPL 39.62, top-1 86.9% (host 39.14 / 87.4%).
+- **qsum rebuild (2026-10-13, `build/deploy_hfgen_qwen3_qs`, §12.4)**: attention probabilities normalized by the quantized sum, 1139 executables all on the accelerator, 17/17 bit-exact on the board; teacher forcing PPL 39.62 → 39.68 (flat), top-1 86.9% → 88.1%, KL 0.053 → 0.038; decode 6.96 tok/s (143.6 ms/step), prefill 20.79 tok/s.
+- Not directly comparable with WP1's 6.28 tok/s: that was the hand-written export path (export_hf), this is the generic frontend (row attention etc.) plus K per channel; how much each contributes has not been separated (that would need a whole-model Qwen3 board point with the generic frontend and per-layer KV).
+- Note: `test_hf_generic.py` reads D only from `SA_D` (default 8), not derived from `SA_KV260_CONFIG`; the first attempt compiled for D = 8, the sim passed too, and the qemu check caught it.
+- `kv_cache_scheme` in llm-compressor 0.14 / compressed-tensors 0.19 can produce static int8 KV scales (observed after RoPE), but only supports the `tensor` and `attn_head` granularities; `channel` explicitly errors for attention. So it can be one input source for the importer, but cannot replace K per-channel calibration.
 
-## 9. 工作包 WP5：Llama-3.2-1B 前端与内存预检
+## 9. Work package WP5: Llama-3.2-1B frontend and memory preflight
 
-### 9.1 模型约束
+### 9.1 Model constraints
 
-以实际 `config.json` 为准，当前预期结构为 16 层、hidden size 2048、FFN 8192、32/8 GQA、head_dim 64、vocab 128256、tied embedding，以及 Llama 3 RoPE scaling。公开的 W8A8 版本（RedHatAI）是 **Instruct** 模型：质量参考用 Instruct 的 bf16，按 chat template 构造输入；这类 checkpoint 通常 `ignore: [lm_head]`，嵌入 / 分类表由本项目量化（manifest 记录）。
+Following the actual `config.json`, the expected structure is 16 layers, hidden size 2048, FFN 8192, 32/8 GQA, head_dim 64, vocab 128256, tied embedding, and Llama 3 RoPE scaling. The public W8A8 version (RedHatAI) is the **Instruct** model: the quality reference is the Instruct bf16, with inputs built using the chat template; such checkpoints usually have `ignore: [lm_head]`, and the embedding / classifier table is quantized by this project (recorded in the manifest).
 
-**预备工作（2026-10-11）**：
-- **checkpoint**：`RedHatAI/Llama-3.2-1B-Instruct-quantized.w8a8`（revision `9c406c48`，不需登录）下载到 `build/llm_cache/Llama-3.2-1B-Instruct-W8A8`（1.9 GB）。配置正好在 importer 范围内（int8 按通道对称、激活按 token 动态、`ignore: [lm_head]`、无 act-order）；recipe 为 SmoothQuant 0.7 + GPTQ（observer mse）。文件里 tied 的 `lm_head.weight` **又单独存了一份**（与嵌入逐位相同）：importer 现在检查二者相同，不同则拒绝（原来会把后读的一张写进共享张量，悄悄替换另一张）；合成变体 `lm-head-dup` / `lm-head-diff` 覆盖。
-- **原版参考**：`meta-llama/Llama-3.2-1B-Instruct` 需要登录并接受许可；用不受限的镜像 `unsloth/Llama-3.2-1B-Instruct`（revision `5a8abab4`，`build/llm_cache/Llama-3.2-1B-Instruct`，2.4 GB）。核对：其嵌入表与 RedHatAI 的逐位相同；对 SmoothQuant 不变的量（权重 × 前面 RMSNorm 的权重），RedHatAI 反量化结果与之相关 0.99987、误差中位数 0.26 个量化步长：同一个基础模型。
-- **分词器**：`hf_tokenizer.py` 原来用一个固定正则近似预分词，Llama 3 只有 114/305 段与 transformers 相同（数字 Llama 3 按 3 位一组）。现在按 tokenizer.json 的 normalizer（NFC）、pre-tokenizer（Split 正则 / Digits / ByteLevel 的 GPT-2 正则）、`ignore_merges` 执行，特殊 token 先整体匹配：Llama 3、SmolLM2、Qwen3 各 1009 段（含 chat template 的特殊 token、中文、全角、2 万字长文）与 transformers **完全相同**。需要 `regex` 模块（Unicode 类别）；没有时（板上的系统 Python：`sudo apt install python3-regex`）退回旧的近似。SmolLM2 / Qwen3 的校准文本与 prompt 的分词不变，已有模型的 KV scale 不受影响；Llama 的校准文本由 47 变 45 个 token。
-- **RoPE**：`RopeTable` 由 HF 的 rotary 模块生成整张 cos / sin 表，llama3 scaling 自然包含；`test_hf_generic` 的改写前后对比会在真实模型上验证。
-- **内存预检**：`compiler/tests/mem_preflight.py`（只读 safetensors 头部）。以板上实测校准：峰值 ≈ 打包参数 + KV + 几 MiB；各项之和比打包文件少 2.0%（Qwen3 570.5 对 582.4 MiB）/ 1.5%（SmolLM2），估算乘 1.025。Llama-3.2-1B：int8 线性层 928.0 + 嵌入 int8 250.5 + scale 等 ≈ 1210 MiB 打包，T = 256 的 KV 4 MiB，余量 32 MiB，合计 **1246 MiB / 1280 MiB，放得下（余 34 MiB）**；KV 最长 T ≈ 2400。注意：staging 现在按 “irpa × 1.1 + 24” 设运行时的堆（Llama 得 1323 MiB，超过池），上板前改为 “打包 + KV + 余量”。
+**Preparation (2026-10-11)**:
+- **checkpoint**: `RedHatAI/Llama-3.2-1B-Instruct-quantized.w8a8` (revision `9c406c48`, no login needed) downloaded to `build/llm_cache/Llama-3.2-1B-Instruct-W8A8` (1.9 GB). The configuration is exactly within the importer's scope (int8 per-channel symmetric, activations dynamic per token, `ignore: [lm_head]`, no act-order); the recipe is SmoothQuant 0.7 + GPTQ (observer mse). The file stores the tied `lm_head.weight` **a second time** (bit-identical to the embedding): the importer now checks that the two are identical and rejects otherwise (it used to write whichever was read last into the shared tensor, silently replacing the other); covered by the synthetic variants `lm-head-dup` / `lm-head-diff`.
+- **Original reference**: `meta-llama/Llama-3.2-1B-Instruct` needs a login and accepting a license; the unrestricted mirror `unsloth/Llama-3.2-1B-Instruct` (revision `5a8abab4`, `build/llm_cache/Llama-3.2-1B-Instruct`, 2.4 GB) is used. Check: its embedding table is bit-identical to RedHatAI's; for SmoothQuant-invariant quantities (weights × the preceding RMSNorm's weights), RedHatAI's dequantized values correlate 0.99987 with it, with a median error of 0.26 quantization steps: the same base model.
+- **Tokenizer**: `hf_tokenizer.py` used to approximate pre-tokenization with one fixed regex; for Llama 3 only 114/305 segments matched transformers (Llama 3 groups digits by 3). It now follows tokenizer.json's normalizer (NFC), pre-tokenizer (Split regex / Digits / ByteLevel's GPT-2 regex) and `ignore_merges`, matching special tokens whole first: Llama 3, SmolLM2 and Qwen3 are **exactly identical** to transformers on 1009 segments each (including chat-template special tokens, Chinese, full-width characters, a 20,000-character text). Needs the `regex` module (Unicode categories); without it (the board's system Python: `sudo apt install python3-regex`) it falls back to the old approximation. The tokenization of SmolLM2 / Qwen3's calibration text and prompts is unchanged, so existing models' KV scales are unaffected; Llama's calibration text goes from 47 to 45 tokens.
+- **RoPE**: `RopeTable` generates the whole cos / sin table from HF's rotary module, naturally including llama3 scaling; `test_hf_generic`'s before/after-rewrite comparison verifies it on the real model.
+- **Memory preflight**: `compiler/tests/mem_preflight.py` (reads only the safetensors headers). Calibrated against board measurements: peak ≈ packed parameters + KV + a few MiB; the sum of the items is 2.0% (Qwen3 570.5 vs 582.4 MiB) / 1.5% (SmolLM2) below the packed file, so the estimate is multiplied by 1.025. Llama-3.2-1B: int8 linear layers 928.0 + int8 embedding 250.5 + scales etc. ≈ 1210 MiB packed, KV for T = 256 4 MiB, margin 32 MiB, total **1246 MiB / 1280 MiB: it fits (34 MiB to spare)**; the longest KV is T ≈ 2400. Note: staging currently sets the runtime heap to "irpa × 1.1 + 24" (1323 MiB for Llama, more than the pool); before going on the board change it to "packed + KV + margin".
 
-### 9.2 前端实现
+### 9.2 Frontend implementation
 
-- importer 先严格校验 compressed-tensors 配置是否属于 WP2 支持范围。
-- `rope_rewrite` 使用模型 RotaryEmbedding 生成频率表，并做改写前后 eager 对比。
-- 对 Llama 3 tokenizer 的特殊 token 和 chat template，逐条与 Transformers 比较；演讲前若本地 tokenizer 仍不完整，允许主机端使用 `tokenizers` 生成 token IDs。
-- embedding gather 做边界和打包测试；tied classifier/embedding 在设备归档中只保留一份。
+- The importer first strictly validates that the compressed-tensors configuration is within WP2's supported scope.
+- `rope_rewrite` generates the frequency table with the model's RotaryEmbedding, and compares eager results before and after the rewrite.
+- Llama 3 tokenizer special tokens and the chat template are compared one by one with Transformers; if the local tokenizer is still incomplete before the talk, the host may generate token IDs with `tokenizers`.
+- Embedding gather gets boundary and packing tests; a tied classifier/embedding keeps a single copy in the device archive.
 
-### 9.3 字节级内存预检
+### 9.3 Byte-level memory preflight
 
-在开始完整 sim 前，生成 memory manifest，逐项统计：
+Before starting the full sim, produce a memory manifest counting item by item:
 
-- 各层 int8 权重和 scale。
-- embedding/classifier 是否共享、是否仍含 bf16 副本。
-- 常量区、descriptor、工作区和对齐浪费。
-- KV cache 随上下文长度的增长。
-- host staging buffer 和设备临时 buffer 的峰值生命周期。
+- Each layer's int8 weights and scales.
+- Whether embedding/classifier are shared, and whether a bf16 copy remains.
+- Constant area, descriptors, workspaces and alignment waste.
+- Growth of the KV cache with context length.
+- The peak lifetimes of host staging buffers and temporary device buffers.
 
-注意：原始 checkpoint 文件约 2 GB，不等于设备归档大小；约 1.24 GB / 1178 MiB 的估计只有在 tied embedding/classifier 被重新量化并去重后才成立。
+Note: the original checkpoint file is about 2 GB, which is not the device archive size; the estimate of about 1.24 GB / 1178 MiB only holds once the tied embedding/classifier is requantized and deduplicated.
 
-**预估**（manifest 出来前的量级）：int8 权重 = 嵌入 2048 × 128256（262.7M）+ 16 层 × 60.8M（Q / O 2 × 4.19M、K / V 2 × 1.05M、gate / up / down 3 × 16.8M）≈ 1236 MB = 1178 MiB；KV cache 每 token 16 层 × 8 头 × 64 × 2 = 16 KB，T = 512 时 8 MiB；pool 1280 MiB，余量约 90 MiB（Qwen3 的峰值 595 MB / heap 640 MB，工作区与 scale 很小），**大概率放得下**。主机侧也要预检：pool 与全局 CMA 之外 Linux 约剩 2.4 GB，加载 1.2 GB 的 irpa 时的主机内存峰值计入门禁。decode 量级：GEMV 部分按字节从 Qwen3（4 口约 92 ms / 607.5 MB）放大约 190 ms，加上固定部分，约 **4 tok/s**（down_proj 走 EX 时更低）。
+**Estimate** (orders of magnitude before the manifest): int8 weights = embedding 2048 × 128256 (262.7M) + 16 layers × 60.8M (Q / O 2 × 4.19M, K / V 2 × 1.05M, gate / up / down 3 × 16.8M) ≈ 1236 MB = 1178 MiB; KV cache per token 16 layers × 8 heads × 64 × 2 = 16 KB, 8 MiB at T = 512; pool 1280 MiB, margin about 90 MiB (Qwen3's peak 595 MB / heap 640 MB, workspaces and scales are small): **it very likely fits**. The host side needs a preflight too: outside the pool and the global CMA, Linux has about 2.4 GB left, and the host memory peak while loading the 1.2 GB irpa counts toward the gate. decode estimate: the GEMV part scaled by bytes from Qwen3 (about 92 ms / 607.5 MB at 4 ports) is about 190 ms; adding the fixed part, about **4 tok/s** (lower with down_proj on EX).
 
-内存门禁：
+Memory gate:
 
-- `archive_bytes + peak_workspace + kv_bytes(T) + safety_margin ≤ pool_bytes` 才允许上板。
-- safety margin 建议至少 32–64 MiB，并在实测后固定。
-- 不把“扩大 1280 MiB pool”作为默认解决方案；现有 CMA、initrd 和低 2 GB 地址空间必须先做无冲突证明。
-- 若短上下文仍无法满足门禁，则将高 2 GB DDR（K5-M M2）提升为 Llama 板上验收的前置任务。
+- Going on the board is allowed only if `archive_bytes + peak_workspace + kv_bytes(T) + safety_margin ≤ pool_bytes`.
+- A safety margin of at least 32–64 MiB is recommended, fixed after measurement.
+- "Enlarging the 1280 MiB pool" is not the default solution; the existing CMA, initrd and low-2 GB address space must first be proven conflict free.
+- If even a short context cannot meet the gate, the high 2 GB of DDR (K5-M M2) becomes a prerequisite of Llama's board acceptance.
 
-### 9.4 EX 正确性基线
+### 9.4 EX correctness baseline
 
-**已具备**：K 放不进时按 K 分块走 EX 是 C6.3 已完成的工作（`iree_compiler_plan.md` §8.9；合成模型 K = 16384 逐位一致，Llama W2 按 2 块执行）；编译器只在 `K × 16 ≤ 65535` 时用 GEMV（`SahlExpandKernels.cpp` `expandLinear`），所以 down_proj 现在就自动走 EX。这一步只需跑通并记录数据。
+**Already available**: when K does not fit, splitting by K on EX is work completed in C6.3 (`iree_compiler_plan.md` §8.9; a synthetic model with K = 16384 bit-exact, Llama's W2 executed in 2 blocks); the compiler uses GEMV only when `K × 16 ≤ 65535` (`expandLinear` in `SahlExpandKernels.cpp`), so down_proj already goes to EX automatically. This step only needs to run through and record data.
 
-- K=8192 的 down_proj 走 EX 路径（现状）。
-- 完成逐 dispatch 和端到端 sim，记录 EX 基线周期和 token/s。
-- 若内存门禁通过，再做板上正确性验收。
+- The K=8192 down_proj goes through the EX path (current state).
+- Complete per-dispatch and end-to-end sim; record EX baseline cycles and token/s.
+- If the memory gate passes, do board correctness acceptance.
 
-**结果（2026-10-12，由 WP6 的关 / 开消融给出，§10）**：`--iree-sa-gemv-k-split=false` 即 EX 基线（K = 8192 的 down_proj 按 K 分块走 EX，其余线性层仍走 GEMV）。Llama-3.2-1B 全模型、四口 overlay，板上 17/17 与 sim 逐位一致、0 个主机 dispatch，logits 与 K 分块开时相同；decode **716.3 ms / 步（1.40 tok/s）**，down_proj 每次 3.20M 周期（5.3 B/周期），16 层合计占 decode 设备时间的约 72%。开 K 分块后同一层 0.275M 周期（61 B/周期），decode 4.03 tok/s（×2.89）。内存门禁已过（§9.3，板上峰值 1190 / 1203 MB）；质量参考为原版 Instruct 模型（§11）。
+**Result (2026-10-12, given by WP6's off / on ablation, §10)**: `--iree-sa-gemv-k-split=false` is the EX baseline (the K = 8192 down_proj split by K on EX, the other linear layers still on GEMV). Llama-3.2-1B whole model, four-port overlay: on the board 17/17 bit-exact with the sim, 0 host dispatches, logits identical to K split on; decode **716.3 ms / step (1.40 tok/s)**, down_proj 3.20M cycles each (5.3 B/cycle), the 16 layers together about 72% of decode device time. With the K split on the same layer takes 0.275M cycles (61 B/cycle), decode 4.03 tok/s (×2.89). The memory gate passed (§9.3, board peak 1190 / 1203 MB); the quality reference is the original Instruct model (§11).
 
-### 验收
+### Acceptance
 
-- tokenizer/token ID 与参考实现一致，或明确采用主机标准 tokenizer。
-- RoPE 改写前后 eager 输出在约定容差内一致。
-- memory manifest 给出可上板/不可上板的明确结论。
-- EX 路径逐 dispatch 正确，质量参考为原版 bf16 模型。
+- tokenizer/token IDs identical to the reference implementation, or the host's standard tokenizer explicitly adopted.
+- eager outputs before and after the RoPE rewrite agree within the agreed tolerance.
+- The memory manifest gives a clear fits / does-not-fit conclusion.
+- The EX path correct per dispatch, with the original bf16 model as the quality reference.
 
-## 10. 工作包 WP6：GEMV K 分块
+## 10. Work package WP6: GEMV K split
 
-**进度（2026-10-11）**：decode 的 K 分块完成。
-- 原来 K 超过 SPAD_B 一个 bank（D = 16 时 4096）时，decode 的线性层微内核**根本不被选中**（调度的块大小按 SPAD_B 算出 0），整层交给通用收缩的 K 分块 EX 路径，GEMV 用不上。改动三处，只在“有 GEMV 且 K 超过原限制”时生效：`KernelMatcher::gemvHolds`（K 只受 x 的存放限制：打包 x 在 SPAD_A，int32 x 在 ACC scratch 的 bank 里）、`linearSchedule`（块大小只按 ACC scratch）、`expandLinear`（K 按 4080 分块，x 与权重取子视图，第一块写累加器，其余设 acc 累加；epilogue 在最后一块之后读）。
-- **黄金语料加入 GEMV 4 口的三个用例**（`qwen3_gemv4`、`smollm2_gemv4`、`stories_gemv4`，板上 `_gemv_np4` 的构建，2814 个 dispatch），用改动前的编译器录制，改动后 16 个用例 7046 个 dispatch 逐字节相同：已部署的 GEMV 模型不变。
-- **合成 Llama，K = 8192**（dim 256、FFN 8192，`run_tests.sh gemvk`）：down_proj 为 3 条 GEMV（4080 + 4080 + 32），decode 0 个主机 dispatch，与 torch W8A8 逐步 argmax 9/9、teacher-forced 40/40（相关 1.0000），prefill 与 decode-only 5/5 逐位一致。
-- **prefill 还剩两类主机回退**（不影响正确性，影响板上 prefill 速度，列入 WP6 / WP7）：① prefill 的 down_proj（`matmul_like_16x…x8192`，按行的 EX 路径没有 K 分块：“contraction not expanded”），整数运算所以仍逐位一致，但在 ARM 上算；② prefill 写 KV 的 scatter（`scatter_…x32x2x1xi8`）：没有 QK-norm 的模型（Llama）里 RoPE 的 swapneg gather 融进了写 cache 的 scatter（“more than two loops”）；Qwen3 有 QK-norm 隔开，不受影响。真实的 Llama-3.2-1B 两者都会遇到。
+**Progress (2026-10-11)**: decode's K split done.
+- Previously, when K exceeded one SPAD_B bank (4096 at D = 16), decode's linear micro-kernel was **not selected at all** (the schedule computed a block size of 0 from SPAD_B), the whole layer went to the generic contraction's K-split EX path, and GEMV was not used. Three changes, effective only when "GEMV is present and K exceeds the old limit": `KernelMatcher::gemvHolds` (K is limited only by where x is stored: packed x in SPAD_A, int32 x in a bank of the ACC scratch), `linearSchedule` (block size by the ACC scratch only), `expandLinear` (K split by 4080, x and weights taken as subviews, the first block writes the accumulator, the others set acc to accumulate; the epilogue reads after the last block).
+- **Three 4-port GEMV cases added to the golden corpus** (`qwen3_gemv4`, `smollm2_gemv4`, `stories_gemv4`, the `_gemv_np4` board builds, 2814 dispatches), recorded with the compiler before the change; after the change the 16 cases' 7046 dispatches are byte-identical: deployed GEMV models are unchanged.
+- **Synthetic Llama, K = 8192** (dim 256, FFN 8192, `run_tests.sh gemvk`): down_proj becomes 3 GEMVs (4080 + 4080 + 32), decode has 0 host dispatches, step-by-step argmax vs torch W8A8 9/9, teacher-forced 40/40 (correlation 1.0000), prefill vs decode-only 5/5 bit-exact.
+- **Two kinds of host fallback remain in prefill** (correctness unaffected; board prefill speed affected; listed under WP6 / WP7): ① prefill's down_proj (`matmul_like_16x…x8192`; the row-wise EX path has no K split: "contraction not expanded"), integer arithmetic so still bit-exact, but computed on the ARM; ② prefill's KV-writing scatter (`scatter_…x32x2x1xi8`): in models without QK-norm (Llama) RoPE's swapneg gather is fused into the scatter that writes the cache ("more than two loops"); Qwen3 is separated by QK-norm and unaffected. The real Llama-3.2-1B meets both.
 
-### 10.1 分块规则
+### 10.1 Splitting rule
 
-GEMV 描述符的 `row_bytes`（w2[63:48]）是 16 位、等于 K × 16，所以 K ≤ 4095；K 还必须是 16 的倍数，x 缓冲每 lane 4096 字节。因此安全上限为：
+The GEMV descriptor's `row_bytes` (w2[63:48]) is 16 bits and equals K × 16, so K ≤ 4095; K must also be a multiple of 16, and the x buffer is 4096 bytes per lane. So the safe limit is:
 
 ```text
 K_BLOCK_MAX = floor(4095 / 16) * 16 = 4080
 ```
 
-不得使用 4096。K=8192 的示例切分为：
+4096 must not be used. The K=8192 example splits as:
 
 ```text
 4080 + 4080 + 32
 ```
 
-最后一块按现有 GEMV 尾部语义处理；若硬件要求完整 strip，则由编译器显式 padding，且 padding 不得越过归档边界。
+The last block uses the existing GEMV tail semantics; if the hardware requires complete strips, the compiler pads explicitly, and padding must not cross the archive's boundaries.
 
-### 10.2 编译器实现
+### 10.2 Compiler implementation
 
-硬件与下层已就绪：`sahl.gemv` 带 accumulate 标志，`SahlToSahw` 的 lowering 已设置描述符的 `acc` 位（w3[58]），funcsim 实现了 acc = 1 的语义；工作量只在 `expandLinear`（现在 `useGemv = gemvPorts && K × d ≤ 65535`，超出则整层走 EX）。
+The hardware and the lower layers are ready: `sahl.gemv` has an accumulate flag, the `SahlToSahw` lowering already sets the descriptor's `acc` bit (w3[58]), and funcsim implements the acc = 1 semantics; the work is only in `expandLinear` (today `useGemv = gemvPorts && K × d ≤ 65535`; otherwise the whole layer goes to EX).
 
-- 在 `expandLinear` 中判断 K、x-buffer 容量、descriptor 字段和对齐要求。
-- 为每个 K block 计算 x/weight 基址偏移、有效 K 和 strip 数。
-- 第一块 `acc=0`，后续块 `acc=1`，在同一 ACC 行累加。
-- 仅最后一个 block 执行 requantize、bias、激活和写回，避免逐块舍入。
-- 添加开发开关 `--iree-sa-gemv-k-split=0|1`，用于正确性对比和消融。
-- 编译日志输出切分方案，例如 `K=8192 -> [4080, 4080, 32]`。
-- **x 驻留**：GEMV 单元的 x 缓冲按 (xword, K) 判断驻留。若 K 块在 strip 组的内层循环，每条命令换一次 x 段，每次重读约 255 个字（down_proj 每条命令约 8160 周期数据，约 3%）。可选：K 块放外层（同一 K 段跑完所有 strip 组，部分和留在 ACC，需要 N × 4 字节 = 8 KB 的 ACC），或接受这 3%；先实现简单的，用 profile 决定。
+- In `expandLinear`, check K, the x-buffer capacity, the descriptor fields and alignment requirements.
+- For each K block compute the x/weight base offsets, the effective K and the number of strips.
+- The first block `acc=0`, later blocks `acc=1`, accumulating in the same ACC rows.
+- Only the last block does requantize, bias, activation and write-back, avoiding per-block rounding.
+- Add a development switch `--iree-sa-gemv-k-split=0|1` for correctness comparison and ablation.
+- The compile log prints the split, e.g. `K=8192 -> [4080, 4080, 32]`.
+- **x residency**: the GEMV unit's x buffer judges residency by (xword, K). If the K blocks are the inner loop of the strip groups, each command switches x segment and re-reads about 255 words (down_proj has about 8160 cycles of data per command, about 3%). Optional: K blocks as the outer loop (the same K segment runs through all strip groups, partial sums stay in ACC, needing N × 4 bytes = 8 KB of ACC), or accept the 3%; implement the simple one first and let the profile decide.
 
-### 10.3 溢出与数值语义
+### 10.3 Overflow and numeric semantics
 
-累加是 int32 回绕、中途没有饱和或舍入（`k2b_gemv_design.md` §4 的语义），而 |Σ| ≤ K × 128 × 128 = 8192 × 2¹⁴ = 2²⁷ ≪ 2³¹，K ≤ 131071 时不可能溢出，所以加法顺序无关。requantize 在 epilogue（读 ACC 之后），每块结束不发生截断。测试只需：
+Accumulation is int32 wrap-around with no saturation or rounding in between (the semantics of `k2b_gemv_design.md` §4), and |Σ| ≤ K × 128 × 128 = 8192 × 2¹⁴ = 2²⁷ ≪ 2³¹, so overflow is impossible for K ≤ 131071 and the order of addition does not matter. Requantize happens in the epilogue (after reading ACC); nothing is truncated at the end of each block. Tests only need:
 
-- 一个全 -128 × -128 的最坏情况用例（确认 2²⁷ 量级的和正确）。
-- K block 边界附近的 4080、4096、4112、8192（16 的倍数）。
+- one worst case of all -128 × -128 (confirming sums of order 2²⁷ are correct).
+- 4080, 4096, 4112, 8192 (multiples of 16) near the K-block boundaries.
 
-**结果（2026-10-12，`compiler/tests/test_gemv_ksplit.py`，`run_tests.sh gemvks`）**：单个 decode 线性层（N = 128）在 4 口 overlay 的 sim 上，与 numpy 的精确和比较；编译器开关 `--iree-sa-gemv-k-split=true|false`（关：K > 4080 的层整层走 EX，即 WP6 之前的行为，消融的基线）。
+**Results (2026-10-12, `compiler/tests/test_gemv_ksplit.py`, `run_tests.sh gemvks`)**: a single decode linear layer (N = 128) on the sim of the 4-port overlay, compared with numpy's exact sum; compiler switch `--iree-sa-gemv-k-split=true|false` (off: layers with K > 4080 go entirely to EX, i.e. the behavior before WP6, the ablation baseline).
 
-| K | 开（GEMV 命令 = 组 × K 块） | 关 |
+| K | On (GEMV commands = groups × K blocks) | Off |
 |---|---|---|
-| 4080 | 逐位一致，8 × 1 | 逐位一致，GEMV（不需要分块） |
-| 4096 | 逐位一致，8 × 2（4080 + 16） | 逐位一致，EX |
-| 4112 | 逐位一致，1 × 2（4080 + 32） | 逐位一致，EX |
-| 8192 | 逐位一致，1 × 3（4080 + 4080 + 32） | 逐位一致，EX |
-| 8192 最坏情况 | x = w = −128：2²⁷，逐位一致 | x = −127、w = −128，逐位一致 |
+| 4080 | Bit-exact, 8 × 1 | Bit-exact, GEMV (no split needed) |
+| 4096 | Bit-exact, 8 × 2 (4080 + 16) | Bit-exact, EX |
+| 4112 | Bit-exact, 1 × 2 (4080 + 32) | Bit-exact, EX |
+| 8192 | Bit-exact, 1 × 3 (4080 + 4080 + 32) | Bit-exact, EX |
+| 8192 worst case | x = w = −128: 2²⁷, bit-exact | x = −127, w = −128, bit-exact |
 
-- **数值约定**：激活的 int8 是 [−127, 127]（各前端的 `to_i8` 对称饱和）。EX 路径的 x 经过 VE 的 int8 转换，会把 −128 变成 −127；GEMV 单元原样读打包字节，−128 也精确。所以 EX 的最坏情况用 −127 × −128；超出约定的输入（x = −128）只在 GEMV 上精确。
-- **板上消融（2026-10-12，Llama-3.2-1B，`deploy_hfgen_llama1b_dyn` / `_nosplit`，同一份导出与参数，只差 `--iree-sa-gemv-k-split`）**：两者都 17/17 与 sim 逐位一致、0 个主机 dispatch，logits 相同（关的 qemu 检查直接对开的 sim 参考通过）。
+- **Numeric convention**: activation int8 is [−127, 127] (the symmetric saturation of every frontend's `to_i8`). On the EX path x goes through VE's int8 conversion, which turns −128 into −127; the GEMV unit reads the packed bytes as they are, so −128 is exact too. So EX's worst case uses −127 × −128; inputs outside the convention (x = −128) are exact only on GEMV.
+- **Board ablation (2026-10-12, Llama-3.2-1B, `deploy_hfgen_llama1b_dyn` / `_nosplit`, the same export and parameters, differing only in `--iree-sa-gemv-k-split`)**: both 17/17 bit-exact with the sim, 0 host dispatches, identical logits (the off build's qemu check passes directly against the on build's sim reference).
 
-  | | K 分块关（down_proj 走 EX） | K 分块开（4080 + 4080 + 32） |
+  | | K split off (down_proj on EX) | K split on (4080 + 4080 + 32) |
   |---|---:|---:|
-  | down_proj 每次（16 次 / 步） | 3.20M 周期，5.3 B/cycle | 0.275M 周期，61 B/cycle（×11.6） |
-  | decode 设备 / 每步 | 711.8 ms / 716.3 ms（1.40 tok/s） | 243.6 ms / 248.1 ms（**4.03 tok/s，×2.89**） |
-  | prefill（batched，每 16-token 块） | 1066 ms | 1066 ms（prefill 的行形式不用 GEMV，不受影响） |
+  | down_proj per call (16 per step) | 3.20M cycles, 5.3 B/cycle | 0.275M cycles, 61 B/cycle (×11.6) |
+  | decode device / per step | 711.8 ms / 716.3 ms (1.40 tok/s) | 243.6 ms / 248.1 ms (**4.03 tok/s, ×2.89**) |
+  | prefill (batched, per 16-token chunk) | 1066 ms | 1066 ms (prefill's row form does not use GEMV; unaffected) |
 
-- **顺带发现**：K ≤ 4096 时 decode 线性层的 chunk 仍按 SPAD_B 一个 bank 的容量取（`sbank / K`：K = 4096 每 chunk 1 个 tile，Qwen3 的 K = 1024 每 chunk 4 个），而 GEMV 的权重是流式读入、不进 SPAD_B；按 ACC scratch 取 chunk 可减少每层的 chunk 数（待评估）。
+- **Found along the way**: for K ≤ 4096, the chunk of a decode linear layer is still sized by the capacity of one SPAD_B bank (`sbank / K`: 1 tile per chunk at K = 4096, 4 per chunk for Qwen3's K = 1024), while GEMV streams the weights and does not use SPAD_B; sizing chunks by the ACC scratch could reduce the number of chunks per layer (to be evaluated).
 
-### 验收
+### Acceptance
 
-- 合成 K>4080 模型与 EX 路径逐位一致。
-- Llama down_proj 明确显示为多条 GEMV descriptor，且逐 dispatch 一致。
-- K 分块开/关的 Llama 输出一致，性能差异入编译器消融表。
-- 现有 K≤4080 黄金语料不发生行为变化。
+- Synthetic models with K>4080 bit-exact with the EX path.
+- Llama's down_proj clearly shown as several GEMV descriptors, consistent per dispatch.
+- Llama outputs identical with the K split on and off; the performance difference goes into the compiler ablation table.
+- No behavior change on the existing K≤4080 golden corpus.
 
-## 11. 工作包 WP7：Llama 完整验收
+## 11. Work package WP7: full Llama acceptance
 
-### 实现
+### Implementation
 
-- 启用 K 分块重新编译 Llama。
-- 完成 sim 端到端；内存门禁通过后进行四口板上运行。
-- 收集 down_proj 从 EX 改为 GEMV 前后的周期、DDR 字节、token/s 和 dispatch 分解。
+- Recompile Llama with the K split enabled.
+- Complete the sim end to end; after the memory gate passes, run on the board with four ports.
+- Collect cycles, DDR bytes, token/s and the dispatch breakdown before and after down_proj moves from EX to GEMV.
 
-### 验收
+### Acceptance
 
-- 逐 dispatch 与 SA oracle 一致；板上与 sim 逐位一致。
-- 报告 decode、prefill、质量、内存峰值和覆盖率。
-- 性能数字区分估算、sim 和板上实测。
+- Per dispatch consistent with the SA oracle; the board bit-exact with the sim.
+- Report decode, prefill, quality, peak memory and coverage.
+- Performance numbers distinguish estimates, sim and board measurements.
 
-### 结果（2026-10-11，板上 PASS）
+### Results (2026-10-11, board PASS)
 
-Llama-3.2-1B-Instruct-W8A8（compressed-tensors，16 层，GQA 32/8，K=8192 的 down_proj），四口 overlay d16_100mhz_w128_p6_gemv_np4：
+Llama-3.2-1B-Instruct-W8A8 (compressed-tensors, 16 layers, GQA 32/8, K=8192 down_proj), four-port overlay d16_100mhz_w128_p6_gemv_np4:
 
     compiler/tests/test_hf_generic.py --model build/llm_cache/Llama-3.2-1B-Instruct-W8A8 --out build/hfgen/llama1b \
         --quant --rope --attn --prefill 16 --mb 1400 --board-bundle build/hfgen/llama1b_bundle     # (MemoryMax=10G)
     HFGEN_TAG=llama1b HFGEN_BUNDLE=build/hfgen/llama1b_bundle compiler/scripts/deploy_hfgen.sh   # -> build/deploy_hfgen_llama1b
 
-- 编译：971 个 executable 全在加速器上，host 0；导出 273 s，编译 253 s。
-- 内存：mem_preflight 估 1246.2 MiB / 1280 MiB pool；实际 sa_packed.irpa 1182.5 MiB，窗口 1203 MB。
-- sim：prefill（M=16，40 token）与只 decode 的 logits 5/5 行逐位一致；teacher-forced 40 位置 top-1 vs fp32 30/40（torch W8A8 32/40，容差 5），设备 vs torch 平均 corr 0.9924。
-- aarch64（qemu）vs sim：3/3 行逐位一致。
-- 板上：17/17 步 logits 与 sim 逐位一致，生成 token 相同，0 个 host dispatch；**prefill 9.38 tok/s（40 token 4264 ms，含首块加载），decode 3.50 tok/s（286 ms/步）**。
-- decode 与带宽模型一致：约 1.18 GB 参数 / 57.95 B/cycle（100 MHz）≈ 214 ms，加上固定开销约 70 ms。
-- **之后（2026-10-12，V 投影走 GEMV `14f5612` + attention 按实际长度 `1860823`）**：板上 17/17 逐位一致，**decode 4.03 tok/s（248.1 ms/步，设备 243.6 ms，GEMV 226 ms = 92.6%，54.7 B/cycle）**，prefill 12.62 tok/s（`board_llm.py`，含首块加载；batched 每块 1066 ms，15.21 tok/s，prefill 中 matmul 占 73%）。K 分块开 / 关的对比见 §10。
-- **K per-channel KV 重建（2026-10-12/13，`build/hfgen/llama1b_kch` → `build/deploy_hfgen_llama1b_kch`）**：原板上构建用按层 KV、约 45 token 的 `CALIB` 校准，与 Qwen3 / SmolLM2 的 WP4 做法不一致；重建用 `--kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024`（导出 330 s，715 个 executable 全在加速器，`sa_packed.irpa` 1240 MB）。sim：teacher forcing 40 个位置与 fp32 top-1 一致 35/40（torch W8A8 也是 35/40），prefill 与只 decode 5/5 行逐位相同；qemu aarch64 3/3。板上 PASS：17/17 逐位一致、0 个主机 dispatch，board_llm decode 4.03 tok/s（248.4 ms/步）、prefill 12.58 tok/s（含加载）；batched decode 247.6 ms/步（**4.04 tok/s**，设备 243.9 ms、runtime 其余 3.6 ms），prefill 每块 1068.9 ms（**14.97 tok/s**），设备内存峰值 1189.8 / 1202.9 MB；逐 dispatch：decode GEMV 226.5 ms（92.5%，1238.8 MB，54.7 B/周期 = 94%），prefill matmul 72.5%、阵列 200 MAC/周期（78%）。速度与按层构建相同（只改 KV scale）。质量（主机 2048 token，`build/quality/llama1b_2048_*.json`，板上内存放不下 prefill_all）：fp32 PPL 22.77；**ct-sa:kch PPL 23.33、top-1 90.7%、相关 0.991、KL 0.036**。
-- 默认 prompt 是 SmolLM2 的 token id，对 Llama 无意义，生成文本只用于逐位比对，不代表质量；质量以 teacher-forced 指标为准。
-- 测试内存：同一时间只保留一个 fp32 模型（关 autograd、del 后 gc.collect），峰值 7.1 GB。
+- Compile: 971 executables all on the accelerator, host 0; export 273 s, compile 253 s.
+- Memory: mem_preflight estimates 1246.2 MiB / 1280 MiB pool; actual sa_packed.irpa 1182.5 MiB, window 1203 MB.
+- sim: prefill (M=16, 40 tokens) vs decode-only logits bit-exact on 5/5 rows; teacher-forced 40 positions top-1 vs fp32 30/40 (torch W8A8 32/40, tolerance 5), device vs torch mean corr 0.9924.
+- aarch64 (qemu) vs sim: 3/3 rows bit-exact.
+- On the board: 17/17 steps of logits bit-exact with the sim, identical generated tokens, 0 host dispatches; **prefill 9.38 tok/s (40 tokens in 4264 ms, including loading in the first chunk), decode 3.50 tok/s (286 ms/step)**.
+- decode agrees with the bandwidth model: about 1.18 GB of parameters / 57.95 B/cycle (100 MHz) ≈ 214 ms, plus about 70 ms of fixed overhead.
+- **Later (2026-10-12, V projection on GEMV `14f5612` + attention over the actual length `1860823`)**: 17/17 bit-exact on the board, **decode 4.03 tok/s (248.1 ms/step, device 243.6 ms, GEMV 226 ms = 92.6%, 54.7 B/cycle)**, prefill 12.62 tok/s (`board_llm.py`, including loading in the first chunk; batched 1066 ms per chunk, 15.21 tok/s, matmul 73% of prefill). The K split on / off comparison is in §10.
+- **K per-channel KV rebuild (2026-10-12/13, `build/hfgen/llama1b_kch` → `build/deploy_hfgen_llama1b_kch`)**: the original board build used per-layer KV calibrated on the ~45-token `CALIB`, inconsistent with WP4's approach for Qwen3 / SmolLM2; the rebuild uses `--kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024` (export 330 s, 715 executables all on the accelerator, `sa_packed.irpa` 1240 MB). sim: teacher forcing over 40 positions top-1 agreement with fp32 35/40 (torch W8A8 also 35/40), prefill vs decode-only 5/5 rows bit-identical; qemu aarch64 3/3. Board PASS: 17/17 bit-exact, 0 host dispatches, board_llm decode 4.03 tok/s (248.4 ms/step), prefill 12.58 tok/s (including loading); batched decode 247.6 ms/step (**4.04 tok/s**, device 243.9 ms, rest of the runtime 3.6 ms), prefill 1068.9 ms per chunk (**14.97 tok/s**), device memory peak 1189.8 / 1202.9 MB; per dispatch: decode GEMV 226.5 ms (92.5%, 1238.8 MB, 54.7 B/cycle = 94%), prefill matmul 72.5%, array 200 MAC/cycle (78%). Speed identical to the per-layer build (only the KV scales changed). Quality (host, 2048 tokens, `build/quality/llama1b_2048_*.json`; the board's memory cannot fit prefill_all): fp32 PPL 22.77; **ct-sa:kch PPL 23.33, top-1 90.7%, correlation 0.991, KL 0.036**.
+- The default prompt is SmolLM2 token ids, meaningless for Llama; the generated text is only used for bit-exact comparison and does not represent quality; quality is judged by the teacher-forced metrics.
+- Test memory: only one fp32 model kept at a time (autograd off, gc.collect after del); peak 7.1 GB.
 
-## 12. 工作包 WP8：Gemma-3-270M 短上下文 bring-up
+## 12. Work package WP8: Gemma-3-270M short-context bring-up
 
-**预备工作（2026-10-11）**：
-- **模型**：`google/gemma-3-270m` 需要登录；用不受限的镜像 `unsloth/gemma-3-270m`（base，revision `edcf1fe3`，`build/llm_cache/gemma-3-270m`，0.5 GB）。结构：18 层，hidden 640，4 / 1 GQA，head_dim 256，词表 262144，FFN 2048，GELU-tanh，滑窗 512（每 6 层 5 层滑窗），RoPE 局部 base 1e4、全局 1e6，`query_pre_attn_scalar` 256，无 logit softcap。内存预检：T = 512 时约 300 MiB，宽裕。
-- **eager 逐项对比**（原版 HF fp32 为参考，24 个 token）发现并修了四处，都只在 Gemma 这类结构上生效：① 包装后的 decoder 与原版就不一致（相关 0.73）：HF 按第 0 层的 cache 长度推算位置，Gemma 的第 0 层是滑窗层，计数器是 `cumulative_length_int`，原来没设（现在 `_at` 一并设置；导出时 sa 注意力不用 HF 的 mask）→ 逐位一致级别（7e-5）；② W8A8 后完全错（相关 0.13）：`Gemma3TextScaledWordEmbedding` 要乘 √640，`QEmbedding` 把它丢了；现在保留 `embed_scale`，反量化后再乘（不能折进 scale：分类层共用这张表而不乘），带自定义 forward 又没有 `embed_scale` 的嵌入子类明确报错；③ `RopeTable` 报错：Gemma 只有一个 rotary 模块、调用时传 `layer_type`，现在每种类型一张表；④ RMSNorm 的增益是 `1 + w`：`SaRMSNorm` 用全 1 向量探测模块实际的增益，判定为 `w` 或 `1 + w`，其他形式报错。另外：`sa_attention` 的分数缩放改用模块自己的 `scaling`（与 1/√head_dim 相同时仍用原来的算法，现有模型逐位不变）；cache 长度超过滑窗时明确报错（设备注意力不做滑窗，T ≤ 512 时语义相同）。
-  结果：包装与 RoPE / norm 改写后与原版一致（7e-5，argmax 24/24），W8A8 相关 0.992，SA 形式（int8 KV、设备注意力、SFU 近似）相关 0.9906、argmax 23/24。SmolLM2 与 Qwen3（截 2 层）的导出与改动前逐字节相同。
-- **分词器**：Gemma 是 SentencePiece 风格的 BPE（normalizer 把空格换成 `▁`、直接对字符做 BPE、byte fallback `<0xNN>`）。`hf_tokenizer.py` 加入这种模式（normalizer Replace / Prepend、`MergedWithPrevious` 的 Split、byte fallback 与对应解码），BPE 改为堆 + 链表（n log n；Gemma 整段文本是一个“词”）。Gemma、Llama 3、SmolLM2、Qwen3 各 1009 段与 transformers 完全相同，解码可还原；Gemma 不需要 `regex` 模块，板上的系统 Python 也是精确的。
-- **还没做**（WP8 正式阶段）：导出与编译（GELU-tanh 在设备上的形式、head_dim 256 的注意力微内核与 SPAD 容量）、`synth_hf.py` 的 Gemma3 结构。
+**Preparation (2026-10-11)**:
+- **Model**: `google/gemma-3-270m` needs a login; the unrestricted mirror `unsloth/gemma-3-270m` is used (base, revision `edcf1fe3`, `build/llm_cache/gemma-3-270m`, 0.5 GB). Structure: 18 layers, hidden 640, 4 / 1 GQA, head_dim 256, vocabulary 262144, FFN 2048, GELU-tanh, sliding window 512 (5 of every 6 layers sliding), RoPE local base 1e4 and global 1e6, `query_pre_attn_scalar` 256, no logit softcap. Memory preflight: about 300 MiB at T = 512, plenty of room.
+- **eager comparison item by item** (original HF fp32 as the reference, 24 tokens) found and fixed four issues, all effective only on Gemma-like structures: ① the wrapped decoder already differed from the original (correlation 0.73): HF infers positions from layer 0's cache length, Gemma's layer 0 is a sliding layer whose counter is `cumulative_length_int`, which was not set (now `_at` sets it too; at export the sa attention does not use HF's mask) → bit-exact level (7e-5); ② completely wrong after W8A8 (correlation 0.13): `Gemma3TextScaledWordEmbedding` multiplies by √640 and `QEmbedding` dropped it; `embed_scale` is now kept and applied after dequantization (it cannot be folded into the scale: the classifier shares the table without the multiply), and an embedding subclass with a custom forward but no `embed_scale` is explicitly rejected; ③ `RopeTable` errored: Gemma has a single rotary module called with `layer_type`; now one table per type; ④ the RMSNorm gain is `1 + w`: `SaRMSNorm` probes the module's actual gain with an all-ones vector, decides between `w` and `1 + w`, and rejects other forms. Also: the score scaling of `sa_attention` now uses the module's own `scaling` (when it equals 1/√head_dim the original algorithm is kept, so existing models are bit-identical); a cache longer than the sliding window is explicitly rejected (the device attention has no sliding window; the semantics are the same for T ≤ 512).
+  Result: after wrapping and the RoPE / norm rewrites it matches the original (7e-5, argmax 24/24), W8A8 correlation 0.992, SA form (int8 KV, device attention, SFU approximation) correlation 0.9906, argmax 23/24. The exports of SmolLM2 and Qwen3 (truncated to 2 layers) are byte-identical to before the change.
+- **Tokenizer**: Gemma uses SentencePiece-style BPE (the normalizer replaces spaces with `▁`, BPE runs directly on characters, byte fallback `<0xNN>`). `hf_tokenizer.py` gained this mode (normalizer Replace / Prepend, `MergedWithPrevious` Split, byte fallback and the matching decoding), and BPE moved to a heap + linked list (n log n; for Gemma a whole text is one "word"). Gemma, Llama 3, SmolLM2 and Qwen3 match transformers exactly on 1009 segments each, and decoding round-trips; Gemma does not need the `regex` module, so the board's system Python is exact too.
+- **Not done yet** (WP8 formal stage): export and compile (the device form of GELU-tanh, the attention micro-kernel and SPAD capacity for head_dim 256), the Gemma3 structure in `synth_hf.py`.
 
-### 12.1 第一阶段范围
+### 12.1 Scope of the first stage
 
-- 以 sim 为主，允许少量 host fallback。
-- tokenizer 初期使用标准 `tokenizers` / Transformers 预生成 token IDs，不让 SentencePiece/byte fallback 阻塞编译器覆盖研究。
-- 从 T=16/32/64/128 逐级增加，不预设 T=512 可以放入当前 SPAD。
+- Mainly on the sim; a few host fallbacks allowed.
+- At first the tokenizer pre-generates token IDs with the standard `tokenizers` / Transformers, so SentencePiece/byte fallback does not block the compiler coverage study.
+- Increase T step by step over 16/32/64/128, without assuming T=512 fits in the current SPAD.
 
-### 12.2 关键适配
+### 12.2 Key adaptations
 
-- 支持约 5 层 sliding-window + 1 层 full attention 的层型模式；T≤窗口时语义相同，但仍分别验证局部/全局 RoPE base。
-- 支持 4 个 RMSNorm、`1 + w` 形式、embedding 乘 `sqrt(d)` 和 QK norm。
-- GELU-tanh 改写为设备可执行图，但正确性参考必须使用设备 EXP/RECIP 的近似语义。
-- 对 `x / (1 + exp(-2u))` 增加大正/负输入、clamp、overflow 和舍入测试，不宣称与 PyTorch GELU 逐位一致。
-- 在 planner 中对 attention 的 K/V、临时 logits 和工作区做显式 SPAD 容量预检。
-- head_dim = 256 是 Qwen3（128）的两倍：除容量外，先检查 attention 微内核、QK-norm、RoPE 改写对 head_dim 的假设与限制。
+- Support the layer pattern of about 5 sliding-window layers + 1 full-attention layer; for T ≤ window the semantics are the same, but the local/global RoPE bases are still verified separately.
+- Support 4 RMSNorms, the `1 + w` form, the embedding multiplied by `sqrt(d)`, and QK norm.
+- GELU-tanh rewritten into a graph the device can execute, but the correctness reference must use the approximate semantics of the device's EXP/RECIP.
+- Add tests for large positive/negative inputs, clamping, overflow and rounding of `x / (1 + exp(-2u))`, without claiming bit-exactness with PyTorch's GELU.
+- Explicit SPAD capacity preflight in the planner for attention's K/V, temporary logits and workspaces.
+- head_dim = 256 is twice Qwen3's (128): besides capacity, first check the head_dim assumptions and limits of the attention micro-kernel, QK-norm and the RoPE rewrite.
 
-### 12.3 T=512 风险
+### 12.3 The T=512 risk
 
-head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超过当前单银行容量。因此：
+With head_dim=256 a single K tensor at T=512 is already about 131072 bytes, possibly more than the current capacity of one bank. Therefore:
 
-- 第一版只承诺实际通过容量检查的上下文长度。
-- 若 T=512 不通过，文档明确标记 C6.5 T 分块为长上下文前置任务。
-- 不以“局部层和全局层在 T≤512 算法相同”推导“现有 SPAD 一定能容纳”。
+- The first version only commits to the context lengths that actually pass the capacity check.
+- If T=512 does not pass, the document explicitly marks C6.5 T tiling as a prerequisite for long contexts.
+- "Local and global layers use the same algorithm for T≤512" is not taken to imply "the existing SPAD can certainly hold it".
 
-### 验收
+### Acceptance
 
-- 至少一个短上下文在 sim 端到端完成。
-- 生成完整回退清单和四类覆盖率。
-- 不能下沉的算子都有可操作的原因分类：frontend、rewrite、lowering、硬件 primitive、内存容量或 tokenizer/runtime。
+- At least one short context completes end to end on the sim.
+- A complete fallback list and the four kinds of coverage are produced.
+- Every operator that cannot be moved down has an actionable reason category: frontend, rewrite, lowering, hardware primitive, memory capacity, or tokenizer/runtime.
 
-### 12.4 正式阶段结果（2026-10-13）
+### 12.4 Results of the formal stage (2026-10-13)
 
-**编译覆盖**：全模型 18 层（`build/hfgen/gemma_kch`，`--quant --rope --attn --kv-channel k --kv-calib train:1024 --prefill 16 --prefill-all`）790 个 executable 全部在加速器上，回退清单为空。为此做的改动（都只在 Gemma 这类结构上生效，golden corpus 7046 个 dispatch 不变）：
-- **GELU-tanh**：HF 的 `GELUTanh` 导出成 `math.fpowi` 落到主机 VMVX。`hf_generic.act_rewrite` 换成 `SaGELUTanh`：`x * recip(exp(x·(A + B·x²)) + 1)`（A = −2√(2/π)，B = 0.044715·A），只用设备有的 EXP / RECIP；先探测模块，非 tanh 形式的 GELU 拒绝。[−20, 20] 上与 PyTorch 最大误差 4.8e−7，两端为 −0 / x。
-- **单 KV 头的 attention**：4 / 1 GQA 让 attention 的 batch_matmul 的 batch 维是 1（`1x4xDx256`），`SahlExpandKernels` 的 batch 循环判定为 −1 而整体留给主机。修复：viewMap 先认尺寸 1 的维再查动态步长；epilogue 输入分析跳过尺寸 1 的维。另加 `sa.unexpanded = "SahlExpandKernels.cpp:LINE"` 属性，未展开的原因直接出现在 codegen 报告里（6772516）。
-- **head_dim 256**：T ≤ 256 的上下文容量检查通过，未用到 C6.5 的 T 分块；T = 512 未验证（§12.3 的风险仍在）。
+**Compile coverage**: the whole model, 18 layers (`build/hfgen/gemma_kch`, `--quant --rope --attn --kv-channel k --kv-calib train:1024 --prefill 16 --prefill-all`), 790 executables all on the accelerator; the fallback list is empty. The changes made for this (all effective only on Gemma-like structures; the golden corpus's 7046 dispatches unchanged):
+- **GELU-tanh**: HF's `GELUTanh` exports as `math.fpowi` and lands on host VMVX. `hf_generic.act_rewrite` replaces it with `SaGELUTanh`: `x * recip(exp(x·(A + B·x²)) + 1)` (A = −2√(2/π), B = 0.044715·A), using only the device's EXP / RECIP; the module is probed first, and non-tanh GELU forms are rejected. Maximum error versus PyTorch on [−20, 20] 4.8e−7, the two ends giving −0 / x.
+- **Attention with a single KV head**: 4 / 1 GQA gives attention's batch_matmul a batch dimension of 1 (`1x4xDx256`); `SahlExpandKernels` judged the batch loop as −1 and left the whole thing to the host. Fix: viewMap recognizes size-1 dimensions before looking at dynamic strides; the epilogue input analysis skips size-1 dimensions. Also a new attribute `sa.unexpanded = "SahlExpandKernels.cpp:LINE"`, so the reason a kernel was not expanded shows directly in the codegen report (6772516).
+- **head_dim 256**: the capacity check passes for contexts with T ≤ 256 without C6.5's T tiling; T = 512 not verified (the risk of §12.3 remains).
 
-**sim 验收**：prefill 与 decode-only 5/5 行逐位一致，prefill_all 40/40；teacher forcing 40 位置设备 33/40（mean corr 0.979），torch W8A8 36/40（0.978），设备 vs torch 差 6 处、corr 0.981（容差内）。aarch64（qemu）3/3 逐位一致。
+**sim acceptance**: prefill vs decode-only 5/5 rows bit-exact, prefill_all 40/40; teacher forcing over 40 positions device 33/40 (mean corr 0.979), torch W8A8 36/40 (0.978), device vs torch differ at 6, corr 0.981 (within tolerance). aarch64 (qemu) 3/3 bit-exact.
 
-**板上（2026-10-13，四口 overlay，`build/deploy_hfgen_gemma_kch`）**：board_llm 17/17 与 sim 逐位一致、0 个主机 dispatch；decode 66.8 ms / 步（14.96 tok/s），prefill 每 16-token 块 256 ms（62.5 tok/s）；设备内存峰值 266 MB。teacher forcing（8 × 256）PPL 158.54（fp32 123.76），top-1 76.0%。注意：`board.txt` 的窗口按 40-token 运行的峰值定（277 MB），teacher forcing 的 256 token 窗口（每块 logits 16 MB）要把窗口调到 640 MB。
+**On the board (2026-10-13, four-port overlay, `build/deploy_hfgen_gemma_kch`)**: board_llm 17/17 bit-exact with the sim, 0 host dispatches; decode 66.8 ms / step (14.96 tok/s), prefill 256 ms per 16-token chunk (62.5 tok/s); device memory peak 266 MB. Teacher forcing (8 × 256) PPL 158.54 (fp32 123.76), top-1 76.0%. Note: the window in `board.txt` is set from the peak of a 40-token run (277 MB); teacher forcing's 256-token windows (16 MB of logits per chunk) need the window raised to 640 MB.
 
-**质量归因**（主机，WikiText-2 test 2048 token，窗口 256，`build/quality/gemma_2048_*.json`；词表 262144 时 2048 token 的 PPL 被少数 token 主导、排序不稳定，以 KL 与 top-1 为准）：
+**Quality attribution** (host, WikiText-2 test 2048 tokens, window 256, `build/quality/gemma_2048_*.json`; with a vocabulary of 262144 the PPL over 2048 tokens is dominated by a few tokens and its ranking is unstable, so KL and top-1 are what count):
 
-| 变体 | PPL | top-1 | corr | KL |
+| Variant | PPL | top-1 | corr | KL |
 |---|---:|---:|---:|---:|
-| torch W8A8（fp32 attention） | 126.15 | 81.8% | 0.9870 | 0.129 |
-| sa:kch（设备语义） | 166.76 | 77.8% | 0.9792 | 0.238 |
-| +act（linear 层 fp32 激活） | 163.98 | 83.1% | 0.9895 | 0.133 |
-| +kv（fp32 KV cache） | 175.47 | 79.5% | 0.9811 | 0.216 |
-| +q（attention query 不量化） | 169.36 | 76.3% | 0.9769 | 0.265 |
-| +sfu（精确 exp / recip / rsqrt） | 158.35 | 75.4% | 0.9771 | 0.274 |
-| **+probs（fp32 注意力概率）** | 137.09 | 80.2% | 0.9830 | 0.181 |
-| +q+probs+kv+sfu（attention 全 fp32） | 136.07 | 82.3% | 0.9873 | 0.126 |
+| torch W8A8 (fp32 attention) | 126.15 | 81.8% | 0.9870 | 0.129 |
+| sa:kch (device semantics) | 166.76 | 77.8% | 0.9792 | 0.238 |
+| +act (fp32 activations in linear layers) | 163.98 | 83.1% | 0.9895 | 0.133 |
+| +kv (fp32 KV cache) | 175.47 | 79.5% | 0.9811 | 0.216 |
+| +q (attention query not quantized) | 169.36 | 76.3% | 0.9769 | 0.265 |
+| +sfu (exact exp / recip / rsqrt) | 158.35 | 75.4% | 0.9771 | 0.274 |
+| **+probs (fp32 attention probabilities)** | 137.09 | 80.2% | 0.9830 | 0.181 |
+| +q+probs+kv+sfu (attention fully fp32) | 136.07 | 82.3% | 0.9873 | 0.126 |
 
-设备语义比 W8A8 多出的损失主要来自 **int8 注意力概率** `i8(p·127)`：分辨率 1/127，Gemma 的注意力分布分散，大量 p < 0.004 被舍为 0。KV、query 量化与 SFU 近似都在噪声内。与 Qwen3（§8，主因是 int8 KV 的 K 通道离群值）不同，这是模型结构决定的另一类误差。
+The extra loss of the device semantics over W8A8 comes mainly from the **int8 attention probabilities** `i8(p·127)`: the resolution is 1/127, Gemma's attention distributions are spread out, and many p < 0.004 are rounded to 0. KV and query quantization and the SFU approximation are within noise. Unlike Qwen3 (§8, where the main cause is the K-channel outliers of the int8 KV), this is another kind of error determined by the model's structure.
 
-**候选修复：非归一化概率量化**。量化 `e = exp(s − max)`（最大值恰为 1，且 e ≥ p）而不是 `p = e·r`：`pq = i8(e·127)`，int32 的 PV 结果再乘每行的 r 与 a_v。同样 8 bit，每行分辨率不差于现状，且 r 从乘 T 个概率变为乘 hd 个输出；不改硬件，只改 `hf_generic.sa_attention` 导出的图。主机评估（同设置）：Gemma sa:kch PPL 166.76 → 145.27，top-1 77.8% → 80.5%，KL 0.238 → 0.167。SmolLM2（ct-sa:kch，`build/quality/smollm2_pe_*.json`）也变好：PPL 28.82 → 28.25，top-1 87.7% → 88.7%，KL 0.072 → 0.053。它改变所有模型的数值语义（golden、四个模型的 sim 与板上验收都要重做）。
+**Candidate fix: unnormalized probability quantization**. Quantize `e = exp(s − max)` (its maximum is exactly 1, and e ≥ p) instead of `p = e·r`: `pq = i8(e·127)`, and the int32 PV result is then multiplied by the row's r and a_v. The same 8 bits, a per-row resolution no worse than today, and r goes from multiplying T probabilities to multiplying hd outputs; no hardware change, only the graph exported by `hf_generic.sa_attention` changes. Host evaluation (same setup): Gemma sa:kch PPL 166.76 → 145.27, top-1 77.8% → 80.5%, KL 0.238 → 0.167. SmolLM2 (ct-sa:kch, `build/quality/smollm2_pe_*.json`) improves too: PPL 28.82 → 28.25, top-1 87.7% → 88.7%, KL 0.072 → 0.053. It changes the numeric semantics of every model (golden, the sim and board acceptance of all four models have to be redone).
 
-**采用：按量化后的和归一化（qsum，2026-10-13）**。`eq = i8(e·127)`，`out = (eq·V) · 127/Σeq · a_v`：实际参与 PV 的权重之和严格为 1，舍为 0 的尾部质量按比例分给留下的 key；Σeq 是精确整数（≤ 127·T），与求和顺序无关。与 fsum（`· 1/Σe`）只差每行一个标量（输出方向相同）。
+**Adopted: normalization by the quantized sum (qsum, 2026-10-13)**. `eq = i8(e·127)`, `out = (eq·V) · 127/Σeq · a_v`: the weights actually taking part in PV sum to exactly 1, and the tail mass rounded to 0 is redistributed proportionally over the remaining keys; Σeq is an exact integer (≤ 127·T), independent of summation order. It differs from fsum (`· 1/Σe`) only by one scalar per row (same output direction).
 
-| 主机 2048 token | 现状 | fsum | **qsum** |
+| Host, 2048 tokens | Current | fsum | **qsum** |
 |---|---|---|---|
 | Gemma PPL / top-1 / KL | 166.76 / 77.8% / 0.238 | 145.27 / 80.5% / 0.167 | 148.52 / 80.3% / 0.176 |
 | SmolLM2 PPL / top-1 / KL | 28.82 / 87.7% / 0.072 | 28.25 / 88.7% / 0.053 | 28.50 / 89.9% / 0.053 |
 
-只看概率量化一步（fp32 Gemma 的 q/k/v，一个 256 token 窗口，16200 个 attention 行）：attention 输出相对误差现状 0.121、fsum 0.0185、qsum 0.0159，qsum 在 81% 的行上更准；尾部质量平均 1.7%（p90 4.0%）。端到端两者之差（Gemma KL 0.009）小于这套评估的波动（如精确 SFU 端到端反而 +0.036），按单步精度与 Σeq 的精确性选 qsum。
+Looking only at the probability-quantization step (fp32 Gemma's q/k/v, one 256-token window, 16200 attention rows): relative error of the attention output is 0.121 today, 0.0185 for fsum, 0.0159 for qsum, with qsum more accurate on 81% of the rows; the tail mass averages 1.7% (p90 4.0%). The end-to-end difference between the two (Gemma KL 0.009) is smaller than this evaluation's noise (e.g. exact SFU end to end was even +0.036), so qsum was chosen for its per-step accuracy and the exactness of Σeq.
 
-实现（`hf_generic.sa_attention` 与归因分支）：Σeq 必须直接对 int8 求和（`eq.to(float32)`，sitofp）：先扩到 i32 再求和（`extsi` 不是 to_i8 的形式）或对 `round(e·127)` 求和（reduction 体里的 `math.roundeven`）都会落到主机。2 层 Gemma 214 个 / SmolLM2 212 个 executable 全在加速器，teacher forcing 设备与 torch 无差异，prefill 5/5 逐位一致；golden 通过。
+Implementation (`hf_generic.sa_attention` and the attribution branches): Σeq must be summed directly over the int8 values (`eq.to(float32)`, sitofp): extending to i32 first and summing (`extsi` is not in to_i8's form) or summing `round(e·127)` (`math.roundeven` in the reduction body) both land on the host. 2-layer Gemma (214) and SmolLM2 (212) executables all on the accelerator, no device vs torch differences in teacher forcing, prefill 5/5 bit-exact; golden passes.
 
-**qsum 板上验收（2026-10-13，四口 overlay，`build/deploy_hfgen_{gemma,smollm2,qwen3}_qs`）**：全模型重建（Gemma 791 / SmolLM2 1221 / Qwen3 1139 个 executable，全在加速器），sim prefill 5/5、prefill_all 40/40 逐位一致，qemu 3/3；板上 board_llm 17/17 与 sim 逐位一致、0 个主机 dispatch。
+**qsum board acceptance (2026-10-13, four-port overlay, `build/deploy_hfgen_{gemma,smollm2,qwen3}_qs`)**: whole-model rebuilds (Gemma 791 / SmolLM2 1221 / Qwen3 1139 executables, all on the accelerator), sim prefill 5/5 and prefill_all 40/40 bit-exact, qemu 3/3; on the board board_llm 17/17 bit-exact with the sim, 0 host dispatches.
 
-| 板上（8 × 256 teacher forcing） | 旧语义 PPL / top-1 / KL | **qsum** | decode（batched） | prefill 每块 |
+| Board (8 × 256 teacher forcing) | Old semantics PPL / top-1 / KL | **qsum** | decode (batched) | prefill per chunk |
 |---|---|---|---:|---:|
-| Gemma-3-270M（fp32 PPL 123.76） | 158.54 / 76.0% / 0.209 | **142.83 / 80.3% / 0.157** | 66.8 → 66.9 ms | 256.0 → 255.5 ms |
-| SmolLM2-135M（fp32 PPL 26.98） | 28.54 / 86.5% / 0.055 | **28.26 / 89.8% / 0.038** | 45.1 → 45.2 ms | 266.3 → 264.5 ms |
-| Qwen3-0.6B（fp32 PPL 39.21） | 39.62 / 86.9% / 0.053 | **39.68 / 88.1% / 0.038** | 145.4 → 143.6 ms | 773 → 769.7 ms |
+| Gemma-3-270M (fp32 PPL 123.76) | 158.54 / 76.0% / 0.209 | **142.83 / 80.3% / 0.157** | 66.8 → 66.9 ms | 256.0 → 255.5 ms |
+| SmolLM2-135M (fp32 PPL 26.98) | 28.54 / 86.5% / 0.055 | **28.26 / 89.8% / 0.038** | 45.1 → 45.2 ms | 266.3 → 264.5 ms |
+| Qwen3-0.6B (fp32 PPL 39.21) | 39.62 / 86.9% / 0.053 | **39.68 / 88.1% / 0.038** | 145.4 → 143.6 ms | 773 → 769.7 ms |
 
-Gemma 量化带来的 PPL 损失 34.8 → 19.1，KL −25%；SmolLM2 KL −31%、top-1 +3.3 点；Qwen3 PPL 持平（+0.06，2048 个位置时在噪声内），KL −29%、top-1 +1.2 点。速度不变：每层每行多一个 Σeq 的 reduction dispatch（decode Gemma 690 → 708、SmolLM2 1000 → 1030、Qwen3 1046 → 1074；prefill 每块 +16 / 层），原 softmax 的归一化不再需要，reduction 与 batch_matmul 的时间一增一减（SmolLM2 prefill：reduction −5.6 ms、batch_matmul +4.5 ms）；batched 的 runtime 其余 +0.1–0.3 ms。Llama 重建中。
+Gemma's quantization PPL loss 34.8 → 19.1, KL −25%; SmolLM2 KL −31%, top-1 +3.3 points; Qwen3 PPL flat (+0.06, within noise over 2048 positions), KL −29%, top-1 +1.2 points. Speed unchanged: one more Σeq reduction dispatch per layer and row (decode Gemma 690 → 708, SmolLM2 1000 → 1030, Qwen3 1046 → 1074; prefill +16 per layer per chunk), the original softmax normalization is no longer needed, and the times of reduction and batch_matmul move in opposite directions (SmolLM2 prefill: reduction −5.6 ms, batch_matmul +4.5 ms); the batched rest of the runtime +0.1–0.3 ms. Llama being rebuilt.
 
-## 13. 工作包 WP9：测量基础设施与覆盖矩阵
+## 13. Work package WP9: measurement infrastructure and coverage matrix
 
-### 13.1 运行时统计
+### 13.1 Runtime statistics
 
-扩展 `SA_STATS=1`，为每个动态 dispatch 记录：
+Extend `SA_STATS=1` to record for every dynamic dispatch:
 
-- 名称、算子类别和关键 shape。
-- 执行位置：host / accelerator。
-- 调用次数。
-- host dispatch 墙钟时间。
-- accelerator 设备周期、命令数、估算 DDR 字节和 MAC。
-- 回退原因。
+- Name, operator category and key shapes.
+- Where it executes: host / accelerator.
+- Call count.
+- Wall-clock time of host dispatches.
+- Accelerator device cycles, command count, estimated DDR bytes and MACs.
+- Fallback reason.
 
-另外：prefill 导出每个位置的 logits（§3.2 的板上 teacher forcing 需要），以及 decode 每步固定部分（attention EX、VE / SFU、LD 命令延迟、dispatch / 主机开销）的分类计时，用于 §16 的决策。
+In addition: prefill exports the logits of every position (needed by the board teacher forcing of §3.2), and the fixed part of each decode step (attention EX, VE / SFU, LD command latency, dispatch / host overhead) is timed by category, for the decisions of §16.
 
-若 host 与 accelerator 可能异步重叠，分别报告两侧时间，并额外使用端到端墙钟作为总时间；不直接相加。
+If host and accelerator may overlap asynchronously, report the two sides' times separately and use the end-to-end wall clock as the total; do not add them directly.
 
-**实现（2026-10-12，d9fea48、f85482e、14f5612）**：
+**Implementation (2026-10-12, d9fea48, f85482e, 14f5612)**:
 
-- 运行时：host fallback 记为 `host:<export>` 行（CPU ns）；`SA_PROFILE_PERF` csv 按段（prefill / decode）输出，sim 上也写；profile 表 4096 个 export（Qwen3 prefill 约 2800 个，原 512 截断了逐行 attention）。
-- `compiler/tests/dispatch_stats.py`：按类别统计调用、周期、MAC（由 dispatch 名的循环范围）、LD/ST 字节，动态 / 时间 / MAC 覆盖率；`--report`（`--iree-sa-codegen-report`）给静态覆盖与回退原因分类（forced / 内存容量 / 硬件原语 / lowering）。
-- 板上 teacher forcing：导出 `prefill_all`（`--prefill-all`，每个位置的 logits，与仅 decode 逐位一致），`sa-llm-run --prefill_all_out`，`board_teacher.py`（板上）+ `board_quality.py prep / sim / score`（主机：fp32 参考、PPL、top-1、参考 top-64 上的 KL）。
+- Runtime: host fallbacks are recorded as `host:<export>` rows (CPU ns); the `SA_PROFILE_PERF` csv is output per section (prefill / decode), also written on the sim; the profile table holds 4096 exports (Qwen3 prefill has about 2800; the old 512 truncated the row attention).
+- `compiler/tests/dispatch_stats.py`: per category the calls, cycles, MACs (from the loop ranges in the dispatch name), LD/ST bytes, dynamic / time / MAC coverage; `--report` (`--iree-sa-codegen-report`) gives static coverage and a classification of fallback reasons (forced / memory capacity / hardware primitive / lowering).
+- Board teacher forcing: export `prefill_all` (`--prefill-all`, the logits of every position, bit-exact with decode only), `sa-llm-run --prefill_all_out`, `board_teacher.py` (on the board) + `board_quality.py prep / sim / score` (host: fp32 reference, PPL, top-1, KL over the reference's top 64).
 
-**Qwen3-0.6B 板上结果**（通用前端，W8A8 + K per-channel KV，4 口 overlay；1140 个可执行全部在加速器上）：
+**Qwen3-0.6B board results** (generic frontend, W8A8 + K per-channel KV, 4-port overlay; 1140 executables all on the accelerator):
 
-- 质量（WikiText-2 test 8 窗口 × 256，teacher forcing）：板上 PPL 39.62（fp32 39.21），top-1 86.9%，KL 0.053（top-64 覆盖参考 87.8% 质量）；主机 ct-sa:kch 39.14 / 87.4% / 0.054，板上与主机模型一致。
-- decode 每步（batched）：设备 175.0 ms，runtime 其余 3.4 ms —— **固定开销在设备上，不在主机**。V 投影修复（14f5612：decode 的 V 投影直接量化进 KV cache，int8 结果原先不被 matchLinear 接受，落到 EX 通用路径，每层 136k 周期 vs 同形状 K 投影 17.6k）后 211.1 → 178.4 ms/step（4.74 → 5.60 tok/s），17/17 逐位一致。
+- Quality (WikiText-2 test 8 windows × 256, teacher forcing): board PPL 39.62 (fp32 39.21), top-1 86.9%, KL 0.053 (the top 64 cover 87.8% of the reference's mass); host ct-sa:kch 39.14 / 87.4% / 0.054; the board agrees with the host model.
+- decode per step (batched): device 175.0 ms, rest of the runtime 3.4 ms — **the fixed overhead is on the device, not the host**. After the V-projection fix (14f5612: decode's V projection is quantized straight into the KV cache; its int8 result was not accepted by matchLinear and fell to the generic EX path, 136k cycles per layer vs 17.6k for the K projection of the same shape) 211.1 → 178.4 ms/step (4.74 → 5.60 tok/s), 17/17 bit-exact.
 
-| decode 类别（修复后） | 周期占比 | ms/步 | 备注 |
+| decode category (after the fix) | Share of cycles | ms/step | Notes |
 |---|---:|---:|---|
-| matvec（权重 GEMV，含 lm_head 27.6 ms） | 63.0% | 111.4 | 读 598 MB，53.7 B/cycle = GEMV 峰值 57.95 的 93%；带宽下限约 103 ms |
-| batch_matmul（attention） | 26.3% | 46.5 | 按静态 T=256 计算，与位置无关 |
-| reduction / elementwise / 其他 | 10.7% | 18.7 | RMSNorm、RoPE、softmax、量化 |
+| matvec (weight GEMV, including lm_head 27.6 ms) | 63.0% | 111.4 | Reads 598 MB, 53.7 B/cycle = 93% of the GEMV peak 57.95; bandwidth floor about 103 ms |
+| batch_matmul (attention) | 26.3% | 46.5 | Computed over the static T=256, independent of position |
+| reduction / elementwise / other | 10.7% | 18.7 | RMSNorm, RoPE, softmax, quantization |
 
-- prefill 每 16-token chunk 1.44 s（11.15 tok/s，batched 142.8M 周期）：逐行 attention（batch_matmul，56 个 export × 16 行）51.7%，matmul 27.9%，reduction 12.5%。**prefill 的下一步是 attention，不是 GEMM。**
-- 下一步候选（§16 决策用）：decode attention 按实际长度而非静态 T（≤46 ms）；prefill attention 按块而非逐行；GEMV 已接近带宽上限。
+- prefill 1.44 s per 16-token chunk (11.15 tok/s, batched 142.8M cycles): row attention (batch_matmul, 56 exports × 16 rows) 51.7%, matmul 27.9%, reduction 12.5%. **The next step for prefill is attention, not GEMM.**
+- Next candidates (for the decisions of §16): decode attention over the actual length instead of a static T (≤46 ms); prefill attention by blocks instead of by rows; GEMV is already close to the bandwidth limit.
 
-**attention 按实际长度（2026-10-12，`1860823`，通用前端默认）**：导出时每个函数多一个 `valid[T]`（T 动态，≤ cache 长度），cache 只取前 T 行；`sa-llm-run --abi=hfv --pad=16` 按位置取 T（位置 + 1 向上取整到 16）。动态 T 让 torch-mlir 在每层 matmul 前留一个 “mismatching contracting dimension” 断言，每个都切断 command buffer（SmolLM2 2 层每步 3 个 list）；`compile_sa.sh` 加 `--iree-opt-strip-assertions` 后恢复每步 1 个（Qwen3 2 个，与静态相同）。Qwen3 板上（位置 32–48）：
+**Attention over the actual length (2026-10-12, `1860823`, generic frontend default)**: at export each function gets an extra `valid[T]` (T dynamic, ≤ cache length) and only the first T rows of the cache are used; `sa-llm-run --abi=hfv --pad=16` picks T from the position (position + 1 rounded up to 16). The dynamic T makes torch-mlir leave a "mismatching contracting dimension" assertion before each layer's matmul, each cutting the command buffer (SmolLM2 with 2 layers: 3 lists per step); with `--iree-opt-strip-assertions` in `compile_sa.sh` it is back to 1 per step (Qwen3 2, the same as static). Qwen3 on the board (positions 32–48):
 
-| | 静态 T = 256 | 按实际长度 |
+| | Static T = 256 | Actual length |
 |---|---:|---:|
-| decode ms/步（tok/s） | 178.4（5.60） | **145.4（6.88）** |
-| 　设备 / runtime 其余 | 175.0 / 3.4 ms | 136.9 / 6.9 ms |
-| 　attention（batch_matmul） | 46.5 ms | 11.8 ms |
-| prefill 每 16-token chunk（batched） | 1428 ms（11.15 tok/s） | **773 ms（20.53 tok/s）** |
-| 　逐行 attention | 744.7 ms | 145.4 ms |
-| teacher forcing（2048 位置） | PPL 39.624 | 39.624，argmax / NLL / top-64 逐位相同 |
+| decode ms/step (tok/s) | 178.4 (5.60) | **145.4 (6.88)** |
+| 　device / rest of the runtime | 175.0 / 3.4 ms | 136.9 / 6.9 ms |
+| 　attention (batch_matmul) | 46.5 ms | 11.8 ms |
+| prefill per 16-token chunk (batched) | 1428 ms (11.15 tok/s) | **773 ms (20.53 tok/s)** |
+| 　row attention | 744.7 ms | 145.4 ms |
+| teacher forcing (2048 positions) | PPL 39.624 | 39.624, argmax / NLL / top-64 bit-identical |
 
-decode 现在 GEMV 占设备时间的 80%（111.4 ms，峰值的 93%）；通用路径超过了手写路径（WP1 的 6.28 tok/s）。runtime 其余从 3.4 增到 6.9 ms（动态形状在主机上的计算，待查）。`dispatch_stats.py` 对动态维（名字里的 `D`）不计 MAC，attention 的 MAC 未计入覆盖率。
+GEMV is now 80% of decode device time (111.4 ms, 93% of peak); the generic path is faster than the hand-written path (WP1's 6.28 tok/s). The rest of the runtime grew from 3.4 to 6.9 ms (dynamic-shape computation on the host, to be investigated). `dispatch_stats.py` does not count MACs for dynamic dimensions (`D` in the name), so attention's MACs are not in the coverage.
 
-### 13.2 最终主表
+### 13.2 Final main table
 
-| 模型 | 权重来源 | 正确性 | 质量 | 动态/时间/MAC覆盖率 | decode | prefill | 带宽利用率 | 内存峰值 |
+| Model | Weight source | Correctness | Quality | Dynamic/time/MAC coverage | decode | prefill | Bandwidth utilization | Memory peak |
 |---|---|---|---|---|---:|---:|---:|---:|
-| Qwen3-0.6B | 外部 W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 39.68（fp32 39.21），top-1 88.1%（qsum） | 100% / 100% / 100% | 6.96 tok/s | 20.79 tok/s | GEMV 93%（decode 4.38 GB/s 平均） | 590 / 613 MB |
-| SmolLM2-135M | llm-compressor W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 28.26（fp32 26.98），top-1 89.8%（qsum） | 100% / 100% / 100% | 22.12 tok/s | 60.50 tok/s | GEMV 82%（decode 3.43 GB/s 平均） | 135 / 150 MB |
-| Llama-3.2-1B | RedHatAI W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 23.33（fp32 22.77），top-1 90.7%（主机 2048-token 评估；内存不够板上 prefill_all） | 100% / 100% / 100% | 4.04 tok/s | 14.97 tok/s | GEMV 94%（decode 5.08 GB/s 平均） | 1190 / 1203 MB |
-| Gemma-3-270M | 自量化 W8A8（per-token 动态激活）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 142.83（fp32 123.76），top-1 80.3%（板上 8×256 teacher forcing，qsum；旧语义 158.54 / 76.0%，§12.4） | 100% / 100% / 100% | 14.95 tok/s | 62.62 tok/s | GEMV 88%（decode 4.38 GB/s 平均） | 266 / 640 MB（窗口按 teacher forcing 设） |
+| Qwen3-0.6B | External W8A8 (ct) + K per-channel KV | Board 17/17 bit-exact | PPL 39.68 (fp32 39.21), top-1 88.1% (qsum) | 100% / 100% / 100% | 6.96 tok/s | 20.79 tok/s | GEMV 93% (decode 4.38 GB/s average) | 590 / 613 MB |
+| SmolLM2-135M | llm-compressor W8A8 (ct) + K per-channel KV | Board 17/17 bit-exact | PPL 28.26 (fp32 26.98), top-1 89.8% (qsum) | 100% / 100% / 100% | 22.12 tok/s | 60.50 tok/s | GEMV 82% (decode 3.43 GB/s average) | 135 / 150 MB |
+| Llama-3.2-1B | RedHatAI W8A8 (ct) + K per-channel KV | Board 17/17 bit-exact | PPL 23.33 (fp32 22.77), top-1 90.7% (host 2048-token evaluation; not enough memory for prefill_all on the board) | 100% / 100% / 100% | 4.04 tok/s | 14.97 tok/s | GEMV 94% (decode 5.08 GB/s average) | 1190 / 1203 MB |
+| Gemma-3-270M | Self-quantized W8A8 (per-token dynamic activations) + K per-channel KV | Board 17/17 bit-exact | PPL 142.83 (fp32 123.76), top-1 80.3% (board 8×256 teacher forcing, qsum; old semantics 158.54 / 76.0%, §12.4) | 100% / 100% / 100% | 14.95 tok/s | 62.62 tok/s | GEMV 88% (decode 4.38 GB/s average) | 266 / 640 MB (window set for teacher forcing) |
 
-**主表分项（2026-10-12，板上，四口 overlay）**：分类时间来自逐 dispatch 计时（`board_profile.py 40 --prompt 32 SA_PROFILE_PERF=...csv` → `dispatch_stats.py`，每个 dispatch 一个 list），每步总时间、设备时间、runtime 其余来自 batched 实测（`--batch`），两者设备时间差约 1%；逐 dispatch 模式的提交时间被放大（每步 90–270 ms），不列。数据：`build/deploy_hfgen_llama1b_kch/prof_llama_*.json`，`build/deploy_hfgen_{qwen3,smollm2,gemma}_qs/prof_{decode,prefill}.json`。
+**Main-table breakdown (2026-10-12, board, four-port overlay)**: category times come from per-dispatch timing (`board_profile.py 40 --prompt 32 SA_PROFILE_PERF=...csv` → `dispatch_stats.py`, one list per dispatch); total per-step time, device time and the rest of the runtime come from batched measurement (`--batch`); the two agree on device time within about 1%; submission time in per-dispatch mode is inflated (90–270 ms per step) and not listed. Data: `build/deploy_hfgen_llama1b_kch/prof_llama_*.json`, `build/deploy_hfgen_{qwen3,smollm2,gemma}_qs/prof_{decode,prefill}.json`.
 
-注意力概率量化：Qwen3、SmolLM2、Gemma 三行（及下面两张分项表的三列）为 qsum（2026-10-13，§12.4）；Llama 一行仍是旧语义，重建后更新。
+Attention-probability quantization: the Qwen3, SmolLM2 and Gemma rows (and the three columns of the two breakdown tables below) are qsum (2026-10-13, §12.4); the Llama row is still the old semantics, updated after the rebuild.
 
-decode 每步：
-
-| | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B | Gemma-3-270M |
-|---|---:|---:|---:|---:|
-| 每步（batched） | 143.6 ms | 45.2 ms | 247.6 ms | 66.9 ms |
-| 　设备 / runtime 其余 | 136.60 / 7.02 ms | 38.48 / 6.71 ms | 243.9 / 3.6 ms | 60.91 / 5.75 ms |
-| dispatch（主机） | 1074（0） | 1030（0） | 538（0） | 708（0） |
-| **GEMV**（matvec_like） | 111.3 ms（80%） | 28.6 ms（71%） | 226.5 ms（93%） | 52.7 ms（85%；lm_head 31.7 ms） |
-| 　GEMV 带宽（峰值 57.95 B/周期） | 53.8（93%） | 47.4（82%） | 54.7（94%） | 51.2（88%） |
-| attention（batch_matmul） | 12.2 ms（9%） | 4.2 ms（10%） | 6.9 ms（3%） | 3.0 ms（5%） |
-| reduction（norm、softmax） | 7.3 ms（5%） | 3.7 ms（9%） | 6.7 ms（3%） | 3.3 ms（5%） |
-| elementwise 类 | 7.4 ms（5%） | 3.5 ms（9%） | 4.6 ms（2%） | 2.8 ms（5%） |
-| scatter（写 KV） | 0.3 ms | 0.3 ms | 0.2 ms | 0.2 ms |
-| DDR 读 | 607 MB，4.38 GB/s | 138 MB，3.43 GB/s | 1243 MB，5.08 GB/s | 272 MB，4.38 GB/s |
-
-prefill 每 16-token chunk：
+decode per step:
 
 | | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B | Gemma-3-270M |
 |---|---:|---:|---:|---:|
-| 每块（batched） | 769.7 ms | 264.5 ms | 1068.9 ms | 255.5 ms |
-| dispatch（主机） | 6838（0） | 5404（0） | 2642（0） | 3876（0） |
-| **GEMM**（matmul_like） | 402.1 ms（51%） | 132.1 ms（48%） | 779.0 ms（73%） | 113.5 ms（44%） |
-| 　阵列利用率（峰值 256 MAC/周期） | 175（68%） | 129（50%） | 200（78%） | 141（55%） |
-| 逐行 attention（batch_matmul） | 152.9 ms（20%） | 55.2 ms（20%） | 88.7 ms（8%） | 38.6 ms（15%） |
-| reduction | 113.9 ms（15%） | 51.6 ms（19%） | 108.3 ms（10%） | 46.3 ms（18%） |
-| elementwise 类 | 81.3 ms（10%） | 26.3 ms（10%） | 50.1 ms（5%） | 25.8 ms（10%） |
-| GEMV（lm_head，最后一行） | 27.6 ms（4%） | 5.2 ms（2%） | 45.6 ms（4%） | 31.7 ms（12%） |
+| Per step (batched) | 143.6 ms | 45.2 ms | 247.6 ms | 66.9 ms |
+| 　device / rest of the runtime | 136.60 / 7.02 ms | 38.48 / 6.71 ms | 243.9 / 3.6 ms | 60.91 / 5.75 ms |
+| dispatches (host) | 1074 (0) | 1030 (0) | 538 (0) | 708 (0) |
+| **GEMV** (matvec_like) | 111.3 ms (80%) | 28.6 ms (71%) | 226.5 ms (93%) | 52.7 ms (85%; lm_head 31.7 ms) |
+| 　GEMV bandwidth (peak 57.95 B/cycle) | 53.8 (93%) | 47.4 (82%) | 54.7 (94%) | 51.2 (88%) |
+| attention (batch_matmul) | 12.2 ms (9%) | 4.2 ms (10%) | 6.9 ms (3%) | 3.0 ms (5%) |
+| reduction (norm, softmax) | 7.3 ms (5%) | 3.7 ms (9%) | 6.7 ms (3%) | 3.3 ms (5%) |
+| elementwise kinds | 7.4 ms (5%) | 3.5 ms (9%) | 4.6 ms (2%) | 2.8 ms (5%) |
+| scatter (KV write) | 0.3 ms | 0.3 ms | 0.2 ms | 0.2 ms |
+| DDR read | 607 MB, 4.38 GB/s | 138 MB, 3.43 GB/s | 1243 MB, 5.08 GB/s | 272 MB, 4.38 GB/s |
+
+prefill per 16-token chunk:
+
+| | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B | Gemma-3-270M |
+|---|---:|---:|---:|---:|
+| Per chunk (batched) | 769.7 ms | 264.5 ms | 1068.9 ms | 255.5 ms |
+| dispatches (host) | 6838 (0) | 5404 (0) | 2642 (0) | 3876 (0) |
+| **GEMM** (matmul_like) | 402.1 ms (51%) | 132.1 ms (48%) | 779.0 ms (73%) | 113.5 ms (44%) |
+| 　array utilization (peak 256 MAC/cycle) | 175 (68%) | 129 (50%) | 200 (78%) | 141 (55%) |
+| row attention (batch_matmul) | 152.9 ms (20%) | 55.2 ms (20%) | 88.7 ms (8%) | 38.6 ms (15%) |
+| reduction | 113.9 ms (15%) | 51.6 ms (19%) | 108.3 ms (10%) | 46.3 ms (18%) |
+| elementwise kinds | 81.3 ms (10%) | 26.3 ms (10%) | 50.1 ms (5%) | 25.8 ms (10%) |
+| GEMV (lm_head, last row) | 27.6 ms (4%) | 5.2 ms (2%) | 45.6 ms (4%) | 31.7 ms (12%) |
 | scatter | 6.0 ms | 4.8 ms | 2.7 ms | 3.0 ms |
 
-- decode 基本是带宽受限的 GEMV（Llama 93%、Qwen3 80%），剩下的固定部分主要是 attention 与 norm；SmolLM2 层内矩阵只有 576 宽，GEMV 命令的固定开销占比高（82%）。
-- prefill 不只是 GEMM：小模型的 GEMM 阵列利用率只有 50–68%，逐行 attention 与 reduction 合计占三到四成。
-- Gemma 的词表 262144 让 lm_head（168 MB int8）成为 decode 最大的单项（GEMV 的 60%、设备时间的 51%）；层内只有 640 宽，prefill 阵列利用率 55%。
-- MAC 覆盖率的 100% 不含 attention：`dispatch_stats.py` 对动态维不计 MAC（待修）。
+- decode is mostly bandwidth-bound GEMV (Llama 93%, Qwen3 80%); the remaining fixed part is mainly attention and norms; SmolLM2's matrices inside the layers are only 576 wide, so the fixed overhead of GEMV commands is a larger share (82%).
+- prefill is not only GEMM: the GEMM array utilization of the small models is only 50–68%, and row attention plus reduction take 30–40%.
+- Gemma's vocabulary of 262144 makes lm_head (168 MB int8) the largest single item of decode (60% of GEMV, 51% of device time); the layers are only 640 wide, prefill array utilization 55%.
+- The 100% MAC coverage excludes attention: `dispatch_stats.py` does not count MACs for dynamic dimensions (to be fixed).
 
-### 13.3 两张消融表
+### 13.3 Two ablation tables
 
-不要把硬件资源和纯编译器功能混在同一张表。
+Do not mix hardware resources and pure compiler features in the same table.
 
-**硬件消融**：EX → GEMV 1 口 → 2 口 → 4 口，并单列 P6/REDUCE 等 bitstream 特性；列 token/s、设备周期、DDR 带宽、LUT、FF、BRAM、DSP、WNS。
+**Hardware ablation**: EX → GEMV 1 port → 2 ports → 4 ports, with bitstream features such as P6/REDUCE listed separately; columns token/s, device cycles, DDR bandwidth, LUT, FF, BRAM, DSP, WNS.
 
-**编译器/模型消融**：自量化→外部 W8A8、K 分块关→开、prefill 逐行关→开、host fallback→accelerator；列质量、覆盖率、周期、token/s 和内存峰值。K 分块不重复填写相同硬件资源。
+**Compiler/model ablation**: self-quantization → external W8A8, K split off → on, row-by-row prefill off → on, host fallback → accelerator; columns quality, coverage, cycles, token/s and memory peak. The K split does not repeat the same hardware resources.
 
-**硬件消融（第一版，2026-10-12）**：同一套手写路径的测试（`c6p_*`、hfgen，staging 时的编译器），每个 overlay 自己的构建，板上 logits 都与 sim 逐位一致；decode 为 `board_llm.py` 每步墙钟（tok/s）。资源与时序来自 `boards/kv260/README.md` 的构建表，GEMV 带宽来自 bwtest（64 KB，x 驻留）。
+**Hardware ablation (first version, 2026-10-12)**: the same hand-written-path tests (`c6p_*`, hfgen, the compiler at staging time), each overlay with its own build, board logits all bit-exact with the sim; decode is `board_llm.py`'s per-step wall clock (tok/s). Resources and timing from the build table in `boards/kv260/README.md`, GEMV bandwidth from bwtest (64 KB, x resident).
 
 | overlay | Qwen3-0.6B | SmolLM2-135M | SmolLM2 hfgen | stories15M | GEMV B/cycle | LUT | FF | BRAM36 | DSP | WNS |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| EX（`p6_red`） | 2.22 | 7.71 | 7.62 | 61.9 | —（LD 15.70） | 88,250（75.4%） | 60,823 | 130 | 347 | +0.123 |
-| GEMV 1 口（`_gemv`） | 2.28 | 8.21 | 8.34 | 68.07 | 15.60 | 92,329（78.8%） | 61,566 | 132 | 349 | +0.274 |
-| GEMV 2 口（`_gemv_np2`） | 3.98 | 12.58 | 12.73 | 100.8 | 30.55 | 96,294（82.2%） | 63,675 | 134 | 349 | +0.138 |
-| GEMV 4 口（`_gemv_np4`） | **6.28** | **17.04** | **17.19** | **131.65** | 57.95 | 101,878（87.0%） | 67,688 | 138 | 349 | +0.168 |
+| EX (`p6_red`) | 2.22 | 7.71 | 7.62 | 61.9 | — (LD 15.70) | 88,250 (75.4%) | 60,823 | 130 | 347 | +0.123 |
+| GEMV 1 port (`_gemv`) | 2.28 | 8.21 | 8.34 | 68.07 | 15.60 | 92,329 (78.8%) | 61,566 | 132 | 349 | +0.274 |
+| GEMV 2 ports (`_gemv_np2`) | 3.98 | 12.58 | 12.73 | 100.8 | 30.55 | 96,294 (82.2%) | 63,675 | 134 | 349 | +0.138 |
+| GEMV 4 ports (`_gemv_np4`) | **6.28** | **17.04** | **17.19** | **131.65** | 57.95 | 101,878 (87.0%) | 67,688 | 138 | 349 | +0.168 |
 
-- 1 口 GEMV 与 EX 的 LD 带宽相同（约 15.6 B/cycle），decode 只快 3–10%（省掉 SPAD_B 往返和 EX 的流水）；收益来自口数：2 口 ×1.8、4 口 ×2.8（Qwen3）。4 口的代价：比 EX 多 13.6k LUT、6.9k FF、8 个 BRAM36、2 个 DSP。
-- 其他 bitstream 特性（Qwen3，手写路径）：P6 批量 SFU prefill 11.4 → 14.0 tok/s；批量 REDUCE prefill → 15.45 tok/s（LUT 72.1% → 75.4%）；decode 不变（2.20–2.22）。
+- One-port GEMV has the same LD bandwidth as EX (about 15.6 B/cycle), and decode is only 3–10% faster (saving the SPAD_B round trip and the EX pipeline); the gain comes from the number of ports: 2 ports ×1.8, 4 ports ×2.8 (Qwen3). The cost of 4 ports: 13.6k LUT, 6.9k FF, 8 BRAM36 and 2 DSP more than EX.
+- Other bitstream features (Qwen3, hand-written path): P6 batched SFU prefill 11.4 → 14.0 tok/s; batched REDUCE prefill → 15.45 tok/s (LUT 72.1% → 75.4%); decode unchanged (2.20–2.22).
 
-**编译器 / 模型消融（第一版，2026-10-12）**：同一硬件（4 口 overlay）、同一模型，只改编译器或前端的一项；除质量外都是板上实测，逐位一致的项注明。
+**Compiler / model ablation (first version, 2026-10-12)**: same hardware (4-port overlay), same model, only one compiler or frontend item changed; everything except quality is measured on the board, and bit-exact items are noted.
 
-| 项 | 模型 | 关 | 开 | 说明 |
+| Item | Model | Off | On | Notes |
 |---|---|---:|---:|---|
-| 自量化 → 外部 W8A8（llm-compressor） | SmolLM2（主机，SA 形式，2048 token） | PPL 30.77，top-1 83.9% | PPL 28.77，top-1 87.1% | §7；KL 0.138 → 0.074 |
-| KV 按层 → K 按通道（+1024 token 校准） | Qwen3（主机，2048 token） | PPL 53.50，top-1 71.5% | PPL 39.14，top-1 87.4% | §8；板上 39.62 / 86.9% |
-| 主机回退 → 加速器（prefill 逐行注意力） | SmolLM2 hfgen | prefill 14.20 tok/s，1440 个主机 dispatch | 27.18 tok/s，0 个 | §7；list 1465 → 37 |
-| K 分块（`--iree-sa-gemv-k-split`） | Llama-3.2-1B | decode 1.40 tok/s | **4.03 tok/s（×2.89）** | §10；logits 逐位相同 |
-| V 投影 int8 结果走 GEMV（`14f5612`） | Qwen3 | decode 4.74 tok/s | 5.60 tok/s | §13.1；逐位相同 |
-| attention 按实际长度（`1860823`） | Qwen3 | decode 5.60 / prefill 11.15 tok/s | **6.88 / 20.53 tok/s** | §13.1；2048 位置 teacher forcing 逐位相同 |
-| 注意力概率 `i8(p·127)` → qsum（`1a0ba3d`） | Gemma-3-270M（板上 8 × 256 teacher forcing） | PPL 158.54，top-1 76.0%，KL 0.209 | **PPL 142.83，top-1 80.3%，KL 0.157** | §12.4；SmolLM2 / Qwen3 KL −31% / −29%；速度不变 |
+| Self-quantization → external W8A8 (llm-compressor) | SmolLM2 (host, SA form, 2048 tokens) | PPL 30.77, top-1 83.9% | PPL 28.77, top-1 87.1% | §7; KL 0.138 → 0.074 |
+| Per-layer KV → K per channel (+1024-token calibration) | Qwen3 (host, 2048 tokens) | PPL 53.50, top-1 71.5% | PPL 39.14, top-1 87.4% | §8; board 39.62 / 86.9% |
+| Host fallback → accelerator (row-by-row prefill attention) | SmolLM2 hfgen | prefill 14.20 tok/s, 1440 host dispatches | 27.18 tok/s, 0 | §7; lists 1465 → 37 |
+| K split (`--iree-sa-gemv-k-split`) | Llama-3.2-1B | decode 1.40 tok/s | **4.03 tok/s (×2.89)** | §10; logits bit-identical |
+| V projection's int8 result on GEMV (`14f5612`) | Qwen3 | decode 4.74 tok/s | 5.60 tok/s | §13.1; bit-identical |
+| Attention over the actual length (`1860823`) | Qwen3 | decode 5.60 / prefill 11.15 tok/s | **6.88 / 20.53 tok/s** | §13.1; 2048-position teacher forcing bit-identical |
+| Attention probabilities `i8(p·127)` → qsum (`1a0ba3d`) | Gemma-3-270M (board 8 × 256 teacher forcing) | PPL 158.54, top-1 76.0%, KL 0.209 | **PPL 142.83, top-1 80.3%, KL 0.157** | §12.4; SmolLM2 / Qwen3 KL −31% / −29%; speed unchanged |
 
-通用前端的 Qwen3 decode（6.88 tok/s，qsum 后 6.96）现在高于手写路径在同一 overlay 上的 6.28。
+The generic frontend's Qwen3 decode (6.88 tok/s, 6.96 after qsum) is now faster than the hand-written path on the same overlay (6.28).
 
-## 14. 时间表与停止条件
+## 14. Schedule and stop conditions
 
-| 日期 | 目标 | 停止条件 / 降级动作 |
+| Dates | Goal | Stop condition / fallback action |
 |---|---|---|
-| ~~10/11–10/14~~ | WP0–WP1：四口收尾 | **10/10 已完成**（剩 perf_model 校准，可与 WP2 并行）；bitstream 冻结为 `d16_100mhz_w128_p6_gemv_np4` |
-| 10/11–10/18 | WP2：importer schema 与合成测试（**10/10 第一版完成**；prefill 等价问题、通用前端 Qwen3 的回退都已解决） | 10/18 前格式解析不稳定，则缩小到单一已验证 checkpoint schema |
-| 10/19–10/24 | WP3–WP4：SmolLM2（**10/11 板上验收**）、Qwen3 | 10/24 前 Qwen 质量无改善，也必须输出四层定位结论，不继续盲调 scale |
-| 10/25–10/29 | WP5：Llama 前端、EX 基线、内存预检 | 内存门禁失败则暂停板上 staging，保留 sim 结果并启动 M2 评估 |
-| 10/30–11/03 | WP6–WP7：K 分块与 Llama | K 分块不稳定则演讲使用 EX 正确性基线，把性能优化标为进行中 |
-| 11/04–11/09 | WP9 初版、消融表 | 先完成可复现数据，不等待 Gemma |
-| 11/04–11/12 | WP8：Gemma 短上下文 sim | 11/10 前未端到端，则展示导入覆盖、首个阻塞点和回退清单 |
-| 11/13–11/15 | 表格冻结、演讲材料 | 11/15 后不引入新硬件或大范围 compiler refactor |
-| 11/16–11/25 | 幻灯片、复现实验、排练 | 只修阻断性 bug；所有新增结果必须能完整复现 |
+| ~~10/11–10/14~~ | WP0–WP1: four-port wrap-up | **Done 10/10** (perf_model calibration left, can run in parallel with WP2); bitstream frozen as `d16_100mhz_w128_p6_gemv_np4` |
+| 10/11–10/18 | WP2: importer schema and synthetic tests (**first version done 10/10**; the prefill equivalence problem and the generic-frontend Qwen3 fallbacks are solved) | If format parsing is unstable by 10/18, narrow to a single verified checkpoint schema |
+| 10/19–10/24 | WP3–WP4: SmolLM2 (**accepted on the board 10/11**), Qwen3 | Even if Qwen's quality has not improved by 10/24, the four-layer attribution conclusion must be delivered; no further blind scale tuning |
+| 10/25–10/29 | WP5: Llama frontend, EX baseline, memory preflight | If the memory gate fails, pause board staging, keep the sim results and start the M2 evaluation |
+| 10/30–11/03 | WP6–WP7: K split and Llama | If the K split is unstable, the talk uses the EX correctness baseline and marks the performance optimization as in progress |
+| 11/04–11/09 | First WP9, ablation tables | Finish reproducible data first; do not wait for Gemma |
+| 11/04–11/12 | WP8: Gemma short-context sim | If not end to end by 11/10, show the import coverage, the first blocking point and the fallback list |
+| 11/13–11/15 | Tables frozen, talk material | After 11/15 no new hardware or large compiler refactoring |
+| 11/16–11/25 | Slides, reproduction experiments, rehearsal | Only blocking bugs fixed; every new result must be fully reproducible |
 
-## 15. 提交拆分建议
+## 15. Suggested commit split
 
-每个提交应能独立测试和回退：
+Each commit should be independently testable and revertible:
 
-1. ~~`docs: sync KV260 G4/G5 status and metrics`~~（`fb01909`、`b42fec6`）
+1. ~~`docs: sync KV260 G4/G5 status and metrics`~~ (`fb01909`, `b42fec6`)
 2. ~~`frontend: parse compressed-tensors W8A8 config`~~
 3. ~~`frontend: add external int8 weight/scale representation`~~
 4. ~~`frontend: preserve imported int8 values including -128`~~
-5. ~~`tests: add synthetic compressed-tensors checkpoints`~~（2–5 合为一个提交）
-6. `frontend: import SmolLM2 and Qwen3 W8A8 checkpoints`（SmolLM2 完成）
-7. ~~`tools: add quantization quality comparison pipeline`~~（`quality_eval.py`）
-8. `frontend: add Llama 3.2 tokenizer and RoPE coverage`（分词器完成）
-9. ~~`tools: add device memory manifest and preflight`~~（`mem_preflight.py`）
-10. ~~`compiler: split GEMV K at aligned 4080-element boundary`~~（decode）
+5. ~~`tests: add synthetic compressed-tensors checkpoints`~~ (2–5 merged into one commit)
+6. `frontend: import SmolLM2 and Qwen3 W8A8 checkpoints` (SmolLM2 done)
+7. ~~`tools: add quantization quality comparison pipeline`~~ (`quality_eval.py`)
+8. `frontend: add Llama 3.2 tokenizer and RoPE coverage` (tokenizer done)
+9. ~~`tools: add device memory manifest and preflight`~~ (`mem_preflight.py`)
+10. ~~`compiler: split GEMV K at aligned 4080-element boundary`~~ (decode)
 11. `tests: cover GEMV K split boundaries and overflow`
 12. `runtime: report per-dispatch host/device timing and fallback reason`
 13. `frontend: add Gemma 3 graph rewrites and short-context bring-up`
 
-避免在同一提交中同时修改 importer、lowering、RTL 和黄金输出；否则逐位不一致时难以定位责任层。
+Avoid changing the importer, lowering, RTL and golden outputs in the same commit; otherwise, when bit-exactness breaks, it is hard to tell which layer is responsible.
 
-## 16. 会后性能项的选择规则
+## 16. Rules for choosing post-meeting performance items
 
-使用 Qwen、Llama、Gemma 三个模型的耗时分解做决策：
+Decide from the time breakdowns of the three models Qwen, Llama and Gemma:
 
-| 观测结果 | 优先项 |
+| Observation | Priority item |
 |---|---|
-| decode 每步的固定部分占比高（四口实测：Qwen3 约 42%、SmolLM2 约 65%） | H2 乱序发射 + LD 命令流水 + 减少 dispatch 数与主机开销；按 WP9 的分类计时先找最大项。**WP9 实测（2026-10-12，Qwen3 通用路径）**：主机 / runtime 只占 3.4 ms，固定部分在设备上；v 投影修复后 attention（静态 T = 256）46.5 ms、其余小算子 18.7 ms、GEMV 111 ms（峰值的 93%）；下一项：attention 按实际长度 |
-| decode 大部分时间为权重流量，四口接近端口上限 | W4A8（只缩短 GEMV 部分）；先做质量可行性实验，再做硬件解包 |
-| 多模型仍受 100 MHz 算术/控制周期限制，且时序修复路径明确 | K2a-2 200 MHz |
-| LD 命令气泡在多个模型中稳定超过约 8–10% | H2 + LD 命令流水 |
-| Qwen prefill 的 SwiGLU/逐元素段占比高 | prefill 逐行执行 |
-| Gemma/长上下文 attention 因容量失败 | C6.5 T 分块，再评估 K3 URAM |
-| prefill 明确受 SPAD bank 冲突限制 | SPAD 子银行 |
+| A high share of fixed per-step cost in decode (measured with four ports: Qwen3 about 42%, SmolLM2 about 65%) | H2 out-of-order issue + LD command pipelining + fewer dispatches and less host overhead; find the largest item first with WP9's categorized timing. **WP9 measurement (2026-10-12, Qwen3 generic path)**: host / runtime only 3.4 ms, the fixed part is on the device; after the v-projection fix attention (static T = 256) 46.5 ms, other small operators 18.7 ms, GEMV 111 ms (93% of peak); next: attention over the actual length |
+| Most decode time is weight traffic, four ports close to the port limit | W4A8 (only shrinks the GEMV part); quality feasibility experiment first, then hardware unpacking |
+| Several models still limited by 100 MHz arithmetic/control cycles, with a clear timing-fix path | K2a-2 200 MHz |
+| LD command bubbles consistently above about 8–10% across models | H2 + LD command pipelining |
+| A high share of SwiGLU/elementwise segments in Qwen prefill | Row-by-row prefill execution |
+| Gemma/long-context attention fails on capacity | C6.5 T tiling, then evaluate K3 URAM |
+| prefill clearly limited by SPAD bank conflicts | SPAD sub-banks |
 
-候选必须同时给出：受益模型、时间占比上限、预期收益、资源预算、时序风险、质量风险和验证成本。
+Each candidate must give at the same time: the models that benefit, an upper bound on its share of time, the expected gain, the resource budget, the timing risk, the quality risk and the verification cost.
 
-## 17. 最终完成定义
+## 17. Final definition of done
 
-本阶段完成时，应能用同一套证据回答以下问题：
+When this stage is complete, the same body of evidence should answer:
 
-1. 编译器能导入哪些公开 W8A8 checkpoint，拒绝哪些格式，为什么？
-2. Qwen3 的质量损失有多少来自 checkpoint，本项目又额外引入多少？
-3. Llama 3.2 的 K=8192 如何在不改硬件的情况下映射到 GEMV，并保持逐位一致？
-4. 三个模型家族中，多少动态工作在加速器执行，剩余热点在哪里？
-5. 四口 GEMV 的实测收益、带宽利用率和资源代价分别是多少？
-6. 下一项硬件投资为什么是 200 MHz、W4A8、URAM 或其他候选中的某一个？
+1. Which public W8A8 checkpoints can the compiler import, which formats does it reject, and why?
+2. How much of Qwen3's quality loss comes from the checkpoint, and how much more does this project introduce?
+3. How is Llama 3.2's K=8192 mapped onto GEMV without changing the hardware, while staying bit-exact?
+4. Across three model families, how much of the dynamic work runs on the accelerator, and where are the remaining hot spots?
+5. What are the measured gain, bandwidth utilization and resource cost of the four-port GEMV?
+6. Why is the next hardware investment 200 MHz, W4A8, URAM or one of the other candidates?
 
-只要这些问题有可复现的数据回答，即使 Gemma 仍有部分 host fallback，本阶段也已经形成比单纯追求额外 10% 性能更强的编译器与系统贡献。
+As long as these questions have reproducible data behind their answers, even if Gemma still has some host fallback, this stage already forms a stronger compiler and systems contribution than simply chasing another 10% of performance.
 
-### 17.2 问题 4 的现有答案（2026-10-13）
+### 17.2 Current answer to question 4 (2026-10-13)
 
-四个模型（Qwen3、SmolLM2（Llama 结构的小模型）、Llama 3.2、Gemma 3）全模型、同一编译流程，板上逐 dispatch 计时（§13.2）：**动态 dispatch、设备时间、MAC 三项覆盖率都是 100%**，没有主机回退（Gemma 的 GELU-tanh 与单 KV 头 attention 是最后两处，§12.4）。剩余热点随形状比例移动：
+Four models (Qwen3, SmolLM2 (a small model with the Llama structure), Llama 3.2, Gemma 3), whole models, the same compile flow, per-dispatch timing on the board (§13.2): **dynamic dispatch, device time and MAC coverage are all 100%**, with no host fallback (Gemma's GELU-tanh and single-KV-head attention were the last two, §12.4). The remaining hot spots move with the shape ratios:
 
-- decode：权重流量主导，GEMV 占设备时间 Qwen3 80%、SmolLM2 71%、Llama 93%、Gemma 85%（其中 Gemma 的 lm_head 一项占 51%，词表 262144），带宽为 4 口峰值的 82–94%；其余是 attention、norm 与每个命令的固定开销，在窄模型（SmolLM2 576、Gemma 640）上占比更高。
-- prefill：GEMM 只占 44–73%，阵列利用率 50–78%（窄模型低）；逐行 attention 与 reduction 合计 18–39%，是编译器侧下一步（attention 批处理、norm 融合）的目标。
-- 尚未计入：attention 的 MAC（`dispatch_stats.py` 对动态维不计）。
+- decode: dominated by weight traffic; GEMV is Qwen3 80%, SmolLM2 71%, Llama 93%, Gemma 85% of device time (Gemma's lm_head alone 51%, vocabulary 262144), at 82–94% of the 4-port peak bandwidth; the rest is attention, norms and the fixed overhead of each command, a larger share on narrow models (SmolLM2 576, Gemma 640).
+- prefill: GEMM only 44–73%, array utilization 50–78% (lower for narrow models); row attention and reduction together 18–39%, the target of the next compiler-side steps (attention batching, norm fusion).
+- Not yet counted: attention's MACs (`dispatch_stats.py` does not count dynamic dimensions).
 
-### 17.1 问题 6 的现有答案（2026-10-12）
+### 17.1 Current answer to question 6 (2026-10-12)
 
-依据：§13.2 三个模型的 decode 分类计时（GEMV 占 decode 时间：Qwen3 80%、SmolLM2 71%、Llama 93%，带宽为 4 口峰值的 82–94%），以及按 Qwen3 通用路径重新校准的 4 口性能模型（prefill +2.3%、decode +3.6%；what-if 表见 `k2b_gemv_design.md` §8.1）。
+Basis: the categorized decode timing of three models in §13.2 (GEMV's share of decode time: Qwen3 80%, SmolLM2 71%, Llama 93%, at 82–94% of the 4-port peak bandwidth), and the 4-port performance model recalibrated on Qwen3's generic path (prefill +2.3%, decode +3.6%; what-if table in `k2b_gemv_design.md` §8.1).
 
-| 候选 | decode | prefill | 代价 / 风险 |
+| Candidate | decode | prefill | Cost / risk |
 |---|---|---|---|
-| **W4A8** | Qwen3 ×1.48（模型）；按 GEMV 占比的上限 Llama ×1.87、SmolLM2 ×1.55 | 不变 | RTL 局限在 GEMV / LD 的 int4 解包；权重内存减半（Llama 1.24 GB → 约 0.65 GB）；质量风险需先用 W4A8 checkpoint 在主机上评估 |
-| 200 MHz | ×1.79 | ×1.88 | 全设计时序收敛（100 MHz 时 LUT 87%、WNS +0.168 ns），DDR 带宽余量变小；项目优先级低于架构 |
-| 6 个 GEMV 口 | ×1.28 | 不变 | PS 只剩 HPC1，需挪 PicoRV32 的口 |
-| H2 / LD 命令流水 | ×1.04–1.05 | ×1.01–1.07 | 单独收益小，与 W4A8 叠加后 ×1.89 |
-| URAM / SPAD 子银行 | 模型无法评估（改变分块） | prefill 阵列利用率 50–78% | 只在 Gemma / 长上下文容量失败时提前（§16） |
+| **W4A8** | Qwen3 ×1.48 (model); upper bound by GEMV share Llama ×1.87, SmolLM2 ×1.55 | Unchanged | RTL limited to int4 unpacking in GEMV / LD; weight memory halved (Llama 1.24 GB → about 0.65 GB); the quality risk must first be evaluated on the host with a W4A8 checkpoint |
+| 200 MHz | ×1.79 | ×1.88 | Whole-design timing closure (at 100 MHz LUT 87%, WNS +0.168 ns), less DDR bandwidth headroom; lower project priority than architecture |
+| 6 GEMV ports | ×1.28 | Unchanged | The PS only has HPC1 left; PicoRV32's port has to move |
+| H2 / LD command pipelining | ×1.04–1.05 | ×1.01–1.07 | Small gains alone; ×1.89 stacked with W4A8 |
+| URAM / SPAD sub-banks | Cannot be evaluated by the model (changes the tiling) | prefill array utilization 50–78% | Only brought forward when Gemma / long contexts fail on capacity (§16) |
 
-**结论**：下一项硬件投资是 **W4A8**。三个模型的 decode 都由权重流量主导且已接近 4 口带宽上限，W4A8 是唯一同时缩短 GEMV 时间和内存占用的项，改动范围局限在流式 GEMV 单元，不牵动全局时序。200 MHz 收益最大且对 prefill 有效，但风险最高，放在 W4A8 之后；两者叠加模型预测 decode ×2.53。
-
+**Conclusion**: the next hardware investment is **W4A8**. The decode of all three models is dominated by weight traffic and already close to the 4-port bandwidth limit; W4A8 is the only item that shortens GEMV time and memory footprint at the same time, and its changes are confined to the streaming GEMV unit without touching global timing. 200 MHz has the largest gain and also helps prefill, but has the highest risk, so it comes after W4A8; stacked, the model predicts decode ×2.53.

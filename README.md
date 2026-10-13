@@ -188,18 +188,18 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 - [Hardware learning path](docs/hardware_learning_path.md) - a staged guide
   from digital design fundamentals to the accelerator RTL, verification,
   timing closure and board measurements, with labs on this repository
-- [Execution walkthrough](docs/execution_walkthrough.en.md) ([中文](docs/execution_walkthrough.md)) - one GEMM
+- [Execution walkthrough](docs/execution_walkthrough.md) - one GEMM
   traced from `m4_demo.py` through the driver, firmware, PCPI, scheduler and
   engines down to BRAM/DDR, with a per-layer debugging checklist
-- [Performance counters and descriptor DMA](docs/perf_counters_and_desc_dma_plan.en.md) ([中文](docs/perf_counters_and_desc_dma_plan.md)) -
+- [Performance counters and descriptor DMA](docs/perf_counters_and_desc_dma_plan.md) -
   plan, implementation record and board results of the two M5 additions:
   counter definitions, descriptor format, verification, milestones
-- [LLM inference plan](docs/llm_inference_plan.en.md) ([中文](docs/llm_inference_plan.md)) - the next stage:
+- [LLM inference plan](docs/llm_inference_plan.md) - the next stage:
   an industry-style LLM inference system (ARM host runtime, command ring and
   completion IRQ, resident RISC-V firmware, compiler-facing command
   extensions for MLIR/IREE, fp32 vector/special-function unit, W8A8 + int8
   KV cache) built in levels L0-L6, 50 MHz with 75 MHz as a stretch goal
-- [LLM compiler plan](docs/iree_compiler_plan.en.md) ([中文](docs/iree_compiler_plan.md)) - the design of the
+- [LLM compiler plan](docs/iree_compiler_plan.md) - the design of the
   end-to-end compiler (level L6-IREE): a quantized PyTorch llama exported with
   iree-turbine, an IREE target-backend plugin that emits descriptor-list
   templates, and a C HAL driver on the ARM that submits them through the
@@ -224,14 +224,14 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   and Qwen3 compiles through the same path without code changes (sim).
   Since then Qwen3-0.6B, SmolLM2-135M, Llama-3.2-1B and Gemma-3-270M run whole
   on the KV260 through this path, every dispatch on the accelerator
-  ([generality plan](docs/generality_implementation_plan.en.md) §13.2; [中文](docs/generality_implementation_plan.md)).
+  ([generality plan](docs/generality_implementation_plan.md) §13.2).
   See [compiler/README.md](compiler/README.md)
-- [PYNQ-Z1 → Kria KV260 upgrade plan](docs/kv260_upgrade_plan.en.md) ([中文](docs/kv260_upgrade_plan.md)) - the
+- [PYNQ-Z1 → Kria KV260 upgrade plan](docs/kv260_upgrade_plan.md) - the
   port in stages (platform at the same accelerator, clock, DMA and on-chip
   memory bandwidth, URAM capacity, Qwen3-0.6B), the measured Z1 time breakdown
   it starts from, and the repository strategy (Z1 frozen at `v1.0-pynq-z1`).
   K1 (K1a 50 MHz, K1b 100 MHz), K2a (128-bit DMA), Qwen3-0.6B (K4a) and the
-  four-port streaming GEMV (K2b, [design](docs/k2b_gemv_design.en.md), [中文](docs/k2b_gemv_design.md)) are
+  four-port streaming GEMV (K2b, [design](docs/k2b_gemv_design.md)) are
   accepted on the board; the overlay, its
   builds, address map and board setup are in [boards/kv260/README.md](boards/kv260/README.md)
 - [Double-buffered accelerator design](docs/double_buffer_design.md) - the

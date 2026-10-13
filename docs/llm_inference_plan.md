@@ -1,1252 +1,1250 @@
-# LLM 推理：架构方案与实施步骤
+# LLM inference: architecture plan and implementation steps
 
-> English version: [`llm_inference_plan.en.md`](llm_inference_plan.en.md) (translated 2026-10-13; this Chinese document is the authoritative one).
+> **PYNQ-Z1 paths**: this document records work done on the PYNQ-Z1. The `RISCV-on-PYNQ-Z1/...` (block design, constraints), `bitstreams/...` (builds verified on the board) and `iree-sa/l0` it mentions are on the `pynq-z1` branch (tag `v1.0-pynq-z1`); on main, PicoRV32 and its IP are in `rtl/picorv32/` and `rtl/ip/`, and the current overlay is in `boards/kv260/`.
 
-> **PYNQ-Z1 的路径**：本文记录的是在 PYNQ-Z1 上完成的工作。文中的 `RISCV-on-PYNQ-Z1/...`（block design、约束）、`bitstreams/...`（板上验证过的构建）和 `iree-sa/l0` 都在 `pynq-z1` 分支（tag `v1.0-pynq-z1`）上；main 上 PicoRV32 与它的 IP 在 `rtl/picorv32/`、`rtl/ip/`，当前的 overlay 在 `boards/kv260/`。
+Status: **L0–L5 and L5b done and verified on the board**. stories15M runs entirely on the device, bit-identical to the reference model:
+- single sequence 15.1 tok/s (wall clock; device 18.9 tok/s);
+- 8 sequences batched 63.3 tok/s (device 77 tok/s);
+- teacher-forced top-1 agreement with fp32 96.2%.
 
-状态：**L0–L5 和 L5b 已完成并上板验证**。stories15M 全部在设备上运行，逐位等于参考模型：
-- 单序列 15.1 tok/s（墙钟；设备 18.9 tok/s）；
-- 8 条序列批处理 63.3 tok/s（设备 77 tok/s）；
-- teacher-forced top-1 与 fp32 一致率 96.2%。
+L6-IREE (the compiler) is mostly done: PyTorch / HuggingFace models compile through IREE with our own `sa` backend (two dialect levels, sahl / sahw), stories15M and SmolLM2-135M run on the board with logits bit-identical to the reference (stories15M 17.7 tok/s, SmolLM2 2.22 tok/s); both can generate text interactively on the board; larger models (C6) are verified on the sim: Qwen3-0.6B, all 28 layers, bit-exact per dispatch, with correct end-to-end generation. Progress and the remaining work (C4 performance, C6 larger models) are in [`iree_compiler_plan.md`](iree_compiler_plan.md).
 
-L6-IREE（编译器）大部分完成：PyTorch / HuggingFace 模型经 IREE 与自己的 `sa` 后端（两层方言 sahl / sahw）编译，stories15M 与 SmolLM2-135M 在板上运行，logits 与参考逐位一致（stories15M 17.7 tok/s，SmolLM2 2.22 tok/s）；两者都能在板上交互式生成文本；更大的模型（C6）在 sim 上验证：Qwen3-0.6B 全 28 层逐 dispatch 逐位一致、端到端生成正确。进度与剩下的工作（C4 性能、C6 更大的模型）见 [`iree_compiler_plan.md`](iree_compiler_plan.md)。
+Not done yet: L5.5 (75 MHz). The implementation records and board results of each level are in
+§4 (L0), §5.5 (L1), §6.9 (L2), §7.3 (L3), §8.7 (L4), §9.3 (L5), §11.1 (L5b), summarized in §13.
 
-还没做的：L5.5（75 MHz）。各级的实现记录与板上结果见
-§4（L0）、§5.5（L1）、§6.9（L2）、§7.3（L3）、§8.7（L4）、§9.3（L5）、§11.1（L5b），汇总见 §13。
+**Goal**: build on the PYNQ-Z1 a complete system **whose architecture matches mainstream industrial LLM inference accelerators**,
+running a llama2-structured model (TinyStories) end to end on the board to generate text. The system has four parts:
 
-**目标**：在 PYNQ-Z1 上做一个**架构与工业界主流 LLM 推理加速器一致**的完整系统，
-端到端地在板上运行 llama2 结构的模型（TinyStories），生成文本。系统由四部分组成：
+- **host**: the ARM, the runtime;
+- **command processor**: PicoRV32 running resident firmware;
+- **accelerator**: DMA, an int8 matrix engine, an fp32 vector engine and a special function unit;
+- **compiler**: targeting **MLIR/IREE**.
 
-- **host**：ARM，运行时；
-- **命令处理器**：PicoRV32，运行常驻固件；
-- **加速器**：DMA、int8 矩阵引擎、fp32 向量引擎与特殊函数单元；
-- **编译器**：以 **MLIR/IREE** 为目标。
+**Position on speed**: architectural alignment is the first goal. Speedups that resources allow and that are cheap are done anyway (§0).
 
-**速度的定位**：架构对齐是第一目标。资源允许、成本又低的提速照做（§0）。
+**Clock**: **50 MHz is a target that must be met**; 75 MHz is an extra target after end-to-end works, a level of its own (L5.5).
 
-**时钟**：**50 MHz 是必须达到的目标**；75 MHz 作为端到端跑通后的附加目标，单独一级（L5.5）。
+Related documents:
 
-相关文档：
-
-- [`double_buffer_design.md`](double_buffer_design.md)：当前加速器，§3 数据布局、§6 VE、§7 记分板、§8 指令与描述符；
-- [`perf_counters_and_desc_dma_plan.md`](perf_counters_and_desc_dma_plan.md)：性能计数器与描述符 DMA（M5）；
-- [`iree_compiler_plan.md`](iree_compiler_plan.md)：L6-IREE 的详细设计（PyTorch → MLIR/IREE → 描述符列表）；
-- [`../notebooks/llm/README.md`](../notebooks/llm/README.md)：第一步测量。结论：单序列 decode 受带宽限制，D=16、50 MHz 下只计 GEMV 为 24.5 tok/s（stories15M），与 ARM 的 int8 版本 22.9 tok/s 基本持平。
+- [`double_buffer_design.md`](double_buffer_design.md): the current accelerator; §3 data layout, §6 VE, §7 scoreboard, §8 instructions and descriptors;
+- [`perf_counters_and_desc_dma_plan.md`](perf_counters_and_desc_dma_plan.md): performance counters and descriptor DMA (M5);
+- [`iree_compiler_plan.md`](iree_compiler_plan.md): the detailed design of L6-IREE (PyTorch → MLIR/IREE → descriptor lists);
+- [`../notebooks/llm/README.md`](../notebooks/llm/README.md): the first measurements. Conclusion: single-sequence decode is bandwidth bound; at D=16, 50 MHz, counting only GEMV gives 24.5 tok/s (stories15M), about the same as the ARM's int8 version at 22.9 tok/s.
 
 ---
 
-## 目录
+## Contents
 
-- [0. 原则](#0-原则)
-- [1. 对标工业界架构](#1-对标工业界架构)
-- [2. 总体架构与一个 token 的数据流](#2-总体架构与一个-token-的数据流)
-- [3. 数值方案](#3-数值方案)
-- [4. L0：基线、参考模型、功能模拟器与工具链验证](#4-l0基线参考模型功能模拟器与工具链验证)
-- [5. L1：host 接口与命令处理扩展](#5-l1host-接口与命令处理扩展)
-- [6. L2：fp32 向量引擎与特殊函数单元](#6-l2fp32-向量引擎与特殊函数单元)
-- [7. L3：量化格式与 GEMM 后处理](#7-l3量化格式与-gemm-后处理)
-- [8. L4：一个 decoder 层在设备上执行](#8-l4一个-decoder-层在设备上执行)
-- [9. L5：ARM 运行时与端到端生成](#9-l5arm-运行时与端到端生成)
-- [10. 编译器接口：MLIR / IREE](#10-编译器接口mlir--iree)
-- [11. L5b、L5.5、L6：多序列并发、75 MHz 与后续扩展](#11-l5bl55l6多序列并发75-mhz-与后续扩展)
-- [12. 资源与时序预算](#12-资源与时序预算)
-- [13. 总体计划与验收](#13-总体计划与验收)
-- [14. 风险与对策](#14-风险与对策)
-- [附录 A：编码变化汇总](#附录-a编码变化汇总)
-- [附录 B：新增与修改文件](#附录-b新增与修改文件)
-
----
-
-## 0. 原则
-
-1. **架构对齐优先，低成本的提速照做**。阵列退回 D=8，把 LUT 让给 fp32 向量单元。这对单序列 decode
-   没有损失：decode 受带宽限制，D=8 的 EX 每周期正好消耗 8 个权重，与 LD 的约 7.9 B/cycle 相当。
-   在资源允许的前提下：
-   - VE 的逐元素运算做成流水结构（§6.7）；
-   - 调度上让 LD、EX、VE 重叠；
-   - 保留多序列并发和 prefill 的路径（§11）。
-2. **一切都能逐位验证**。Python **功能模拟器**直接执行描述符列表。
-   - 板上结果、RTL 联合仿真和功能模拟器三者逐位比对；
-   - 精度只在“功能模拟器 vs fp32 参考模型”这一处评估。
-3. **先测量再定方案**。量化方案先在主机上用参考模型测精度（L0），通过后再做硬件。
-   IREE 运行时能否在 32 位 ARM 上运行，也在 L0 验证。
-4. **面向编译器设计接口**。硬件提供 IREE 需要的抽象：binding、push constant、动态形状、命令缓冲、
-   barrier、信号量（§10）。先手写列表生成器（L3–L5），之后由 IREE 目标后端替代，两者输出同一种描述符。
-5. **时钟**：
-   - 现有模块不做时序修改，在 50 MHz 下已有余量；
-   - **新写的模块**（fp32 单元、SFU、取指单元的新译码）**都按 13.3 ns（75 MHz）设计流水**，
-     只多用一些 FF（目前 FF 用了 34%），为 L5.5 保留余地。
-6. **每一级都能单独上板**，有独立的板上脚本和验收标准，与 M1–M5 的做法相同。
-7. **向后兼容**：
-   - 现有指令、描述符和整数 VE 的语义不变；
-   - 新功能通过新 opcode 或 key、以前的保留位和新 CAPS 位加入；
-   - 现有测试全部保留。
+- [0. Principles](#0-principles)
+- [1. Comparison with industrial architectures](#1-comparison-with-industrial-architectures)
+- [2. Overall architecture and the data flow of one token](#2-overall-architecture-and-the-data-flow-of-one-token)
+- [3. Numeric scheme](#3-numeric-scheme)
+- [4. L0: baselines, reference model, functional simulator and toolchain verification](#4-l0-baselines-reference-model-functional-simulator-and-toolchain-verification)
+- [5. L1: host interface and command-processing extensions](#5-l1-host-interface-and-command-processing-extensions)
+- [6. L2: fp32 vector engine and special function unit](#6-l2-fp32-vector-engine-and-special-function-unit)
+- [7. L3: quantization format and GEMM post-processing](#7-l3-quantization-format-and-gemm-post-processing)
+- [8. L4: one decoder layer executing on the device](#8-l4-one-decoder-layer-executing-on-the-device)
+- [9. L5: ARM runtime and end-to-end generation](#9-l5-arm-runtime-and-end-to-end-generation)
+- [10. Compiler interface: MLIR / IREE](#10-compiler-interface-mlir--iree)
+- [11. L5b, L5.5, L6: concurrent sequences, 75 MHz and later extensions](#11-l5b-l55-l6-concurrent-sequences-75-mhz-and-later-extensions)
+- [12. Resource and timing budget](#12-resource-and-timing-budget)
+- [13. Overall plan and acceptance](#13-overall-plan-and-acceptance)
+- [14. Risks and mitigations](#14-risks-and-mitigations)
+- [Appendix A: summary of encoding changes](#appendix-a-summary-of-encoding-changes)
+- [Appendix B: new and modified files](#appendix-b-new-and-modified-files)
 
 ---
 
-## 1. 对标工业界架构
+## 0. Principles
 
-主流推理加速器（数据中心 NPU、手机 NPU、带 RISC-V 控制核的 AI 芯片）的共同结构，以及本项目的对应部分：
+1. **Architectural alignment first; cheap speedups are done anyway**. The array goes back to D=8, giving the LUTs to the fp32 vector unit. This costs single-sequence decode nothing:
+   decode is bandwidth bound, and EX at D=8 consumes exactly 8 weights per cycle, matching LD's about 7.9 B/cycle.
+   Where resources allow:
+   - the VE's elementwise operations are pipelined (§6.7);
+   - scheduling overlaps LD, EX and VE;
+   - the paths for concurrent sequences and prefill are kept (§11).
+2. **Everything can be verified bit for bit**. A Python **functional simulator** executes descriptor lists directly.
+   - Board results, RTL co-simulation and the functional simulator are compared bit for bit;
+   - accuracy is evaluated in only one place, "functional simulator vs the fp32 reference model".
+3. **Measure before deciding**. The quantization scheme's accuracy is first measured on the host with the reference model (L0), and only then is hardware built.
+   Whether the IREE runtime runs on 32-bit ARM is also verified in L0.
+4. **Design the interfaces for the compiler**. The hardware provides the abstractions IREE needs: bindings, push constants, dynamic shapes, command buffers,
+   barriers, semaphores (§10). Hand-written list generators come first (L3–L5) and are later replaced by an IREE target backend; both output the same descriptors.
+5. **Clock**:
+   - existing modules get no timing changes; they already have margin at 50 MHz;
+   - **newly written modules** (fp32 units, SFU, the fetch unit's new decoding) **are all pipelined for 13.3 ns (75 MHz)**,
+     using only some more FFs (34% of FFs are used today), leaving room for L5.5.
+6. **Each level can go on the board alone**, with its own board script and acceptance criteria, as in M1–M5.
+7. **Backward compatibility**:
+   - the semantics of existing instructions, descriptors and the integer VE are unchanged;
+   - new functions come in through new opcodes or keys, formerly reserved bits and new CAPS bits;
+   - all existing tests are kept.
 
-| 层次 | 工业界通行做法 | 本项目现状 | 本方案 |
+---
+
+## 1. Comparison with industrial architectures
+
+The common structure of mainstream inference accelerators (data-center NPUs, phone NPUs, AI chips with RISC-V control cores), and this project's counterparts:
+
+| Layer | Common industrial practice | This project today | This plan |
 |---|---|---|---|
-| 编译器 | 框架 → MLIR 等 IR → 算子融合、分块、布局 → 设备代码（如 IREE、XLA、TVM） | 手写固件和驱动 | IREE：先用模板库，再做完整的代码生成（§10） |
-| host 运行时 | 加载模型、分配 KV cache、调度 prefill/decode、分词、采样 | Python 驱动，每次调用一个算子 | L5 用 Python 调通，L6-IREE 换成 C 写的 IREE HAL 驱动 |
-| host ↔ 设备接口 | 内存中的命令队列、门铃、完成中断或信号量 | mailbox 参数，每种算子一个固件，ARM 轮询 | L1：DDR 命令环、门铃、完成记录、PL→PS 中断 |
-| 命令处理器 | 设备上的微控制器（很多芯片用 RISC-V）取命令、分派、同步 | PicoRV32，按算子换固件 | L1：常驻固件 `rt_fw` |
-| 命令缓冲与可执行体 | 录一次、改参数就能重放（CUDA Graph、Vulkan 命令缓冲）；binding 与 push constant；位置无关的 kernel | 描述符列表 + 4 个 BASE（M5） | L1：16 个 BASE、8 个 PARAM、动态字段、SETREG、LOOP、CALL/RET、LDPARAM |
-| 矩阵引擎 | int8/fp8/bf16 脉动阵列或张量核 | int8 16×16，int32 累加 | 保留 int8，改为 D=8 |
-| 向量单元与特殊函数单元 | fp32/bf16 向量 ALU、归约，查表计算 exp/rsqrt 等 | 只有整数逐元素运算和 requant | L2：fp32 VPU 与 SFU，外加归约、转置和掩码 |
-| 量化 | W8A8：权重按通道、激活按 token 动态量化；KV cache 用 int8/fp8 静态 scale | 只有一个整型 scale | L3：同样的方案 |
-| 注意力 | KV cache 在显存里，decode 时整个注意力在设备上算 | 没有 | L4：q·Kᵀ、softmax、p·V 全在设备上 |
-| 可观测性 | 硬件计数器、追踪 | 32 个计数器（M4p） | 保留，并新增 VPU 与取指事件 |
+| Compiler | Framework → an IR such as MLIR → operator fusion, tiling, layout → device code (e.g. IREE, XLA, TVM) | Hand-written firmware and drivers | IREE: a template library first, then full code generation (§10) |
+| Host runtime | Load the model, allocate the KV cache, schedule prefill/decode, tokenization, sampling | Python driver, one operator per call | L5 brings it up in Python; L6-IREE replaces it with an IREE HAL driver in C |
+| Host ↔ device interface | Command queues in memory, doorbells, completion interrupts or semaphores | mailbox parameters, one firmware per operator, ARM polling | L1: DDR command ring, doorbell, completion records, PL→PS interrupt |
+| Command processor | An on-device microcontroller (many chips use RISC-V) fetches commands, dispatches, synchronizes | PicoRV32, firmware swapped per operator | L1: resident firmware `rt_fw` |
+| Command buffers and executables | Record once, replay with changed parameters (CUDA Graph, Vulkan command buffers); bindings and push constants; position-independent kernels | Descriptor lists + 4 BASEs (M5) | L1: 16 BASEs, 8 PARAMs, dynamic fields, SETREG, LOOP, CALL/RET, LDPARAM |
+| Matrix engine | int8/fp8/bf16 systolic arrays or tensor cores | int8 16×16, int32 accumulation | Keep int8, change to D=8 |
+| Vector unit and special function unit | fp32/bf16 vector ALUs, reductions, table-based exp/rsqrt etc. | Only integer elementwise operations and requant | L2: fp32 VPU and SFU, plus reductions, transpose and masks |
+| Quantization | W8A8: weights per channel, activations dynamic per token; KV cache int8/fp8 with static scales | A single integer scale only | L3: the same scheme |
+| Attention | KV cache in device memory; in decode the whole attention runs on the device | None | L4: q·Kᵀ, softmax, p·V all on the device |
+| Observability | Hardware counters, tracing | 32 counters (M4p) | Kept, with new VPU and fetch events |
 
-**不做的部分**：
-- 多核和片上网络；
-- HBM；
-- 分页 KV cache（L6 可选）；
-- 连续批处理；
-- fp8/bf16 矩阵乘。
+**Not done**:
+- multiple cores and a network on chip;
+- HBM;
+- paged KV cache (optional in L6);
+- continuous batching;
+- fp8/bf16 matrix multiplication.
 
-这些是规模上的差别，不是结构上的差别。
+These are differences of scale, not of structure.
 
-**EX 保持 int8**：
-- W8A8 的 int32 累加是精确的，scale 在 VE 的后处理中乘一次，数学上与先反量化再做浮点乘法等价；
-- 64 个 fp32 乘加单元约需 32k LUT、128 个 DSP（估计），放不下。
+**EX stays int8**:
+- W8A8's int32 accumulation is exact, and the scale is multiplied once in the VE post-processing, mathematically equivalent to dequantizing first and multiplying in floating point;
+- 64 fp32 multiply-add units would need about 32k LUT and 128 DSPs (estimate), which do not fit.
 
 ---
 
-## 2. 总体架构与一个 token 的数据流
+## 2. Overall architecture and the data flow of one token
 
 ```
 ┌──────────────── ARM Cortex-A9 (host) ────────────────┐
-│ 运行时：L5 用 Python LlamaDevice / L6 用 IREE + HAL 驱动   │
-│  模型加载 → DDR │ KV cache │ 静态描述符列表（每个模型一张）  │
-│  每个 token：写参数块（PARAM）+ 命令环条目 │ 分词、采样     │
+│ Runtime: Python LlamaDevice in L5 / IREE + HAL driver in L6 │
+│  model loading → DDR │ KV cache │ static descriptor lists (one per model) │
+│  per token: write the parameter block (PARAM) + a ring entry │ tokenization, sampling │
 └──────┬───────────────────────────────────▲───────────┘
-       │ ① 写条目 + flush                   │ ⑤ IRQ (PL→PS)，读完成记录
-       │ ② 门铃：mailbox RING_TAIL          │
+       │ ① write the entry + flush          │ ⑤ IRQ (PL→PS), read the completion record
+       │ ② doorbell: mailbox RING_TAIL      │
 ┌──────▼───────────────────────────────────┴───────────┐
-│ PicoRV32 常驻固件 rt_fw（命令处理器）                    │
-│  ③ 取条目 → 设置 BASE0-3、PARAM0-7 → mat_submit → mat_fence │
-│  ④ 写完成记录 → mat_notify                              │
+│ PicoRV32 resident firmware rt_fw (command processor)    │
+│  ③ fetch the entry → set BASE0-3, PARAM0-7 → mat_submit → mat_fence │
+│  ④ write the completion record → mat_notify            │
 └──────┬───────────────────────────────────────────────┘
        │ PCPI
-┌──────▼─────────────── 加速器 sa_unit（D = 8）───────────┐
-│ 描述符取指：BASE0-15 │ PARAM0-7 │ 动态字段 │ SETREG │     │
+┌──────▼─────────────── accelerator sa_unit (D = 8) ──────┐
+│ Descriptor fetch: BASE0-15 │ PARAM0-7 │ dynamic fields │ SETREG │ │
 │             LOOP │ CALL/RET │ LDPARAM                  │
-│ → 调度器（记分板）                                       │
-│   LD / ST（DMA，HP2）│ EX（int8 阵列）│ VE（int + fp32 VPU/SFU）│
-│   SPAD_A 128 KB │ SPAD_B 128 KB │ ACC 256 KB（int32 / fp32）│
+│ → scheduler (scoreboard)                                │
+│   LD / ST (DMA, HP2) │ EX (int8 array) │ VE (int + fp32 VPU/SFU) │
+│   SPAD_A 128 KB │ SPAD_B 128 KB │ ACC 256 KB (int32 / fp32) │
 └──────────────────────────────────────────────────────┘
-DDR：权重（int8 + scale）、KV cache（int8）、RoPE 表、嵌入表、logits、列表、命令环、参数块
+DDR: weights (int8 + scales), KV cache (int8), RoPE tables, embedding table, logits, lists, command ring, parameter blocks
 ```
 
-**一个 token 的执行流程**：
+**The execution of one token**:
 
-1. ARM 采样出上一个 token 后，写一个 32 字节的参数块：pos、pos+1、pos_pad、token×dim 等（§8.5）。
-   **列表本身不改**；
-2. 提交命令环条目，然后按门铃；
-3. `rt_fw` 把参数块装进 PARAM，然后执行这个模型的静态列表。列表中每一层依次是：
-   RMSNorm → QKV → RoPE → 追加 KV → 注意力 → Wo → 残差 → RMSNorm → SwiGLU FFN → 残差；
-   层与层之间用 LOOP 串起来；最后是分类层；
-4. logits（fp32）写回 DDR；
-5. `rt_fw` 写完成记录，然后发中断；
-6. ARM 采样。
+1. After the ARM samples the previous token, it writes a 32-byte parameter block: pos, pos+1, pos_pad, token×dim, etc. (§8.5).
+   **The list itself is not changed**;
+2. submit a command-ring entry, then ring the doorbell;
+3. `rt_fw` loads the parameter block into the PARAMs and executes the model's static list. Each layer in the list is in turn:
+   RMSNorm → QKV → RoPE → append KV → attention → Wo → residual → RMSNorm → SwiGLU FFN → residual;
+   layers are chained with LOOP; finally the classifier;
+4. the logits (fp32) are written back to DDR;
+5. `rt_fw` writes the completion record, then raises the interrupt;
+6. the ARM samples.
 
 ---
 
-## 3. 数值方案
+## 3. Numeric scheme
 
-### 3.1 格式
+### 3.1 Formats
 
-| 数据 | 格式 | 位置 |
+| Data | Format | Location |
 |---|---|---|
-| 线性层权重 W（out × in） | int8 对称量化，**每个输出通道一个 fp32 scale** `s_w[o] = max|W[o,:]| / 127`；DDR 中转置存放为 Wᵀ（in × out），作为 B 操作数 | DDR |
-| 线性层输入激活 | int8 对称量化，**每个 token 动态计算** `s_x = max|x| / 127`，在设备上算 | SPAD |
-| 矩阵乘累加 | int32 | ACC |
-| 残差流、norm、RoPE、softmax、SiLU 的中间值 | **fp32** | ACC |
-| KV cache | int8，**每层 K 和 V 各一个静态 scale**（L0 离线标定） | DDR |
-| q（注意力） | int8，每个头动态 scale | SPAD |
-| softmax 概率 p | int8，静态 scale 1/127 | SPAD |
-| 嵌入表 | int8，每行一个 fp32 scale | DDR |
-| RMSNorm 权重、RoPE 的 cos/sin 表 | fp32 | DDR |
+| Linear-layer weights W (out × in) | int8 symmetric, **one fp32 scale per output channel** `s_w[o] = max|W[o,:]| / 127`; stored transposed in DDR as Wᵀ (in × out), used as the B operand | DDR |
+| Linear-layer input activations | int8 symmetric, **computed dynamically per token** `s_x = max|x| / 127`, on the device | SPAD |
+| Matrix multiply-accumulate | int32 | ACC |
+| Residual stream, intermediates of norm, RoPE, softmax, SiLU | **fp32** | ACC |
+| KV cache | int8, **one static scale each for K and V per layer** (calibrated offline in L0) | DDR |
+| q (attention) | int8, dynamic scale per head | SPAD |
+| softmax probabilities p | int8, static scale 1/127 | SPAD |
+| Embedding table | int8, one fp32 scale per row | DDR |
+| RMSNorm weights, RoPE cos/sin tables | fp32 | DDR |
 | logits | fp32 | DDR |
 
-这就是 W8A8 的 SmoothQuant 式做法，外加 int8 KV cache，是工业界 int8 推理的常见组合。
-llama2.c 的 Q8_0（沿 K 方向每 32 个元素一组 scale）在脉动阵列上需要把 K 拆开分别累加，
-所以本方案不采用；如果 L0 测出按通道量化的精度不够，再作为备选（§14）。
+This is the SmoothQuant-style W8A8 approach plus an int8 KV cache, the common combination of industrial int8 inference.
+llama2.c's Q8_0 (one scale per group of 32 elements along K) would need K split and accumulated separately on a systolic array,
+so this plan does not use it; if L0 finds per-channel quantization insufficiently accurate, it is a fallback (§14).
 
-### 3.2 fp32 运算的约定
+### 3.2 Conventions for fp32 arithmetic
 
-硬件、功能模拟器和编译器三方都照这份约定实现。它同时就是给 IREE 的数值约定：按 fast-math 声明（§10.4）。
+Hardware, functional simulator and compiler all implement this convention. It is also the numeric convention given to IREE: declared as fast-math (§10.4).
 
-- 加法和乘法按 IEEE-754 binary32 实现，**舍入到最近偶数（RNE）**。
-- **非规格化数清零（FTZ）**：输入和输出的非规格化数都当作同号的 0。
-- 溢出得到 ±inf。NaN 按 IEEE 规则传播，但 RTL 测试不覆盖 NaN。
-- 没有融合乘加：`a·x + b` 是一次乘法、一次加法，舍入两次。
-- 类型转换：
-  - int32 → fp32 按 RNE；
-  - fp32 → int8/int32 也按 RNE，再饱和；int8 的范围是 [−127, 127]；
-  - （可选）bf16 ↔ fp32：截断，加最近偶数舍入。
-- 归约的**加法顺序是固定的**（§6.4）。
-- 特殊函数 EXP、RECIP、RSQRT 用固定的算法实现（§6.5），模型实现的是**同一套算法**，而不是 libm。
-  所以除法 = RECIP 加乘法，**不是 IEEE 精确除法**。
+- Addition and multiplication follow IEEE-754 binary32 with **round to nearest even (RNE)**.
+- **Flush to zero for denormals (FTZ)**: denormal inputs and outputs are treated as a 0 of the same sign.
+- Overflow gives ±inf. NaN propagates by the IEEE rules, but the RTL tests do not cover NaN.
+- No fused multiply-add: `a·x + b` is one multiply and one add, rounded twice.
+- Type conversions:
+  - int32 → fp32 with RNE;
+  - fp32 → int8/int32 also with RNE, then saturation; the int8 range is [−127, 127];
+  - (optional) bf16 ↔ fp32: truncation, plus round to nearest even.
+- The **order of additions in reductions is fixed** (§6.4).
+- The special functions EXP, RECIP, RSQRT are implemented with fixed algorithms (§6.5), and the models implement **the same algorithms**, not libm.
+  So division = RECIP plus a multiply, **not IEEE exact division**.
 
-在这些约定下，fp32 的每一步都可以用 NumPy float32 加 FTZ 处理精确复现。
-
----
-
-## 4. L0：基线、参考模型、功能模拟器与工具链验证
-
-L0 不改 RTL。
-
-### 4.1 D=8 基线 bitstream 与时序摸底
-
-- 构建 `scripts/build_bitstream.sh -jobs 4 -sa_d 8`，PERF 和 DESC 都保留，50 MHz。
-- 记录资源，作为 L1/L2 的预算基准。M3 在 D=8 时是 21,720 LUT、96 DSP、130 BRAM36；
-  加上计数器和取指单元后估计约 24k LUT。
-- **时序摸底**：同一份 RTL 在 75 MHz 约束下做一次 OOC 综合，记录最差的 10 条路径，作为 L5.5 的输入。
-  已知 m5（D=16）的最差路径是 `ex/drain_active` 驱动所有 PE 寄存器的使能（CE）：
-  16.8 ns，其中走线占 15.8 ns，属于扇出问题。
-- 板上回归：`m4_perf.py`、`m5_desc_demo.py`、`m4_demo.py` 都能按 D=8 运行。
-- 归档为 `bitstreams/l0/`。
-
-> **L0 实测**（`bitstreams/l0/`）：
-> - **资源**：23,452 LUT（44.1%）、19,193 FF、96 DSP、130 BRAM36；
-> - **时序**：50 MHz 下 WNS +1.555 ns；
-> - **板上回归全部 PASS**：`m4_demo`（256³ 59.0 MAC/cycle，峰值的 92%）、`m4_perf` 69/69、`m5_desc_demo`。
->
-> **75 MHz OOC 时序摸底**（`rtl/sysarray`，`make synth CLOCK_NS=13.333`，D=8）：WNS −0.717 ns，估计最高约 71.2 MHz。
-> 最差的 20 条路径**全部在 `sa_ld.v`**，分两类：
-> 1. **突发生成**：从 `off` 出发，先算地址，再取三个量的最小值决定突发长度（本行剩余、到 4 KB 边界的距离、16 拍），
->    然后乘以 `step`（经过 DSP）得到 `cur_word`。17 级逻辑，13.9 ns。
-> 2. **读数据写回的地址**：从 `q_rp` 出发，计算 `lw_word = h_word + (h_sum >> lpwl) * step`（经过 DSP），
->    驱动 SPAD/ACC 的地址、数据和写使能。6 级逻辑，13.5 ns，其中走线占约 60%。
->
-> 两类都是 `* step` 乘法串在组合路径上。改法：把乘法换成随拍递增的累加器；写回的地址、数据和使能多打一拍寄存器。
-> 这两处就是 L5.5 的修复清单。整机构建还要加上 PicoRV32 和 AXI 互连，以 L5.5 的实际构建为准。
-
-### 4.2 参考模型 `llm/ref_model.py`
-
-读取 llama2.c 的 fp32 checkpoint，用 NumPy 写两种前向计算：
-
-- **fp32 模式**：与 `run.c` 的计算顺序一致。
-  - 验收：stories15M 贪心解码 256 个 token，文本与 `run.c` 完全相同。
-- **设备数值模式**：用 §3.1 的量化方式模拟设备的计算。特殊函数先用 float64 近似，L2 之后换成功能模拟器。
-
-精度评估（`llm/eval_quant.py`）：
-- **teacher forcing**：两个模式都输入 fp32 模式生成的 token 序列，逐位置比较两者的 top-1 是否一致，
-  同时算 logits 的 KL 散度。
-- 模型：stories15M、42M、110M；
-- 数据：约 8 条提示词，每条 256 个 token；
-- 同时标定每层 KV 的静态 scale：取绝对值最大值或 99.99 分位数，两种都试。
-- **验收门槛**：15M 的 top-1 一致率 ≥ 95%，贪心生成的文本通顺。
-  - 未达标时按 §14 的顺序改方案；
-  - 这个 95% 是初定值，L0 测完后写入本文档，作为之后各级的精度基准。
-
-> **L0 实测**（主机，`llm/eval_quant.py`，详见 [`llm/README.md`](../llm/README.md)）：
-> - 三个模型、两种 KV 标定都达到 95% 的门槛，设备模型的 argmax 100% 落在 fp32 的前 5 名内；
-> - top-1 一致率：15M 为 95.6%（absmax）/ **96.3%**（99.99 分位数），42M 为 96.0% / 95.9%，110M 为 97.9% / 98.1%；
-> - KL 散度均值：15M 约 0.011，42M 0.007–0.010，110M 约 0.004。
->
-> **精度基准定为**：stories15M、99.99 分位数的 KV scale、top-1 96.3%。
-> L2 把特殊函数换成硬件算法之后要重新评估，结果仍须 ≥ 95%。
-
-### 4.3 功能模拟器 `llm/sa_funcsim.py`
-
-用 Python 模拟描述符列表的执行：
-
-- **状态**：DDR（字节数组）、SPAD_A、SPAD_B、ACC，按字存储，布局与设计文档 §3.4 一致；
-  另外有 BASE 和 PARAM 寄存器。
-- **LD / ST**：LINEAR、INTERLEAVE、ZERO_PAD。
-- **EX**：包括 repeat、bstep、cstep、crow、accumulate。
-- **VE**：现有的整数运算；L2 加入 fp32 的全部运算。
-- **控制类描述符**：FENCE、JUMP、END、BASE 重定位；L1 的扩展（§5.3）也要实现。
-- **周期估计模型**：给编译器用作代价模型。先按每种命令的理论周期估算，L1 之后用计数器校准。
-
-**验收**：
-- 用现有 `gen_desc_cases.py` 的 7 个 case 作输入，功能模拟器的输出与 RTL 联合仿真的期望字节逐位一致；
-- 抽取 `m5_desc_demo.py` 里的几个列表，与板上结果比对。
-
-之后每加一个硬件功能，都**先在功能模拟器里实现并给出测试向量**，再写 RTL。
-
-### 4.4 IREE 工具链验证（最大的软件风险，放在最前面）
-
-- **主机端**：安装或构建 IREE 编译器。用 iree-turbine 把一个小的 torch 模型（2 层 MLP，加一次 softmax）编译到 `llvm-cpu` 目标，
-  target triple 是 `armv7-linux-gnueabihf`。
-- **板上**：交叉编译 IREE 运行时（armhf，hard-float），用 `iree-run-module` 运行上面的模型，结果与 PyTorch 一致。
-  IREE 主要测试的是 aarch64，32 位 ARM 没有保证，这一步就是要确认它能用。
-- **还要确认**：
-  - 自定义 HAL 驱动与目标后端的插件机制，在所选 IREE 版本上的接口；
-  - C 运行时怎样访问 CMA 缓冲（u-dma-buf 或 PYNQ 的 CMA 接口）和中断（UIO）。
-- **不通过时**：只用 IREE 编译器，运行时自己用 C 写一个小的执行器，读 IREE 输出的可执行体和调度信息。
-  §10 的硬件接口不受影响。
-
-> **L0 实测：通过**（IREE 3.11.0，详见 [`iree-sa/l0/README.md`](../iree-sa/l0/README.md)）。
-> - **流程**：torch → iree-turbine → iree-compile（llvm-cpu，armv7）→ 板上的 IREE 运行时
->   （clang-18 交叉编译，静态链接）。
-> - **结果**：测试模型用 local-sync 和 local-task 两种驱动都与 torch 一致，15 个单算子测试全部 PASS。
->
-> 途中解决了 armv7 特有的两个问题，都通过链接器包装脚本加一个很小的 libm shim 解决：
-> 1. **缺少 `fmaxf`/`fminf`**：Cortex-A9 没有 IEEE 语义的 max/min 指令，LLVM 会调用这两个函数，
->    而嵌入式 ELF 里没有 libm。
-> 2. **IREE 自带 musl 里的 `fmaf` 是空实现（`unreachable`）**：Cortex-A9 没有 FMA，`exp` 的多项式近似会调用它，
->    结果 `exp` 总是返回常数 4。shim 提供了正确舍入的软件 `fmaf`，与 glibc 在 4000 万组输入上逐位一致。
->    这可能是 IREE 的 bug，值得向上游报告。
->
-> 编译脚本会在主机上检查每个 armv7 可执行体，不允许有外部导入，也不允许 libm 函数是空实现。
+Under these conventions every fp32 step can be reproduced exactly with NumPy float32 plus FTZ handling.
 
 ---
 
-## 5. L1：host 接口与命令处理扩展
+## 4. L0: baselines, reference model, functional simulator and toolchain verification
 
-L1 的硬件改动分两部分，一次构建：
-- **命令环与完成中断**：面向 host 运行时；
-- **命令处理扩展**：面向编译器，包括 IREE 的 binding、push constant、命令缓冲和动态形状。
+L0 does not change the RTL.
 
-> **L1 完成并上板验证**（`bitstreams/l1/`）。
-> - **仿真**：
->   - 功能模拟器 272 项检查；
->   - `tb_sa_unit` 新增 15 项 L1 检查，8 个故意引入的错误都被发现；
->   - 两张 Python 生成的 L1 列表在 RTL 上联合仿真通过，D=8 和 16 都做了；
->   - `RING_TEST`：9 个条目提交到大小为 4 的命令环，3 个故意引入的固件错误都被发现；
->   - 所有旧测试不回归。
-> - **板上**：`l1_ring_demo.py` 的 6 项测试全部通过；`m4_demo`、`m4_perf`、`m5_desc_demo` 不回归。
-> - **与计划的差别**：
->   1. 完成中断改为边沿中断 `notify_irq`，因为 ARM 访问不到加速器的 CSR；
->   2. 驱动必须在读走完成记录之后才能复用命令环的槽。上板时发现，只按 `RING_HEAD` 判断环满，
->      会让固件覆盖还没读取的完成记录；已修正。
->   3. 取指单元实测 4.4k LUT，高于预估。
+### 4.1 D=8 baseline bitstream and timing survey
 
-### 5.1 命令环
+- Build `scripts/build_bitstream.sh -jobs 4 -sa_d 8`, keeping both PERF and DESC, at 50 MHz.
+- Record resources as the budget baseline of L1/L2. M3 at D=8 was 21,720 LUT, 96 DSP, 130 BRAM36;
+  with the counters and the fetch unit about 24k LUT estimated.
+- **Timing survey**: one OOC synthesis of the same RTL under a 75 MHz constraint, recording the 10 worst paths as input to L5.5.
+  m5's (D=16) known worst path is `ex/drain_active` driving the enables (CE) of all PE registers:
+  16.8 ns, 15.8 ns of it routing, a fan-out problem.
+- Board regression: `m4_perf.py`, `m5_desc_demo.py`, `m4_demo.py` all run at D=8.
+- Archived as `bitstreams/l0/`.
 
-**提交命令环**：由 ARM 在 DDR 里分配，不开 cache，或者每次写完都 flush。条目个数是 2 的幂，默认 64 个；
-每个条目 64 字节。
+> **L0 measured** (`bitstreams/l0/`):
+> - **Resources**: 23,452 LUT (44.1%), 19,193 FF, 96 DSP, 130 BRAM36;
+> - **Timing**: WNS +1.555 ns at 50 MHz;
+> - **Board regression all PASS**: `m4_demo` (256³ 59.0 MAC/cycle, 92% of peak), `m4_perf` 69/69, `m5_desc_demo`.
+>
+> **75 MHz OOC timing survey** (`rtl/sysarray`, `make synth CLOCK_NS=13.333`, D=8): WNS −0.717 ns, estimated maximum about 71.2 MHz.
+> The 20 worst paths are **all in `sa_ld.v`**, in two kinds:
+> 1. **Burst generation**: starting from `off`, the address is computed, then the minimum of three quantities decides the burst length (what remains of the row, the distance to the 4 KB boundary, 16 beats),
+>    then multiplied by `step` (through a DSP) to give `cur_word`. 17 logic levels, 13.9 ns.
+> 2. **The write-back address of read data**: starting from `q_rp`, computing `lw_word = h_word + (h_sum >> lpwl) * step` (through a DSP),
+>    driving the SPAD/ACC address, data and write enables. 6 logic levels, 13.5 ns, about 60% routing.
+>
+> Both have the `* step` multiply in a combinational path. Fix: replace the multiply with an accumulator incremented per beat; register the write-back address, data and enables one more cycle.
+> These two are L5.5's fix list. The full build also adds PicoRV32 and the AXI interconnect; L5.5's actual build decides.
 
-| 字 | 内容 |
+### 4.2 Reference model `llm/ref_model.py`
+
+Reads llama2.c's fp32 checkpoints and implements two forward computations in NumPy:
+
+- **fp32 mode**: the same order of computation as `run.c`.
+  - Acceptance: stories15M greedy decoding of 256 tokens gives text identical to `run.c`.
+- **Device numeric mode**: simulates the device's computation with the quantization of §3.1. Special functions first use float64 approximations, replaced by the functional simulator after L2.
+
+Accuracy evaluation (`llm/eval_quant.py`):
+- **teacher forcing**: both modes are fed the token sequence generated by the fp32 mode, comparing at each position whether their top-1 agree,
+  and computing the KL divergence of the logits.
+- Models: stories15M, 42M, 110M;
+- Data: about 8 prompts, 256 tokens each;
+- Also calibrates each layer's static KV scales: absolute maximum or the 99.99th percentile, both tried.
+- **Acceptance threshold**: top-1 agreement ≥ 95% for 15M, and fluent greedy-generated text.
+  - If not met, change the scheme in the order of §14;
+  - this 95% is a provisional value, written into this document after L0's measurement as the accuracy baseline of later levels.
+
+> **L0 measured** (host, `llm/eval_quant.py`, details in [`llm/README.md`](../llm/README.md)):
+> - All three models and both KV calibrations meet the 95% threshold; the device model's argmax is within fp32's top 5 100% of the time;
+> - top-1 agreement: 15M 95.6% (absmax) / **96.3%** (99.99th percentile), 42M 96.0% / 95.9%, 110M 97.9% / 98.1%;
+> - mean KL divergence: 15M about 0.011, 42M 0.007–0.010, 110M about 0.004.
+>
+> **Accuracy baseline set to**: stories15M, KV scales at the 99.99th percentile, top-1 96.3%.
+> After L2 replaces the special functions with the hardware algorithms it is re-evaluated, and must still be ≥ 95%.
+
+### 4.3 Functional simulator `llm/sa_funcsim.py`
+
+Simulates the execution of descriptor lists in Python:
+
+- **State**: DDR (a byte array), SPAD_A, SPAD_B, ACC, stored by words with the layout of design document §3.4;
+  plus the BASE and PARAM registers.
+- **LD / ST**: LINEAR, INTERLEAVE, ZERO_PAD.
+- **EX**: including repeat, bstep, cstep, crow, accumulate.
+- **VE**: the existing integer operations; L2 adds all fp32 operations.
+- **Control descriptors**: FENCE, JUMP, END, BASE relocation; L1's extensions (§5.3) too.
+- **Cycle estimation model**: used by the compiler as a cost model. First estimated from each command's theoretical cycles, calibrated with the counters after L1.
+
+**Acceptance**:
+- with the 7 cases of the existing `gen_desc_cases.py` as input, the functional simulator's output is bit-identical to the bytes expected from RTL co-simulation;
+- a few lists extracted from `m5_desc_demo.py` compared with board results.
+
+From then on, every new hardware function is **first implemented in the functional simulator with test vectors**, before writing RTL.
+
+### 4.4 IREE toolchain verification (the largest software risk, placed first)
+
+- **Host**: install or build the IREE compiler. Compile a small torch model (a 2-layer MLP plus one softmax) with iree-turbine to the `llvm-cpu` target,
+  with target triple `armv7-linux-gnueabihf`.
+- **Board**: cross-compile the IREE runtime (armhf, hard-float) and run the model above with `iree-run-module`, matching PyTorch.
+  IREE is mostly tested on aarch64 and 32-bit ARM is not guaranteed; this step confirms it works.
+- **Also confirm**:
+  - the interfaces of the plugin mechanisms for custom HAL drivers and target backends in the chosen IREE version;
+  - how the C runtime accesses CMA buffers (u-dma-buf or PYNQ's CMA interface) and interrupts (UIO).
+- **If it fails**: use only the IREE compiler, and write a small executor in C as the runtime, reading the executables and scheduling information IREE outputs.
+  The hardware interface of §10 is unaffected.
+
+> **L0 measured: passes** (IREE 3.11.0, details in [`iree-sa/l0/README.md`](../iree-sa/l0/README.md)).
+> - **Flow**: torch → iree-turbine → iree-compile (llvm-cpu, armv7) → the IREE runtime on the board
+>   (cross-compiled with clang-18, statically linked).
+> - **Results**: the test model matches torch with both the local-sync and local-task drivers, and all 15 single-operator tests PASS.
+>
+> Two armv7-specific problems were solved along the way, both with a linker wrapper script plus a tiny libm shim:
+> 1. **Missing `fmaxf`/`fminf`**: the Cortex-A9 has no IEEE-semantics max/min instructions, so LLVM calls these two functions,
+>    and the embedded ELF has no libm.
+> 2. **`fmaf` in IREE's bundled musl is an empty implementation (`unreachable`)**: the Cortex-A9 has no FMA, `exp`'s polynomial approximation calls it,
+>    and `exp` always returned the constant 4. The shim provides a correctly rounded software `fmaf`, bit-identical to glibc on 40 million inputs.
+>    This may be an IREE bug worth reporting upstream.
+>
+> The build script checks every armv7 executable on the host, allowing neither external imports nor empty libm implementations.
+
+---
+
+## 5. L1: host interface and command-processing extensions
+
+L1's hardware changes have two parts, built together:
+- **command ring and completion interrupt**: for the host runtime;
+- **command-processing extensions**: for the compiler, covering IREE's bindings, push constants, command buffers and dynamic shapes.
+
+> **L1 done and verified on the board** (`bitstreams/l1/`).
+> - **Simulation**:
+>   - 272 functional-simulator checks;
+>   - 15 new L1 checks in `tb_sa_unit`; all 8 deliberately introduced bugs caught;
+>   - two Python-generated L1 lists pass RTL co-simulation, at both D=8 and 16;
+>   - `RING_TEST`: 9 entries submitted to a command ring of size 4; all 3 deliberately introduced firmware bugs caught;
+>   - no old test regresses.
+> - **Board**: all 6 tests of `l1_ring_demo.py` pass; `m4_demo`, `m4_perf`, `m5_desc_demo` do not regress.
+> - **Differences from the plan**:
+>   1. the completion interrupt became an edge interrupt `notify_irq`, because the ARM cannot access the accelerator's CSRs;
+>   2. the driver must reuse a command-ring slot only after reading out its completion record. On the board it turned out that judging ring-full by `RING_HEAD` alone
+>      let the firmware overwrite completion records not yet read; fixed.
+>   3. the fetch unit measured 4.4k LUT, above the estimate.
+
+### 5.1 Command ring
+
+**Submission ring**: allocated by the ARM in DDR, uncached, or flushed after every write. The number of entries is a power of 2, 64 by default;
+64 bytes per entry.
+
+| Word | Content |
 |---|---|
-| w0 | [7:0] 类型：0x01 RUN_LIST、0x02 NOP、0x03 RESET（`mat_reset` 后继续）；[8] 完成后中断；[9] 转存计数器；[63:32] `seq` |
-| w1 | 列表地址（64 字节对齐） |
-| w2 | [31:0] count（0 表示执行到 END） |
+| w0 | [7:0] type: 0x01 RUN_LIST, 0x02 NOP, 0x03 RESET (continue after `mat_reset`); [8] interrupt on completion; [9] dump counters; [63:32] `seq` |
+| w1 | List address (64-byte aligned) |
+| w2 | [31:0] count (0 means run until END) |
 | w3–w6 | BASE0–BASE3 |
-| w7 | [31:0] **参数块地址**：8 个 32 位 PARAM，按 32 字节对齐；0 表示不装载 |
+| w7 | [31:0] **parameter block address**: 8 32-bit PARAMs, 32-byte aligned; 0 means do not load |
 
-BASE4–15 由列表内部的 SETREG 设置（§5.3）。
+BASE4–15 are set by SETREG inside the list (§5.3).
 
-**完成记录环**：与提交环同样的索引，每条 32 字节。
+**Completion record ring**: the same indices as the submission ring, 32 bytes per record.
 
-| 字 | 内容 |
+| Word | Content |
 |---|---|
-| c0 | [31:0] `seq`；[63:32] 状态：0 表示成功，否则是 `ext_status`，其中含错误引擎号和错误码 |
-| c1 | [31:0] 周期数；[63:32] 执行过的描述符条数（`DL_EXEC`） |
-| c2 | [31:0] END 的完成值（`DL_STATUS`）；[63:32] 保留 |
-| c3 | 保留 |
+| c0 | [31:0] `seq`; [63:32] status: 0 for success, otherwise `ext_status`, containing the error engine number and error code |
+| c1 | [31:0] cycles; [63:32] number of descriptors executed (`DL_EXEC`) |
+| c2 | [31:0] END's completion value (`DL_STATUS`); [63:32] reserved |
+| c3 | Reserved |
 
-**mailbox 新字段**（BRAM 0x1F00 起，0xB0–0xD0 目前空闲）：
+**New mailbox fields** (from BRAM 0x1F00; 0xB0–0xD0 are free today):
 
-| 偏移 | 名称 | 写方 | 说明 |
+| Offset | Name | Writer | Notes |
 |---|---|---|---|
-| 0xB0 | `RING_BASE` | ARM | 提交环物理地址 |
-| 0xB4 | `RING_SIZE` | ARM | 条目数（2 的幂） |
-| 0xB8 | `RING_TAIL` | ARM | **门铃**：新的尾指针 |
-| 0xBC | `RING_HEAD` | 固件 | 已完成的条目数（单调递增） |
-| 0xC0 | `CPL_BASE` | ARM | 完成记录环物理地址 |
-| 0xC4 | `FW_STATE` | 固件 | 0x52554E00 `RUN\0` 表示就绪；出错时为 0xDEADxxxx |
-| 0xC8 | `FW_VERSION` | 固件 | 接口版本 |
-| 0xCC | `HEARTBEAT` | 固件 | 空闲循环计数，调试用 |
+| 0xB0 | `RING_BASE` | ARM | Physical address of the submission ring |
+| 0xB4 | `RING_SIZE` | ARM | Number of entries (a power of 2) |
+| 0xB8 | `RING_TAIL` | ARM | **Doorbell**: the new tail pointer |
+| 0xBC | `RING_HEAD` | Firmware | Number of completed entries (monotonically increasing) |
+| 0xC0 | `CPL_BASE` | ARM | Physical address of the completion record ring |
+| 0xC4 | `FW_STATE` | Firmware | 0x52554E00 `RUN\0` means ready; 0xDEADxxxx on error |
+| 0xC8 | `FW_VERSION` | Firmware | Interface version |
+| 0xCC | `HEARTBEAT` | Firmware | Idle loop count, for debugging |
 
-**门铃**：ARM 写 `RING_TAIL`，`rt_fw` 在空闲循环里轮询。这是一种简化：
-真实芯片一般是写一个 MMIO 门铃寄存器，产生设备端中断。改成中断方式放在 L6。
+**Doorbell**: the ARM writes `RING_TAIL`, and `rt_fw` polls it in its idle loop. This is a simplification:
+real chips usually write an MMIO doorbell register that raises a device-side interrupt. Switching to interrupts is deferred to L6.
 
-**完成中断**（实现时修改为边沿中断，原因见下）：
-- 新指令 `mat_notify`（funct7=1，funct3=7）：`sa_unit` 的新输出 **`notify_irq`** 产生一个脉冲
-  （高 4 个周期，之后至少低 1 个周期；连续的 notify 会排队，保证每次都有独立的上升沿），`NOTIFY_COUNT` 加 1。
-- BD：`irqConcat` 改为 `NUM_PORTS 2`，`In1` 接 `matmul_0/notify_irq`（接口声明为 `EDGE_RISING`），
-  经已有的 `psInterruptController`（axi_intc）送到 `IRQ_F2P`。axi_intc 锁存边沿，ARM 在 intc 上应答。
-- **为什么不用原计划的电平中断加 W1C**：当前 BD 中 `matmul_0` 的 CSR 只映射在 PicoRV32 的地址空间（0x80000000），
-  ARM 访问不到，也就无法写 1 清除状态。边沿中断不需要清除加速器里的状态，性质上类似 PCIe 的 MSI 消息中断。
-- ARM 端：Python 用 `pynq.Interrupt("matmul_0/notify_irq")`，C 运行时用 UIO；两者都保留轮询 `RING_HEAD` 的备用路径。
-  多个边沿在 ARM 应答前可能合并成一次中断，所以 ARM 醒来后要按 `RING_HEAD` 处理所有已完成的条目。
-- 为什么由固件发中断：固件必须先写完完成记录，ARM 被唤醒时才能读到一致的状态。
-  END 描述符的 IRQ 位留给 ARM 直接提交的场景（L6）。
+**Completion interrupt** (changed to an edge interrupt in the implementation; reasons below):
+- A new instruction `mat_notify` (funct7=1, funct3=7): a new output of `sa_unit`, **`notify_irq`**, produces a pulse
+  (high for 4 cycles, then low for at least 1; consecutive notifies queue so each has its own rising edge), and `NOTIFY_COUNT` increments.
+- BD: `irqConcat` changes to `NUM_PORTS 2`, with `In1` connected to `matmul_0/notify_irq` (interface declared `EDGE_RISING`),
+  through the existing `psInterruptController` (axi_intc) to `IRQ_F2P`. The axi_intc latches the edge, and the ARM acknowledges at the intc.
+- **Why not the originally planned level interrupt with W1C**: in the current BD, the CSRs of `matmul_0` are only mapped in PicoRV32's address space (0x80000000),
+  so the ARM cannot access them, nor write 1 to clear a status. An edge interrupt needs no state cleared in the accelerator, similar in nature to PCIe's MSI message interrupts.
+- ARM side: Python uses `pynq.Interrupt("matmul_0/notify_irq")`, the C runtime UIO; both keep a fallback path polling `RING_HEAD`.
+  Several edges may merge into one interrupt before the ARM acknowledges, so after waking the ARM processes all completed entries by `RING_HEAD`.
+- Why the firmware raises the interrupt: the firmware must finish writing the completion record first, so the ARM reads a consistent state when woken.
+  The IRQ bit of the END descriptor is left for direct submission from the ARM (L6).
 
-**新增 CSR**（AXI-Lite，只有 PicoRV32 可访问）：0xD4 `NOTIFY_COUNT`（只读）。
-**CAPS bit 22** 表示有 `mat_notify` 和 `notify_irq`。
+**New CSR** (AXI-Lite, accessible only to PicoRV32): 0xD4 `NOTIFY_COUNT` (read-only).
+**CAPS bit 22** means `mat_notify` and `notify_irq` are present.
 
-### 5.2 固件 `firmware/rt/rt_fw.c`
+### 5.2 Firmware `firmware/rt/rt_fw.c`
 
 ```c
-init: 检查 CAPS（需要 bit 21 DESC、bit 22 NOTIFY、bit 24 CMDX）；FW_STATE = RUN；
+init: check CAPS (needs bit 21 DESC, bit 22 NOTIFY, bit 24 CMDX); FW_STATE = RUN;
 loop:
   while (RING_HEAD == RING_TAIL) HEARTBEAT++;
-  e = &ring[RING_HEAD % RING_SIZE];               // PicoRV32 经 HP0 读 DDR
+  e = &ring[RING_HEAD % RING_SIZE];               // PicoRV32 reads DDR through HP0
   switch (e->type):
-    RUN_LIST: mat_cfg(BASE0..3)；if (e->params) mat_cfg(PARAM0..7 ← 参数块)；
+    RUN_LIST: mat_cfg(BASE0..3); if (e->params) mat_cfg(PARAM0..7 ← parameter block);
               t0 = rdcycle; mat_submit(e->list, e->count); mat_fence();
               st = ext_status;  if (error) mat_reset();
     NOP:      st = 0;
     RESET:    mat_reset(); st = 0;
-  写完成记录；  [可选] 转存计数器；  RING_HEAD++；  if (e->flags & IRQ) mat_notify();
+  write the completion record;  [optional] dump counters;  RING_HEAD++;  if (e->flags & IRQ) mat_notify();
 ```
 
-- 固件**常驻**：ARM 只加载一次，之后不再换固件。
-- 程序必须放在 0x1E00 以下，这个循环很小，估计在 1 KB 以内。
-- 现有的 `gemm_fw`、`vector_fw`、`desc_run_fw` 保留，供旧脚本使用。
+- The firmware is **resident**: the ARM loads it once and never swaps firmware afterwards.
+- The program must stay below 0x1E00; this loop is small, estimated within 1 KB.
+- The existing `gemm_fw`, `vector_fw`, `desc_run_fw` are kept for the old scripts.
 
-### 5.3 命令处理扩展（面向编译器）
+### 5.3 Command-processing extensions (for the compiler)
 
-所有扩展都在 `sa_cmdfetch.v` 中，译码时生效。取指和译码本来就按顺序进行，所以后面的描述符自然看到新的寄存器值；
-已经送出的命令包里的地址和长度都已算好，不受之后修改的影响。
+All extensions are in `sa_cmdfetch.v` and take effect at decode. Fetch and decode are already in order, so later descriptors naturally see new register values;
+addresses and lengths in command packets already sent are already computed and unaffected by later changes.
 
-| # | 扩展 | 编码 | 作用 |
+| # | Extension | Encoding | Purpose |
 |---|---|---|---|
-| 1 | **BASE0–15** | BASESEL 加宽到 4 位：`{w0[14:13], w0[10:9]}`。旧列表的 w0[14:13] 为 0，含义不变 | IREE 一个 dispatch 常有 5–8 个 binding |
-| 2 | **PARAM0–7**（32 位） | `mat_cfg` key 27–34；命令环参数块；SETREG；LDPARAM | 动态形状和位置，对应 IREE 的 push constant |
-| 3 | **动态字段** | w0[31:16] 是两个 8 位动态槽（原为保留位）：`[3:0]` 字段号（0 = 不用），`[6:4]` 选哪个 PARAM，`[7]` 0 = 替换、1 = 相加 | 长度、次数、地址偏移可以取自 PARAM，于是一个模型只需一张静态列表 |
-| 4 | **SETREG**（opcode 0x14） | w1：3 个 7 位项，位于 [6:0]、[14:8]、[22:16]，每项 {[6] 有效，[5:0] 寄存器号：0–15 = BASE，16–23 = PARAM}；w2–w4：对应的值；w5[2:0]：每项替换（0）还是相加（1）；按项的顺序依次写入 | 在列表内部绑定参数，相当于 Vulkan 的 bind descriptor set 和 push constants |
-| 5 | **LOOP_END**（opcode 0x13） | w1：跳回的目标（相对偏移，单位是描述符条数，有符号）；w2[15:0]：次数（≥ 1，也可以用动态槽取自 PARAM）；w2[18:16] / w2[21:19]：每轮递增的 PARAM k1 / k2；w3 / w4：各自的步长（有符号 32 位） | 分块循环、按头循环、按层循环；对应 IREE 的 workgroup 数量 |
-| 6 | **相对 JUMP、CALL、RET** | JUMP / CALL（0x15）：w2[0] = REL 时 w1 是有符号偏移（单位是描述符条数），否则是 64 字节对齐的绝对地址；CALL 把下一条的地址压入**深度 4** 的返回栈；RET（0x16）：弹出并跳转 | 位置无关的可执行体：命令缓冲 = SETREG … CALL 某个 kernel |
-| 7 | **LDPARAM**（opcode 0x17） | w1：DDR 地址（可以重定位，4 字节对齐）；w2[2:0]：写入哪个 PARAM；w3[15:0]：乘数；w4：加数。结果 `PARAM = mem32 × mul + add` | 由数据决定的地址：嵌入表查找、按位置张量更新 KV、gather；如果数据刚由 ST 写入，前面必须有 FENCE |
+| 1 | **BASE0–15** | BASESEL widened to 4 bits: `{w0[14:13], w0[10:9]}`. Old lists have w0[14:13] = 0, same meaning | An IREE dispatch often has 5–8 bindings |
+| 2 | **PARAM0–7** (32-bit) | `mat_cfg` keys 27–34; the command ring's parameter block; SETREG; LDPARAM | Dynamic shapes and positions, corresponding to IREE's push constants |
+| 3 | **Dynamic fields** | w0[31:16] holds two 8-bit dynamic slots (formerly reserved): `[3:0]` field number (0 = unused), `[6:4]` which PARAM, `[7]` 0 = replace, 1 = add | Lengths, counts and address offsets can come from PARAMs, so one model needs only one static list |
+| 4 | **SETREG** (opcode 0x14) | w1: 3 7-bit items at [6:0], [14:8], [22:16], each {[6] valid, [5:0] register number: 0–15 = BASE, 16–23 = PARAM}; w2–w4: the matching values; w5[2:0]: per item replace (0) or add (1); written in item order | Binds parameters inside a list, like Vulkan's bind descriptor set and push constants |
+| 5 | **LOOP_END** (opcode 0x13) | w1: the jump-back target (relative offset in descriptors, signed); w2[15:0]: count (≥ 1, can also come from a PARAM through a dynamic slot); w2[18:16] / w2[21:19]: PARAMs k1 / k2 incremented each round; w3 / w4: their strides (signed 32-bit) | Tile loops, per-head loops, per-layer loops; corresponds to IREE's workgroup count |
+| 6 | **Relative JUMP, CALL, RET** | JUMP / CALL (0x15): with w2[0] = REL, w1 is a signed offset (in descriptors), otherwise a 64-byte-aligned absolute address; CALL pushes the address of the next descriptor onto a return stack of **depth 4**; RET (0x16): pops and jumps | Position-independent executables: a command buffer = SETREG … CALL some kernel |
+| 7 | **LDPARAM** (opcode 0x17) | w1: DDR address (relocatable, 4-byte aligned); w2[2:0]: which PARAM to write; w3[15:0]: multiplier; w4: addend. Result `PARAM = mem32 × mul + add` | Data-dependent addresses: embedding lookup, KV update by the position tensor, gather; if the data was just written by ST, a FENCE must precede it |
 
-**LOOP 的语义**：
-- 循环体放在 LOOP_END 之前，执行 `count` 次，count 必须 ≥ 1；
-- 计数器栈深度为 2，按 LOOP_END 自身的地址识别所属层：栈顶的地址与当前 LOOP_END 相同，就继续使用栈顶；
-  否则压入一个新计数器；计数到 0 时弹出，继续往下执行；
-- 每轮结束时做 `P[k1] += s1`、`P[k2] += s2`；循环结束后 PARAM 保持最终值，编译器需要时用 SETREG 复位；
-- 跳回时丢弃已预取的描述符，重新取指，沿用 JUMP 的实现；每轮都会从 DDR 重新读取循环体，不做循环缓冲。
+**LOOP semantics**:
+- The loop body precedes LOOP_END and executes `count` times; count must be ≥ 1;
+- the counter stack has depth 2, and a LOOP_END identifies its level by its own address: if the top of the stack has the same address as the current LOOP_END, the top is used;
+  otherwise a new counter is pushed; when it counts down to 0 it pops and execution continues;
+- at the end of each round `P[k1] += s1`, `P[k2] += s2`; after the loop the PARAMs keep their final values, and the compiler resets them with SETREG when needed;
+- jumping back discards prefetched descriptors and refetches, reusing JUMP's implementation; each round rereads the loop body from DDR, with no loop buffer.
 
-**动态字段号**（L1 实现后的定稿，与 `sa_cmdfetch.v`、`llm/sa_funcsim.py` 的 `DYN_FIELDS` 一致）：
+**Dynamic field numbers** (final after L1's implementation, consistent with `sa_cmdfetch.v` and `DYN_FIELDS` in `llm/sa_funcsim.py`):
 
-| opcode | 字段号 |
+| opcode | Field numbers |
 |---|---|
-| LD / ST | 1 DDR 地址，2 LADDR（字号），3 rows，4 row_bytes，5 pitch |
-| EX | 1 A，2 B，3 C，4 Kt，5 repeat，6 bstep，7 cstep |
-| VE | 1 src1，2 src2，3 dst，4 LEN，5 VALID，6 ROWLEN，7 P1，8 P2，9 A（fp32 位模式），10 B，11 IMM |
-| LOOP_END | 1 次数 |
-| LDPARAM | 1 地址 |
-| JUMP / CALL | 1 目标 |
-| SETREG | 1–3 第 1–3 项的值 |
+| LD / ST | 1 DDR address, 2 LADDR (word number), 3 rows, 4 row_bytes, 5 pitch |
+| EX | 1 A, 2 B, 3 C, 4 Kt, 5 repeat, 6 bstep, 7 cstep |
+| VE | 1 src1, 2 src2, 3 dst, 4 LEN, 5 VALID, 6 ROWLEN, 7 P1, 8 P2, 9 A (fp32 bit pattern), 10 B, 11 IMM |
+| LOOP_END | 1 count |
+| LDPARAM | 1 address |
+| JUMP / CALL | 1 target |
+| SETREG | 1–3 the values of items 1–3 |
 
-- 地址类字段的计算顺序：`BASE[sel] + 字段 + PARAM`；
-- 替换或相加之后的值仍由调度器现有的范围检查把关，越界会报错。
+- Address-type fields are computed in the order `BASE[sel] + field + PARAM`;
+- values after replacement or addition still pass the scheduler's existing range checks; out of range raises an error.
 
-**错误**：以下情况报错，错误引擎号为 FETCH（4），恢复方法仍是 `mat_reset`：
-- 返回栈或计数器栈溢出、下溢；
-- 次数为 0；
-- 未定义的字段号；
-- LDPARAM 读取时收到 AXI 错误。
+**Errors**: the following raise an error with error engine number FETCH (4); recovery is still `mat_reset`:
+- return-stack or counter-stack overflow or underflow;
+- a count of 0;
+- an undefined field number;
+- an AXI error on LDPARAM's read.
 
-**CAPS bit 24（CMDX）** 表示这些扩展都存在。
+**CAPS bit 24 (CMDX)** means all these extensions are present.
 
-**`mat_cfg` 新 key**：15–26 设置 BASE4–15，27–34 设置 PARAM0–7。
+**New `mat_cfg` keys**: 15–26 set BASE4–15, 27–34 set PARAM0–7.
 
-### 5.4 驱动
+### 5.4 Driver
 
-- `driver/pynq_matmul.py` 新增 `class Device`：
-  - `Device(bitfile)`：加载 `rt_fw`，分配两个环，等待 `FW_STATE == RUN`；
-  - `submit(dl, bases, params=None, irq=True) -> seq`；
-  - `wait(seq)` 和 `async wait_async(seq)`；
-  - `run(dl, bases, params)`：同步调用的便捷接口。
-- `DescList` 新增 `setreg`、`loop_end`、`call`、`ret`、`ldparam`，以及动态槽参数 `dyn=[(字段, param, add)]`。
+- `driver/pynq_matmul.py` gains `class Device`:
+  - `Device(bitfile)`: loads `rt_fw`, allocates the two rings, waits for `FW_STATE == RUN`;
+  - `submit(dl, bases, params=None, irq=True) -> seq`;
+  - `wait(seq)` and `async wait_async(seq)`;
+  - `run(dl, bases, params)`: a convenience for synchronous calls.
+- `DescList` gains `setreg`, `loop_end`, `call`, `ret`, `ldparam`, and the dynamic-slot argument `dyn=[(field, param, add)]`.
 
-### 5.5 验证
+### 5.5 Verification
 
-- **`tb_sa_unit`**：
-  - `mat_notify`：每次一个 4 周期脉冲，连续两次产生两个独立的上升沿，`NOTIFY_COUNT` 计数，legacy `irq` 不受影响；
-  - 负向测试原来用 funct3=7 作为非法编码，现在它已占用，改用 funct7=3；
-  - **命令处理扩展的定向测试**：
-    - 每个动态字段的替换和相加；
-    - SETREG 对后续描述符生效，且不影响已送出的命令；
-    - LOOP 的 1 次和 N 次、两层嵌套、PARAM 每轮递增；
-    - CALL/RET 嵌套到深度 4；
-    - LDPARAM 的乘加，以及“ST → FENCE → LDPARAM”的顺序；
-    - 各类错误与恢复；
-    - 与 FENCE、END、BASE0–15 混用；
-  - **随机列表**：含动态槽、循环和调用，与功能模拟器逐位比对。
-- **`tb_system.v` 新增 `RING_TEST`**：环中 N 条条目，覆盖回绕、NOP、一条故意出错的列表、RESET，以及带参数块的条目；
-  核对每条完成记录和中断次数。
-- **板上** `notebooks/llm/l1_ring_demo.py`：
-  - 异步提交 200 条列表，结果全部正确，中断次数与完成数一致；
-  - 用一张带 LOOP 和动态字段的静态列表，只改参数块就对不同长度的输入给出正确结果；
-  - 测量提交到完成的延迟，只作记录。
+- **`tb_sa_unit`**:
+  - `mat_notify`: one 4-cycle pulse each time, two in a row give two separate rising edges, `NOTIFY_COUNT` counts, the legacy `irq` is unaffected;
+  - the negative test used funct3=7 as an illegal encoding; it is now taken, so funct7=3 is used instead;
+  - **directed tests of the command-processing extensions**:
+    - replace and add for each dynamic field;
+    - SETREG takes effect on later descriptors without affecting commands already sent;
+    - LOOP with 1 and N iterations, two nested levels, PARAMs incremented each round;
+    - CALL/RET nested to depth 4;
+    - LDPARAM's multiply-add, and the order "ST → FENCE → LDPARAM";
+    - each kind of error and recovery;
+    - mixed with FENCE, END, BASE0–15;
+  - **random lists**: with dynamic slots, loops and calls, compared bit for bit with the functional simulator.
+- **New `RING_TEST` in `tb_system.v`**: N entries in the ring, covering wrap-around, NOP, a deliberately failing list, RESET, and entries with parameter blocks;
+  checking every completion record and the number of interrupts.
+- **On the board**, `notebooks/llm/l1_ring_demo.py`:
+  - submit 200 lists asynchronously, all results correct, interrupt count equal to completion count;
+  - with one static list containing LOOP and dynamic fields, give correct results for inputs of different lengths by changing only the parameter block;
+  - measure the submission-to-completion latency, recorded only.
 
 ---
 
-## 6. L2：fp32 向量引擎与特殊函数单元
+## 6. L2: fp32 vector engine and special function unit
 
-### 6.1 运算流水（fp32 模式）
+### 6.1 The operation pipeline (fp32 mode)
 
-VE 命令增加 **FP 位**。FP=0 时行为与现在完全相同；FP=1 时，每组（VL = D 个元素）依次经过：
+VE commands gain an **FP bit**. With FP=0 the behavior is exactly as today; with FP=1 each group (VL = D elements) passes in turn through:
 
 ```
-src1 ─ 取数（下标模式 M1）─ 转 fp32 ─ [SWAPNEG] ─┐
-                                               ├─ OP ─ ×A + B ─ FUNC ─ [RELU] ─┬─ 输出转换 → dst
-src2 ─ 取数（M2，或立即数 IMM）─ 转 fp32 ────────┘                              └─ 归约 → dst
+src1 ─ fetch (index mode M1) ─ to fp32 ─ [SWAPNEG] ─┐
+                                                  ├─ OP ─ ×A + B ─ FUNC ─ [RELU] ─┬─ output conversion → dst
+src2 ─ fetch (M2, or immediate IMM) ─ to fp32 ─────┘                              └─ reduction → dst
 ```
 
-| 级 | 内容 |
+| Stage | Content |
 |---|---|
-| 输入 | src1 与 src2 的类型可以是 I8（SPAD）、I32 或 F32（ACC），读出后转成 fp32；src2 也可以是命令中的 fp32 立即数 `IMM` |
-| SWAPNEG（src1，可选） | 每对相邻元素 (2i, 2i+1) 变为 (−x[2i+1], x[2i])，给 RoPE 用 |
-| OP | ADD、SUB、MUL、MAX、MIN、COPY（与整数模式编码相同） |
-| 仿射 | y = y × A + B，A、B 是 fp32 立即数，默认 1.0 和 0.0 |
-| FUNC | NONE、EXP、RECIP、RSQRT、ABS |
-| RELU | 与现有位相同 |
-| 输出 | F32 写 ACC；I32 按 RNE 转换并饱和后写 ACC；I8 按 RNE 转换、饱和到 ±127 后写 SPAD；或者进入归约 |
+| Input | src1 and src2 can be I8 (SPAD), I32 or F32 (ACC), converted to fp32 after reading; src2 can also be an fp32 immediate `IMM` in the command |
+| SWAPNEG (src1, optional) | Each adjacent pair (2i, 2i+1) becomes (−x[2i+1], x[2i]), for RoPE |
+| OP | ADD, SUB, MUL, MAX, MIN, COPY (same encoding as the integer mode) |
+| Affine | y = y × A + B, with A, B fp32 immediates, defaulting to 1.0 and 0.0 |
+| FUNC | NONE, EXP, RECIP, RSQRT, ABS |
+| RELU | Same as the existing bit |
+| Output | F32 written to ACC; I32 converted with RNE and saturated, written to ACC; I8 converted with RNE, saturated to ±127, written to SPAD; or into the reduction |
 
-新增类型编码 **VT_F32 = 3**，只能放在 ACC。（可选）VT_BF16 = 4，放在 SPAD，布局同 int16，只做存储格式和转换。
+New type encoding **VT_F32 = 3**, only in ACC. (Optional) VT_BF16 = 4 in SPAD, laid out like int16, only a storage format and conversions.
 
-### 6.2 下标模式
+### 6.2 Index modes
 
-src1 与 src2 统一。设输出组号为 g：
+Unified for src1 and src2. Let the output group number be g:
 
-| 模式 | src 字 | 用途 |
+| Mode | src word | Use |
 |---|---|---|
-| LINEAR | g | 普通逐元素运算 |
-| MOD P | g mod P | 按列广播：每通道 scale、RMSNorm 权重、RoPE 表（现有的 period 模式） |
-| DIV P | ⌊g / P⌋ | 按行广播：每行一个标量（max、sum、s_x）；**复制行**：P = D 时把一个向量展开成 A 条带的 D 行（§8.2） |
-| IMM（仅 src2） | — | 命令中的 fp32 常数 |
+| LINEAR | g | Ordinary elementwise operations |
+| MOD P | g mod P | Column broadcast: per-channel scales, RMSNorm weights, RoPE tables (the existing period mode) |
+| DIV P | ⌊g / P⌋ | Row broadcast: one scalar per row (max, sum, s_x); **row replication**: with P = D a vector expands into the D rows of an A strip (§8.2) |
+| IMM (src2 only) | — | An fp32 constant in the command |
 
-两个源各有自己的 P：src1 用新字段 P1，src2 用现有的 period 字段 P2。
+Each source has its own P: src1 uses the new field P1, src2 the existing period field P2.
 
-### 6.3 转置 TRANSPOSE（op=6）
+### 6.3 TRANSPOSE (op=6)
 
-按 D×D 块转置一个“R 行 × S 字”的矩阵，每行 S·D 个元素：
-- 输出第 b 个块的第 i 个字 = 输入第 b 个块中每个字的第 i 个元素；
-- 输入第 b 个块的第 j 个字位于 `src + (⌊b/S⌋·D + j)·S + (b mod S)`；
-- 输出第 b 个块的第 i 个字位于 `dst + b·D + i`。
+Transposes a matrix of "R rows × S words", S·D elements per row, in D×D blocks:
+- word i of output block b = element i of each word of input block b;
+- word j of input block b is at `src + (⌊b/S⌋·D + j)·S + (b mod S)`;
+- word i of output block b is at `dst + b·D + i`.
 
-效果：一个行主序的 K（pos × hs）直接变成矩阵引擎的 B 条带布局（Kᵀ，每 D 个位置一段），见 §8.3。
-- 支持 I8（SPAD → SPAD）和 F32/I32（ACC → ACC）；
-- 硬件上用一个 D×D 的寄存器缓冲，吞吐为每周期一个字。
+Effect: a row-major K (pos × hs) turns directly into the matrix engine's B-strip layout (Kᵀ, one segment per D positions), see §8.3.
+- Supports I8 (SPAD → SPAD) and F32/I32 (ACC → ACC);
+- in hardware a D×D register buffer, with a throughput of one word per cycle.
 
-### 6.4 归约与尾部掩码
+### 6.4 Reductions and tail masks
 
-REDUCE ∈ {NONE, SUM, MAX}，按行进行：一行 = `ROWLEN` 个组。行内先按 lane 累加，再把 D 个 lane 合并。
-**每行只输出一个 fp32 字，值广播到全部 D 个 lane**，这样后续用 DIV 模式就能直接按行取用。
+REDUCE ∈ {NONE, SUM, MAX}, per row: a row = `ROWLEN` groups. Within a row, accumulate per lane first, then merge the D lanes.
+**Each row outputs a single fp32 word, broadcast to all D lanes**, so later DIV-mode accesses can take it per row directly.
 
-- **VALID**：每行只有前 VALID 个元素有效，0 表示全部有效。
-  - 无效元素在归约中取单位元：SUM 取 0，MAX 取 −inf；
-  - 逐元素输出时，无效元素写 0。
-- **加法顺序**（规范，模型必须照做）：
-  1. 每个 lane 按组号顺序**依次**累加：`acc = ((v0 + v1) + v2) + …`；
-  2. 然后对 D 个 lane 按 lane 号两两配对，做二叉树合并：`(l0+l1)+(l2+l3)…`。
-- 归约走多拍路径（§6.7），每个组要等加法器的延迟，吞吐约为每 3–5 个周期一组，换来简单的硬件和确定的顺序。
+- **VALID**: only the first VALID elements of each row are valid; 0 means all are valid.
+  - invalid elements take the identity in reductions: 0 for SUM, −inf for MAX;
+  - in elementwise output, invalid elements are written as 0.
+- **Order of additions** (normative; the models must follow it):
+  1. each lane accumulates **sequentially** in group order: `acc = ((v0 + v1) + v2) + …`;
+  2. then the D lanes are merged by a binary tree, pairing by lane number: `(l0+l1)+(l2+l3)…`.
+- Reductions take the multi-cycle path (§6.7), each group waiting out the adder latency, about one group every 3–5 cycles, in exchange for simple hardware and a deterministic order.
 
-### 6.5 特殊函数
+### 6.5 Special functions
 
-| 函数 | 算法 | 目标精度（对照 float64） |
+| Function | Algorithm | Target accuracy (vs float64) |
 |---|---|---|
-| EXP | t = x·log2(e)，拆成 n = ⌊t⌋ 和 f = t − n；2^f 用 64 段的表 T[i] 加斜率 S[i] 线性插值；结果再乘 2^n（直接加到指数上）；x < −87 输出 0，x > 88 输出 +inf | 相对误差 ≤ 3e-5 |
-| RECIP | x = m·2^e；1/m 用 64 段的表线性插值得到初值；再做一次牛顿迭代 r = r·(2 − m·r)；最后把指数取负 | 相对误差 ≤ 2e-7 |
-| RSQRT | 按指数奇偶把 m 规约到 [1, 4)；查表初值；再做一次牛顿迭代 r = r·(1.5 − 0.5·m·r²) | 相对误差 ≤ 5e-7 |
-| ABS | 清掉符号位 | 精确 |
+| EXP | t = x·log2(e), split into n = ⌊t⌋ and f = t − n; 2^f by linear interpolation in a 64-segment table T[i] with slopes S[i]; the result multiplied by 2^n (added directly to the exponent); x < −87 gives 0, x > 88 gives +inf | Relative error ≤ 3e-5 |
+| RECIP | x = m·2^e; initial 1/m from linear interpolation in a 64-segment table; one Newton step r = r·(2 − m·r); finally the exponent negated | Relative error ≤ 2e-7 |
+| RSQRT | m reduced to [1, 4) by the parity of the exponent; initial value from a table; one Newton step r = r·(1.5 − 0.5·m·r²) | Relative error ≤ 5e-7 |
+| ABS | Clear the sign bit | Exact |
 
-表格由 `llm/sfu_tables.py` 生成，RTL 和功能模拟器共用这一份。
-其他激活函数都由这些基本函数组合，例如 sigmoid(x) = RECIP(1 + EXP(−x))，SiLU(x) = x·sigmoid(x)。
+The tables are generated by `llm/sfu_tables.py`, shared by the RTL and the functional simulator.
+Other activation functions are compositions of these basic functions, e.g. sigmoid(x) = RECIP(1 + EXP(−x)), SiLU(x) = x·sigmoid(x).
 
-### 6.6 编码
+### 6.6 Encoding
 
-**VE 描述符**：M5 格式的扩展。FP=0 时新增字段必须为 0，旧列表语义不变。
+**VE descriptors**: an extension of the M5 format. With FP=0 the new fields must be 0, and old lists keep their meaning.
 
-| 字 | 现有内容 | 新增 |
+| Word | Existing content | New |
 |---|---|---|
-| w1 | src1、src2 LADDR | — |
-| w2 | dst LADDR、LEN | — |
-| w3 | [7:0] op（op 6 = TRANSPOSE），[13:8] types（[1:0] 输入，[3:2] 输出，[5:4] src2 类型，见 §6.9），[31:16] P2（period），[47:32] scale，[52:48] shift | [53] FP，[56:54] FUNC，[58:57] M1，[60:59] M2（3 = IMM），[62:61] REDUCE，[63] SWAPNEG |
-| w4 | [31:0] zp，[63:32] lo | — |
-| w5 | [31:0] hi | [63:32] IMM（fp32） |
-| w6 | 保留 | [31:0] A（fp32），[63:32] B（fp32） |
-| w7 | 保留 | [15:0] ROWLEN，[31:16] VALID，[47:32] P1，[63:48] S（转置的行宽，单位是字） |
+| w1 | src1, src2 LADDR | — |
+| w2 | dst LADDR, LEN | — |
+| w3 | [7:0] op (op 6 = TRANSPOSE), [13:8] types ([1:0] input, [3:2] output, [5:4] src2 type, see §6.9), [31:16] P2 (period), [47:32] scale, [52:48] shift | [53] FP, [56:54] FUNC, [58:57] M1, [60:59] M2 (3 = IMM), [62:61] REDUCE, [63] SWAPNEG |
+| w4 | [31:0] zp, [63:32] lo | — |
+| w5 | [31:0] hi | [63:32] IMM (fp32) |
+| w6 | Reserved | [31:0] A (fp32), [63:32] B (fp32) |
+| w7 | Reserved | [15:0] ROWLEN, [31:16] VALID, [47:32] P1, [63:48] S (transpose row width, in words) |
 
-- **PCPI `vec_cfg` 新 key**：10 FLAGS（对应 w3[63:53]），11 IMM，12 A，13 B，14 ROWLEN/VALID，15 P1/S。
-- 调度器命令包 `SA_PKT_W` 从 261 位加宽；调度器 FIFO 用的是 LUTRAM，加宽不影响 BRAM。
-- **CAPS bit 23** 表示有 fp32 VE。
+- **New PCPI `vec_cfg` keys**: 10 FLAGS (corresponding to w3[63:53]), 11 IMM, 12 A, 13 B, 14 ROWLEN/VALID, 15 P1/S.
+- The scheduler command packet `SA_PKT_W` widens beyond 261 bits; the scheduler FIFO uses LUTRAM, so widening does not affect BRAM.
+- **CAPS bit 23** means an fp32 VE is present.
 
-### 6.7 实现：混合结构
+### 6.7 Implementation: a hybrid structure
 
-每个 lane 的数据通路：
+Each lane's data path:
 
 ```
 cvt(src1) ─ SWAPNEG ─┐
-                      ├─ [M1 乘 | A1 加减 | 比较] ─ [M2 乘 A] ─ [A2 加 B] ─┬─ cvt/饱和 ─► 输出 FIFO
-cvt(src2)/IMM ────────┘                                                   │
-                                        FUNC ≠ NONE 或 REDUCE ≠ NONE：回到 M2/A2 做多拍微操作
-                                        （查表、插值、牛顿迭代、累加）
+                      ├─ [M1 mul | A1 add/sub | compare] ─ [M2 mul A] ─ [A2 add B] ─┬─ cvt/saturate ─► output FIFO
+cvt(src2)/IMM ────────┘                                                            │
+                                        FUNC ≠ NONE or REDUCE ≠ NONE: back to M2/A2 for multi-cycle micro-operations
+                                        (lookup, interpolation, Newton steps, accumulation)
 ```
 
-- **流水部分**：输入转换 → OP → 仿射 → 输出转换。每个 lane 有 2 个乘法器（M1、M2）和 2 个加法器（A1、A2）。
-  **逐元素运算和仿射每周期处理一组**，这是后处理、RoPE、残差、量化这些高频操作的路径。
-- **多拍部分**：特殊函数和归约**复用 M2、A2**，由所有 lane 共用的一个微程序控制器按步执行。
-  - EXP 约 8 步，RECIP/RSQRT 约 10 步，归约每组 1 步，外加加法器延迟；
-  - 这段时间里读数单元由 `fp_ready` 暂停；
-  - 特殊函数只出现在 softmax、norm、SiLU 中，元素数量不多。
-- **为什么不全做成多拍**：
-  - 单序列 decode 时，多拍结构的 VE 只多约 6% 的时间；
-  - 但多序列并发和 prefill 时，VE 的工作量随行数成倍增加，而读权重的量不变。
-    例如 8 条序列同时解码时，多拍结构的 VE 会占约 40% 的时间，流水结构约 5%（估计）。
-  - 资源放得下（§12），所以选流水。
-- **新文件**：
-  - `sa_fp32_add.v`、`sa_fp32_mul.v`、`sa_fp32_cvt.v`：自己写，不用 Xilinx IP，这样 xsim 不需要 IP 仿真库；
-    都**按 13.3 ns 设计流水**：加法器 5–6 级，乘法器 3–4 级，每个乘法器用 2 个 DSP；
-  - `sa_sfu_seq.v`：微程序控制器与 LUTRAM 表格；
-  - `sa_ve_fp.v`：D 个 lane，含下标生成、归约和转置缓冲。
-- **与 `sa_ve.v` 的关系**：读写口、命令接口、FIFO 信用计数、写回级和记分板接口都共用，由 FP 位选择路径。
-  - 整数路径不动，M3 的测试不受影响；
-  - FIFO 信用数从 8 增加到 16，以覆盖更长的流水。
-- **调度器**：新模式（DIV/MOD、IMM、TRANSPOSE、归约）下的**精确访问范围**：
-  - DIV P 模式的最后一个字 = 起始 + ⌊(组数 − 1)/P⌋；
-  - IMM 模式没有 src2；
-  - TRANSPOSE 按块的公式计算。
-  这些既用于范围检查，也用于记分板的 bank 掩码。记分板仍按 bank 跟踪；改成更细的按区跟踪是可选项，看数据再决定（§11）。
-- **新增计数器事件**：原计划是 `VE_FP_ACTIVE`、`VE_SFU_BUSY`、`VE_REDUCE`。实际没有新增：fp32 VE 与整数 VE 共用现有的 VE 事件（§6.9）。
+- **Pipelined part**: input conversion → OP → affine → output conversion. Each lane has 2 multipliers (M1, M2) and 2 adders (A1, A2).
+  **Elementwise operations and the affine step process one group per cycle**: this is the path of the frequent operations post-processing, RoPE, residuals and quantization.
+- **Multi-cycle part**: special functions and reductions **reuse M2 and A2**, stepped by one microprogram controller shared by all lanes.
+  - EXP about 8 steps, RECIP/RSQRT about 10, reductions 1 step per group, plus adder latency;
+  - meanwhile the read unit is paused by `fp_ready`;
+  - special functions only occur in softmax, norms and SiLU, on few elements.
+- **Why not make everything multi-cycle**:
+  - for single-sequence decode a multi-cycle VE would take only about 6% more time;
+  - but with concurrent sequences and prefill the VE's work multiplies with the number of rows while the weights read stay the same.
+    E.g. decoding 8 sequences at once, a multi-cycle VE would take about 40% of the time, a pipelined one about 5% (estimate).
+  - the resources fit (§12), so pipelined it is.
+- **New files**:
+  - `sa_fp32_add.v`, `sa_fp32_mul.v`, `sa_fp32_cvt.v`: written ourselves, not Xilinx IP, so xsim needs no IP simulation libraries;
+    all **pipelined for 13.3 ns**: adder 5–6 stages, multiplier 3–4 stages, 2 DSPs per multiplier;
+  - `sa_sfu_seq.v`: the microprogram controller and LUTRAM tables;
+  - `sa_ve_fp.v`: D lanes, with index generation, reductions and the transpose buffer.
+- **Relationship with `sa_ve.v`**: the read/write ports, command interface, FIFO credit counting, write-back stage and scoreboard interface are shared, the FP bit selecting the path.
+  - the integer path is untouched, so M3's tests are unaffected;
+  - FIFO credits increase from 8 to 16 to cover the longer pipeline.
+- **Scheduler**: the **exact access ranges** in the new modes (DIV/MOD, IMM, TRANSPOSE, reductions):
+  - the last word in DIV P mode = start + ⌊(groups − 1)/P⌋;
+  - IMM mode has no src2;
+  - TRANSPOSE computed by the block formula.
+  These serve both the range checks and the scoreboard's bank masks. The scoreboard still tracks by bank; finer per-region tracking is optional, decided by data (§11).
+- **New counter events**: originally planned `VE_FP_ACTIVE`, `VE_SFU_BUSY`, `VE_REDUCE`. None were actually added: the fp32 VE shares the existing VE events with the integer VE (§6.9).
 
-### 6.8 验证
+### 6.8 Verification
 
-- **基本单元的 testbench**：`fp32_add`、`fp32_mul`、`fp32_cvt` 各 10⁶ 组随机输入，外加边界值：
-  ±0、非规格化数、±inf、恰好在 .5 处的舍入、溢出。与 NumPy float32 加 FTZ 处理逐位比对。
-- **`tb_sa_ve_fp`**：测试向量由功能模拟器生成，逐位比对。覆盖：
-  - 每一种 OP、FUNC、下标模式和类型组合；
-  - 归约（含 VALID）、转置、SWAPNEG；
-  - fp32 → int8 的饱和与舍入。
-- **SFU 精度测试**：扫描 10⁶ 个输入，最大相对误差必须满足 §6.5 的目标。
-- **`tb_sa_unit`**：fp32 VE 与 EX、LD 并发时的记分板冲突测试，以及精确访问范围的测试。
-- **系统级**：`gen_desc_cases.py` 增加 softmax、RMSNorm、RoPE、转置等列表，在 `tb_system` 上做联合仿真。
-- **板上** `notebooks/llm/l2_vpu_demo.py`：同样这些算子，板上结果与功能模拟器逐位一致。
-- 所有现有测试不回归：D=8 和 16，`PERF = 0`。
+- **Testbenches of the basic units**: `fp32_add`, `fp32_mul`, `fp32_cvt` with 10⁶ random inputs each, plus boundary values:
+  ±0, denormals, ±inf, rounding exactly at .5, overflow. Compared bit for bit with NumPy float32 plus FTZ handling.
+- **`tb_sa_ve_fp`**: test vectors generated by the functional simulator, compared bit for bit. Coverage:
+  - every combination of OP, FUNC, index mode and type;
+  - reductions (with VALID), transpose, SWAPNEG;
+  - saturation and rounding of fp32 → int8.
+- **SFU accuracy test**: a sweep of 10⁶ inputs; the maximum relative error must meet the targets of §6.5.
+- **`tb_sa_unit`**: scoreboard conflict tests with the fp32 VE concurrent with EX and LD, and tests of the exact access ranges.
+- **System level**: `gen_desc_cases.py` adds lists for softmax, RMSNorm, RoPE, transpose etc., co-simulated on `tb_system`.
+- **On the board**, `notebooks/llm/l2_vpu_demo.py`: the same operators, board results bit-identical to the functional simulator.
+- No existing test regresses: D=8 and 16, `PERF = 0`.
 
-### 6.9 实现记录（与上文设计的差异）
+### 6.9 Implementation record (differences from the design above)
 
-**编码补充**
-- **src2 类型**：types[5:4] 单独给出 src2 的类型：0 与 src1 相同，1 I8，2 I32，3 F32。
-  例如反量化时 src1 是 I32 累加结果，src2 是 F32 的每通道 scale。只在 FP=1 时有效。
-  驱动写作 `DescList.ve(..., t2=...)`，固件用 `SA_VT2(t)`。
-- **PCPI 路径**：`sa_pcpi` 保存 key 10–15 的值，A 的复位值是 1.0。
-  - 只有 FP 命令才把这些字段放进命令包；S 只随 TRANSPOSE 发送；
-  - 所以整数 VE 命令不受之前 `vec_cfg` 设置的影响。
+**Encoding additions**
+- **src2 type**: types[5:4] gives src2's type separately: 0 same as src1, 1 I8, 2 I32, 3 F32.
+  E.g. in dequantization src1 is the I32 accumulator result and src2 the F32 per-channel scales. Only valid with FP=1.
+  The driver writes it as `DescList.ve(..., t2=...)`, the firmware as `SA_VT2(t)`.
+- **PCPI path**: `sa_pcpi` keeps the values of keys 10–15, with A reset to 1.0.
+  - only FP commands put these fields into the command packet; S is sent only with TRANSPOSE;
+  - so integer VE commands are unaffected by earlier `vec_cfg` settings.
 
-**范围规则**（调度器与功能模拟器相同，都是保守的规则）
-- DIV 模式的源、以及 REDUCE 的输出，都按 G 个字做范围检查，而不是按 §6.7 的精确公式。
-- 记分板仍按 bank 跟踪，这样做不影响正确性，只是少数合法命令会被拒绝，编译器必须遵守。
-- TRANSPOSE 要求 (G/D) mod S = 0。功能模拟器检查这一条，RTL 不检查（结果未定义）。
-- LEN 必须是 ROWLEN 的整数倍。功能模拟器报 SHAPE 错误，RTL 不检查。
+**Range rules** (identical in the scheduler and the functional simulator; both conservative)
+- DIV-mode sources and REDUCE outputs are range-checked as G words, not by the exact formula of §6.7.
+- The scoreboard still tracks by bank; this does not affect correctness, it only rejects a few legal commands, which the compiler must respect.
+- TRANSPOSE requires (G/D) mod S = 0. The functional simulator checks this, the RTL does not (the result is undefined).
+- LEN must be a multiple of ROWLEN. The functional simulator reports a SHAPE error, the RTL does not check.
 
-**结构**（`rtl/sysarray/sa_vefp.v`）
-- 整数的 `sa_ve.v` 保持原样，fp32 部分是并列的新模块 `sa_vefp`：
-  - `sa_unit` 按 FP 位和 op=6 把命令分给两者之一；
-  - 两者不会同时忙，存储口和事件按位或；
-  - 计数器事件复用现有的 VE 事件，没有新增编号。
-- **lane 折叠**：`sa_vefp` 只有 FL = D/2 个物理 fp lane（参数，也可以设成 FL = D）。
-  - 一组 D 个元素分成两半，在相邻的两个周期依次进入流水，输出时再拼回一个字；
-  - 原因：D 个 lane 的版本在 D=8 时 sa_unit 综合后约 51k LUT，加上 PicoRV32 装不进 xc7z020（布局失败）；
-    折叠后 sa_vefp 从 28.9k 降到 17.6k LUT，sa_unit 约 40k；
-  - 代价：二元运算本来每组就要读两次，所以速度不变；一元运算和多拍模式慢一半；
-  - 指令集、数值和功能模拟器都不变，结果仍然逐位一致。
-- **流水模式**：FUNC 为 NONE 或 ABS，且没有 REDUCE。
-  - 每 lane 一条固定延迟的流水：i2f ×2 → SWAPNEG → A1/M1/比较 → M2（×A）→ A2（+B）→ RELU/VALID → f2i；
-  - 每周期发出半组，输出 FIFO 32 项。
-- **多拍模式**：EXP、RECIP、RSQRT 或 REDUCE。
-  - 一次只处理一组；A2 之后由微程序控制器复用各 lane 的 M2、A2、i2f、f2i，按 `llm/sfu.py` 的步骤逐个半组执行；
-  - 查表只有一个 ROM，按 lane 依次读取；
-  - 之后做 RELU/VALID，再归约（A2 或比较器，最后是 lane 二叉树）或输出转换。
-- **TRANSPOSE**：一个状态机，把 D 个字按步长 S 读进 D×D 寄存器缓冲，再写出 D 个转置后的字。
-  支持 I8（SPAD）和 I32/F32（ACC）。
-- **基本单元**：`sa_fp32_add.v` 4 级，`sa_fp32_mul.v` 4 级（DSP），`sa_fp32_cvt.v` 的 i2f 和 f2i 各 2 级。
-- **SFU 表格**：`rtl/sysarray/gen_sfu_tables.py` 从 `llm/sfu.py` 生成 `sa_sfu_tables.vh`，一张 256 项的 ROM。
-- **SFU 实测精度**（对照 float64）：EXP 1.84e-5，RECIP 1.18e-7，RSQRT 1.17e-7。
+**Structure** (`rtl/sysarray/sa_vefp.v`)
+- The integer `sa_ve.v` stays as is; the fp32 part is a new parallel module `sa_vefp`:
+  - `sa_unit` routes commands to one of the two by the FP bit and op=6;
+  - the two are never busy at the same time, and their memory ports and events are ORed;
+  - counter events reuse the existing VE events, with no new numbers.
+- **Lane folding**: `sa_vefp` has only FL = D/2 physical fp lanes (a parameter; FL = D also possible).
+  - a group of D elements is split in two halves entering the pipeline in two consecutive cycles, and the output is reassembled into one word;
+  - reason: the D-lane version made sa_unit about 51k LUT after synthesis at D=8, which with PicoRV32 did not fit in the xc7z020 (placement failed);
+    folded, sa_vefp drops from 28.9k to 17.6k LUT, sa_unit about 40k;
+  - cost: binary operations already read twice per group, so their speed is unchanged; unary operations and the multi-cycle mode are half as fast;
+  - the instruction set, numerics and functional simulator are unchanged; results remain bit-exact.
+- **Pipelined mode**: FUNC is NONE or ABS, with no REDUCE.
+  - one fixed-latency pipeline per lane: i2f ×2 → SWAPNEG → A1/M1/compare → M2 (×A) → A2 (+B) → RELU/VALID → f2i;
+  - half a group issued per cycle, an output FIFO of 32 entries.
+- **Multi-cycle mode**: EXP, RECIP, RSQRT or REDUCE.
+  - one group at a time; after A2 the microprogram controller reuses each lane's M2, A2, i2f, f2i, executing the steps of `llm/sfu.py` half group by half group;
+  - there is only one lookup ROM, read lane by lane;
+  - then RELU/VALID, then the reduction (A2 or the comparator, finally the lane binary tree) or the output conversion.
+- **TRANSPOSE**: a state machine reads D words with stride S into a D×D register buffer, then writes out D transposed words.
+  Supports I8 (SPAD) and I32/F32 (ACC).
+- **Basic units**: `sa_fp32_add.v` 4 stages, `sa_fp32_mul.v` 4 stages (DSP), `sa_fp32_cvt.v` i2f and f2i 2 stages each.
+- **SFU tables**: `rtl/sysarray/gen_sfu_tables.py` generates `sa_sfu_tables.vh` from `llm/sfu.py`, one 256-entry ROM.
+- **Measured SFU accuracy** (vs float64): EXP 1.84e-5, RECIP 1.18e-7, RSQRT 1.17e-7.
 
-**验证**
-- `tb_fp32`：56 万组以上向量，含 RNE 恰好在中点的情况；变异测试能检出错误。
-- `tb_sa_vefp`：31 个用例，D=8 和 16，FL = D/2 和 FL = D 都测；折叠逻辑的变异测试能检出错误。
-- `tb_sa_unit`：CAPS 检查，以及经 PCPI `vec_cfg` 的 fp32 与 TRANSPOSE 定向测试。
-- 系统级 `desc_run` 联合仿真：
-  - 4 个 L2 列表：softmax、GEMM + 反量化、RMSNorm + 量化、带 TRANSPOSE 的注意力分数；
-  - 12 个随机 fp32 列表：输入含 NaN、inf、非规格化数；
-  - 预期值由功能模拟器给出，与 RTL 逐位一致。
-- 板上 `notebooks/llm/l2_vpu_demo.py`：
-  - 同样这些列表，外加每次运行几百个随机 fp32 列表；
-  - 功能模拟器拒绝的命令，设备也必须报错。
-- **板上结果**（`bitstreams/l2`：44,005 LUT，82.7%；WNS +1.836 ns，50 MHz）：
-  - 13 个描述符列表全部通过：softmax 4,235 周期，GEMM + 反量化 783，RMSNorm + 量化 997，注意力分数 524；
-  - 300 个随机 fp32 列表与功能模拟器逐位一致；错误隔离通过；
-  - L1、M5、M4 的回归测试全部通过。
+**Verification**
+- `tb_fp32`: over 560k vectors, including RNE cases exactly at the midpoint; mutation tests catch errors.
+- `tb_sa_vefp`: 31 cases at D=8 and 16, tested with both FL = D/2 and FL = D; mutation tests of the folding logic catch errors.
+- `tb_sa_unit`: CAPS checks, and directed tests of fp32 and TRANSPOSE through PCPI `vec_cfg`.
+- System-level `desc_run` co-simulation:
+  - 4 L2 lists: softmax, GEMM + dequantization, RMSNorm + quantization, attention scores with TRANSPOSE;
+  - 12 random fp32 lists with inputs containing NaN, inf, denormals;
+  - expected values from the functional simulator, bit-identical with the RTL.
+- On the board, `notebooks/llm/l2_vpu_demo.py`:
+  - the same lists, plus a few hundred random fp32 lists per run;
+  - commands rejected by the functional simulator must also raise errors on the device.
+- **Board results** (`bitstreams/l2`: 44,005 LUT, 82.7%; WNS +1.836 ns at 50 MHz):
+  - all 13 descriptor lists pass: softmax 4,235 cycles, GEMM + dequantization 783, RMSNorm + quantization 997, attention scores 524;
+  - 300 random fp32 lists bit-identical to the functional simulator; error isolation passes;
+  - the L1, M5 and M4 regressions all pass.
 
 ---
 
-## 7. L3：量化格式与 GEMM 后处理
+## 7. L3: quantization format and GEMM post-processing
 
-### 7.1 模型导出 `llm/export_w8a8.py`
+### 7.1 Model export `llm/export_w8a8.py`
 
-把 llama2.c 的 fp32 checkpoint 导出成设备用的 `*.w8a8` 文件：一个头部加若干段，每段 64 字节对齐。
+Exports llama2.c's fp32 checkpoint to the device's `*.w8a8` file: a header plus several sections, each 64-byte aligned.
 
-| 段 | 内容 |
+| Section | Content |
 |---|---|
-| header | 魔数、版本、dim、hidden、layers、heads、vocab、seq_len、D、各段偏移 |
-| embed | 嵌入表 int8（vocab × dim），外加 s_emb fp32（vocab） |
-| 每层（各层结构相同，按固定步长存放，方便 LOOP 按层递增地址） | rms_att、rms_ffn（fp32，dim）；**Wqkvᵀ**（dim × 3·dim，int8）加 s_w；Woᵀ 加 s_w；**W13ᵀ**（dim × 2·hidden，W1 与 W3 按输出通道拼接）加 s_w；W2ᵀ 加 s_w；K、V 的静态 scale（写入该层描述符的立即数） |
-| final | rms_final（fp32）；Wclsᵀ（dim × vocab）加 s_w |
-| rope | cos 和 sin 表，fp32，seq_len × hs/2，每个元素在一对位置上各存一次（与 SWAPNEG 的配对一致），并按 D 对齐 |
+| header | Magic, version, dim, hidden, layers, heads, vocab, seq_len, D, section offsets |
+| embed | Embedding table int8 (vocab × dim), plus s_emb fp32 (vocab) |
+| Per layer (all layers have the same structure, stored at a fixed stride so LOOP can advance addresses per layer) | rms_att, rms_ffn (fp32, dim); **Wqkvᵀ** (dim × 3·dim, int8) plus s_w; Woᵀ plus s_w; **W13ᵀ** (dim × 2·hidden, W1 and W3 concatenated by output channel) plus s_w; W2ᵀ plus s_w; static scales of K and V (written as immediates into that layer's descriptors) |
+| final | rms_final (fp32); Wclsᵀ (dim × vocab) plus s_w |
+| rope | cos and sin tables, fp32, seq_len × hs/2, each element stored once at each position of a pair (matching SWAPNEG's pairing), D aligned |
 
-KV scale 在不同层取值不同，而 LOOP 按层重复的是同一段循环体。所以每层放一小段参数（fp32 位模式），
-用 LDPARAM 读进 PARAM，再通过动态槽替换 VE 的 A 字段。
+KV scales differ per layer, while LOOP repeats the same body for every layer. So each layer stores a small parameter section (fp32 bit patterns),
+read into a PARAM with LDPARAM and substituted into VE's A field through a dynamic slot.
 
-### 7.2 GEMM 与后处理的命令序列
+### 7.2 Command sequence of GEMM and post-processing
 
-y = x·Wᵀ：
+y = x·Wᵀ:
 
-1. **激活量化**（x 是 fp32 行向量）：
-   - `amax = REDUCE MAX(ABS(x))`；
-   - `inv = RECIP(amax × (1/127))`，得到 127/amax；
-   - `s_x = amax × (1/127)`；
-   - `xq = x × inv`（src2 用 DIV 模式），输出 I8，src1 用 **DIV D** 复制成 A 条带的 D 行（§8.2）。
-2. **GEMM**：Wᵀ 按列分块放进 SPAD_B，两个 bank **交替使用**：计算第 i 块的同时加载第 i+1 块。
-   A 是复制行后的 xq，EX 输出到 ACC（int32）。分块循环用 LOOP 表示，块的地址用 PARAM 按轮递增。
-3. **后处理**（与下一块的加载重叠）：
-   - `y = acc × s_w`：src2 用 MOD 模式，输入 I32 输出 F32；
-   - `y = y × s_x`：src2 用 DIV 模式。
+1. **Activation quantization** (x is an fp32 row vector):
+   - `amax = REDUCE MAX(ABS(x))`;
+   - `inv = RECIP(amax × (1/127))`, giving 127/amax;
+   - `s_x = amax × (1/127)`;
+   - `xq = x × inv` (src2 in DIV mode), output I8, with src1 in **DIV D** mode replicating it into the D rows of an A strip (§8.2).
+2. **GEMM**: Wᵀ goes into SPAD_B in column blocks, the two banks **alternating**: while block i computes, block i+1 loads.
+   A is the row-replicated xq; EX outputs to ACC (int32). The block loop is expressed with LOOP, and the block address advances per round through a PARAM.
+3. **Post-processing** (overlapped with the next block's load):
+   - `y = acc × s_w`: src2 in MOD mode, input I32, output F32;
+   - `y = y × s_x`: src2 in DIV mode.
 
-**L3 验收**：
-- 板上 `l3_linear_demo.py` 用 stories15M 的真实权重，逐层比对 QKV、Wo、W13、W2 和分类层的输出，
-  与功能模拟器逐位一致，与 fp32 参考的误差在 L0 标定的范围内；
-- **计数器指标**：分类层 GEMV 的 LD 忙碌 ≥ 90%，说明 LD 与 EX 确实重叠了。
+**L3 acceptance**:
+- on the board, `l3_linear_demo.py` uses stories15M's real weights to compare the outputs of QKV, Wo, W13, W2 and the classifier layer by layer,
+  bit-identical to the functional simulator, with errors versus the fp32 reference within the range calibrated in L0;
+- **counter metric**: LD busy ≥ 90% for the classifier GEMV, showing that LD and EX really overlap.
 
-### 7.3 实现记录与结果
+### 7.3 Implementation record and results
 
-**文件**
-- `llm/export_w8a8.py`：导出与读取 `.w8a8`。头部之后是张量表（名字、偏移、字节数、是否按层）。
-  - 线性层权重按 B 条带**预先打包**：第 t 块是输出通道 [tD, (t+1)D) 的 (in × D) 行主序 int8；
-  - 所以任意连续的几块在 DDR 中是连续的，一次 LINEAR LD 就能装进 SPAD_B，不需要跨步 DMA；
-  - 打包与 D 有关，头部记录 D。stories15M 在 D=8 时是 24.2 MB。
-- `llm/compile_layer.py`：手写的列表生成器。
-  - `quant_act`：4 条 VE，依次算 amax、s_x、1/s_x，最后用 src1 DIV D 输出复制行的 int8 A 条带；
-  - `linear`：每块 NC 个输出块。NC 取能整除输出块数的最大值，同时要放得下 SPAD_B 一个 bank 和 ACC 的暂存区；
-  - DDR 地址都通过 BASE 重定位（BASE0 = 模型，BASE1 = 输入输出）；
-  - 输出到 DDR 且块数多（分类层）时，用 LOOP_END 循环一对块，PARAM0/1 按步长递增 DDR 地址：
-    列表只有 32 条描述符，实际执行 1046 条。
-- `ref_model.SfuExact`：DeviceModel 用上与硬件逐位一致的 SFU。
-- `llm/test_l3.py`：主机测试。用真实输入跑第 0、5 层和分类层，与 DeviceModel 逐位比对；
-  `--save` 输出板上测试用的用例文件。
-- `notebooks/llm/l3_linear_demo.py`：板上测试。L3 不改硬件，用的是 `bitstreams/l2`。
+**Files**
+- `llm/export_w8a8.py`: exports and reads `.w8a8`. After the header comes a tensor table (name, offset, bytes, whether per layer).
+  - Linear-layer weights are **pre-packed** as B strips: block t is the (in × D) row-major int8 of output channels [tD, (t+1)D);
+  - so any run of consecutive blocks is contiguous in DDR and loads into SPAD_B with one LINEAR LD, with no strided DMA;
+  - the packing depends on D, which the header records. stories15M at D=8 is 24.2 MB.
+- `llm/compile_layer.py`: the hand-written list generator.
+  - `quant_act`: 4 VEs computing amax, s_x, 1/s_x in turn, and finally outputting the row-replicated int8 A strip with src1 DIV D;
+  - `linear`: NC output blocks per chunk. NC is the largest value that divides the number of output blocks while fitting one SPAD_B bank and the ACC staging area;
+  - DDR addresses are all relocated through BASEs (BASE0 = model, BASE1 = input/output);
+  - when the output goes to DDR and there are many blocks (the classifier), LOOP_END loops over a pair of blocks, with PARAM0/1 advancing the DDR addresses by a stride:
+    the list has only 32 descriptors but executes 1046.
+- `ref_model.SfuExact`: DeviceModel uses an SFU bit-identical to the hardware.
+- `llm/test_l3.py`: host test. Runs layers 0, 5 and the classifier with real inputs, compared bit for bit with DeviceModel;
+  `--save` outputs case files for the board test.
+- `notebooks/llm/l3_linear_demo.py`: board test. L3 changes no hardware and uses `bitstreams/l2`.
 
-**验证**
-- 主机上，D=8 和 16 时各层都与 DeviceModel 逐位一致，与 fp32 参考的相对误差为 0.37–3.27%（W2 最大）。
-  循环形式与展开形式的结果完全相同。
-- 变异测试：把反量化顺序改成先乘 s_x 再乘 s_w，每一层都被检出不一致。
-- RTL 联合仿真：`desc_run` 增加一个合成的 L3 线性层（64 → 2880，强制使用循环形式），D=8 和 16 都通过。
+**Verification**
+- On the host, every layer is bit-identical to DeviceModel at D=8 and 16, with relative errors versus the fp32 reference of 0.37–3.27% (W2 the largest).
+  The loop form and the unrolled form give exactly the same results.
+- Mutation test: changing the dequantization order to multiply by s_x before s_w is detected as a mismatch in every layer.
+- RTL co-simulation: `desc_run` gains a synthetic L3 linear layer (64 → 2880, forced into the loop form), passing at D=8 and 16.
 
-**板上结果**（stories15M，D=8，50 MHz）
+**Board results** (stories15M, D=8, 50 MHz)
 
-| 层 | in → out | 周期 | 权重 B/周期 | EX useful | LD 忙碌 |
+| Layer | in → out | Cycles | Weight B/cycle | EX useful | LD busy |
 |---|---|---|---|---|---|
 | Wqkv | 288 → 864 | 42,121 | 5.91 | 73.7% | 75.9% |
 | Wo | 288 → 288 | 16,997 | 4.88 | 60.7% | 63.5% |
 | W13 | 288 → 1536 | 67,517 | 6.55 | 81.8% | 84.0% |
 | W2 | 768 → 288 | 36,319 | 6.09 | 75.9% | 78.4% |
-| 分类层 | 288 → 32000 | 1,258,768 | 7.32 | 91.5% | **93.9%** |
+| Classifier | 288 → 32000 | 1,258,768 | 7.32 | 91.5% | **93.9%** |
 
-- 9 个线性层的板上结果与板上运行的功能模拟器、主机的 DeviceModel 都逐位一致。
-- **分类层 LD 忙碌 93.9%，验收（≥ 90%）通过**。LD 每个忙碌周期 7.91 B，接近一个 HP 口的上限。
-- 小的层 LD 忙碌只有 64–84%：第一块的加载和最后一块的后处理无法重叠，块数少时占比大。
-  L4 把一层的多个线性层串成一个列表，可以把下一个线性层的第一块提前加载。
-- 一层的 4 个线性层合计约 163k 周期（3.3 ms），6 层约 19.7 ms；加上分类层 25 ms，
-  线性层部分约 45 ms/token（约 22 tok/s 的上限，不含注意力和其他 VE 运算）。
+- The board results of 9 linear layers are bit-identical to both the functional simulator run on the board and the host's DeviceModel.
+- **The classifier's LD busy is 93.9%; acceptance (≥ 90%) passes**. LD moves 7.91 B per busy cycle, close to the limit of one HP port.
+- The small layers have LD busy of only 64–84%: the first block's load and the last block's post-processing cannot overlap, a large share when there are few blocks.
+  L4 chains a layer's linear layers into one list, so the next linear layer's first block can be loaded ahead.
+- A layer's 4 linear layers total about 163k cycles (3.3 ms), 6 layers about 19.7 ms; plus the classifier's 25 ms,
+  the linear-layer part is about 45 ms/token (a ceiling of about 22 tok/s, excluding attention and other VE operations).
 
 ---
 
-## 8. L4：一个 decoder 层在设备上执行
+## 8. L4: one decoder layer executing on the device
 
-### 8.1 片上存储分配（D=8，示意，L4 设计时再细化）
+### 8.1 On-chip memory allocation (D=8, illustrative; refined during L4's design)
 
-| 区域 | 用途 |
+| Region | Use |
 |---|---|
-| ACC bank 0 | 残差流 x（fp32，dim/D 个字）；xn；q、k、v；注意力输出；FFN 中间值 h（fp32）；标量（amax、s_x、sum 等，一个字一个） |
-| ACC bank 1 | GEMM 输出（int32，复制行 D × N）；scores |
-| SPAD_A | 复制行的 xq、q、p（int8）；RoPE 表的当前行；各种 scale 向量 |
-| SPAD_B | Wᵀ 的列分块（两个 bank 交替使用）；注意力时放 Kᵀ 条带和 V |
+| ACC bank 0 | Residual stream x (fp32, dim/D words); xn; q, k, v; attention output; FFN intermediate h (fp32); scalars (amax, s_x, sum etc., one per word) |
+| ACC bank 1 | GEMM outputs (int32, replicated rows D × N); scores |
+| SPAD_A | Row-replicated xq, q, p (int8); the current row of the RoPE table; various scale vectors |
+| SPAD_B | Column blocks of Wᵀ (the two banks alternating); Kᵀ strips and V during attention |
 
-手写路径（L4/L5）让残差流一直留在 ACC 中。IREE 路径中，dispatch 之间的数据经过 DDR（§10.3）。
+The hand-written path (L4/L5) keeps the residual stream in ACC throughout. On the IREE path data between dispatches goes through DDR (§10.3).
 
-### 8.2 复制行布局
+### 8.2 The replicated-row layout
 
-A 条带的布局是：字 `w·D + g` = `A[g][w·D .. w·D+D−1]`。
-如果**所有 D 行都放同一个向量 v**，那么字 `w·D + g` 就是 v 的第 w 段，这正好等于用 VE 的 src1 **DIV D** 模式
-展开紧凑存放的 v。
+An A strip's layout is: word `w·D + g` = `A[g][w·D .. w·D+D−1]`.
+If **all D rows hold the same vector v**, word `w·D + g` is the w-th segment of v, which is exactly what VE's src1 **DIV D** mode
+produces when expanding the compactly stored v.
 
-于是 C 的 D 行完全相同，第 0 行按字连续存放（Cstep=1）就是结果向量。
-- 单序列 decode 受带宽限制，D 倍的冗余计算不影响速度；
-- 不需要改 EX；
-- 多序列并发和 prefill 时，把这 D 行换成 D 条不同的序列或 D 个 token 即可（§11）。
+Then the D rows of C are identical, and row 0 stored word-contiguously (Cstep=1) is the result vector.
+- Single-sequence decode is bandwidth bound, so the D-fold redundant computation does not affect speed;
+- EX needs no change;
+- for concurrent sequences and prefill, these D rows are simply replaced by D different sequences or D tokens (§11).
 
-### 8.3 注意力
+### 8.3 Attention
 
-KV cache 每层两块，都是行主序：位置 t 对应 `Smax × dim` 中的第 t 行（int8，所有头放在一起）。
-- **追加一个 token**：k 和 v 各写一行，每行 dim 字节，是 8 的倍数，一条 ST 即可；
-- **按头读取**：rows = pos_pad，row_bytes = hs，pitch = dim。
+The KV cache has two blocks per layer, both row major: position t is row t of `Smax × dim` (int8, all heads together).
+- **Appending a token**: one row each for k and v, dim bytes each, a multiple of 8, one ST each;
+- **Reading per head**: rows = pos_pad, row_bytes = hs, pitch = dim.
 
-对每个头 h（pos_pad = ⌈(pos+1)/D⌉·D，由 PARAM 提供），这一段循环体用 LOOP 重复 heads 次，头的偏移用 PARAM 按轮递增：
+For each head h (pos_pad = ⌈(pos+1)/D⌉·D, supplied by a PARAM), this loop body is repeated heads times with LOOP, the head offset advancing per round through a PARAM:
 
-| 步 | 引擎 | 操作 |
+| Step | Engine | Operation |
 |---|---|---|
-| 1 | LD | K_h（pos_pad × hs）按 LINEAR 读入 SPAD，每行 hs/D 个字。**FENCE_BEFORE**：本 token 的 K 刚由 ST 写入 DDR |
-| 2 | VE | TRANSPOSE（S = hs/D）→ SPAD_B，得到 Kᵀ 条带 |
-| 3 | VE | q_h：amax → s_q；量化成 I8，用 DIV D 复制成 A 条带（K 维 = hs） |
-| 4 | EX | scores = Q_rep · Kᵀ：M = D，K = hs，N = pos_pad（repeat = pos_pad/D，bstep = hs） |
-| 5 | VE | scores 第 0 行 × s_q（DIV 模式）；仿射 A = s_k/√hs；输出 F32 |
-| 6 | VE | softmax，VALID = pos + 1：m = REDUCE MAX；e = EXP(s − m)；sum = REDUCE SUM(e)；r = RECIP(sum)；p = e × r |
-| 7 | VE | pq = p × 127 输出 I8，用 DIV D 复制成 A 条带（K 维 = pos_pad） |
-| 8 | LD | V_h（pos_pad × hs）按 INTERLEAVE 读入 SPAD_B，布局就是 B 条带 |
-| 9 | EX | out_h = P_rep · V_h：M = D，K = pos_pad，N = hs |
-| 10 | VE | × s_v/127（仿射），写入注意力输出的第 h 段（fp32） |
+| 1 | LD | K_h (pos_pad × hs) read LINEAR into SPAD, hs/D words per row. **FENCE_BEFORE**: this token's K was just written to DDR by ST |
+| 2 | VE | TRANSPOSE (S = hs/D) → SPAD_B, giving the Kᵀ strip |
+| 3 | VE | q_h: amax → s_q; quantized to I8, replicated by DIV D into an A strip (K dimension = hs) |
+| 4 | EX | scores = Q_rep · Kᵀ: M = D, K = hs, N = pos_pad (repeat = pos_pad/D, bstep = hs) |
+| 5 | VE | Row 0 of the scores × s_q (DIV mode); affine A = s_k/√hs; output F32 |
+| 6 | VE | softmax with VALID = pos + 1: m = REDUCE MAX; e = EXP(s − m); sum = REDUCE SUM(e); r = RECIP(sum); p = e × r |
+| 7 | VE | pq = p × 127 output as I8, replicated by DIV D into an A strip (K dimension = pos_pad) |
+| 8 | LD | V_h (pos_pad × hs) read INTERLEAVE into SPAD_B, the layout being the B strip |
+| 9 | EX | out_h = P_rep · V_h: M = D, K = pos_pad, N = hs |
+| 10 | VE | × s_v/127 (affine), written into segment h of the attention output (fp32) |
 
-位置 pos 之后填充的 K、V 行由 ARM 在分配时清零，而且 p 在这些位置上为 0，所以结果不受影响。
+The K, V rows padded after position pos are cleared by the ARM at allocation, and p is 0 at those positions, so the result is unaffected.
 
-### 8.4 一层的完整序列
+### 8.4 The complete sequence of one layer
 
-| # | 内容 | 主要命令 |
+| # | Content | Main commands |
 |---|---|---|
-| 0 | （第一层之前）x = 嵌入 | LD 嵌入行（地址 = BASE + PARAM[token×dim]）；LDPARAM 读 s_emb[token]；VE CVT × A（动态槽取 PARAM） |
-| 1 | xn = RMSNorm(x) | VE：REDUCE SUM(x·x)；RSQRT(ss·(1/dim) + eps)；x × r（DIV）；× g（MOD） |
-| 2 | q、k、v = GEMM(xn, Wqkv) | §7.2 |
-| 3 | RoPE(q)、RoPE(k) | LD 读 cos/sin 表的第 pos 行（地址 + PARAM[pos×行字节]）；VE：t1 = x·cos，t2 = SWAPNEG(x)·sin，x = t1 + t2 |
-| 4 | 追加 KV | VE：k × (1/s_k) 输出 I8；ST 写到 K cache 的第 pos 行（地址 = BASE + 层偏移 + PARAM[pos×dim]）；v 同理 |
-| 5 | 注意力 | §8.3 |
-| 6 | x += GEMM(att, Wo) | §7.2，外加 VE ADD |
-| 7 | xn = RMSNorm(x) | 同第 1 步 |
+| 0 | (before the first layer) x = embedding | LD the embedding row (address = BASE + PARAM[token×dim]); LDPARAM reads s_emb[token]; VE CVT × A (dynamic slot from a PARAM) |
+| 1 | xn = RMSNorm(x) | VE: REDUCE SUM(x·x); RSQRT(ss·(1/dim) + eps); x × r (DIV); × g (MOD) |
+| 2 | q, k, v = GEMM(xn, Wqkv) | §7.2 |
+| 3 | RoPE(q), RoPE(k) | LD row pos of the cos/sin tables (address + PARAM[pos×row bytes]); VE: t1 = x·cos, t2 = SWAPNEG(x)·sin, x = t1 + t2 |
+| 4 | Append KV | VE: k × (1/s_k) output as I8; ST to row pos of the K cache (address = BASE + layer offset + PARAM[pos×dim]); likewise v |
+| 5 | Attention | §8.3 |
+| 6 | x += GEMM(att, Wo) | §7.2, plus a VE ADD |
+| 7 | xn = RMSNorm(x) | As step 1 |
 | 8 | h13 = GEMM(xn, W13) | §7.2 |
-| 9 | h = SiLU(h1) · h3 | VE：EXP(−h1)；RECIP(1 + ·)；× h1；× h3 |
-| 10 | x += GEMM(h, W2) | §7.2，外加 VE ADD |
+| 9 | h = SiLU(h1) · h3 | VE: EXP(−h1); RECIP(1 + ·); × h1; × h3 |
+| 10 | x += GEMM(h, W2) | §7.2, plus a VE ADD |
 
-第 1–10 步是一段循环体，用 LOOP 重复 layers 次，每层的权重和 KV 地址用 PARAM 按层步长递增。
-最后：RMSNorm → 分类层 GEMM（按列分块，LOOP）→ 后处理 → ST 把 logits 写回 DDR → END。
+Steps 1–10 are one loop body repeated layers times with LOOP, each layer's weight and KV addresses advancing by the layer stride through PARAMs.
+Finally: RMSNorm → classifier GEMM (column blocks, LOOP) → post-processing → ST writes the logits back to DDR → END.
 
-**规模估计**：有 LOOP 之后，一个模型的静态列表约 150–300 条描述符（展开后约 1.5–2k 条）。
+**Size estimate**: with LOOP, a model's static list is about 150–300 descriptors (about 1.5–2k when unrolled).
 
-### 8.5 PARAM 的分配（手写路径）
+### 8.5 PARAM assignment (hand-written path)
 
-| PARAM | 内容 | 谁来算 |
+| PARAM | Content | Computed by |
 |---|---|---|
-| P0 | pos + 1（VALID） | ARM，每个 token |
-| P1 | pos_pad（rows、LEN） | ARM |
-| P2 | pos_pad / D（repeat、Kt） | ARM |
-| P3 | pos × dim（KV 追加的偏移） | ARM |
-| P4 | pos × RoPE 行字节数 | ARM |
-| P5 | token × dim（嵌入行的偏移） | ARM；IREE 路径用 LDPARAM 在设备上计算 |
-| P6、P7 | 循环变量（层偏移、头偏移、分块偏移） | LOOP 按轮递增；进入循环前用 SETREG 复位 |
+| P0 | pos + 1 (VALID) | ARM, per token |
+| P1 | pos_pad (rows, LEN) | ARM |
+| P2 | pos_pad / D (repeat, Kt) | ARM |
+| P3 | pos × dim (offset for appending KV) | ARM |
+| P4 | pos × RoPE row bytes | ARM |
+| P5 | token × dim (offset of the embedding row) | ARM; on the IREE path computed on the device with LDPARAM |
+| P6, P7 | Loop variables (layer offset, head offset, block offset) | Advanced per round by LOOP; reset with SETREG before entering a loop |
 
-### 8.6 验证
+### 8.6 Verification
 
-- **列表生成器 `llm/compile_layer.py`**：输入模型配置与存储分配，输出带 LOOP、PARAM 的静态列表。L6-IREE 会把它换成编译器。
-- **小模型联合仿真**：随机权重，dim=32、hidden=64、2 个头、2 层（用来测试 LOOP）、vocab=64、seq=16。
-  - 同一张列表在 `tb_system`（RTL）与功能模拟器上执行，logits 逐位一致；
-  - 功能模拟器与 `ref_model.py` 的设备数值模式对比，误差在容限内；
-  - 覆盖 pos = 0、pos = D−1、pos = D，**只改参数块，列表不变**。
-- **板上** `l4_layer_demo.py`：stories15M 的第 0 层，多个 pos，与功能模拟器逐位一致。
+- **List generator `llm/compile_layer.py`**: takes the model configuration and memory allocation, outputs a static list with LOOP and PARAMs. L6-IREE replaces it with the compiler.
+- **Co-simulation of a small model**: random weights, dim=32, hidden=64, 2 heads, 2 layers (to test LOOP), vocab=64, seq=16.
+  - the same list executed on `tb_system` (RTL) and the functional simulator gives bit-identical logits;
+  - the functional simulator compared with the device numeric mode of `ref_model.py`, errors within tolerance;
+  - covering pos = 0, pos = D−1, pos = D, **changing only the parameter block, the list unchanged**.
+- **On the board**, `l4_layer_demo.py`: layer 0 of stories15M at several pos, bit-identical to the functional simulator.
 
-### 8.7 实现记录与结果
+### 8.7 Implementation record and results
 
-**实现**（`llm/compile_model.py`，`ModelCompiler.build()`）
-- 一张静态列表：嵌入 → 各层 → final RMSNorm → 分类层（循环形式）→ END。
-- 每个 token 只改两样东西：
-  - ARM 的参数块 P0–P5：pos+1、pos_pad、pos_pad/D、scratch、pos_pad·hs、pos_pad·D；
-  - DDR 中的两字参数块（pos、token）。
-- 其余的地址由设备自己用 LDPARAM（读数 × mul）算出：KV 行偏移、RoPE 行偏移、嵌入行偏移；
-  嵌入的 scale 读进 PARAM，再通过动态槽替换 VE 的 A 字段。
-- 注意力按头用 LOOP_END 循环：P6 是 K/V 的字节偏移，P7 是 q/att 的字偏移。
-  - 每个头：K_h 读入后用 TRANSPOSE 得到 Kᵀ 条带；q_h 量化；EX 算分数；分数乘 s_q·a_k；
-  - softmax 用 VALID 掩码；(e·r)·127 量化成 int8 的 P 条带；V_h 用 INTERLEAVE 读入；EX 算 P·V；乘 a_v。
-- 与 §8.4 的差异：
-  - 各层**依次展开**，每层的常数（1/s_k、a_k 等）和权重偏移写成立即数，而不是按层 LOOP。
-    按层 LOOP 需要用 LDPARAM 把这些常数读进动态槽，留到 L5 决定；
-  - stories15M：列表 953 条描述符，每个 token 实际执行 2,477 条。
-- `B = −0.0`：y + (−0) = y 对所有 y 成立，保持零的符号，从而与 DeviceModel 逐位一致。
-- `DeviceModel.forward(n_layers=…)` 可以只跑前 N 层。
+**Implementation** (`llm/compile_model.py`, `ModelCompiler.build()`)
+- One static list: embedding → layers → final RMSNorm → classifier (loop form) → END.
+- Only two things change per token:
+  - the ARM's parameter block P0–P5: pos+1, pos_pad, pos_pad/D, scratch, pos_pad·hs, pos_pad·D;
+  - the two-word parameter block in DDR (pos, token).
+- The other addresses are computed by the device itself with LDPARAM (value read × mul): the KV row offset, the RoPE row offset, the embedding row offset;
+  the embedding's scale is read into a PARAM and substituted into VE's A field through a dynamic slot.
+- Attention loops over heads with LOOP_END: P6 is the byte offset into K/V, P7 the word offset into q/att.
+  - per head: K_h is read and turned into a Kᵀ strip with TRANSPOSE; q_h is quantized; EX computes the scores; the scores are multiplied by s_q·a_k;
+  - softmax with the VALID mask; (e·r)·127 quantized into an int8 P strip; V_h read with INTERLEAVE; EX computes P·V; multiplied by a_v.
+- Differences from §8.4:
+  - layers are **unrolled one after another**, each layer's constants (1/s_k, a_k etc.) and weight offsets written as immediates rather than a per-layer LOOP.
+    A per-layer LOOP needs these constants read into dynamic slots with LDPARAM; left for L5 to decide;
+  - stories15M: the list has 953 descriptors and executes 2,477 per token.
+- `B = −0.0`: y + (−0) = y holds for every y and keeps the sign of zero, making the result bit-identical to DeviceModel.
+- `DeviceModel.forward(n_layers=…)` can run only the first N layers.
 
-**验证**
-- 主机（`llm/test_l4.py`），功能模拟器 vs `DeviceModel(sfu=SfuExact)`：
-  - tiny 模型（dim 32、2 个头、2 层、vocab 64、seq 16）：16 个位置在 D=8 和 16 时，logits 和 KV cache 都逐位一致；
-  - stories15M：12 个 token 逐位一致。
-- RTL 联合仿真（`desc_run`）：tiny 解码器，token 在 pos 0、D−1、D 时，logits 和 KV cache 都逐位一致（D=8 和 16）。
-  每个 token 约 221 条描述符、约 3 万周期。
-- 变异测试：去掉 SWAPNEG，或去掉 V 的 bstep 动态参数，都被检出。
-  去掉 softmax max 的 VALID 没有被检出：填充位置的分数正好是 0，而且 p 的 int8 量化吸收了舍入差异。
-  只有全部有效分数都很负时（exp 下溢，结果为 NaN）掩码才起作用，这个测试没有覆盖到。
+**Verification**
+- Host (`llm/test_l4.py`), functional simulator vs `DeviceModel(sfu=SfuExact)`:
+  - tiny model (dim 32, 2 heads, 2 layers, vocab 64, seq 16): at 16 positions with D=8 and 16, logits and KV cache all bit-identical;
+  - stories15M: 12 tokens bit-identical.
+- RTL co-simulation (`desc_run`): the tiny decoder with tokens at pos 0, D−1, D, logits and KV cache all bit-identical (D=8 and 16).
+  About 221 descriptors and about 30k cycles per token.
+- Mutation tests: removing SWAPNEG, or removing V's dynamic bstep parameter, are both detected.
+  Removing VALID from softmax's max is not detected: the scores at padded positions are exactly 0, and the int8 quantization of p absorbs the rounding differences.
+  The mask only matters when all valid scores are very negative (exp underflows, giving NaN), which this test does not cover.
 
-**板上结果**（`notebooks/llm/l4_decoder_demo.py`，`bitstreams/l2`，stories15M，D=8，50 MHz）
-- 16 个 token 的提示加 20 个贪心 token，**36 个 token 的 logits 都与 DeviceModel 逐位一致**；
-  前 2 个 token 的 logits 和 KV cache 也与板上运行的功能模拟器逐位一致。
-- 设备生成的文本：“Once upon a time, there was a little girl named Lily. She loved to play outside in the
-  sunshine. One day, she saw a big, red ball in”。
-- **每个 token 约 2.48M 周期 = 49.6 ms，即 20.2 tok/s**；加上提交和等待是 51.1 ms。
-  - pos 每增加 D 个位置，多约 18.5k 周期（注意力）；
-  - 对比：ARM 上 llama2.c 的 int8 版本，2 线程 22.9 tok/s。
-- 最后一个 token 的计数器：
-  - EX useful 76.1%，LD 忙碌 78.2%，VE active 15.4%；
-  - 队首阻塞中 VE 占 80.0%：后处理和注意力的 VE 步骤等着前面的 EX 完成；
-  - 每个 token 执行的命令：LD 634 条、ST 172 条、EX 340 条、VE 1,187 条。
+**Board results** (`notebooks/llm/l4_decoder_demo.py`, `bitstreams/l2`, stories15M, D=8, 50 MHz)
+- A 16-token prompt plus 20 greedy tokens: **the logits of all 36 tokens are bit-identical to DeviceModel**;
+  the logits and KV cache of the first 2 tokens are also bit-identical to the functional simulator run on the board.
+- Text generated by the device: "Once upon a time, there was a little girl named Lily. She loved to play outside in the
+  sunshine. One day, she saw a big, red ball in".
+- **About 2.48M cycles per token = 49.6 ms, i.e. 20.2 tok/s**; 51.1 ms including submission and waiting.
+  - every D more positions add about 18.5k cycles (attention);
+  - for comparison: llama2.c's int8 version on the ARM, 2 threads, 22.9 tok/s.
+- Counters of the last token:
+  - EX useful 76.1%, LD busy 78.2%, VE active 15.4%;
+  - VE accounts for 80.0% of head-of-queue blocking: post-processing and attention VE steps waiting for the preceding EX to finish;
+  - commands executed per token: 634 LD, 172 ST, 340 EX, 1,187 VE.
 
-### 8.8 每个 token 的周期分解与优化（L4 之后）
+### 8.8 Per-token cycle breakdown and optimizations (after L4)
 
-**优化 1：预取下一个线性层的第 0 块**（`ModelCompiler(prefetch=True)`，默认开启）
-- 每个线性层最后一块的 EX 一发出，就把下一层第 0 块的权重 LD 进空出来的 SPAD_B bank；注意力改用另一个 bank；
-- 板上 A/B（`notebooks/llm/l4_prefetch_ab.py`）：每个 token 2,477,683 → 2,399,968 周期（**−3.1%**），20.18 → 20.83 tok/s；
-  LD 忙碌 78.2% → 80.7%；两种列表都逐位一致；
-- 收益低于最初的估计：改动前，第 0 块的 LD 本来就和该层的激活量化并行，新增的重叠只有量化之前的那些 VE 步骤。
+**Optimization 1: prefetch block 0 of the next linear layer** (`ModelCompiler(prefetch=True)`, on by default)
+- As soon as the EX of a linear layer's last block is issued, the weights of the next layer's block 0 are LD'd into the freed SPAD_B bank; attention uses the other bank;
+- board A/B (`notebooks/llm/l4_prefetch_ab.py`): 2,477,683 → 2,399,968 cycles per token (**−3.1%**), 20.18 → 20.83 tok/s;
+  LD busy 78.2% → 80.7%; both lists bit-exact;
+- the gain is below the initial estimate: before the change, block 0's LD already ran in parallel with the layer's activation quantization, so the new overlap is only the VE steps before the quantization.
 
-**优化 2：SiLU 融进 W13 的分块循环**（`ModelCompiler(fuse_silu=True)`，默认开启）
-- W13 按 h1 块、h3 块交错计算，每做完一对就算这一段的 SiLU（逐元素，结果不变）；
-- FFN 的激活（H13、U）放在另一个 ACC bank，避开后面偶数位置块的暂存区。EX 和 VE 共用 ACC 端口，
-  碰到同一个 bank 会串行，这样前 3 段 SiLU 就能和下一个 h1 块的 EX 并行；
-- 列表从 953 条增加到 1,025 条描述符（每层多出 3 段，每段 4 条 VE）。
+**Optimization 2: SiLU fused into W13's block loop** (`ModelCompiler(fuse_silu=True)`, on by default)
+- W13 computes h1 blocks and h3 blocks interleaved, and after each pair computes that segment's SiLU (elementwise, results unchanged);
+- the FFN activations (H13, U) live in the other ACC bank, avoiding the staging area of the even-numbered blocks that follow. EX and VE share the ACC port
+  and serialize on the same bank, so this lets the first 3 SiLU segments run in parallel with the next h1 block's EX;
+- the list grows from 953 to 1,025 descriptors (3 more segments per layer, 4 VEs each).
 
-**三方板上对比**（stories15M，`bitstreams/l2`，36 个 token，全部与 DeviceModel 逐位一致）
+**Three-way board comparison** (stories15M, `bitstreams/l2`, 36 tokens, all bit-identical to DeviceModel)
 
-| 列表 | 每个 token 周期 | tok/s（设备） | 相对基线 | LD 忙碌 |
+| List | Cycles per token | tok/s (device) | vs baseline | LD busy |
 |---|---|---|---|---|
-| 基线 | 2,477,684 | 20.18 | — | 78.2% |
-| 预取 | 2,399,974 | 20.83 | −3.1% | 80.7% |
-| 预取 + SiLU 融合 | **2,293,970** | **21.80** | **−7.4%** | 84.4% |
+| Baseline | 2,477,684 | 20.18 | — | 78.2% |
+| Prefetch | 2,399,974 | 20.83 | −3.1% | 80.7% |
+| Prefetch + SiLU fusion | **2,293,970** | **21.80** | **−7.4%** | 84.4% |
 
-- SiLU 融合在预取的基础上又省了约 10.6 万周期（4.4%），与估算（约 4%）一致；
-- tiny 模型（只有 1 对块）用融合反而慢约 5%：拆块增加了开销，唯一的一段 SiLU 后面没有 EX 可以重叠。
-  融合只在块数多的层上划算。
+- SiLU fusion saves another ~106k cycles (4.4%) on top of prefetch, matching the estimate (about 4%);
+- the tiny model (only 1 pair of blocks) is about 5% slower with fusion: splitting blocks adds overhead, and its single SiLU segment has no EX after it to overlap with.
+  Fusion only pays off on layers with many blocks.
 
-**每段单独计时**（`notebooks/llm/l4_phase_cost.py`，pos 35，不预取，每段一张小列表）
+**Each segment timed separately** (`notebooks/llm/l4_phase_cost.py`, pos 35, no prefetch, one small list per segment)
 
-| 段（每层） | 周期 | 其中搬权重的下限（7.9 B/周期） | 其他 |
+| Segment (per layer) | Cycles | Of which the floor for moving weights (7.9 B/cycle) | Other |
 |---|---|---|---|
 | RMSNorm ×2 | 4,367 | — | 4.4k |
-| 量化 + Wqkv 288→864 | 41,513 | 31,498 | 10.0k |
-| RoPE、KV 追加、残差 ×2 | 2,367 | — | 2.4k |
-| 注意力（6 个头，随 pos 增长） | 20,513 | — | 20.5k |
-| 量化 + Wo 288→288 | 16,676 | 10,499 | 6.2k |
-| 量化 + W13 288→1536 | 66,578 | 55,996 | 10.6k |
+| Quantization + Wqkv 288→864 | 41,513 | 31,498 | 10.0k |
+| RoPE, KV append, residual ×2 | 2,367 | — | 2.4k |
+| Attention (6 heads, grows with pos) | 20,513 | — | 20.5k |
+| Quantization + Wo 288→288 | 16,676 | 10,499 | 6.2k |
+| Quantization + W13 288→1536 | 66,578 | 55,996 | 10.6k |
 | SiLU × h3 | 24,780 | — | 24.8k |
-| 量化 + W2 768→288 | 35,746 | 27,998 | 7.7k |
-| **每层合计** | **212,540** | **125,991（59%）** | **86.5k** |
+| Quantization + W2 768→288 | 35,746 | 27,998 | 7.7k |
+| **Total per layer** | **212,540** | **125,991 (59%)** | **86.5k** |
 
-- 分类层（含 final norm）：1,260,410 周期，下限 1,166,582，多出 94k（每块之间的空档）；嵌入 476 周期。
-- 各段相加 2.536M；整张列表实测 2.40M，说明段与段之间已经重叠了约 13.6 万周期。
-- **天花板**：权重流之外的时间全部藏住，每个 token 1.92M 周期，约 26 tok/s（单口、50 MHz）。现在是 20.8 tok/s。
+- The classifier (including the final norm): 1,260,410 cycles, floor 1,166,582, 94k extra (gaps between blocks); embedding 476 cycles.
+- The segments add up to 2.536M; the whole list measures 2.40M, showing about 136k cycles already overlap between segments.
+- **Ceiling**: with all time outside the weight stream hidden, 1.92M cycles per token, about 26 tok/s (single port, 50 MHz). Today 20.8 tok/s.
 
-**剩下的时间在哪里，怎么处理**
+**Where the remaining time is and what to do about it**
 
-| 来源 | 每个 token | 办法 | 类型 |
+| Source | Per token | Approach | Kind |
 |---|---|---|---|
-| SiLU（768 个元素的 EXP、RECIP 走多拍模式） | 约 15 万 | 融进 W13 的分块循环：h1、h3 块交错，每拿到一对就做这一段的 SiLU，与下一块的 EX 并行 | 软件，**已完成**，省约 10.6 万（优化 2） |
-| 注意力（每头十几条串行的小 VE 命令） | 约 12 万，随 pos 增长 | online softmax 合并遍数；相邻两个头交错排列 | 软件 |
-| 每块之间的空档（两个 SPAD_B bank 只能提前一块） | 约 13 万 | 细粒度记分板（§11.3），可以提前两块以上 | 硬件，约 400–600 LUT |
-| 多拍模式本身慢（折叠 + 每步等待） | 包含在前两行里 | 微程序控制器多组交错执行 | 硬件，LUT 紧张 |
+| SiLU (EXP, RECIP of 768 elements in multi-cycle mode) | About 150k | Fused into W13's block loop: h1, h3 blocks interleaved, each pair's SiLU computed as soon as it is available, in parallel with the next block's EX | Software, **done**, saves about 106k (optimization 2) |
+| Attention (a dozen or so serial small VE commands per head) | About 120k, grows with pos | Online softmax to merge passes; interleave two adjacent heads | Software |
+| Gaps between blocks (two SPAD_B banks allow only one block ahead) | About 130k | A fine-grained scoreboard (§11.3) allows two or more blocks ahead | Hardware, about 400–600 LUT |
+| The multi-cycle mode itself is slow (folding + waiting at each step) | Included in the first two rows | Multi-group interleaved execution in the microprogram controller | Hardware, LUTs tight |
 
 ---
 
-## 9. L5：ARM 运行时与端到端生成
+## 9. L5: ARM runtime and end-to-end generation
 
-### 9.1 `llm/runtime.py`：`LlamaDevice`（Python，用于调通和作参考）
+### 9.1 `llm/runtime.py`: `LlamaDevice` (Python, for bring-up and as a reference)
 
-- **加载**：把 `*.w8a8` 读进一块 CMA 缓冲。stories15M 约 16 MB，110M 约 115 MB，需要确认 CMA 大小。
-  另外分配 KV cache（清零）、RoPE 表、logits、scratch、两个命令环和参数块。
-- **列表**：用 `compile_layer.py` 生成一张静态列表，只加载一次。
-- **每个 token**：写参数块（§8.5）→ 提交条目 → 等中断 → 读回 logits → 采样（argmax 或 temperature/top-p，用 NumPy）。
-- **提示词**：L5 逐个 token 走 decode 路径，只是不采样；真正的 prefill 放在 L6。
-- **tokenizer**：`llm/tokenizer.py`，把 llama2.c 的 `tokenizer.bin`（BPE）编码和解码移植过来。
+- **Loading**: read `*.w8a8` into one CMA buffer. stories15M is about 16 MB, 110M about 115 MB; the CMA size needs checking.
+  Also allocate the KV cache (cleared), RoPE tables, logits, scratch, the two command rings and the parameter block.
+- **List**: generate one static list with `compile_layer.py`, loaded once.
+- **Per token**: write the parameter block (§8.5) → submit an entry → wait for the interrupt → read back the logits → sample (argmax or temperature/top-p, in NumPy).
+- **Prompt**: L5 sends the prompt token by token through the decode path, just without sampling; real prefill is left to L6.
+- **tokenizer**: `llm/tokenizer.py`, porting the encoding and decoding of llama2.c's `tokenizer.bin` (BPE).
 
-### 9.2 验收
+### 9.2 Acceptance
 
-板上 `notebooks/llm/l5_generate.py`：
+On the board, `notebooks/llm/l5_generate.py`:
 
-1. **正确性**：stories15M，给定提示词，贪心生成 128 个 token。每个 token 的 logits 与功能模拟器逐位一致，文本完全相同。
-2. **精度**：teacher-forced 条件下，与 fp32 参考的 top-1 一致率达到 L0 定的门槛。
-3. **演示**：生成通顺的 TinyStories 文本，打印 tok/s 和每个 token 的周期分解，只作记录。
-   估计 50 MHz 下约 25 tok/s（stories15M）。
-4. **稳定性**：连续生成 10 段，每段 256 个 token，没有错误和超时，中断次数等于 token 数。
+1. **Correctness**: stories15M with a given prompt, 128 greedy tokens. Every token's logits bit-identical to the functional simulator, identical text.
+2. **Accuracy**: under teacher forcing, top-1 agreement with the fp32 reference reaches the threshold set in L0.
+3. **Demo**: generate fluent TinyStories text, printing tok/s and the per-token cycle breakdown, recorded only.
+   Estimated about 25 tok/s at 50 MHz (stories15M).
+4. **Stability**: 10 consecutive generations of 256 tokens each, no errors or timeouts, interrupt count equal to token count.
 
-### 9.3 实现记录与结果
+### 9.3 Implementation record and results
 
-**文件**
-- `llm/runtime.py`：`LlamaDevice` 与 `Sampler`。
-  - 模型、io 区、KV cache 和静态列表放在同一块 CMA 缓冲里，列表只生成、写入一次；
-  - 每个 token：写参数块 (pos, token) → 带 PARAM 块通过 rt_fw 命令环提交 → 等 notify 中断 → 读 logits → 在 ARM 上采样；
-  - `Sampler` 移植自 run.c：temperature、top-p 和 xorshift 随机数；
-  - 提示词走同一条 decode 路径，`generate()` 也支持 teacher forcing。
-- `driver/pynq_matmul.py`：`Device.irq_events` 统计收到的中断次数。
-- `llm/prepare_l5.py`：主机端参考数据。
-  - 贪心：DeviceModel 金标准每个位置 logits 的 MD5；
-  - 精度：L0 的 8 个评测提示词，fp32 的贪心序列及其每个位置的 top-5，以及 DeviceModel 的 argmax。
-- `notebooks/llm/l5_generate.py`：板上验收，对应 §9.2 的 4 项。
+**Files**
+- `llm/runtime.py`: `LlamaDevice` and `Sampler`.
+  - the model, io area, KV cache and static list share one CMA buffer, and the list is generated and written once;
+  - per token: write the parameter block (pos, token) → submit through rt_fw's command ring with a PARAM block → wait for the notify interrupt → read the logits → sample on the ARM;
+  - `Sampler` is ported from run.c: temperature, top-p and the xorshift random numbers;
+  - the prompt goes through the same decode path, and `generate()` also supports teacher forcing.
+- `driver/pynq_matmul.py`: `Device.irq_events` counts the interrupts received.
+- `llm/prepare_l5.py`: host-side reference data.
+  - greedy: MD5 of the DeviceModel gold-standard logits at every position;
+  - accuracy: L0's 8 evaluation prompts, fp32's greedy sequences with the top-5 at every position, and DeviceModel's argmax.
+- `notebooks/llm/l5_generate.py`: board acceptance, covering the 4 items of §9.2.
 
-**板上结果**（stories15M，D=8，50 MHz，`bitstreams/l2`，每个 token 都等中断）
+**Board results** (stories15M, D=8, 50 MHz, `bitstreams/l2`, waiting for the interrupt on every token)
 
-| 项 | 结果 |
+| Item | Result |
 |---|---|
-| 1 正确性 | 提示词加 128 个贪心 token，共 132 个位置，logits 全部与 DeviceModel 逐位一致，文本完全相同：**通过** |
-| 2 精度 | 在 1,554 个位置上 teacher-forced top-1 与 fp32 一致率 **96.2%**（门槛 95%）；每个位置的 argmax 与 DeviceModel 相同：**通过** |
-| 3 演示 | temperature 0.8、top-p 0.9 生成的故事通顺。墙钟 **15.1 tok/s**，其中设备 18.9 tok/s（每个 token 2.44–2.85M 周期，随 pos 增长）。一个 token 的计数器：EX useful 77%，LD 忙碌 80%（每个忙碌周期 7.90 B），队首阻塞中 VE 占 81% |
-| 4 稳定性 | 10 段 × 256 个 token，共 2,560 个 token，0 个错误，收到 2,560 次中断：**通过**（14.7 tok/s） |
+| 1 Correctness | Prompt plus 128 greedy tokens, 132 positions in all, logits all bit-identical to DeviceModel, identical text: **pass** |
+| 2 Accuracy | Teacher-forced top-1 agreement with fp32 over 1,554 positions **96.2%** (threshold 95%); every position's argmax identical to DeviceModel: **pass** |
+| 3 Demo | Stories generated at temperature 0.8, top-p 0.9 are fluent. Wall clock **15.1 tok/s**, device 18.9 tok/s (2.44–2.85M cycles per token, growing with pos). Counters of one token: EX useful 77%, LD busy 80% (7.90 B per busy cycle), VE accounts for 81% of head-of-queue blocking |
+| 4 Stability | 10 runs × 256 tokens, 2,560 tokens in all, 0 errors, 2,560 interrupts received: **pass** (14.7 tok/s) |
 
-- 墙钟与设备速度的差距约 13 ms/token，花在 ARM 端：NumPy 对 32000 维 logits 做 softmax 和采样、中断等待、logits 拷贝。
-- 对比 ARM 上 llama2.c 的 int8 版本（2 线程）是 22.9 tok/s。本方案的目标是工业界式的架构，而不是速度。
-  主要的提速方向留到 L6：VE 与 EX 重叠、L5.5 的 75 MHz、prefill。
+- The gap between wall-clock and device speed is about 13 ms/token, spent on the ARM: NumPy softmax and sampling over 32000-dimensional logits, waiting for the interrupt, copying the logits.
+- For comparison, llama2.c's int8 version on the ARM (2 threads) does 22.9 tok/s. This plan aims at an industrial-style architecture, not speed.
+  The main speedups are left to L6: overlapping VE with EX, L5.5's 75 MHz, prefill.
 
 ---
 
-## 10. 编译器接口：MLIR / IREE
+## 10. Compiler interface: MLIR / IREE
 
-### 10.1 IREE 的结构与接入点
+### 10.1 IREE's structure and integration points
 
 ```
 PyTorch ──(iree-turbine / torch-mlir)──► MLIR (linalg / tensor)
-  IREE 编译器：Flow（算子融合，划分 dispatch）→ Stream（异步调度，分配缓冲）
-             → HAL（每个 dispatch 编译成目标可执行体；host 端生成 VM 字节码）
-IREE 运行时（ARM 上的 C 代码）：VM → HAL 驱动 → 命令缓冲 → 队列提交 → 信号量
+  IREE compiler: Flow (operator fusion, dispatch formation) → Stream (async scheduling, buffer allocation)
+             → HAL (each dispatch compiled into a target executable; VM bytecode generated for the host)
+IREE runtime (C on the ARM): VM → HAL driver → command buffers → queue submission → semaphores
 ```
 
-接入一个新加速器要做两部分：
-- **编译器端**：一个**目标后端**，把 dispatch 编译成我们的可执行体，也就是位置无关的描述符列表模板，附带元数据：
-  binding 数、push constant 数、入口。
-- **运行时端**：一个 **HAL 驱动**（C 代码），实现设备、内存分配、可执行体缓存、命令缓冲、队列和信号量。
+Integrating a new accelerator takes two parts:
+- **Compiler side**: a **target backend** compiling dispatches into our executables, i.e. position-independent descriptor-list templates with metadata:
+  number of bindings, number of push constants, entry points.
+- **Runtime side**: a **HAL driver** (C code) implementing the device, memory allocation, executable cache, command buffers, queues and semaphores.
 
-### 10.2 概念对照与所需硬件
+### 10.2 Concept mapping and required hardware
 
-| IREE 概念 | 硬件与固件的对应 | 位置 |
+| IREE concept | Hardware and firmware counterpart | Where |
 |---|---|---|
-| dispatch 的 binding | BASE0–15 + 重定位 | §5.3 #1 |
-| push constants、动态维度 | PARAM0–7 + 动态字段 | §5.3 #2、#3 |
-| workgroup 数量（可以是动态的） | LOOP_END，次数可以取自 PARAM | §5.3 #5 |
-| 命令缓冲：记录多个“绑定 + dispatch” | SETREG + CALL 某个可执行体，组成一张列表 | §5.3 #4、#6 |
-| 可执行体（只加载一次） | 位置无关的描述符模板（相对 JUMP/LOOP，CALL/RET） | §5.3 #6 |
-| execution barrier | FENCE 描述符。IREE 要求在屏障处显式同步，与“DDR 依赖不由硬件跟踪”的规则一致 | 已有 |
-| 队列提交与 timeline 信号量 | 命令环条目 + 完成记录的 seq + 中断 | §5.1 |
-| 由数据决定的地址（gather、嵌入、按位置写） | LDPARAM | §5.3 #7 |
-| 缓冲的 flush / invalidate | CMA 缓冲 + 缓存维护 | 软件 |
-| fill、copy、update 缓冲命令 | 可执行体模板：DDR→SPAD→DDR 拷贝；VE 写立即数后 ST | 软件 |
-| 数据分块（`tensor.pack`、mmt4d） | A、B 条带就是 [D, D] 内块的 pack 布局；LD INTERLEAVE 在搬运时完成 pack；权重在编译时预先 pack | 已有 |
-| 多设备（部分 dispatch 在 CPU 上） | ARM 上的 `llvm-cpu` 目标；CMA 缓冲两边都能访问 | 软件 |
+| Dispatch bindings | BASE0–15 + relocation | §5.3 #1 |
+| Push constants, dynamic dimensions | PARAM0–7 + dynamic fields | §5.3 #2, #3 |
+| Workgroup count (can be dynamic) | LOOP_END, with the count from a PARAM | §5.3 #5 |
+| Command buffer: recording several "bind + dispatch" | SETREG + CALL an executable, forming one list | §5.3 #4, #6 |
+| Executables (loaded once) | Position-independent descriptor templates (relative JUMP/LOOP, CALL/RET) | §5.3 #6 |
+| Execution barrier | FENCE descriptor. IREE requires explicit synchronization at barriers, consistent with the rule "DDR dependencies are not tracked by hardware" | Existing |
+| Queue submission and timeline semaphores | Command-ring entries + the seq of completion records + interrupts | §5.1 |
+| Data-dependent addresses (gather, embedding, writes by position) | LDPARAM | §5.3 #7 |
+| Buffer flush / invalidate | CMA buffers + cache maintenance | Software |
+| fill, copy, update buffer commands | Executable templates: DDR→SPAD→DDR copy; VE writes an immediate, then ST | Software |
+| Data tiling (`tensor.pack`, mmt4d) | A and B strips are the pack layout of [D, D] inner tiles; LD INTERLEAVE packs while moving; weights packed ahead at compile time | Existing |
+| Multiple devices (some dispatches on the CPU) | The `llvm-cpu` target on the ARM; CMA buffers accessible from both sides | Software |
 
-### 10.3 由 IREE 带来的约定（不改硬件）
+### 10.3 Conventions that come with IREE (no hardware change)
 
-1. **dispatch 之间的数据经过 DDR**。片上 SPAD/ACC 只相当于 GPU 的 shared memory，不跨 dispatch 保留。
-   decode 时激活只有几 KB，影响很小；dispatch 划得多大由 IREE 的融合决定。
-2. **数值约定**：§3.2 以 fast-math 的形式声明，与 GPU 的做法一致：
-   - FTZ；
-   - EXP/RECIP/RSQRT 是近似计算；
-   - `arith.divf` 降级为 RECIP 加乘法；
-   - `math.exp`、`math.rsqrt` 直接对应 FUNC。
-3. **逐元素运算体**：一个 `linalg.generic` 如果超出 VE 的固定运算链，就拆成几条 VE 命令，中间值放在片上。
-4. **布局类型**：编译器内部定义以下几种布局，并做布局传播：
-   - 紧凑向量；
-   - A 条带、B 条带；
-   - 广播字（每行一个标量）；
-   - Kᵀ 条带。
-   转换算子有三种：TRANSPOSE、DIV-D 复制行、经 DDR 的 LD INTERLEAVE。
-5. **代价模型**：功能模拟器的周期估计（§4.3），用计数器校准。
+1. **Data between dispatches goes through DDR**. The on-chip SPAD/ACC are only like a GPU's shared memory, not kept across dispatches.
+   In decode activations are only a few KB, so the impact is small; how large dispatches are is decided by IREE's fusion.
+2. **Numeric convention**: §3.2 declared as fast-math, as GPUs do:
+   - FTZ;
+   - EXP/RECIP/RSQRT are approximate;
+   - `arith.divf` lowers to RECIP plus a multiply;
+   - `math.exp`, `math.rsqrt` map directly to FUNC.
+3. **Elementwise bodies**: a `linalg.generic` that exceeds the VE's fixed operation chain is split into several VE commands, with intermediates kept on chip.
+4. **Layout types**: the compiler internally defines the following layouts and propagates them:
+   - compact vectors;
+   - A strips, B strips;
+   - broadcast words (one scalar per row);
+   - Kᵀ strips.
+   There are three conversion operators: TRANSPOSE, DIV-D row replication, LD INTERLEAVE through DDR.
+5. **Cost model**: the functional simulator's cycle estimates (§4.3), calibrated with the counters.
 
-> **详细设计**：本节是概要。编译器与运行时的完整设计、分阶段计划（C0–C7）、实现记录和验收见
-> [`iree_compiler_plan.md`](iree_compiler_plan.md)。
+> **Detailed design**: this section is an outline. The full design of the compiler and runtime, the staged plan (C0–C7), implementation records and acceptance are in
+> [`iree_compiler_plan.md`](iree_compiler_plan.md).
 
-### 10.4 两种接入方式
+### 10.4 Two ways of integrating
 
-- **A. 模板库**（先做，L6-IREE）：把 linalg 的具名算子匹配到预先写好的可执行体模板，
-  算子包括 matmul 及其量化形式、softmax、RMSNorm 形式的归约、逐元素运算、transpose、gather。
-  这些模板就是 `compile_layer.py` 中各段的通用化；不支持的 dispatch 留在 `llvm-cpu` 上运行。
-- **B. 完整代码生成**（之后做）：定义一个 `sa` 方言。linalg 经过分块、按 SPAD 做打包和内存规划后，
-  降级成 `sa.ld`、`sa.ex`、`sa.ve`、`sa.loop` 等操作，再序列化成描述符。
+- **A. Template library** (first, L6-IREE): match linalg named operators to pre-written executable templates,
+  covering matmul and its quantized forms, softmax, RMSNorm-style reductions, elementwise operations, transpose, gather.
+  These templates generalize the segments of `compile_layer.py`; unsupported dispatches run on `llvm-cpu`.
+- **B. Full code generation** (later): define an `sa` dialect. After tiling, packing per SPAD and memory planning, linalg
+  lowers to operations such as `sa.ld`, `sa.ex`, `sa.ve`, `sa.loop`, then serializes to descriptors.
 
-两种方式对硬件的要求**相同**，都由 §5.3 和 §6 满足。
+Both approaches have **the same** hardware requirements, met by §5.3 and §6.
 
-**实现情况**：两种都做了。A 是 C3（模板库）；B 是 C5，实际做成两层方言：`sahl`（片上缓冲与 DDR 读写，微内核、内存规划在这一层）与 `sahw`（一个操作对应一条加速器命令），A 的模板改写成 `sahl` 层的微内核，没有微内核时通用降级也能编译全部 dispatch（`iree_compiler_plan.md` §8）。
+**Implementation status**: both were done. A is C3 (the template library); B is C5, actually built as two dialect levels: `sahl` (on-chip buffers and DDR reads/writes, where micro-kernels and memory planning live) and `sahw` (one operation per accelerator command); A's templates were rewritten as `sahl`-level micro-kernels, and without micro-kernels the generic lowering still compiles every dispatch (`iree_compiler_plan.md` §8).
 
-### 10.5 L6-IREE 的交付与验收
+### 10.5 L6-IREE deliverables and acceptance
 
-（实际的位置：编译器插件在 `compiler/plugins/sa`，HAL 驱动在 `compiler/runtime/sa`，见 `compiler/README.md`。现状与之后的计划见 [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.12–§8.19：prefill + decode、代码生成分层重构、主机退路、HuggingFace 原始模型的通用前端（prefill + decode 板上逐位一致）、更大模型所需的 FPGA 规模。）
+(Actual locations: the compiler plugin is in `compiler/plugins/sa`, the HAL driver in `compiler/runtime/sa`, see `compiler/README.md`. The current state and later plans are in [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.12–§8.19: prefill + decode, the layered restructuring of code generation, host fallback, a generic frontend for original HuggingFace models (prefill + decode bit-exact on the board), the FPGA size larger models need.)
 
-- **`iree-sa/compiler`**：HAL 目标后端插件，使用模板库，可执行体格式为 `sa-desc-v1`。
-- **`iree-sa/runtime`**：C 写的 HAL 驱动：
-  - 访问 mailbox、命令环和参数块（通过 mmap）；
-  - UIO 中断；
-  - 用 CMA 分配缓冲；
-  - 信号量对应完成记录的 seq。
-- **验收**：
-  1. IREE 编译的 MLP、softmax、单个 decoder 层，在“CPU + 加速器”混合执行下，结果与功能模拟器逐位一致；
-  2. 用 IREE 编译 stories15M，在板上生成文本，与 L5 手写路径的文本一致（数值约定相同时应逐位一致）。
-- **结果**：第 2 条在 C3 达到（板上 logits 与手写路径逐位一致），第 1 条由逐 dispatch 的差分测试覆盖（每个 dispatch 与 oracle 逐位一致）；之后 C5 换成完整代码生成，C5.5 编译了没有写过专用代码的 SmolLM2-135M（板上）与 Qwen3 结构（sim）。C6：Qwen3-0.6B 全 28 层（sim）。
+- **`iree-sa/compiler`**: the HAL target backend plugin, using the template library, with executable format `sa-desc-v1`.
+- **`iree-sa/runtime`**: a HAL driver in C:
+  - accesses the mailbox, command ring and parameter blocks (through mmap);
+  - UIO interrupts;
+  - allocates buffers from CMA;
+  - semaphores map to the seq of completion records.
+- **Acceptance**:
+  1. an MLP, a softmax and a single decoder layer compiled by IREE, in mixed "CPU + accelerator" execution, bit-identical to the functional simulator;
+  2. stories15M compiled with IREE generates text on the board identical to L5's hand-written path (bit-exact when the numeric conventions are the same).
+- **Result**: item 2 was reached in C3 (board logits bit-identical to the hand-written path), item 1 is covered by per-dispatch differential tests (every dispatch bit-identical to the oracle); afterwards C5 switched to full code generation, and C5.5 compiled SmolLM2-135M (on the board) and the Qwen3 structure (sim) with no dedicated code written for them. C6: Qwen3-0.6B, all 28 layers (sim).
 
 ---
 
-## 11. L5b、L5.5、L6：多序列并发、75 MHz 与后续扩展
+## 11. L5b, L5.5, L6: concurrent sequences, 75 MHz and later extensions
 
-### 11.1 L5b：多序列并发 decode（不改硬件）
+### 11.1 L5b: concurrent multi-sequence decode (no hardware change)
 
-复制行布局中的 D 行换成 D 条序列：
-- 每条序列有自己的 KV cache 与 pos；
-- A 条带由 D 条序列的激活组成：先经 DDR 用 LD INTERLEAVE 转成条带，或者 VE 按行写入；
-- 注意力部分每条序列单独做，因为各自的 pos 不同；
-- 同一份权重服务 D 行，吞吐接近单序列的 D 倍。
+The D rows of the replicated-row layout become D sequences:
+- each sequence has its own KV cache and pos;
+- the A strip is made of the activations of D sequences: converted into a strip through DDR with LD INTERLEAVE, or written row by row by VE;
+- attention is done separately per sequence, since their pos differ;
+- the same weights serve D rows, so throughput approaches D times the single sequence.
 
-验收：8 条序列同时生成，每条的文本与单独生成时一致；记录总 tok/s。
+Acceptance: 8 sequences generated at once, each one's text identical to generating it alone; total tok/s recorded.
 
-**实现记录**（`llm/compile_batch.py` 的 `BatchCompiler`、`llm/runtime.py` 的 `BatchLlamaDevice`；只支持 D=8，D=16 的 ACC 放不下）
-- **激活**：D × n 行主序的 fp32 矩阵，行 b 是序列 b。
-  - 逐元素的 VE 直接跑 D 倍长；
-  - 按序列的归约用 REDUCE 的 ROWLEN = n/D，顺序与单序列相同，所以结果逐位一致；
-  - 每条序列的标量用 DIV 广播，每通道的向量用 MOD。
-- **A 条带**（字 kb·D + b = 序列 b 的第 kb 段）：VE 的下标模式表达不了这种映射，所以绕道 DDR：ST 量化后的矩阵 → FENCE → LD INTERLEAVE。
-- **GEMM**：EX 把 C 直接写进输出矩阵（C 的行步长 = 矩阵的一行），分块边界与 q/k/v、h1/h3 的分段对齐，
-  它们各成一个矩阵；反量化每个线性层只做一次。
-  分类层分块处理，用跨步 ST 写出 D × vocab 的 logits 矩阵。
-- **注意力**：按序列展开，每条序列内部是头循环；该序列的 PARAM 从 DDR 参数表的对应项用 LDPARAM 读入。
-- **每条序列独立**：各有一个 KV cache 和一个 pos，可以在不同的步开始（连续批处理的雏形）；
-  没有序列的槽位跑一个 pos 0 的哑 token。
-- ACC 中注意力阶段与 FFN 阶段的缓冲区复用同一片空间：stories15M 用 3,820 个字。
-- 列表 2,137 条描述符，每步执行 7,231 条。
+**Implementation record** (`BatchCompiler` in `llm/compile_batch.py`, `BatchLlamaDevice` in `llm/runtime.py`; D=8 only, D=16's ACC is too small)
+- **Activations**: a row-major D × n fp32 matrix, row b being sequence b.
+  - elementwise VEs simply run D times as long;
+  - per-sequence reductions use REDUCE with ROWLEN = n/D, in the same order as a single sequence, so the results are bit-exact;
+  - per-sequence scalars are broadcast with DIV, per-channel vectors with MOD.
+- **A strip** (word kb·D + b = segment kb of sequence b): the VE's index modes cannot express this mapping, so it detours through DDR: ST the quantized matrix → FENCE → LD INTERLEAVE.
+- **GEMM**: EX writes C directly into the output matrix (C's row stride = one matrix row), with block boundaries aligned to the segments of q/k/v and h1/h3,
+  each of which becomes its own matrix; dequantization is done once per linear layer.
+  The classifier is processed in blocks, writing the D × vocab logits matrix with strided STs.
+- **Attention**: unrolled per sequence, with a head loop inside each sequence; that sequence's PARAMs are read from its entry in a DDR parameter table with LDPARAM.
+- **Each sequence is independent**: each has its own KV cache and pos and can start at a different step (an early form of continuous batching);
+  slots without a sequence run a dummy token at pos 0.
+- The buffers of the attention phase and the FFN phase reuse the same space in ACC: stories15M uses 3,820 words.
+- The list has 2,137 descriptors and executes 7,231 per step.
 
-**验证**
-- 主机：tiny 模型 16 步、stories15M 12 步，8 条序列错开开始，各序列的 logits 和 KV cache 都与单序列 DeviceModel 逐位一致。
-- RTL 联合仿真：批处理的 tiny 解码器，第 0 步和第 8 步（位置 8..1）逐位一致。
-- 变异测试：RMSNorm 权重的 MOD 改成 DIV，被检出。
+**Verification**
+- Host: the tiny model for 16 steps and stories15M for 12 steps, 8 sequences starting at staggered times, each sequence's logits and KV cache bit-identical to the single-sequence DeviceModel.
+- RTL co-simulation: the batched tiny decoder, bit-exact at steps 0 and 8 (positions 8..1).
+- Mutation test: changing the RMSNorm weights' MOD to DIV is detected.
 
-**板上结果**（`notebooks/llm/l5b_batch_demo.py`，stories15M，`bitstreams/l2`）
+**Board results** (`notebooks/llm/l5b_batch_demo.py`, stories15M, `bitstreams/l2`)
 
-| 方式 | 墙钟 tok/s | 设备 |
+| Mode | Wall-clock tok/s | Device |
 |---|---|---|
-| 单序列（L5 的 `LlamaDevice`） | 17.5 | 2.51M 周期/token，19.9 tok/s |
-| 8 条序列批处理 | **63.3（3.6×）** | 5.19M 周期/步，**77.0 tok/s（3.9×）** |
+| Single sequence (L5's `LlamaDevice`) | 17.5 | 2.51M cycles/token, 19.9 tok/s |
+| 8 sequences batched | **63.3 (3.6×)** | 5.19M cycles/step, **77.0 tok/s (3.9×)** |
 
-- 8 条序列错开开始时，每条 64 个位置都与单独生成**逐位一致**，文本完全相同。
-- 没有达到 8×，因为每一步中与序列数成正比的工作增加了 8 倍：VE 的逐元素和归约、按序列的注意力、A 条带经 DDR 的往返（每次 FENCE）。
-  一步的计数器：EX useful 40.5%，LD 忙碌 42.6%，VE active 51.3%，队首阻塞 VE 28.8%、EX 24.1%、ST 12.3%；VE 命令 4,104 条。
-  所以权重带宽不再是瓶颈，VE 成了瓶颈。继续提速要让 VE 与 EX 重叠、加宽 VE（资源紧），或者减少 FENCE。
+- With the 8 sequences starting at staggered times, all 64 positions of each are **bit-identical** to generating it alone, with identical text.
+- Not 8×, because the work proportional to the number of sequences grows 8-fold per step: VE elementwise operations and reductions, per-sequence attention, the A strip's round trip through DDR (a FENCE each time).
+  Counters of one step: EX useful 40.5%, LD busy 42.6%, VE active 51.3%, head-of-queue blocking VE 28.8%, EX 24.1%, ST 12.3%; 4,104 VE commands.
+  So weight bandwidth is no longer the bottleneck; VE is. Going faster needs VE overlapped with EX, a wider VE (resources are tight), or fewer FENCEs.
 
-### 11.2 L5.5：75 MHz（附加目标）
+### 11.2 L5.5: 75 MHz (extra target)
 
-- `pico_bit.tcl` 中的 `subprocessorClk` 改为 75 MHz。PicoRV32、加速器和 HP 口都用这个时钟，HP 口本身支持到 150 MHz。
-  驱动和运行时里的频率常数同步修改。
-- 以 L0 的时序摸底结果为准，只修必要的路径。已知一条是 `ex/drain_active` 的扇出：
-  复制寄存器，或者给使能加一级流水，按行分组驱动，数据同步延迟一拍。
-- 新模块已经按 13.3 ns 设计，理论上不需要改。
-- **验收**：
-  - WNS ≥ 0；
-  - L1–L5 的全部板上脚本在 75 MHz 下通过；
-  - 性能按周期计算不变，按时间计算快 1.5 倍（估计 stories15M 约 37 tok/s）。
-- **失败不影响前面的成果**：继续在 50 MHz 下使用。
+- Change `subprocessorClk` in `pico_bit.tcl` to 75 MHz. PicoRV32, the accelerator and the HP ports all use this clock; the HP ports themselves support up to 150 MHz.
+  The frequency constants in the driver and runtime change accordingly.
+- Following L0's timing survey, fix only the necessary paths. One known path is the fan-out of `ex/drain_active`:
+  replicate the register, or pipeline the enable one stage driving it in row groups, delaying the data by one cycle to match.
+- The new modules are already designed for 13.3 ns and in principle need no change.
+- **Acceptance**:
+  - WNS ≥ 0;
+  - all L1–L5 board scripts pass at 75 MHz;
+  - performance unchanged in cycles and 1.5× faster in time (estimated about 37 tok/s for stories15M).
+- **Failure does not affect earlier results**: keep using 50 MHz.
 
-### 11.3 L6：后续扩展（按需选做）
+### 11.3 L6: later extensions (optional, as needed)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| 真正的 prefill | D 个 token 一批做 GEMM：先 ST 到 DDR，再用 LD INTERLEAVE 读回，得到 A 条带；块内的因果掩码用按行变化的 VALID |
-| 细粒度记分板 | 每块存储器从 2 个 bank 分成 8 个区跟踪（掩码从 6 位加宽到 24 位），减少虚假依赖。条件是 L4/L5 的计数器显示 `HAZ_*` 占比明显；约 400–600 LUT |
-| bf16 | VE 的 bf16 存储格式与转换（如果 §6 没有做），用于 bf16 导出的 torch 模型 |
-| int4 权重 | 在 LD 路径上把 int4 解包成 int8。**只有 EX 每周期能消耗更多权重时才有收益**，D=8 时没有收益 |
-| ARM 直接提交 | 实现 END 的 IRQ 位，ARM 把列表直接交给取指单元 |
-| 分页 KV cache | K、V 按块存放，ARM 维护块表，块地址通过 LDPARAM 从块表中读取 |
-| 设备端中断门铃 | 用 MMIO 门铃寄存器触发 PicoRV32 中断，取代轮询 |
-| 完整代码生成 | §10.4 的方式 B |
+| Real prefill | GEMM on batches of D tokens: ST to DDR, then read back with LD INTERLEAVE to get A strips; the causal mask within a block uses a VALID that varies by row |
+| Fine-grained scoreboard | Track each memory in 8 regions instead of 2 banks (masks widened from 6 to 24 bits), reducing false dependencies. Conditioned on L4/L5 counters showing a significant `HAZ_*` share; about 400–600 LUT |
+| bf16 | The VE's bf16 storage format and conversions (if not done in §6), for torch models exported in bf16 |
+| int4 weights | Unpack int4 to int8 on the LD path. **Only pays off if EX can consume more weights per cycle**; no gain at D=8 |
+| Direct submission from the ARM | Implement END's IRQ bit; the ARM hands lists directly to the fetch unit |
+| Paged KV cache | K and V stored in blocks, the ARM maintains a block table, block addresses read from it with LDPARAM |
+| Device-side interrupt doorbell | An MMIO doorbell register triggers a PicoRV32 interrupt, replacing polling |
+| Full code generation | Approach B of §10.4 |
 
 ---
 
-## 12. 资源与时序预算
+## 12. Resource and timing budget
 
-xc7z020：53,200 LUT、106,400 FF、220 DSP、140 BRAM36。以下都是**估计值**，以综合结果为准：
+xc7z020: 53,200 LUT, 106,400 FF, 220 DSP, 140 BRAM36. All figures below are **estimates**; synthesis results decide:
 
-| 部分 | LUT | DSP | BRAM36 | 依据 |
+| Part | LUT | DSP | BRAM36 | Basis |
 |---|---|---|---|---|
-| D=8 基线（M3 实测 21.7k，加 PERF 和 DESC） | ~24k | 96 | 130 | M3 报告；D=16 时计数器与取指合计约 +1.8k |
-| L1 命令环、中断、`mat_notify` | < 0.3k | 0 | 0 | 几个寄存器 |
-| L1 命令处理扩展（16 个 BASE、PARAM、动态字段、SETREG、LOOP、CALL/RET、LDPARAM） | 1.5–2.5k（**实测约 3.6k**） | 1（实测 2） | 0 | **OOC 实测**（D=8，50 MHz）：取指单元 4,408 LUT、2,106 FF、2 DSP，整个 `sa_unit` 21,787 LUT，WNS +2.37 ns。多出的主要是寄存器组的多个读写口和字段改写逻辑 |
-| L2 fp32 lane × 8（2 个乘法器、2 个加法器、转换、比较、表格） | 11–14k（**实测：8 lane 约 18.6k，放不下；折叠成 4 lane 后约 9.7k**） | 32（实测 16） | 0 | 每个 lane 实测约 2.3k LUT、2 DSP（i2f ×2、f2i 占了一半）；表格是一张 256 项的 ROM。折叠见 §6.9 |
-| L2 微程序控制、转置缓冲、归约、下标生成、加宽的命令包、精确访问范围 | 2–3k（**实测约 7.5k + 调度器 / 取指 +1.2k**） | 0（实测 2） | 0 | **OOC 实测**（D=8，FL=4，50 MHz）：`sa_vefp` 17,197 LUT、11,696 FF、18 DSP；整个 `sa_unit` 39,062 LUT（73.4%）、28,232 FF、116 DSP、128 BRAM36，WNS +1.62 ns。整体估计约 44.4k（83%） |
-| **合计** | **~39–44k（73–83%）** | **~129** | **130** | D=16 在 92% 时仍能满足 50 MHz |
+| D=8 baseline (M3 measured 21.7k, plus PERF and DESC) | ~24k | 96 | 130 | M3 report; at D=16 counters and fetch together add about 1.8k |
+| L1 command ring, interrupt, `mat_notify` | < 0.3k | 0 | 0 | A few registers |
+| L1 command-processing extensions (16 BASEs, PARAMs, dynamic fields, SETREG, LOOP, CALL/RET, LDPARAM) | 1.5–2.5k (**measured about 3.6k**) | 1 (measured 2) | 0 | **OOC measurement** (D=8, 50 MHz): fetch unit 4,408 LUT, 2,106 FF, 2 DSP, the whole `sa_unit` 21,787 LUT, WNS +2.37 ns. The excess is mainly the register file's multiple read/write ports and the field-rewrite logic |
+| L2 fp32 lanes × 8 (2 multipliers, 2 adders, conversions, comparisons, tables) | 11–14k (**measured: 8 lanes about 18.6k, does not fit; folded to 4 lanes about 9.7k**) | 32 (measured 16) | 0 | Measured about 2.3k LUT and 2 DSP per lane (i2f ×2 and f2i take half); the tables are one 256-entry ROM. Folding: see §6.9 |
+| L2 microprogram control, transpose buffer, reductions, index generation, wider command packet, exact access ranges | 2–3k (**measured about 7.5k + scheduler / fetch +1.2k**) | 0 (measured 2) | 0 | **OOC measurement** (D=8, FL=4, 50 MHz): `sa_vefp` 17,197 LUT, 11,696 FF, 18 DSP; the whole `sa_unit` 39,062 LUT (73.4%), 28,232 FF, 116 DSP, 128 BRAM36, WNS +1.62 ns. Overall estimate about 44.4k (83%) |
+| **Total** | **~39–44k (73–83%)** | **~129** | **130** | D=16 still met 50 MHz at 92% |
 
-- **BRAM** 是最紧张的资源，只剩 10 个。新增存储全部用 LUTRAM 或 FF。
-- **FF** 预计约 50–55k（约 50%），流水寄存器的余量充足。
-- **时序**：50 MHz 下，现有模块已有余量，新模块按 13.3 ns 设计。LUT 超过 80% 时布线拥挤会加重，但 50 MHz 仍有余量。
-- **LUT 超出预算时，按以下顺序削减**：
-  1. 去掉整数 VE 的 int16 路径；
-  2. 去掉 CALL/RET，可执行体改由 ARM 在加载时修改绝对地址；
-  3. fp32 lane 的 M1 与 M2 合并（MUL 与仿射乘法不能同时进行，改为两拍）；
-  4. SFU 表格改成 32 段。
+- **BRAM** is the tightest resource, with only 10 left. All new storage uses LUTRAM or FFs.
+- **FF** expected at about 50–55k (about 50%), plenty of margin for pipeline registers.
+- **Timing**: at 50 MHz the existing modules have margin and the new modules are designed for 13.3 ns. Above 80% LUT routing congestion worsens, but 50 MHz still has margin.
+- **If LUTs exceed the budget, cut in this order**:
+  1. remove the integer VE's int16 path;
+  2. remove CALL/RET, with executables' absolute addresses patched by the ARM at load time;
+  3. merge M1 and M2 of the fp32 lanes (MUL and the affine multiply cannot happen at once; two cycles instead);
+  4. reduce the SFU tables to 32 segments.
 
 ---
 
-## 13. 总体计划与验收
+## 13. Overall plan and acceptance
 
-| 级 | 内容 | 要改的地方 | 需要构建 bitstream | 验收 | 状态（提交） |
+| Level | Content | What changes | Bitstream build needed | Acceptance | Status (commit) |
 |---|---|---|---|---|---|
-| **L0** | D=8 基线与 75 MHz 时序摸底；参考模型与量化精度；功能模拟器；IREE 在 armv7 上的验证 | Python；构建一次 D=8 | 是（不改 RTL） | D=8 回归全部通过；fp32 参考与 `run.c` 文本一致；top-1 一致率 ≥ 门槛；功能模拟器与联合仿真 case 逐位一致；IREE 的 `llvm-cpu` 小模型在板上运行正确，或确定退路 | **完成**（2915e89、602f79c） |
-| **L1** | 命令环、`rt_fw`、中断；命令处理扩展 | sa_cmdfetch、sa_pcpi、sa_legacy、sa_unit、sa_defs、BD、固件、驱动、功能模拟器 | 是 | §5.5：定向测试与随机测试逐位一致；`RING_TEST`；板上 200 条异步提交全部正确；静态列表只改参数块就能正确运行 | **完成**（0d626b8，`bitstreams/l1`） |
-| **L2** | fp32 VPU（混合结构）、SFU、归约、转置、掩码 | sa_ve 与新增 fp32 模块、sa_sched、sa_defs、sa_pcpi、sa_cmdfetch、驱动、功能模拟器 | 是 | §6.8：逐位一致；SFU 精度达标；板上算子与功能模拟器逐位一致；不回归 | **完成**（98a4a66，`bitstreams/l2`；fp lane 折叠为 D/2，44.0k LUT） |
-| **L3** | W8A8 导出；GEMM 与后处理（B 双缓冲） | Python | 否 | 板上各线性层与功能模拟器逐位一致；分类层 GEMV 的 LD 忙碌 ≥ 90% | **完成**（318df51；LD 忙碌 93.9%） |
-| **L4** | 一个 decoder 层（含注意力）在设备上执行，静态列表加 PARAM | Python | 否 | 小模型 RTL、功能模拟器和参考模型三方比对；板上第 0 层逐位一致 | **完成**（a452ca4；整个模型在设备上，20.2 tok/s） |
-| **L5** | Python 运行时；端到端生成文本 | Python | 否 | §9.2 的 4 项 | **完成**（89741a3；15.1 tok/s 墙钟，top-1 96.2%） |
-| L5b | 多序列并发 decode | Python | 否 | §11.1 | **完成**（faf7bc7；8 条序列 63.3 tok/s） |
-| L5.5 | 75 MHz | 时钟与少量时序修复 | 是 | §11.2 | 未做（LUT 已用 83%，时序更难收敛） |
-| **L6-IREE** | 目标后端（模板库）+ C 写的 HAL 驱动 | IREE 插件、C 运行时 | 否 | §10.5，详细设计见 [`iree_compiler_plan.md`](iree_compiler_plan.md) | **大部分完成**（C0–C3、C5 完成：stories15M 板上 17.7 tok/s、SmolLM2-135M 板上 2.22 tok/s，均逐位一致；C4 部分完成；C6 更大的模型进行中：Qwen3-0.6B 全 28 层在 sim 上逐位一致；通用前端：原版 HF 的 SmolLM2 prefill + decode 板上与 sim 逐位一致，Qwen3 不改代码通过） |
-| L6 | 其他扩展 | — | 视情况 | 每项单独定 | 未做 |
+| **L0** | D=8 baseline and 75 MHz timing survey; reference model and quantization accuracy; functional simulator; IREE on armv7 | Python; one D=8 build | Yes (no RTL change) | D=8 regression all passes; the fp32 reference's text identical to `run.c`; top-1 agreement ≥ threshold; functional simulator bit-identical to the co-simulation cases; IREE's `llvm-cpu` small model runs correctly on the board, or a fallback decided | **Done** (2915e89, 602f79c) |
+| **L1** | Command ring, `rt_fw`, interrupt; command-processing extensions | sa_cmdfetch, sa_pcpi, sa_legacy, sa_unit, sa_defs, BD, firmware, driver, functional simulator | Yes | §5.5: directed and random tests bit-exact; `RING_TEST`; 200 asynchronous submissions all correct on the board; a static list runs correctly with only the parameter block changed | **Done** (0d626b8, `bitstreams/l1`) |
+| **L2** | fp32 VPU (hybrid structure), SFU, reductions, transpose, masks | sa_ve and the new fp32 modules, sa_sched, sa_defs, sa_pcpi, sa_cmdfetch, driver, functional simulator | Yes | §6.8: bit-exact; SFU accuracy met; board operators bit-identical to the functional simulator; no regression | **Done** (98a4a66, `bitstreams/l2`; fp lanes folded to D/2, 44.0k LUT) |
+| **L3** | W8A8 export; GEMM and post-processing (B double buffering) | Python | No | Every linear layer on the board bit-identical to the functional simulator; classifier GEMV LD busy ≥ 90% | **Done** (318df51; LD busy 93.9%) |
+| **L4** | One decoder layer (with attention) executing on the device, static list plus PARAMs | Python | No | Small model compared three ways between RTL, functional simulator and reference model; layer 0 bit-exact on the board | **Done** (a452ca4; the whole model on the device, 20.2 tok/s) |
+| **L5** | Python runtime; end-to-end text generation | Python | No | The 4 items of §9.2 | **Done** (89741a3; 15.1 tok/s wall clock, top-1 96.2%) |
+| L5b | Concurrent multi-sequence decode | Python | No | §11.1 | **Done** (faf7bc7; 8 sequences 63.3 tok/s) |
+| L5.5 | 75 MHz | Clock and a few timing fixes | Yes | §11.2 | Not done (LUT already at 83%, timing harder to close) |
+| **L6-IREE** | Target backend (template library) + HAL driver in C | IREE plugin, C runtime | No | §10.5; detailed design in [`iree_compiler_plan.md`](iree_compiler_plan.md) | **Mostly done** (C0–C3 and C5 done: stories15M 17.7 tok/s on the board, SmolLM2-135M 2.22 tok/s on the board, both bit-exact; C4 partly done; C6 larger models in progress: Qwen3-0.6B all 28 layers bit-exact on the sim; generic frontend: the original HF SmolLM2 prefill + decode bit-exact between board and sim, Qwen3 passes without code changes) |
+| L6 | Other extensions | — | Depends | Defined per item | Not done |
 
-- **建议顺序**：L0 → L1 → L2 → L3 → L4 → L5 → L6-IREE，L5b 和 L5.5 可以穿插进行。
-  L1 与 L2 的 RTL 可以合并成一次 bitstream 构建，但分开验证。
-- **构建约定**：Vivado 限 4 个 job，长时间的构建由用户在自己的终端里运行。
-- **提交约定**：每一级上板通过后提交，bitstream 归档到 `bitstreams/l<n>/`。
-
----
-
-## 14. 风险与对策
-
-| 风险 | 表现 | 对策 |
-|---|---|---|
-| W8A8 按通道量化在 15M 这样的小模型上精度不够 | L0 的 top-1 一致率不达标 | 依次尝试：① 改用 42M 或 110M；② KV 改为动态 scale（每个 token 的 scale 存成广播字，读回时用 TRANSPOSE 整理）；③ 对异常值较多的层走 fp32 旁路（在 VE 上用逐元素乘加按行归约做 GEMV）；④ 按组量化：K 按组拆成多条 EX，结果放在不同的 ACC 区，在 VE 中乘各组的 scale 后再累加 |
-| IREE 运行时不能在 armv7 上运行 | L0 §4.4 不通过 | 只用 IREE 编译器，运行时自己用 C 写一个执行器；硬件接口不受影响 |
-| IREE 的插件接口随版本变化 | 升级后编译不过 | 固定一个 IREE 版本；插件代码与 IREE 本身隔离 |
-| LUT 超出预算 | 超过 83%，或布线失败 | 按 §12 的顺序削减 |
-| 动态字段与控制流描述符的逻辑出错 | 列表执行结果错误 | 每一类都有定向测试，外加与功能模拟器对照的随机列表测试；错误都是粘滞的，并记录出错描述符的序号 |
-| PicoRV32 与 ARM 看到的 DDR 不一致 | 固件读到旧的条目或参数块，或 ARM 读到旧的完成记录 | 命令环、参数块和列表都用不开 cache 的缓冲，或者严格执行 flush / invalidate；完成记录先写数据，最后再更新 `RING_HEAD` |
-| PYNQ 或 UIO 找不到中断 | 查不到 `matmul_0/irq` | 先离线用 pynqmetadata 检查 hwh；轮询 `RING_HEAD` 作为备用路径 |
-| 75 MHz 无法满足时序 | L5.5 的 WNS < 0 | 继续使用 50 MHz，前面的成果都不受影响 |
-| 功能模拟器与 RTL 不一致 | 逐位比对失败 | 这正是要发现的问题。以本文档的规范为准，两边都按规范修，并补上测试向量 |
-| 程序 BRAM 不够 | `rt_fw` 超过 0x1E00 | 这个循环很小，估计在 1 KB 以内 |
+- **Suggested order**: L0 → L1 → L2 → L3 → L4 → L5 → L6-IREE, with L5b and L5.5 interleaved.
+  The RTL of L1 and L2 can be merged into one bitstream build but verified separately.
+- **Build convention**: Vivado limited to 4 jobs; long builds are run by the user in their own terminal.
+- **Commit convention**: commit after each level passes on the board, archiving the bitstream in `bitstreams/l<n>/`.
 
 ---
 
-## 附录 A：编码变化汇总
+## 14. Risks and mitigations
 
-| 项 | 编码 | 级 |
+| Risk | Symptom | Mitigation |
 |---|---|---|
-| `mat_notify` | funct7=1，funct3=7：`notify_irq` 一个上升沿脉冲，`NOTIFY_COUNT` 加 1 | L1 |
-| CSR | 0xD4 `NOTIFY_COUNT`（只读） | L1 |
-| `sa_unit` 端口 | `notify_irq`（EDGE_RISING），BD 中接 `irqConcat/In1` | L1 |
-| CAPS | bit 22 NOTIFY/IRQ，bit 23 FP32 VE，bit 24 CMDX（命令处理扩展） | L1 / L2 |
-| mailbox | 0xB0–0xCC：命令环与固件状态（§5.1） | L1 |
-| 命令环条目 | w7 = 参数块地址 | L1 |
-| 描述符 w0 | BASESEL = `{w0[14:13], w0[10:9]}`；w0[31:16] 是两个动态槽 | L1 |
-| 新 opcode | 0x13 LOOP_END，0x14 SETREG，0x15 CALL，0x16 RET，0x17 LDPARAM；JUMP 的 w2[0] = REL | L1 |
-| `mat_cfg` key | 15–26 BASE4–15，27–34 PARAM0–7 | L1 |
-| VE types | VT_F32 = 3（只能放在 ACC）；types[5:4] 是 src2 的类型（0 与 src1 相同，1 I8，2 I32，3 F32）。可选的 VT_BF16 没有实现 | L2 |
-| VE op | 6 = TRANSPOSE（7 保留） | L2 |
-| VE 描述符 | w3[63:53]、w5[63:32]、w6、w7（§6.6） | L2 |
-| `vec_cfg` key | 10 FLAGS，11 IMM，12 A，13 B，14 ROWLEN/VALID，15 P1/S | L2 |
+| Per-channel W8A8 is not accurate enough on a model as small as 15M | L0's top-1 agreement misses the threshold | Try in order: ① switch to 42M or 110M; ② dynamic KV scales (each token's scale stored as a broadcast word, rearranged with TRANSPOSE when read back); ③ an fp32 bypass for layers with many outliers (GEMV on the VE as elementwise multiply-add plus per-row reduction); ④ per-group quantization: K split into several EXs by group, results in different ACC regions, each group's scale multiplied in the VE before accumulating |
+| The IREE runtime does not run on armv7 | L0 §4.4 fails | Use only the IREE compiler, with a self-written executor in C as the runtime; the hardware interface is unaffected |
+| IREE's plugin interfaces change between versions | Compilation breaks after an upgrade | Pin one IREE version; keep plugin code isolated from IREE itself |
+| LUTs over budget | Over 83%, or routing fails | Cut in the order of §12 |
+| Bugs in the dynamic-field and control-flow descriptor logic | Wrong list execution results | Directed tests for every kind, plus random list tests against the functional simulator; all errors are sticky and record the index of the failing descriptor |
+| PicoRV32 and the ARM seeing different DDR contents | The firmware reads stale entries or parameter blocks, or the ARM reads stale completion records | Uncached buffers for the command ring, parameter blocks and lists, or strict flush / invalidate; completion records write data first and update `RING_HEAD` last |
+| PYNQ or UIO cannot find the interrupt | `matmul_0/irq` not found | Check the hwh offline with pynqmetadata first; polling `RING_HEAD` as a fallback path |
+| 75 MHz cannot meet timing | L5.5's WNS < 0 | Keep using 50 MHz; earlier results are unaffected |
+| Functional simulator and RTL disagree | Bit-exact comparison fails | This is exactly what it is meant to find. This document's specification decides; fix both sides to it and add test vectors |
+| Not enough program BRAM | `rt_fw` exceeds 0x1E00 | The loop is small, estimated within 1 KB |
 
-## 附录 B：新增与修改文件
+---
 
-| 路径 | 级 | 内容 |
+## Appendix A: summary of encoding changes
+
+| Item | Encoding | Level |
 |---|---|---|
-| `llm/ref_model.py`、`llm/eval_quant.py` | L0 | 参考模型、量化精度评估与 KV scale 标定 |
-| `llm/sa_funcsim.py` | L0–L2 | 功能模拟器（逐位黄金参考）与周期估计 |
-| `llm/sfu_tables.py`、`llm/gen_ve_fp_vectors.py` | L2 | SFU 表格，fp32 VE 测试向量 |
-| `llm/export_w8a8.py` | L3 | 模型导出 |
-| `llm/compile_layer.py`、`llm/test_l3.py` | L3、L4 | 手写列表生成器（LOOP、PARAM）及其主机测试 |
-| `llm/compile_model.py`、`llm/test_l4.py` | L4 | 整个解码器的静态列表（每个 token 只改参数）及其主机测试 |
-| `llm/runtime.py`、`llm/prepare_l5.py` | L5 | ARM 运行时 `LlamaDevice`、采样器；验收用的参考数据 |
-| `llm/compile_batch.py`、`llm/test_l5b.py` | L5b | 多序列并发 decode 的静态列表（`BatchLlamaDevice`）及其主机测试 |
-| `llm/runtime.py`、`llm/tokenizer.py` | L5 | Python 运行时 |
-| `firmware/rt/` | L1 | 常驻固件 `rt_fw` |
-| `firmware/include/mailbox.h`、`sysarray_intrinsics.h` | L1、L2 | 命令环字段、`mat_notify`、新的 `mat_cfg` / `vec_cfg` key |
-| `rtl/sysarray/sa_cmdfetch.v` | L1 | 命令处理扩展 |
-| `rtl/sysarray/sa_pcpi.v`、`sa_legacy.v`、`sa_unit.v`、`sa_defs.vh` | L1、L2 | `mat_notify`、中断、新 CSR 和 CAPS、新 key、加宽的命令包 |
-| `rtl/sysarray/sa_ve.v`，新增 `sa_ve_fp.v`、`sa_fp32_add.v`、`sa_fp32_mul.v`、`sa_fp32_cvt.v`、`sa_sfu_seq.v` | L2 | fp32 VPU 与 SFU |
-| `rtl/sysarray/sa_sched.v` | L2 | 新模式下的精确访问范围 |
-| `rtl/sysarray/sim/tb_sa_ve_fp.v`，`tb_sa_unit.v`、`firmware/sim/tb_system.v` | L1、L2、L4 | 新测试 |
-| `RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl` | L1、L5.5 | `irqConcat` 改为 2 个端口；时钟改为 75 MHz |
-| `driver/pynq_matmul.py` | L1、L2 | `Device`（命令环、参数块），`DescList` 的新描述符与新字段 |
-| `compiler/plugins/sa`、`compiler/runtime/sa`（原计划的 `iree-sa/…`） | L6-IREE | IREE 目标后端插件与 HAL 驱动 |
-| `notebooks/llm/l1_ring_demo.py` … `l5_generate.py` | L1–L5 | 板上脚本 |
+| `mat_notify` | funct7=1, funct3=7: one rising-edge pulse on `notify_irq`, `NOTIFY_COUNT` incremented | L1 |
+| CSR | 0xD4 `NOTIFY_COUNT` (read-only) | L1 |
+| `sa_unit` port | `notify_irq` (EDGE_RISING), connected to `irqConcat/In1` in the BD | L1 |
+| CAPS | bit 22 NOTIFY/IRQ, bit 23 FP32 VE, bit 24 CMDX (command-processing extensions) | L1 / L2 |
+| mailbox | 0xB0–0xCC: command ring and firmware status (§5.1) | L1 |
+| Command-ring entry | w7 = parameter block address | L1 |
+| Descriptor w0 | BASESEL = `{w0[14:13], w0[10:9]}`; w0[31:16] holds two dynamic slots | L1 |
+| New opcodes | 0x13 LOOP_END, 0x14 SETREG, 0x15 CALL, 0x16 RET, 0x17 LDPARAM; JUMP's w2[0] = REL | L1 |
+| `mat_cfg` keys | 15–26 BASE4–15, 27–34 PARAM0–7 | L1 |
+| VE types | VT_F32 = 3 (only in ACC); types[5:4] is src2's type (0 same as src1, 1 I8, 2 I32, 3 F32). The optional VT_BF16 is not implemented | L2 |
+| VE op | 6 = TRANSPOSE (7 reserved) | L2 |
+| VE descriptor | w3[63:53], w5[63:32], w6, w7 (§6.6) | L2 |
+| `vec_cfg` keys | 10 FLAGS, 11 IMM, 12 A, 13 B, 14 ROWLEN/VALID, 15 P1/S | L2 |
+
+## Appendix B: new and modified files
+
+| Path | Level | Content |
+|---|---|---|
+| `llm/ref_model.py`, `llm/eval_quant.py` | L0 | Reference model, quantization accuracy evaluation and KV scale calibration |
+| `llm/sa_funcsim.py` | L0–L2 | Functional simulator (the bit-exact golden reference) and cycle estimates |
+| `llm/sfu_tables.py`, `llm/gen_ve_fp_vectors.py` | L2 | SFU tables, fp32 VE test vectors |
+| `llm/export_w8a8.py` | L3 | Model export |
+| `llm/compile_layer.py`, `llm/test_l3.py` | L3, L4 | Hand-written list generator (LOOP, PARAM) and its host test |
+| `llm/compile_model.py`, `llm/test_l4.py` | L4 | Static list of the whole decoder (only parameters change per token) and its host test |
+| `llm/runtime.py`, `llm/prepare_l5.py` | L5 | ARM runtime `LlamaDevice`, sampler; reference data for acceptance |
+| `llm/compile_batch.py`, `llm/test_l5b.py` | L5b | Static list for concurrent multi-sequence decode (`BatchLlamaDevice`) and its host test |
+| `llm/runtime.py`, `llm/tokenizer.py` | L5 | Python runtime |
+| `firmware/rt/` | L1 | Resident firmware `rt_fw` |
+| `firmware/include/mailbox.h`, `sysarray_intrinsics.h` | L1, L2 | Command-ring fields, `mat_notify`, new `mat_cfg` / `vec_cfg` keys |
+| `rtl/sysarray/sa_cmdfetch.v` | L1 | Command-processing extensions |
+| `rtl/sysarray/sa_pcpi.v`, `sa_legacy.v`, `sa_unit.v`, `sa_defs.vh` | L1, L2 | `mat_notify`, interrupt, new CSRs and CAPS, new keys, wider command packet |
+| `rtl/sysarray/sa_ve.v`, new `sa_ve_fp.v`, `sa_fp32_add.v`, `sa_fp32_mul.v`, `sa_fp32_cvt.v`, `sa_sfu_seq.v` | L2 | fp32 VPU and SFU |
+| `rtl/sysarray/sa_sched.v` | L2 | Exact access ranges in the new modes |
+| `rtl/sysarray/sim/tb_sa_ve_fp.v`, `tb_sa_unit.v`, `firmware/sim/tb_system.v` | L1, L2, L4 | New tests |
+| `RISCV-on-PYNQ-Z1/scripts/pico_bit.tcl` | L1, L5.5 | `irqConcat` changed to 2 ports; clock changed to 75 MHz |
+| `driver/pynq_matmul.py` | L1, L2 | `Device` (command ring, parameter blocks), new descriptors and fields in `DescList` |
+| `compiler/plugins/sa`, `compiler/runtime/sa` (the originally planned `iree-sa/…`) | L6-IREE | IREE target backend plugin and HAL driver |
+| `notebooks/llm/l1_ring_demo.py` … `l5_generate.py` | L1–L5 | Board scripts |

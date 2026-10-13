@@ -1,3 +1,6 @@
 # local build output (bitstreams, deploy staging)
 /build/
 __pycache__/
+
+# Chinese copies of the docs: local only (the English docs/*.md are authoritative)
+/docs/*.zh.md
