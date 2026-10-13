@@ -97,6 +97,8 @@ def main():
     ap.add_argument("--static-len", action="store_true", help="export the attention over the whole cache (default "
                     "with --attn: over valid[T], T dynamic; sa-llm-run --abi=hfv --pad=D)")
     ap.add_argument("--dyn-len", action="store_true", help=argparse.SUPPRESS)      # (the default)
+    ap.add_argument("--max-len", type=int, default=256, help="the KV cache's length (the longest context); "
+                    "sa-llm-run then needs --valid_len of it (written to sa_args.txt)")
     args = ap.parse_args()
     global ABI
     args.dyn_len = args.attn and not args.static_len
@@ -104,6 +106,8 @@ def main():
     if args.skip_export:                 # (the export's: a build before --dyn-len became the default has none: hf)
         args.dyn_len = os.path.exists(abi_file) and open(abi_file).read().strip() == "hfv"
     ABI = ["--abi=hfv", f"--pad={D}"] if args.dyn_len else ["--abi=hf"]
+    if args.max_len != 256:              # (sa-llm-run's default valid_len)
+        ABI.append(f"--valid_len={args.max_len}")
     torch.set_grad_enabled(False)        # (an autograd graph would keep each fp32 model alive past its del)
     # the wrapper (static cache at the input positions) vs plain HF on the whole prompt
     pr = [int(t) for t in args.prompt.split(",")]
@@ -125,19 +129,19 @@ def main():
     del plain, wr
     gc.collect()                         # (HF modules hold reference cycles: freed only by the collector)
     if args.rope:                        # the rewrite keeps the fp32 model's logits (checked here)
-        base = H.load(args.model, layers=args.layers)
+        base = H.load(args.model, args.max_len, layers=args.layers)
         pr = [int(t) for t in args.prompt.split(",")]
         a = [base(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] for i, t in enumerate(pr)]
         del base                         # (one fp32 model at a time: Llama-1B's is ~5 GB)
         gc.collect()
-        rw = H.load(args.model, rope=True, layers=args.layers)
+        rw = H.load(args.model, args.max_len, rope=True, layers=args.layers)
         b = [rw(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] for i, t in enumerate(pr)]
         del rw
         gc.collect()
         d = max(float((x - y).abs().max()) for x, y in zip(a, b))
         print(f"rope rewrite vs the original model (fp32, torch): max |diff| {d:.3g}")
     if not args.skip_export:
-        w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers,
+        w = H.load(args.model, args.max_len, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers,
                    kv_channel=args.kv_channel, kv_calib=H.kv_calib_arg(args.kv_calib))
         H.export(w, args.out, args.prefill, args.prefill_all, args.dyn_len)
         del w                            # (freed before the compile and the reload below)
@@ -155,7 +159,7 @@ def main():
     ref, tok = [], None
     import contextlib
     with device_sfu() if args.quant else contextlib.nullcontext():
-        w = H.load(args.model, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers,
+        w = H.load(args.model, args.max_len, quant=args.quant, rope=args.rope, attn=args.attn, kv_scales=args.kv_scales, layers=args.layers,
                    kv_channel=args.kv_channel, kv_calib=H.kv_calib_arg(args.kv_calib))   # (fresh state)
         for pos in range(len(prompt) + args.generate):
             tok = prompt[pos] if pos < len(prompt) else tok
@@ -299,7 +303,7 @@ def stage(args, prompt, run):
     if args.layers:
         cfg.num_hidden_layers = args.layers
     hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
-    kv = 2 * cfg.num_hidden_layers * 256 * cfg.num_key_value_heads * hd       # (H.load's max_len)
+    kv = 2 * cfg.num_hidden_layers * args.max_len * cfg.num_key_value_heads * hd
     mb = math.ceil((os.path.getsize(os.path.join(args.out, "sa_packed.irpa")) + kv) / 2**20) + 16
     if mb > 1280:
         raise SystemExit(f"board bundle: window {mb} MB beyond the 1280 MiB pool")

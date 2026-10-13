@@ -393,6 +393,17 @@ Memory gate:
 - "Enlarging the 1280 MiB pool" is not the default solution; the existing CMA, initrd and low-2 GB address space must first be proven conflict free.
 - If even a short context cannot meet the gate, the high 2 GB of DDR (K5-M M2) becomes a prerequisite of Llama's board acceptance.
 
+**Context length (2026-10-13)**: `test_hf_generic.py --max-len T` (default 256, the KV cache's length; writes `--valid_len=T` into `sa_args.txt` when T ≠ 256), and `mem_preflight.py --packed <build>/sa_packed.irpa` uses a build's measured packed size. The packed file contains the KV cache's initial value (`kc` / `vc`), so the device holds the KV twice; the tool corrects the file for the target T. Checked against the board: Llama qsum at T = 256, packed 1182.5 + KV 4.0 = 1186.5 MiB, measured peak 1189.7 MiB. Pool 1280 MiB, 32 MiB margin:
+
+| Model | T = 256 total | T = 512 total | Longest T that fits |
+|---|---:|---:|---:|
+| Llama-3.2-1B | 1218.5 MiB (+61.5) | 1226.5 MiB (+53.5) | 2223 |
+| Qwen3-0.6B | 628.4 MiB | 656.4 MiB | 6213 |
+| Gemma-3-270M | 292.1 MiB | 296.6 MiB | memory 56454; the frontend stops at the 512 sliding window (C6.5) |
+| SmolLM2-135M | 165.9 MiB | 171.5 MiB | 50959 |
+
+Device memory does not limit T = 512 for any of the four models (Llama's earlier "1203 MB" was the `board.txt` window = packed + KV + 16 MiB, not the pool). What T = 512 still needs: the compile-time SPAD capacity check for attention (head_dim 64 / 128 / 256) and a rebuild with the RoPE tables and KV calibration at the new length.
+
 ### 9.4 EX correctness baseline
 
 **Already available**: when K does not fit, splitting by K on EX is work completed in C6.3 (`iree_compiler_plan.md` §8.9; a synthetic model with K = 16384 bit-exact, Llama's W2 executed in 2 blocks); the compiler uses GEMV only when `K × 16 ≤ 65535` (`expandLinear` in `SahlExpandKernels.cpp`), so down_proj already goes to EX automatically. This step only needs to run through and record data.

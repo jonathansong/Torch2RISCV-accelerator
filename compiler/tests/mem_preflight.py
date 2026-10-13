@@ -18,7 +18,8 @@ the packed parameters (sa_packed.irpa) plus the KV cache plus a few MiB
 packed files (constants such as the RoPE tables and the KV scales, padding):
 the estimate takes the items x 1.025.
 
-    python3 compiler/tests/mem_preflight.py build/llm_cache/Llama-3.2-1B-Instruct-W8A8 [--t 256] [--pool-mib 1280]
+    python3 compiler/tests/mem_preflight.py build/llm_cache/Llama-3.2-1B-Instruct-W8A8 [--t 256] [--pool-mib 1280] \
+        [--packed build/hfgen/llama1b_qs/sa_packed.irpa]
 """
 import argparse
 import json
@@ -47,12 +48,26 @@ def tensors(model_dir):
     return out
 
 
+def packed_kv_len(path, per_t):
+    """the KV cache length a packed file was built with (its kc / vc initial values;
+    hf_generic.SaDecoder's buffers), 0 when unknown"""
+    try:
+        import iree.runtime as rt
+    except ImportError:
+        return 0
+    idx = rt.ParameterIndex()
+    idx.load(path)
+    n = sum(e.length for k, e in idx.items() if k.endswith(".kc") or k.endswith(".vc"))
+    return n // per_t
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("model")
     ap.add_argument("--t", type=int, default=256, help="the KV cache's length (the export's max_len)")
     ap.add_argument("--pool-mib", type=float, default=1280, help="the accelerator pool (K5-M M1: 1280 MiB)")
     ap.add_argument("--margin-mib", type=float, default=32, help="work buffers and allocator slack")
+    ap.add_argument("--packed", help="an existing build's sa_packed.irpa: its size instead of the estimate")
     args = ap.parse_args()
     cfg = json.load(open(os.path.join(args.model, "config.json")))
     t = tensors(args.model)
@@ -84,18 +99,30 @@ def main():
             (f"embedding int8{' (shared with the tied classifier)' if tied else ''}", emb), ("its scales", emb_s),
             ("other fp32 (norms, biases)", other)]
     packed = sum(b for _, b in rows)
-    rows += [("constants, padding (2.5%)", 0.025 * packed)]
-    packed *= 1.025
+    per_t = 2 * L * cfg["num_key_value_heads"] * hd                  # KV bytes per position
+    kv_in = 0                                                        # the packed file's own KV (the cache's initial value)
+    if args.packed:                                                  # (measured: the rest is constants, padding)
+        size = os.path.getsize(args.packed)
+        t_build = packed_kv_len(args.packed, per_t)
+        if t_build:                                                  # (the file holds kc / vc at the build's max_len)
+            size += (args.t - t_build) * per_t
+            kv_in = args.t * per_t
+        rows += [(f"constants, padding, KV init ({os.path.basename(args.packed)}"
+                  f"{f', built at T = {t_build}' if t_build else ''})", size - packed)]
+        packed = size
+    else:
+        rows += [("constants, padding (2.5%)", 0.025 * packed)]
+        packed *= 1.025
     rows += [(f"int8 KV cache (T = {args.t})", kv), ("margin (work buffers)", args.margin_mib * 2**20)]
     total = sum(b for _, b in rows)
     print(f"{args.model}: {L} layers, kv_heads {cfg['num_key_value_heads']} x head_dim {hd}, vocab {cfg['vocab_size']}, "
           f"tied {tied}")
     for name, b in rows:
         print(f"  {name:45s} {mib(b):9.1f} MiB")
-    print(f"  {'packed parameters (sa_packed.irpa, about)':45s} {mib(packed):9.1f} MiB")
+    print(f"  {'packed parameters (sa_packed.irpa' + ('' if args.packed else ', about') + ')':45s} {mib(packed):9.1f} MiB")
     print(f"  {'total':45s} {mib(total):9.1f} MiB  of the {args.pool_mib:.0f} MiB pool: "
           f"{'FITS' if mib(total) <= args.pool_mib else 'DOES NOT FIT'} ({args.pool_mib - mib(total):+.1f} MiB)")
-    tmax = int((args.pool_mib * 2**20 - packed - args.margin_mib * 2**20) // (2 * L * cfg["num_key_value_heads"] * hd))
+    tmax = int((args.pool_mib * 2**20 - (packed - kv_in) - args.margin_mib * 2**20) // (per_t * (2 if kv_in else 1)))
     print(f"  the longest KV cache that fits: T = {tmax}")
     return 0 if mib(total) <= args.pool_mib else 1
 
