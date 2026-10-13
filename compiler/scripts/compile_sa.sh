@@ -10,6 +10,8 @@
 # the command buffer (SmolLM2 2 layers: 3 lists a step instead of 1).
 # SA_COMPILE_FLAGS: extra iree-compile flags. SA_D: the array size (--iree-sa-d; default 8).
 # SA_GEMV_PORTS: the overlay's GEMV unit (--iree-sa-gemv-ports; default 0 = none).
+# <dir>/compile_flags.txt (the export's, hf_generic.export): flags the model needs, e.g.
+# --iree-sa-max-dynamic=<the KV cache's length> beyond the default 256.
 # SA_HOST_FALLBACK=0: no host fallback (default 1: every dispatch also gets a
 # VMVX variant; one the sa backend cannot compile runs on the ARM host, plan
 # §8.15; IREE's executable linking is off, it would merge the VMVX variants of
@@ -27,4 +29,5 @@ mkdir -p "$dir/sa_sources"
   $( [ "${SA_HOST_FALLBACK:-1}" = 1 ] && echo --iree-sa-host-fallback --iree-hal-link-executables=false ) \
   $( [ -n "${SA_D:-}" ] && [ "$SA_D" != 8 ] && echo --iree-sa-d="$SA_D" ) \
   $( [ "${SA_GEMV_PORTS:-0}" != 0 ] && echo --iree-sa-gemv-ports="$SA_GEMV_PORTS" ) \
-  --iree-hal-dump-executable-sources-to="$dir/sa_sources" ${SA_COMPILE_FLAGS:-} "$@" -o "$dir/sa.vmfb"
+  --iree-hal-dump-executable-sources-to="$dir/sa_sources" $( [ -f "$dir/compile_flags.txt" ] && cat "$dir/compile_flags.txt" ) \
+  ${SA_COMPILE_FLAGS:-} "$@" -o "$dir/sa.vmfb"

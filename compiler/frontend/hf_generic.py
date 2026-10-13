@@ -850,6 +850,12 @@ def export(w, out, prefill=0, prefill_all=False, dyn_len=None):
     aot.save_module_parameters(irpa, w)
     with open(os.path.join(out, "abi.txt"), "w") as f:      # (sa-llm-run --abi: test_hf_generic --skip-export)
         f.write("hfv\n" if dyn_len else "hf\n")
+    flags = os.path.join(out, "compile_flags.txt")         # (compile_sa.sh: the compiler plans the SPAD for
+    if getattr(w.cache, "max_len", 256) != 256:            # dynamic lengths up to max_dynamic, default 256)
+        with open(flags, "w") as f:
+            f.write(f"--iree-sa-max-dynamic={w.cache.max_len}\n")
+    elif os.path.exists(flags):
+        os.remove(flags)
     print(f"exported in {time.time() - t0:.0f} s: {mlir} ({os.path.getsize(mlir) / 1e6:.1f} MB), "
           f"{irpa} ({os.path.getsize(irpa) / 1e6:.1f} MB)")
     return mlir, irpa
