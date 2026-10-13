@@ -576,7 +576,18 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 
 设备语义比 W8A8 多出的损失主要来自 **int8 注意力概率** `i8(p·127)`：分辨率 1/127，Gemma 的注意力分布分散，大量 p < 0.004 被舍为 0。KV、query 量化与 SFU 近似都在噪声内。与 Qwen3（§8，主因是 int8 KV 的 K 通道离群值）不同，这是模型结构决定的另一类误差。
 
-**候选修复：非归一化概率量化**。量化 `e = exp(s − max)`（最大值恰为 1，且 e ≥ p）而不是 `p = e·r`：`pq = i8(e·127)`，int32 的 PV 结果再乘每行的 r 与 a_v。同样 8 bit，每行分辨率不差于现状，且 r 从乘 T 个概率变为乘 hd 个输出；不改硬件，只改 `hf_generic.sa_attention` 导出的图。主机评估（同设置）：Gemma sa:kch PPL 166.76 → 145.27，top-1 77.8% → 80.5%，KL 0.238 → 0.167。SmolLM2（ct-sa:kch，`build/quality/smollm2_pe_*.json`）也变好：PPL 28.82 → 28.25，top-1 87.7% → 88.7%，KL 0.072 → 0.053。它改变所有模型的数值语义（golden、四个模型的 sim 与板上验收都要重做），是否采用待定。
+**候选修复：非归一化概率量化**。量化 `e = exp(s − max)`（最大值恰为 1，且 e ≥ p）而不是 `p = e·r`：`pq = i8(e·127)`，int32 的 PV 结果再乘每行的 r 与 a_v。同样 8 bit，每行分辨率不差于现状，且 r 从乘 T 个概率变为乘 hd 个输出；不改硬件，只改 `hf_generic.sa_attention` 导出的图。主机评估（同设置）：Gemma sa:kch PPL 166.76 → 145.27，top-1 77.8% → 80.5%，KL 0.238 → 0.167。SmolLM2（ct-sa:kch，`build/quality/smollm2_pe_*.json`）也变好：PPL 28.82 → 28.25，top-1 87.7% → 88.7%，KL 0.072 → 0.053。它改变所有模型的数值语义（golden、四个模型的 sim 与板上验收都要重做）。
+
+**采用：按量化后的和归一化（qsum，2026-10-13）**。`eq = i8(e·127)`，`out = (eq·V) · 127/Σeq · a_v`：实际参与 PV 的权重之和严格为 1，舍为 0 的尾部质量按比例分给留下的 key；Σeq 是精确整数（≤ 127·T），与求和顺序无关。与 fsum（`· 1/Σe`）只差每行一个标量（输出方向相同）。
+
+| 主机 2048 token | 现状 | fsum | **qsum** |
+|---|---|---|---|
+| Gemma PPL / top-1 / KL | 166.76 / 77.8% / 0.238 | 145.27 / 80.5% / 0.167 | 148.52 / 80.3% / 0.176 |
+| SmolLM2 PPL / top-1 / KL | 28.82 / 87.7% / 0.072 | 28.25 / 88.7% / 0.053 | 28.50 / 89.9% / 0.053 |
+
+只看概率量化一步（fp32 Gemma 的 q/k/v，一个 256 token 窗口，16200 个 attention 行）：attention 输出相对误差现状 0.121、fsum 0.0185、qsum 0.0159，qsum 在 81% 的行上更准；尾部质量平均 1.7%（p90 4.0%）。端到端两者之差（Gemma KL 0.009）小于这套评估的波动（如精确 SFU 端到端反而 +0.036），按单步精度与 Σeq 的精确性选 qsum。
+
+实现（`hf_generic.sa_attention` 与归因分支）：Σeq 必须直接对 int8 求和（`eq.to(float32)`，sitofp）：先扩到 i32 再求和（`extsi` 不是 to_i8 的形式）或对 `round(e·127)` 求和（reduction 体里的 `math.roundeven`）都会落到主机。2 层 Gemma 214 个 / SmolLM2 212 个 executable 全在加速器，teacher forcing 设备与 torch 无差异，prefill 5/5 逐位一致；golden 通过。
 
 ## 13. 工作包 WP9：测量基础设施与覆盖矩阵
 

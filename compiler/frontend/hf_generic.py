@@ -212,8 +212,10 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
     M = 1 in decode, the chunk's rows in prefill), key / value the layer's int8
     cache rows [T, kv_heads * hd] (SaCache); per query row (a decode step's
     form: its scalar position): q per head quantized, int32 scores, the prefix
-    mask from the position (HF's mask is not used), softmax, int8
-    probabilities, int32 P V."""
+    mask from the position (HF's mask is not used), the unnormalized softmax
+    e = exp(s - max) quantized (eq = i8(e * 127): the row's largest is 127
+    whatever the row's spread), int32 eq V normalized by the quantized sum
+    (* 127 / sum(eq): the weights sum to 1 exactly; plan §12.4)."""
     cache = module.sa_cache
     l = module.layer_idx
     if SA_FP32 & {"kv", "q", "probs"}:
@@ -243,10 +245,12 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
         mask = torch.arange(T) <= cache.positions[m:m + 1]
         mx = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
         e = torch.where(mask, torch.exp(sc - mx), torch.tensor(0.0))
-        r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
-        pq = _to_i8((e * r) * 127.0).to(torch.int32).reshape(Hk, G, T)
+        eq = _to_i8(e * 127.0)
+        pq = eq.to(torch.int32).reshape(Hk, G, T)
         att = torch.matmul(pq, vh)                                               # (Hk, G, hd) int32
-        outs.append((att.to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd))      # (a_v: a scalar or [Hk, G, hd])
+        # sum(eq) in fp32 straight from the int8 (exact: at most 127 T)
+        rq = torch.reciprocal(torch.sum(eq.to(torch.float32), dim=-1, keepdim=True)).reshape(Hk, G, 1) * 127.0
+        outs.append(((att.to(torch.float32) * rq) * cache.a_v[l]).reshape(1, 1, H, hd))  # (a_v: a scalar or [Hk, G, hd])
     return (outs[0] if M == 1 else torch.cat(outs, dim=1)), None
 
 
@@ -346,15 +350,19 @@ def _sa_attention_fp32(module, query, key, value, scaling):
         mask = torch.arange(T) <= cache.positions[m:m + 1]
         mx = torch.amax(torch.where(mask, sc, torch.tensor(float("-inf"))), dim=-1, keepdim=True)
         e = torch.where(mask, torch.exp(sc - mx), torch.tensor(0.0))
-        r = torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
         if "probs" in SA_FP32 or kv32:
-            p = e * r if "probs" in SA_FP32 else _to_i8((e * r) * 127.0).to(torch.float32) * _f32c(1.0 / 127.0)
+            if "probs" in SA_FP32:
+                p = e * torch.reciprocal(torch.sum(e, dim=-1, keepdim=True))
+            else:
+                eq = _to_i8(e * 127.0).to(torch.float32)
+                p = eq * torch.reciprocal(torch.sum(eq, dim=-1, keepdim=True))
             sv = cache.kv_v[l][:, :1] if cache.v_ch[l] else _f32c(cache.kv_v[l])
             vf = vh if kv32 else vh.to(torch.float32) * sv
             outs.append(torch.matmul(p, vf).reshape(1, 1, H, hd))
         else:
-            pq = _to_i8((e * r) * 127.0).to(torch.int32)
-            outs.append((torch.matmul(pq, vh).to(torch.float32) * cache.a_v[l]).reshape(1, 1, H, hd))
+            pq = _to_i8(e * 127.0).to(torch.int32)
+            rq = torch.reciprocal(torch.sum(pq.to(torch.float32), dim=-1, keepdim=True)) * 127.0
+            outs.append(((torch.matmul(pq, vh).to(torch.float32) * rq) * cache.a_v[l]).reshape(1, 1, H, hd))
     return (outs[0] if M == 1 else torch.cat(outs, dim=1)), None
 
 
