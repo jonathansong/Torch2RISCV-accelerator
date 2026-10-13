@@ -1,6 +1,6 @@
 # After the 4-port GEMV: implementation plan for generality and quantization quality
 
-Status: implementation draft (reviewed 2026-10-10 against the code and the four-port board results: WP0 and WP1 are basically done, WP5's EX baseline already exists, WP6 only lacks compiler integration). **Progress 2026-10-12**: WP2, WP3 (SmolLM2), WP7 (Llama-3.2-1B) accepted on the board; WP4 Qwen3 K per-channel accepted on the board; first version of WP9 done (§13.1: statistics, board teacher forcing, decode / prefill breakdown; with the V projection on GEMV and attention over the actual length, Qwen3 decode 6.88 tok/s, prefill 20.5 tok/s); WP6 switch and boundary tests done; WP6 decode K split integrated into the compiler; SmolLM2 per-channel KV evaluation done (kch 28.82 / 87.7%), SmolLM2 whole model with kch + actual length accepted on the board (decode 22.17, prefill 60.09 tok/s, board PPL 28.55, §7). **Progress 2026-10-13**: Llama-3.2-1B K per-channel rebuild accepted on the board (4.04 / 14.97 tok/s, §11); 4-port performance model recalibrated, §17.1 answers question 6 (next hardware investment W4A8); **WP8 Gemma-3-270M whole model accepted on the board** (790 executables all on the accelerator, 17/17 bit-exact, decode 14.96, prefill 62.5 tok/s, board PPL 158.5, §12.4), §13.2 main table has all four rows, §17.2 answers question 4; Gemma's quality loss traced to the int8 attention probabilities, changed to normalization by the quantized sum (qsum, 1a0ba3d): Gemma, SmolLM2, Qwen3 rebuilt and accepted on the board, board KL −25% / −31% / −29% (Gemma PPL 158.5 → 142.8), speed unchanged (§12.4); Llama being rebuilt  
+Status: implementation draft (reviewed 2026-10-10 against the code and the four-port board results: WP0 and WP1 are basically done, WP5's EX baseline already exists, WP6 only lacks compiler integration). **Progress 2026-10-12**: WP2, WP3 (SmolLM2), WP7 (Llama-3.2-1B) accepted on the board; WP4 Qwen3 K per-channel accepted on the board; first version of WP9 done (§13.1: statistics, board teacher forcing, decode / prefill breakdown; with the V projection on GEMV and attention over the actual length, Qwen3 decode 6.88 tok/s, prefill 20.5 tok/s); WP6 switch and boundary tests done; WP6 decode K split integrated into the compiler; SmolLM2 per-channel KV evaluation done (kch 28.82 / 87.7%), SmolLM2 whole model with kch + actual length accepted on the board (decode 22.17, prefill 60.09 tok/s, board PPL 28.55, §7). **Progress 2026-10-13**: Llama-3.2-1B K per-channel rebuild accepted on the board (4.04 / 14.97 tok/s, §11); 4-port performance model recalibrated, §17.6 answers question 6 (next hardware investment W4A8); **WP8 Gemma-3-270M whole model accepted on the board** (790 executables all on the accelerator, 17/17 bit-exact, decode 14.96, prefill 62.5 tok/s, board PPL 158.5, §12.4), §13.2 main table has all four rows, §17.4 answers question 4; Gemma's quality loss traced to the int8 attention probabilities, changed to normalization by the quantized sum (qsum, 1a0ba3d): Gemma, SmolLM2, Qwen3 rebuilt and accepted on the board, board KL −25% / −31% / −29% (Gemma PPL 158.5 → 142.8), speed unchanged (§12.4); Llama being rebuilt; §17 now answers all six questions (17.1–17.6)  
 Date: 2026-10-10 (updated 2026-10-12)  
 Baseline: `main@b42fec6` (four-port acceptance `fb01909`)  
 Milestones: talk content freeze 2026-11-15; IREE community meeting 2026-11-25
@@ -795,7 +795,45 @@ When this stage is complete, the same body of evidence should answer:
 
 As long as these questions have reproducible data behind their answers, even if Gemma still has some host fallback, this stage already forms a stronger compiler and systems contribution than simply chasing another 10% of performance.
 
-### 17.2 Current answer to question 4 (2026-10-13)
+### 17.1 Question 1: which W8A8 checkpoints import, and which formats are rejected (2026-10-13)
+
+`compiler/frontend/ct_import.py` (§6) accepts exactly the compressed-tensors scheme the hardware executes as is, and rejects everything else with the layer, field and supported range named; there is no silent fallback or requantization.
+
+| | Accepted | Rejected (and why) |
+|---|---|---|
+| Format | `quant_method: compressed-tensors`, `format: int-quantized`, `quantization_status: compressed` | Any other method / format / status |
+| Weights | int8, static, per output channel, symmetric (zero point 0), `group_size` unset; scales fp32 / bf16 / fp16 (converted to fp32, int8 values untouched, -128 kept); GPTQ `actorder: static` (only a column order, already folded into the weights) | Per-group / per-block scales (EX accumulates a whole K in int32; per-group scales would need a split K with a rescale per group); asymmetric / zero points (no zero-point path in EX or the GEMV unit); int4 and FP8 (EX and the GEMV unit multiply int8 × int8 only; W4A8 is §17.6's candidate) |
+| Activations | int8, dynamic, per token, symmetric: the device computes `amax / 127` per token itself | Static activation scales; output activations quantized |
+| KV cache | — (the project calibrates K per channel, §8) | `kv_cache_scheme` set: llm-compressor 0.14 offers only `tensor` / `attn_head` granularity, which loses Qwen3's quality (§8) |
+| Layers | `ignore` lists (e.g. `lm_head`, then quantized by the project and recorded in the manifest) | A tied `lm_head` stored separately and different from the embedding; an embedding shared with a quantized (not ignored) classifier (the embedding gather goes through VE, which saturates -128 to -127) |
+
+Tested: `test_ct_import.py` (`run_tests.sh ctimport`) covers 8 rejection variants and 3 accepted ones on synthetic checkpoints, byte-identical int8 and scales, and an end-to-end synthetic model on the sim. Imported in practice and accepted on the board (§13.2): RedHatAI `Llama-3.2-1B-Instruct-quantized.w8a8` (SmoothQuant 0.7 + GPTQ, public), SmolLM2-135M and Qwen3-0.6B W8A8 generated with llm-compressor (SmoothQuant 0.8 + GPTQ, `compiler/frontend/llmc_w8a8.py`); Gemma-3-270M uses the project's own W8A8 quantization. The external checkpoints beat self-quantization under the device's arithmetic (SmolLM2 KL 0.138 → 0.074, Qwen3 top-1 +3 points), almost entirely thanks to SmoothQuant.
+
+### 17.2 Question 2: Qwen3's quality loss, checkpoint versus this project (2026-10-13)
+
+Qwen3-0.6B, WikiText-2 test, 2048 positions in windows of 256, reference the original fp32 model (PPL 39.21); details in §8.
+
+| Layer | PPL | top-1 | KL | Loss attributed to |
+|---|---:|---:|---:|---|
+| Checkpoint, standard semantics (ct-w8a8, host) | 40.05 | 92.3% | 0.022 | The checkpoint itself |
+| Device semantics, first version (per-layer static int8 KV, host) | 53.50 | 71.5% | 0.411 | This project |
+| + K per channel, KV calibrated on 1024 train tokens (host) | 39.14 | 87.4% | 0.054 | This project |
+| Same, on the board (teacher forcing 8 × 256) | 39.62 | 86.9% | 0.053 | This project |
+| + attention probabilities normalized by their quantized sum (qsum, board) | **39.68** | **88.1%** | **0.038** | This project |
+
+- **The checkpoint costs** PPL +0.84 (2%), 7.7 points of top-1 and KL 0.022.
+- **This project's first version added** far more (top-1 −21 points, KL ×19). The attribution (switching one item at a time to fp32, §8) put almost all of it on the **int8 KV cache**: fp32 KV alone gives back 91.7%; q, probabilities and the SFU approximations were each within ±1 point. The cause was outlier channels of K (per-channel max/median 7–120×), so the fix is per-channel K scales folded into q (int8 dot product unchanged, no hardware change) plus enough calibration data; neither alone helps.
+- **What remains today**: on the board, versus the checkpoint, top-1 4.2 points lower and KL 0.016 higher, at the same PPL; the board agrees with the host model of the device semantics (39.62 vs 39.14 PPL, within noise). Most of the gap is the remaining KV quantization error (fp32 KV on top of per-channel K reaches 92.0% on the host); percentile-clipping calibration is the next candidate.
+
+### 17.3 Question 3: Llama 3.2's K = 8192 on GEMV without hardware changes (2026-10-13)
+
+The GEMV descriptor's `row_bytes` is 16 bits and equals K × 16, and the unit's x buffer is 4096 bytes per lane, so one GEMV command takes K ≤ 4080 (the largest multiple of 16 below 4096). Llama-3.2-1B's `down_proj` has K = 8192. Before WP6 such layers did not match the decode linear micro-kernel at all and ran entirely on EX through SPAD_B.
+
+- **Mapping** (compiler only, `expandLinear`, switch `--iree-sa-gemv-k-split`): K is split into 4080 + 4080 + 32; each block is one GEMV command over the matching slices of x and the packed weights; the first writes the ACC words (`acc = 0`), the others add into them through the descriptor's existing `acc` bit (w3[58]); the epilogue (dequantization, requantization) runs once after the last block.
+- **Why it is bit-exact**: accumulation is int32 with no saturation or rounding between blocks, and |Σ| ≤ K × 128 × 128 = 2²⁷ ≪ 2³¹ (no overflow for any K ≤ 131071), so the sum is independent of the order and the split. `test_gemv_ksplit.py` checks K = 4080, 4096, 4112, 8192 and the −128 × −128 worst case against numpy's exact sum, with the split both on and off; the golden corpus (7046 dispatches of the existing GEMV models) is byte-identical.
+- **Result on the board** (§10): logits identical with the split on and off; `down_proj` 3.20M → 0.275M cycles per call (5.3 → 61 B/cycle), Llama decode **1.40 → 4.03 tok/s (×2.89)**. Today GEMV runs at 94% of the four-port peak in Llama's decode (§13.2).
+
+### 17.4 Question 4: coverage and remaining hot spots (2026-10-13)
 
 Four models (Qwen3, SmolLM2 (a small model with the Llama structure), Llama 3.2, Gemma 3), whole models, the same compile flow, per-dispatch timing on the board (§13.2): **dynamic dispatch, device time and MAC coverage are all 100%**, with no host fallback (Gemma's GELU-tanh and single-KV-head attention were the last two, §12.4). The remaining hot spots move with the shape ratios:
 
@@ -803,7 +841,24 @@ Four models (Qwen3, SmolLM2 (a small model with the Llama structure), Llama 3.2,
 - prefill: GEMM only 44–73%, array utilization 50–78% (lower for narrow models); row attention and reduction together 18–39%, the target of the next compiler-side steps (attention batching, norm fusion).
 - Not yet counted: attention's MACs (`dispatch_stats.py` does not count dynamic dimensions).
 
-### 17.1 Current answer to question 6 (2026-10-12)
+### 17.5 Question 5: gain, bandwidth utilization and cost of the four-port GEMV (2026-10-13)
+
+Data from §5, §13.3 and `k2b_gemv_design.md` §8.
+
+| | EX path | GEMV 1 port | 2 ports | **4 ports** |
+|---|---:|---:|---:|---:|
+| bwtest GEMV, 64 KB (B/cycle; peak 16 × ports) | — (LD 15.70) | 15.64 | 30.55 | **57.95** (90.5%) |
+| Qwen3 decode, hand-written path (tok/s) | 2.22 | 2.28 | 3.98 | **6.28** (×2.83) |
+| SmolLM2 decode, hand-written path (tok/s) | 7.71 | 8.21 | 12.58 | **17.04** (×2.21) |
+| LUT | 88,250 (75.4%) | 92,329 | 96,294 | **101,878 (87.0%)** |
+| FF / BRAM36 / DSP | 60,823 / 130 / 347 | 61,566 / 132 / 349 | 63,675 / 134 / 349 | 67,688 / 138 / 349 |
+| WNS (100 MHz) | +0.123 | +0.274 | +0.138 | +0.168 |
+
+- **Gain**: one port alone gains only 3–10% (it saves the SPAD_B round trip but has the same 16 B/cycle as LD); the gain comes from the ports: decode ×1.8 at 2 ports and ×2.8 at 4 ports for Qwen3, against a model prediction of ×3.15. The gap is a fixed per-step part (about 67 ms for Qwen3 at the time) that does not scale with ports; compiler work then cut it (V projection on GEMV, attention over the actual length), so on the generic path Qwen3 decodes at 6.96 tok/s (§13.2).
+- **Bandwidth utilization**: the 64 KB microbenchmark reaches 90.5% of 64 B/cycle (a fixed ~100 cycles per command on top of 1024 data cycles; steady state close to 64). Inside the models GEMV runs at 82–94% of the 57.95 B/cycle measured peak (Llama 94%, Qwen3 93%, Gemma 88%, SmolLM2 82%: narrow 576-wide layers pay the per-command overhead more), and GEMV is 71–93% of decode device time.
+- **Cost**: versus the EX overlay, +13.6k LUT (75.4% → 87.0%), +6.9k FF, +8 BRAM36 (one x buffer per lane), +2 DSP; timing still closes at 100 MHz (the worst path is the PicoRV32 reset fan-out, not the GEMV data path). prefill is unchanged by construction (it uses EX).
+
+### 17.6 Question 6: the next hardware investment (2026-10-12)
 
 Basis: the categorized decode timing of three models in §13.2 (GEMV's share of decode time: Qwen3 80%, SmolLM2 71%, Llama 93%, at 82–94% of the 4-port peak bandwidth), and the 4-port performance model recalibrated on Qwen3's generic path (prefill +2.3%, decode +3.6%; what-if table in `k2b_gemv_design.md` §8.1).
 
