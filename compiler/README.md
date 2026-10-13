@@ -210,8 +210,9 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   accelerator and 2 on the host (prefill only); the device keeps the torch
   W8A8 model's quality (SmolLM2 34/40 teacher-forced top-1 agreement with
   plain HF fp32, as the torch W8A8 model; Qwen3's W8A8 quality is a
-  quantization item of its own, C6.2). An IREE fix is applied from
-  `compiler/patches/iree/` by `fetch_iree_sources.sh`. Next (plan §8.17):
+  quantization item of its own, C6.2). Two IREE fixes (both in
+  `MergeIndexSwitchPattern`) are applied from `compiler/patches/iree/` by
+  `fetch_iree_sources.sh`. Next (plan §8.17):
   micro-kernels expanded at the sahl level, memory planning with lifetimes.
   Since then (docs/generality_implementation_plan.md §13.2): Qwen3-0.6B,
   SmolLM2-135M, Llama-3.2-1B and Gemma-3-270M run whole on the board through

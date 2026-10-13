@@ -76,3 +76,42 @@ util.func @sameSelector(%a: index) -> (i32, i32) {
   }
   util.return %r0, %r1 : i32, i32
 }
+
+// -----
+
+// compiler/patches/iree/0002-util-merge-index-switch-yield-outer-values.patch:
+// the second switch's cases may yield values defined above both switches (a
+// constant hoisted out of the cases by canonicalization); without the patch
+// the merged scf.yield got a null operand and the compiler crashed.
+
+// CHECK-LABEL: @outerYields
+// CHECK-SAME: (%[[A:.+]]: index, %[[X:.+]]: i32, %[[Y:.+]]: i32, %[[Z:.+]]: i32)
+util.func @outerYields(%a: index, %x: i32, %y: i32, %z: i32) -> (i32, i32) {
+  // CHECK: %[[R:.+]]:2 = scf.index_switch %[[A]] -> i32, i32
+  // CHECK: scf.yield %[[X]], %[[Y]] : i32, i32
+  // CHECK: scf.yield %[[Y]], %[[Z]] : i32, i32
+  // CHECK: scf.yield %[[Z]], %[[X]] : i32, i32
+  // CHECK-NOT: scf.index_switch
+  %r0 = scf.index_switch %a -> i32
+  case 0 {
+    scf.yield %x : i32
+  }
+  case 1 {
+    scf.yield %y : i32
+  }
+  default {
+    scf.yield %z : i32
+  }
+  %r1 = scf.index_switch %a -> i32
+  case 0 {
+    scf.yield %y : i32
+  }
+  case 1 {
+    scf.yield %z : i32
+  }
+  default {
+    scf.yield %x : i32
+  }
+  // CHECK: util.return %[[R]]#0, %[[R]]#1
+  util.return %r0, %r1 : i32, i32
+}
