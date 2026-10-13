@@ -28,6 +28,7 @@ Variants (names on the command line, --variants):
 """
 import argparse
 import contextlib
+import gc
 import json
 import math
 import os
@@ -102,9 +103,12 @@ def build(name, args):
                              kv_scales=kv[0] if kv else None, kv_channel=kv_channel,
                              kv_calib=H.kv_calib_arg(args.kv_calib))
                 kv[:] = [dec.kv_scales]
-                return logits_steps(dec, ids)
+                out = logits_steps(dec, ids)
+                del dec
+                return out
             finally:
                 H.SA_FP32.clear()
+                gc.collect()             # (HF modules hold reference cycles: two Llama-1B decoders exceed 10 GB)
         return run, (contextlib.nullcontext if "sfu" in keep else TH.device_sfu)
     raise SystemExit(f"unknown variant {name}")
 
@@ -163,7 +167,6 @@ def main():
             if args.ref_cache:
                 np.save(args.ref_cache, torch.stack(ref).numpy())
         f = ctx = None                   # (the model freed before the next one loads: one at a time in memory)
-        import gc
         gc.collect()
         P = len(wins) * (args.window - 1)
         res[name] = {"ppl": math.exp(nll / P), "seconds": round(time.time() - t0, 1)}
