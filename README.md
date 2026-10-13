@@ -191,6 +191,9 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 - [Execution walkthrough](docs/execution_walkthrough.md) - one GEMM
   traced from `m4_demo.py` through the driver, firmware, PCPI, scheduler and
   engines down to BRAM/DDR, with a per-layer debugging checklist
+- [Dispatch walkthrough](docs/dispatch_walkthrough.md) - one IREE dispatch (decode
+  attention scores) through every pass of the sa compiler to its sa-desc
+  descriptor template, bit by bit, and what the driver and accelerator do with it
 - [Performance counters and descriptor DMA](docs/perf_counters_and_desc_dma_plan.md) -
   plan, implementation record and board results of the two M5 additions:
   counter definitions, descriptor format, verification, milestones

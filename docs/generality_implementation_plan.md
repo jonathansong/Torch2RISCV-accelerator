@@ -1,6 +1,6 @@
 # After the 4-port GEMV: implementation plan for generality and quantization quality
 
-Status: implementation draft (reviewed 2026-10-10 against the code and the four-port board results: WP0 and WP1 are basically done, WP5's EX baseline already exists, WP6 only lacks compiler integration). **Progress 2026-10-12**: WP2, WP3 (SmolLM2), WP7 (Llama-3.2-1B) accepted on the board; WP4 Qwen3 K per-channel accepted on the board; first version of WP9 done (§13.1: statistics, board teacher forcing, decode / prefill breakdown; with the V projection on GEMV and attention over the actual length, Qwen3 decode 6.88 tok/s, prefill 20.5 tok/s); WP6 switch and boundary tests done; WP6 decode K split integrated into the compiler; SmolLM2 per-channel KV evaluation done (kch 28.82 / 87.7%), SmolLM2 whole model with kch + actual length accepted on the board (decode 22.17, prefill 60.09 tok/s, board PPL 28.55, §7). **Progress 2026-10-13**: Llama-3.2-1B K per-channel rebuild accepted on the board (4.04 / 14.97 tok/s, §11); 4-port performance model recalibrated, §17.6 answers question 6 (next hardware investment W4A8); **WP8 Gemma-3-270M whole model accepted on the board** (790 executables all on the accelerator, 17/17 bit-exact, decode 14.96, prefill 62.5 tok/s, board PPL 158.5, §12.4), §13.2 main table has all four rows, §17.4 answers question 4; Gemma's quality loss traced to the int8 attention probabilities, changed to normalization by the quantized sum (qsum, 1a0ba3d): Gemma, SmolLM2, Qwen3 rebuilt and accepted on the board, board KL −25% / −31% / −29% (Gemma PPL 158.5 → 142.8), speed unchanged (§12.4); Llama being rebuilt; §17 now answers all six questions (17.1–17.6)  
+Status: implementation draft (reviewed 2026-10-10 against the code and the four-port board results: WP0 and WP1 are basically done, WP5's EX baseline already exists, WP6 only lacks compiler integration). **Progress 2026-10-12**: WP2, WP3 (SmolLM2), WP7 (Llama-3.2-1B) accepted on the board; WP4 Qwen3 K per-channel accepted on the board; first version of WP9 done (§13.1: statistics, board teacher forcing, decode / prefill breakdown; with the V projection on GEMV and attention over the actual length, Qwen3 decode 6.88 tok/s, prefill 20.5 tok/s); WP6 switch and boundary tests done; WP6 decode K split integrated into the compiler; SmolLM2 per-channel KV evaluation done (kch 28.82 / 87.7%), SmolLM2 whole model with kch + actual length accepted on the board (decode 22.17, prefill 60.09 tok/s, board PPL 28.55, §7). **Progress 2026-10-13**: Llama-3.2-1B K per-channel rebuild accepted on the board (4.04 / 14.97 tok/s, §11); 4-port performance model recalibrated, §17.6 answers question 6 (next hardware investment W4A8); **WP8 Gemma-3-270M whole model accepted on the board** (790 executables all on the accelerator, 17/17 bit-exact, decode 14.96, prefill 62.5 tok/s, board PPL 158.5, §12.4), §13.2 main table has all four rows, §17.4 answers question 4; Gemma's quality loss traced to the int8 attention probabilities, changed to normalization by the quantized sum (qsum, 1a0ba3d): Gemma, SmolLM2, Qwen3 rebuilt and accepted on the board, board KL −25% / −31% / −29% (Gemma PPL 158.5 → 142.8), speed unchanged (§12.4); Llama rebuilt and accepted too (KL −16%, host evaluation); §17 now answers all six questions (17.1–17.6)  
 Date: 2026-10-10 (updated 2026-10-12)  
 Baseline: `main@b42fec6` (four-port acceptance `fb01909`)  
 Milestones: talk content freeze 2026-11-15; IREE community meeting 2026-11-25
@@ -511,6 +511,7 @@ Llama-3.2-1B-Instruct-W8A8 (compressed-tensors, 16 layers, GQA 32/8, K=8192 down
 - decode agrees with the bandwidth model: about 1.18 GB of parameters / 57.95 B/cycle (100 MHz) ≈ 214 ms, plus about 70 ms of fixed overhead.
 - **Later (2026-10-12, V projection on GEMV `14f5612` + attention over the actual length `1860823`)**: 17/17 bit-exact on the board, **decode 4.03 tok/s (248.1 ms/step, device 243.6 ms, GEMV 226 ms = 92.6%, 54.7 B/cycle)**, prefill 12.62 tok/s (`board_llm.py`, including loading in the first chunk; batched 1066 ms per chunk, 15.21 tok/s, matmul 73% of prefill). The K split on / off comparison is in §10.
 - **K per-channel KV rebuild (2026-10-12/13, `build/hfgen/llama1b_kch` → `build/deploy_hfgen_llama1b_kch`)**: the original board build used per-layer KV calibrated on the ~45-token `CALIB`, inconsistent with WP4's approach for Qwen3 / SmolLM2; the rebuild uses `--kv-channel k --kv-calib build/llm_cache/wikitext-2-raw-v1-train.txt:1024` (export 330 s, 715 executables all on the accelerator, `sa_packed.irpa` 1240 MB). sim: teacher forcing over 40 positions top-1 agreement with fp32 35/40 (torch W8A8 also 35/40), prefill vs decode-only 5/5 rows bit-identical; qemu aarch64 3/3. Board PASS: 17/17 bit-exact, 0 host dispatches, board_llm decode 4.03 tok/s (248.4 ms/step), prefill 12.58 tok/s (including loading); batched decode 247.6 ms/step (**4.04 tok/s**, device 243.9 ms, rest of the runtime 3.6 ms), prefill 1068.9 ms per chunk (**14.97 tok/s**), device memory peak 1189.8 / 1202.9 MB; per dispatch: decode GEMV 226.5 ms (92.5%, 1238.8 MB, 54.7 B/cycle = 94%), prefill matmul 72.5%, array 200 MAC/cycle (78%). Speed identical to the per-layer build (only the KV scales changed). Quality (host, 2048 tokens, `build/quality/llama1b_2048_*.json`; the board's memory cannot fit prefill_all): fp32 PPL 22.77; **ct-sa:kch PPL 23.33, top-1 90.7%, correlation 0.991, KL 0.036**.
+- **qsum rebuild (2026-10-13, `build/deploy_hfgen_llama1b_qs`, §12.4)**: 716 executables all on the accelerator, sim prefill vs decode-only 5/5 bit-exact, qemu 3/3; on the board 17/17 bit-exact, 0 host dispatches, batched decode 247.3 ms/step (4.04 tok/s), prefill 1061.6 ms per chunk (15.07 tok/s), peak 1189.7 / 1202.9 MB. Host quality (2048 tokens, `build/quality/llama1b_2048_ct-sa_kch_qsum.json`): PPL 23.33 → 23.08, top-1 90.7% → 91.2%, KL 0.036 → 0.030.
 - The default prompt is SmolLM2 token ids, meaningless for Llama; the generated text is only used for bit-exact comparison and does not represent quality; quality is judged by the teacher-forced metrics.
 - Test memory: only one fp32 model kept at a time (autograd off, gc.collect after del); peak 7.1 GB.
 
@@ -591,15 +592,16 @@ Looking only at the probability-quantization step (fp32 Gemma's q/k/v, one 256-t
 
 Implementation (`hf_generic.sa_attention` and the attribution branches): Σeq must be summed directly over the int8 values (`eq.to(float32)`, sitofp): extending to i32 first and summing (`extsi` is not in to_i8's form) or summing `round(e·127)` (`math.roundeven` in the reduction body) both land on the host. 2-layer Gemma (214) and SmolLM2 (212) executables all on the accelerator, no device vs torch differences in teacher forcing, prefill 5/5 bit-exact; golden passes.
 
-**qsum board acceptance (2026-10-13, four-port overlay, `build/deploy_hfgen_{gemma,smollm2,qwen3}_qs`)**: whole-model rebuilds (Gemma 791 / SmolLM2 1221 / Qwen3 1139 executables, all on the accelerator), sim prefill 5/5 and prefill_all 40/40 bit-exact, qemu 3/3; on the board board_llm 17/17 bit-exact with the sim, 0 host dispatches.
+**qsum board acceptance (2026-10-13, four-port overlay, `build/deploy_hfgen_{gemma,smollm2,qwen3,llama1b}_qs`)**: whole-model rebuilds (Gemma 791 / SmolLM2 1221 / Qwen3 1139 / Llama 716 executables, all on the accelerator), sim prefill 5/5 and prefill_all 40/40 bit-exact, qemu 3/3; on the board board_llm 17/17 bit-exact with the sim, 0 host dispatches.
 
 | Board (8 × 256 teacher forcing) | Old semantics PPL / top-1 / KL | **qsum** | decode (batched) | prefill per chunk |
 |---|---|---|---:|---:|
 | Gemma-3-270M (fp32 PPL 123.76) | 158.54 / 76.0% / 0.209 | **142.83 / 80.3% / 0.157** | 66.8 → 66.9 ms | 256.0 → 255.5 ms |
 | SmolLM2-135M (fp32 PPL 26.98) | 28.54 / 86.5% / 0.055 | **28.26 / 89.8% / 0.038** | 45.1 → 45.2 ms | 266.3 → 264.5 ms |
 | Qwen3-0.6B (fp32 PPL 39.21) | 39.62 / 86.9% / 0.053 | **39.68 / 88.1% / 0.038** | 145.4 → 143.6 ms | 773 → 769.7 ms |
+| Llama-3.2-1B (fp32 PPL 22.77; host 2048 tokens, see below) | 23.33 / 90.7% / 0.036 | **23.08 / 91.2% / 0.030** | 247.6 → 247.3 ms | 1068.9 → 1061.6 ms |
 
-Gemma's quantization PPL loss 34.8 → 19.1, KL −25%; SmolLM2 KL −31%, top-1 +3.3 points; Qwen3 PPL flat (+0.06, within noise over 2048 positions), KL −29%, top-1 +1.2 points. Speed unchanged: one more Σeq reduction dispatch per layer and row (decode Gemma 690 → 708, SmolLM2 1000 → 1030, Qwen3 1046 → 1074; prefill +16 per layer per chunk), the original softmax normalization is no longer needed, and the times of reduction and batch_matmul move in opposite directions (SmolLM2 prefill: reduction −5.6 ms, batch_matmul +4.5 ms); the batched rest of the runtime +0.1–0.3 ms. Llama being rebuilt.
+Gemma's quantization PPL loss 34.8 → 19.1, KL −25%; SmolLM2 KL −31%, top-1 +3.3 points; Qwen3 PPL flat (+0.06, within noise over 2048 positions), KL −29%, top-1 +1.2 points. Llama (the board cannot hold prefill_all, so its quality is the host evaluation of the device semantics, `quality_eval.py --variants ct-sa:kch`): KL −16%, top-1 +0.5 points, PPL 23.33 → 23.08. Speed unchanged: one more Σeq reduction dispatch per layer and row (decode Gemma 690 → 708, SmolLM2 1000 → 1030, Qwen3 1046 → 1074, Llama 538 → 554; prefill +16 per layer per chunk), the original softmax normalization is no longer needed, and the times of reduction and batch_matmul move in opposite directions (SmolLM2 prefill: reduction −5.6 ms, batch_matmul +4.5 ms); the batched rest of the runtime +0.1–0.3 ms. Llama: `build/deploy_hfgen_llama1b_qs`, 716 executables, sim and board 17/17 bit-exact, 0 host dispatches.
 
 ## 13. Work package WP9: measurement infrastructure and coverage matrix
 
@@ -661,24 +663,24 @@ GEMV is now 80% of decode device time (111.4 ms, 93% of peak); the generic path 
 |---|---|---|---|---|---:|---:|---:|---:|
 | Qwen3-0.6B | External W8A8 (ct) + K per-channel KV | Board 17/17 bit-exact | PPL 39.68 (fp32 39.21), top-1 88.1% (qsum) | 100% / 100% / 100% | 6.96 tok/s | 20.79 tok/s | GEMV 93% (decode 4.38 GB/s average) | 590 / 613 MB |
 | SmolLM2-135M | llm-compressor W8A8 (ct) + K per-channel KV | Board 17/17 bit-exact | PPL 28.26 (fp32 26.98), top-1 89.8% (qsum) | 100% / 100% / 100% | 22.12 tok/s | 60.50 tok/s | GEMV 82% (decode 3.43 GB/s average) | 135 / 150 MB |
-| Llama-3.2-1B | RedHatAI W8A8 (ct) + K per-channel KV | Board 17/17 bit-exact | PPL 23.33 (fp32 22.77), top-1 90.7% (host 2048-token evaluation; not enough memory for prefill_all on the board) | 100% / 100% / 100% | 4.04 tok/s | 14.97 tok/s | GEMV 94% (decode 5.08 GB/s average) | 1190 / 1203 MB |
+| Llama-3.2-1B | RedHatAI W8A8 (ct) + K per-channel KV | Board 17/17 bit-exact | PPL 23.08 (fp32 22.77), top-1 91.2% (qsum; host 2048-token evaluation of the device semantics: not enough memory for prefill_all on the board) | 100% / 100% / 100% | 4.04 tok/s | 15.07 tok/s | GEMV 94% (decode 5.08 GB/s average) | 1190 / 1203 MB |
 | Gemma-3-270M | Self-quantized W8A8 (per-token dynamic activations) + K per-channel KV | Board 17/17 bit-exact | PPL 142.83 (fp32 123.76), top-1 80.3% (board 8×256 teacher forcing, qsum; old semantics 158.54 / 76.0%, §12.4) | 100% / 100% / 100% | 14.95 tok/s | 62.62 tok/s | GEMV 88% (decode 4.38 GB/s average) | 266 / 640 MB (window set for teacher forcing) |
 
-**Main-table breakdown (2026-10-12, board, four-port overlay)**: category times come from per-dispatch timing (`board_profile.py 40 --prompt 32 SA_PROFILE_PERF=...csv` → `dispatch_stats.py`, one list per dispatch); total per-step time, device time and the rest of the runtime come from batched measurement (`--batch`); the two agree on device time within about 1%; submission time in per-dispatch mode is inflated (90–270 ms per step) and not listed. Data: `build/deploy_hfgen_llama1b_kch/prof_llama_*.json`, `build/deploy_hfgen_{qwen3,smollm2,gemma}_qs/prof_{decode,prefill}.json`.
+**Main-table breakdown (2026-10-12, board, four-port overlay)**: category times come from per-dispatch timing (`board_profile.py 40 --prompt 32 SA_PROFILE_PERF=...csv` → `dispatch_stats.py`, one list per dispatch); total per-step time, device time and the rest of the runtime come from batched measurement (`--batch`); the two agree on device time within about 1%; submission time in per-dispatch mode is inflated (90–270 ms per step) and not listed. Data: `build/deploy_hfgen_{qwen3,smollm2,llama1b,gemma}_qs/prof_{decode,prefill}.json`.
 
-Attention-probability quantization: the Qwen3, SmolLM2 and Gemma rows (and the three columns of the two breakdown tables below) are qsum (2026-10-13, §12.4); the Llama row is still the old semantics, updated after the rebuild.
+Attention-probability quantization: all four rows and the breakdown tables below are qsum (2026-10-13, §12.4).
 
 decode per step:
 
 | | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B | Gemma-3-270M |
 |---|---:|---:|---:|---:|
-| Per step (batched) | 143.6 ms | 45.2 ms | 247.6 ms | 66.9 ms |
-| 　device / rest of the runtime | 136.60 / 7.02 ms | 38.48 / 6.71 ms | 243.9 / 3.6 ms | 60.91 / 5.75 ms |
-| dispatches (host) | 1074 (0) | 1030 (0) | 538 (0) | 708 (0) |
-| **GEMV** (matvec_like) | 111.3 ms (80%) | 28.6 ms (71%) | 226.5 ms (93%) | 52.7 ms (85%; lm_head 31.7 ms) |
-| 　GEMV bandwidth (peak 57.95 B/cycle) | 53.8 (93%) | 47.4 (82%) | 54.7 (94%) | 51.2 (88%) |
-| attention (batch_matmul) | 12.2 ms (9%) | 4.2 ms (10%) | 6.9 ms (3%) | 3.0 ms (5%) |
-| reduction (norm, softmax) | 7.3 ms (5%) | 3.7 ms (9%) | 6.7 ms (3%) | 3.3 ms (5%) |
+| Per step (batched) | 143.6 ms | 45.2 ms | 247.3 ms | 66.9 ms |
+| 　device / rest of the runtime | 136.60 / 7.02 ms | 38.48 / 6.71 ms | 243.57 / 3.74 ms | 60.91 / 5.75 ms |
+| dispatches (host) | 1074 (0) | 1030 (0) | 554 (0) | 708 (0) |
+| **GEMV** (matvec_like) | 111.3 ms (80%) | 28.6 ms (71%) | 226.7 ms (93%) | 52.7 ms (85%; lm_head 31.7 ms) |
+| 　GEMV bandwidth (peak 57.95 B/cycle) | 53.8 (93%) | 47.4 (82%) | 54.6 (94%) | 51.2 (88%) |
+| attention (batch_matmul) | 12.2 ms (9%) | 4.2 ms (10%) | 7.4 ms (3%) | 3.0 ms (5%) |
+| reduction (norm, softmax) | 7.3 ms (5%) | 3.7 ms (9%) | 5.7 ms (2%) | 3.3 ms (5%) |
 | elementwise kinds | 7.4 ms (5%) | 3.5 ms (9%) | 4.6 ms (2%) | 2.8 ms (5%) |
 | scatter (KV write) | 0.3 ms | 0.3 ms | 0.2 ms | 0.2 ms |
 | DDR read | 607 MB, 4.38 GB/s | 138 MB, 3.43 GB/s | 1243 MB, 5.08 GB/s | 272 MB, 4.38 GB/s |
@@ -687,15 +689,15 @@ prefill per 16-token chunk:
 
 | | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B | Gemma-3-270M |
 |---|---:|---:|---:|---:|
-| Per chunk (batched) | 769.7 ms | 264.5 ms | 1068.9 ms | 255.5 ms |
-| dispatches (host) | 6838 (0) | 5404 (0) | 2642 (0) | 3876 (0) |
+| Per chunk (batched) | 769.7 ms | 264.5 ms | 1061.6 ms | 255.5 ms |
+| dispatches (host) | 6838 (0) | 5404 (0) | 2898 (0) | 3876 (0) |
 | **GEMM** (matmul_like) | 402.1 ms (51%) | 132.1 ms (48%) | 779.0 ms (73%) | 113.5 ms (44%) |
 | 　array utilization (peak 256 MAC/cycle) | 175 (68%) | 129 (50%) | 200 (78%) | 141 (55%) |
-| row attention (batch_matmul) | 152.9 ms (20%) | 55.2 ms (20%) | 88.7 ms (8%) | 38.6 ms (15%) |
-| reduction | 113.9 ms (15%) | 51.6 ms (19%) | 108.3 ms (10%) | 46.3 ms (18%) |
+| row attention (batch_matmul) | 152.9 ms (20%) | 55.2 ms (20%) | 96.9 ms (9%) | 38.6 ms (15%) |
+| reduction | 113.9 ms (15%) | 51.6 ms (19%) | 93.1 ms (9%) | 46.3 ms (18%) |
 | elementwise kinds | 81.3 ms (10%) | 26.3 ms (10%) | 50.1 ms (5%) | 25.8 ms (10%) |
-| GEMV (lm_head, last row) | 27.6 ms (4%) | 5.2 ms (2%) | 45.6 ms (4%) | 31.7 ms (12%) |
-| scatter | 6.0 ms | 4.8 ms | 2.7 ms | 3.0 ms |
+| GEMV (lm_head, last row) | 27.6 ms (4%) | 5.2 ms (2%) | 45.8 ms (4%) | 31.7 ms (12%) |
+| scatter | 6.0 ms | 4.8 ms | 2.8 ms | 3.0 ms |
 
 - decode is mostly bandwidth-bound GEMV (Llama 93%, Qwen3 80%); the remaining fixed part is mainly attention and norms; SmolLM2's matrices inside the layers are only 576 wide, so the fixed overhead of GEMV commands is a larger share (82%).
 - prefill is not only GEMM: the GEMM array utilization of the small models is only 50–68%, and row attention plus reduction take 30–40%.
@@ -732,7 +734,7 @@ Do not mix hardware resources and pure compiler features in the same table.
 | K split (`--iree-sa-gemv-k-split`) | Llama-3.2-1B | decode 1.40 tok/s | **4.03 tok/s (×2.89)** | §10; logits bit-identical |
 | V projection's int8 result on GEMV (`14f5612`) | Qwen3 | decode 4.74 tok/s | 5.60 tok/s | §13.1; bit-identical |
 | Attention over the actual length (`1860823`) | Qwen3 | decode 5.60 / prefill 11.15 tok/s | **6.88 / 20.53 tok/s** | §13.1; 2048-position teacher forcing bit-identical |
-| Attention probabilities `i8(p·127)` → qsum (`1a0ba3d`) | Gemma-3-270M (board 8 × 256 teacher forcing) | PPL 158.54, top-1 76.0%, KL 0.209 | **PPL 142.83, top-1 80.3%, KL 0.157** | §12.4; SmolLM2 / Qwen3 KL −31% / −29%; speed unchanged |
+| Attention probabilities `i8(p·127)` → qsum (`1a0ba3d`) | Gemma-3-270M (board 8 × 256 teacher forcing) | PPL 158.54, top-1 76.0%, KL 0.209 | **PPL 142.83, top-1 80.3%, KL 0.157** | §12.4; SmolLM2 / Qwen3 / Llama KL −31% / −29% / −16%; speed unchanged |
 
 The generic frontend's Qwen3 decode (6.88 tok/s, 6.96 after qsum) is now faster than the hand-written path on the same overlay (6.28).
 
