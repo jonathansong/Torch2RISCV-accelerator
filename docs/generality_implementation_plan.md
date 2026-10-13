@@ -1,6 +1,6 @@
 # 4 口 GEMV 之后：通用性与量化质量实现方案
 
-状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；V 投影走 GEMV、attention 按实际长度后 Qwen3 decode 6.88 tok/s、prefill 20.5 tok/s）；WP6 开关与边界测试完成；WP6 decode K 分块已接入编译器；SmolLM2 KV 按通道评估完成（kch 28.82 / 87.7%），SmolLM2 全模型 kch + 按实际长度板上验收（decode 22.17、prefill 60.09 tok/s，板上 PPL 28.55，§7）  
+状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；V 投影走 GEMV、attention 按实际长度后 Qwen3 decode 6.88 tok/s、prefill 20.5 tok/s）；WP6 开关与边界测试完成；WP6 decode K 分块已接入编译器；SmolLM2 KV 按通道评估完成（kch 28.82 / 87.7%），SmolLM2 全模型 kch + 按实际长度板上验收（decode 22.17、prefill 60.09 tok/s，板上 PPL 28.55，§7）。**2026-10-13 进度**：Llama-3.2-1B K per-channel 重建板上验收（4.04 / 14.97 tok/s，§11）；4 口性能模型重新校准，§17.1 回答问题 6（下一项硬件投资 W4A8）；**WP8 Gemma-3-270M 全模型板上验收**（790 个 executable 全在加速器，17/17 逐位一致，decode 14.96、prefill 62.5 tok/s，板上 PPL 158.5，§12.4），§13.2 主表四行齐全，§17.2 回答问题 4；Gemma 质量损失定位到 int8 注意力概率，非归一化概率量化在评估中（§12.4）  
 日期：2026-10-10（2026-10-12 更新）  
 基线：`main@b42fec6`（四口验收 `fb01909`）  
 目标节点：2026-11-15 演讲内容冻结；2026-11-25 IREE 社区会议  
@@ -550,6 +550,34 @@ head_dim=256 时，单个 K 张量在 T=512 已约为 131072 bytes，可能超�
 - 生成完整回退清单和四类覆盖率。
 - 不能下沉的算子都有可操作的原因分类：frontend、rewrite、lowering、硬件 primitive、内存容量或 tokenizer/runtime。
 
+### 12.4 正式阶段结果（2026-10-13）
+
+**编译覆盖**：全模型 18 层（`build/hfgen/gemma_kch`，`--quant --rope --attn --kv-channel k --kv-calib train:1024 --prefill 16 --prefill-all`）790 个 executable 全部在加速器上，回退清单为空。为此做的改动（都只在 Gemma 这类结构上生效，golden corpus 7046 个 dispatch 不变）：
+- **GELU-tanh**：HF 的 `GELUTanh` 导出成 `math.fpowi` 落到主机 VMVX。`hf_generic.act_rewrite` 换成 `SaGELUTanh`：`x * recip(exp(x·(A + B·x²)) + 1)`（A = −2√(2/π)，B = 0.044715·A），只用设备有的 EXP / RECIP；先探测模块，非 tanh 形式的 GELU 拒绝。[−20, 20] 上与 PyTorch 最大误差 4.8e−7，两端为 −0 / x。
+- **单 KV 头的 attention**：4 / 1 GQA 让 attention 的 batch_matmul 的 batch 维是 1（`1x4xDx256`），`SahlExpandKernels` 的 batch 循环判定为 −1 而整体留给主机。修复：viewMap 先认尺寸 1 的维再查动态步长；epilogue 输入分析跳过尺寸 1 的维。另加 `sa.unexpanded = "SahlExpandKernels.cpp:LINE"` 属性，未展开的原因直接出现在 codegen 报告里（6772516）。
+- **head_dim 256**：T ≤ 256 的上下文容量检查通过，未用到 C6.5 的 T 分块；T = 512 未验证（§12.3 的风险仍在）。
+
+**sim 验收**：prefill 与 decode-only 5/5 行逐位一致，prefill_all 40/40；teacher forcing 40 位置设备 33/40（mean corr 0.979），torch W8A8 36/40（0.978），设备 vs torch 差 6 处、corr 0.981（容差内）。aarch64（qemu）3/3 逐位一致。
+
+**板上（2026-10-13，四口 overlay，`build/deploy_hfgen_gemma_kch`）**：board_llm 17/17 与 sim 逐位一致、0 个主机 dispatch；decode 66.8 ms / 步（14.96 tok/s），prefill 每 16-token 块 256 ms（62.5 tok/s）；设备内存峰值 266 MB。teacher forcing（8 × 256）PPL 158.54（fp32 123.76），top-1 76.0%。注意：`board.txt` 的窗口按 40-token 运行的峰值定（277 MB），teacher forcing 的 256 token 窗口（每块 logits 16 MB）要把窗口调到 640 MB。
+
+**质量归因**（主机，WikiText-2 test 2048 token，窗口 256，`build/quality/gemma_2048_*.json`；词表 262144 时 2048 token 的 PPL 被少数 token 主导、排序不稳定，以 KL 与 top-1 为准）：
+
+| 变体 | PPL | top-1 | corr | KL |
+|---|---:|---:|---:|---:|
+| torch W8A8（fp32 attention） | 126.15 | 81.8% | 0.9870 | 0.129 |
+| sa:kch（设备语义） | 166.76 | 77.8% | 0.9792 | 0.238 |
+| +act（linear 层 fp32 激活） | 163.98 | 83.1% | 0.9895 | 0.133 |
+| +kv（fp32 KV cache） | 175.47 | 79.5% | 0.9811 | 0.216 |
+| +q（attention query 不量化） | 169.36 | 76.3% | 0.9769 | 0.265 |
+| +sfu（精确 exp / recip / rsqrt） | 158.35 | 75.4% | 0.9771 | 0.274 |
+| **+probs（fp32 注意力概率）** | 137.09 | 80.2% | 0.9830 | 0.181 |
+| +q+probs+kv+sfu（attention 全 fp32） | 136.07 | 82.3% | 0.9873 | 0.126 |
+
+设备语义比 W8A8 多出的损失主要来自 **int8 注意力概率** `i8(p·127)`：分辨率 1/127，Gemma 的注意力分布分散，大量 p < 0.004 被舍为 0。KV、query 量化与 SFU 近似都在噪声内。与 Qwen3（§8，主因是 int8 KV 的 K 通道离群值）不同，这是模型结构决定的另一类误差。
+
+**候选修复：非归一化概率量化**。量化 `e = exp(s − max)`（最大值恰为 1，且 e ≥ p）而不是 `p = e·r`：`pq = i8(e·127)`，int32 的 PV 结果再乘每行的 r 与 a_v。同样 8 bit，每行分辨率不差于现状，且 r 从乘 T 个概率变为乘 hd 个输出；不改硬件，只改 `hf_generic.sa_attention` 导出的图。主机评估（同设置）：Gemma sa:kch PPL 166.76 → 145.27，top-1 77.8% → 80.5%，KL 0.238 → 0.167。SmolLM2（ct-sa:kch，`build/quality/smollm2_pe_*.json`）也变好：PPL 28.82 → 28.25，top-1 87.7% → 88.7%，KL 0.072 → 0.053。它改变所有模型的数值语义（golden、四个模型的 sim 与板上验收都要重做），是否采用待定。
+
 ## 13. 工作包 WP9：测量基础设施与覆盖矩阵
 
 ### 13.1 运行时统计
@@ -607,41 +635,42 @@ decode 现在 GEMV 占设备时间的 80%（111.4 ms，峰值的 93%）；通用
 | Qwen3-0.6B | 外部 W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 39.62（fp32 39.21），top-1 86.9% | 100% / 100% / 100% | 6.88 tok/s | 20.53 tok/s | GEMV 93%（decode 4.37 GB/s 平均） | 590 / 613 MB |
 | SmolLM2-135M | llm-compressor W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 28.55（fp32 26.98），top-1 86.5% | 100% / 100% / 100% | 22.17 tok/s | 60.09 tok/s | GEMV 82%（decode 3.58 GB/s 平均） | 135 / 150 MB |
 | Llama-3.2-1B | RedHatAI W8A8（ct）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 23.33（fp32 22.77），top-1 90.7%（主机 2048-token 评估；内存不够板上 prefill_all） | 100% / 100% / 100% | 4.04 tok/s | 14.97 tok/s | GEMV 94%（decode 5.08 GB/s 平均） | 1190 / 1203 MB |
-| Gemma-3-270M | 自量化 / llm-compressor | | | | | | | |
+| Gemma-3-270M | 自量化 W8A8（per-token 动态激活）+ K per-channel KV | 板上 17/17 逐位一致 | PPL 158.54（fp32 123.76），top-1 76.0%（板上 8×256 teacher forcing；损失主要来自 int8 注意力概率，§12.4） | 100% / 100% / 100% | 14.96 tok/s | 62.50 tok/s | GEMV 88%（decode 4.38 GB/s 平均） | 266 / 277 MB（teacher forcing 需 640 MB 窗口） |
 
-**主表分项（2026-10-12，板上，四口 overlay）**：分类时间来自逐 dispatch 计时（`board_profile.py 40 --prompt 32 SA_PROFILE_PERF=...csv` → `dispatch_stats.py`，每个 dispatch 一个 list），每步总时间、设备时间、runtime 其余来自 batched 实测（`--batch`），两者设备时间差约 1%；逐 dispatch 模式的提交时间被放大（每步 90–270 ms），不列。数据：`build/deploy_hfgen_{qwen3_dyn,smollm2_kch_dyn,llama1b_kch}/` 的 `stats_*.json` / `prof_llama_*.json`。
+**主表分项（2026-10-12，板上，四口 overlay）**：分类时间来自逐 dispatch 计时（`board_profile.py 40 --prompt 32 SA_PROFILE_PERF=...csv` → `dispatch_stats.py`，每个 dispatch 一个 list），每步总时间、设备时间、runtime 其余来自 batched 实测（`--batch`），两者设备时间差约 1%；逐 dispatch 模式的提交时间被放大（每步 90–270 ms），不列。数据：`build/deploy_hfgen_{qwen3_dyn,smollm2_kch_dyn,llama1b_kch,gemma_kch}/` 的 `stats_*.json` / `prof_{llama,gemma}_*.json`。
 
 decode 每步：
 
-| | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B |
-|---|---:|---:|---:|
-| 每步（batched） | 145.4 ms | 45.1 ms | 247.6 ms |
-| 　设备 / runtime 其余 | 136.9 / 6.9 ms | 38.64 / 6.45 ms | 243.9 / 3.6 ms |
-| dispatch（主机） | 1046（0） | 1000（0） | 538（0） |
-| **GEMV**（matvec_like） | 111.4 ms（80%） | 28.6 ms（71%） | 226.5 ms（93%） |
-| 　GEMV 带宽（峰值 57.95 B/周期） | 53.7（93%） | 47.4（82%） | 54.7（94%） |
-| attention（batch_matmul） | 11.8 ms（8%） | 4.0 ms（10%） | 6.9 ms（3%） |
-| reduction（norm、softmax） | 8.0 ms（6%） | 4.0 ms（10%） | 6.7 ms（3%） |
-| elementwise 类 | 7.4 ms（5%） | 3.6 ms（9%） | 4.6 ms（2%） |
-| scatter（写 KV） | 0.3 ms | 0.3 ms | 0.2 ms |
-| DDR 读 | 607 MB，4.37 GB/s | 138 MB，3.42 GB/s | 1243 MB，5.08 GB/s |
+| | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B | Gemma-3-270M |
+|---|---:|---:|---:|---:|
+| 每步（batched） | 145.4 ms | 45.1 ms | 247.6 ms | 66.8 ms |
+| 　设备 / runtime 其余 | 136.9 / 6.9 ms | 38.64 / 6.45 ms | 243.9 / 3.6 ms | 60.95 / 5.62 ms |
+| dispatch（主机） | 1046（0） | 1000（0） | 538（0） | 690（0） |
+| **GEMV**（matvec_like） | 111.4 ms（80%） | 28.6 ms（71%） | 226.5 ms（93%） | 52.7 ms（85%；lm_head 31.7 ms） |
+| 　GEMV 带宽（峰值 57.95 B/周期） | 53.7（93%） | 47.4（82%） | 54.7（94%） | 51.2（88%） |
+| attention（batch_matmul） | 11.8 ms（8%） | 4.0 ms（10%） | 6.9 ms（3%） | 3.0 ms（5%） |
+| reduction（norm、softmax） | 8.0 ms（6%） | 4.0 ms（10%） | 6.7 ms（3%） | 3.4 ms（5%） |
+| elementwise 类 | 7.4 ms（5%） | 3.6 ms（9%） | 4.6 ms（2%） | 2.8 ms（5%） |
+| scatter（写 KV） | 0.3 ms | 0.3 ms | 0.2 ms | 0.2 ms |
+| DDR 读 | 607 MB，4.37 GB/s | 138 MB，3.42 GB/s | 1243 MB，5.08 GB/s | 272 MB，4.38 GB/s |
 
 prefill 每 16-token chunk：
 
-| | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B |
-|---|---:|---:|---:|
-| 每块（batched） | 773 ms | 266.3 ms | 1068.9 ms |
-| dispatch（主机） | 6390（0） | 4924（0） | 2642（0） |
-| **GEMM**（matmul_like） | 402.0 ms（51%） | 132.1 ms（48%） | 779.0 ms（73%） |
-| 　阵列利用率（峰值 256 MAC/周期） | 175（68%） | 129（50%） | 200（78%） |
-| 逐行 attention（batch_matmul） | 145.4 ms（18%） | 50.7 ms（18%） | 88.7 ms（8%） |
-| reduction | 124.5 ms（16%） | 57.2 ms（21%） | 108.3 ms（10%） |
-| elementwise 类 | 81.2 ms（11%） | 26.3 ms（10%） | 50.1 ms（5%） |
-| GEMV（lm_head，最后一行） | 27.6 ms（4%） | 5.2 ms（2%） | 45.6 ms（4%） |
-| scatter | 6.0 ms | 4.8 ms | 2.7 ms |
+| | Qwen3-0.6B | SmolLM2-135M | Llama-3.2-1B | Gemma-3-270M |
+|---|---:|---:|---:|---:|
+| 每块（batched） | 773 ms | 266.3 ms | 1068.9 ms | 256.0 ms |
+| dispatch（主机） | 6390（0） | 4924（0） | 2642（0） | 3588（0） |
+| **GEMM**（matmul_like） | 402.0 ms（51%） | 132.1 ms（48%） | 779.0 ms（73%） | 113.5 ms（44%） |
+| 　阵列利用率（峰值 256 MAC/周期） | 175（68%） | 129（50%） | 200（78%） | 141（55%） |
+| 逐行 attention（batch_matmul） | 145.4 ms（18%） | 50.7 ms（18%） | 88.7 ms（8%） | 37.6 ms（15%） |
+| reduction | 124.5 ms（16%） | 57.2 ms（21%） | 108.3 ms（10%） | 47.3 ms（18%） |
+| elementwise 类 | 81.2 ms（11%） | 26.3 ms（10%） | 50.1 ms（5%） | 25.8 ms（10%） |
+| GEMV（lm_head，最后一行） | 27.6 ms（4%） | 5.2 ms（2%） | 45.6 ms（4%） | 31.7 ms（12%） |
+| scatter | 6.0 ms | 4.8 ms | 2.7 ms | 3.0 ms |
 
 - decode 基本是带宽受限的 GEMV（Llama 93%、Qwen3 80%），剩下的固定部分主要是 attention 与 norm；SmolLM2 层内矩阵只有 576 宽，GEMV 命令的固定开销占比高（82%）。
 - prefill 不只是 GEMM：小模型的 GEMM 阵列利用率只有 50–68%，逐行 attention 与 reduction 合计占三到四成。
+- Gemma 的词表 262144 让 lm_head（168 MB int8）成为 decode 最大的单项（GEMV 的 60%、设备时间的 51%）；层内只有 640 宽，prefill 阵列利用率 55%。
 - MAC 覆盖率的 100% 不含 attention：`dispatch_stats.py` 对动态维不计 MAC（待修）。
 
 ### 13.3 两张消融表
@@ -739,6 +768,14 @@ prefill 每 16-token chunk：
 6. 下一项硬件投资为什么是 200 MHz、W4A8、URAM 或其他候选中的某一个？
 
 只要这些问题有可复现的数据回答，即使 Gemma 仍有部分 host fallback，本阶段也已经形成比单纯追求额外 10% 性能更强的编译器与系统贡献。
+
+### 17.2 问题 4 的现有答案（2026-10-13）
+
+四个模型（Qwen3、SmolLM2（Llama 结构的小模型）、Llama 3.2、Gemma 3）全模型、同一编译流程，板上逐 dispatch 计时（§13.2）：**动态 dispatch、设备时间、MAC 三项覆盖率都是 100%**，没有主机回退（Gemma 的 GELU-tanh 与单 KV 头 attention 是最后两处，§12.4）。剩余热点随形状比例移动：
+
+- decode：权重流量主导，GEMV 占设备时间 Qwen3 80%、SmolLM2 71%、Llama 93%、Gemma 85%（其中 Gemma 的 lm_head 一项占 51%，词表 262144），带宽为 4 口峰值的 82–94%；其余是 attention、norm 与每个命令的固定开销，在窄模型（SmolLM2 576、Gemma 640）上占比更高。
+- prefill：GEMM 只占 44–73%，阵列利用率 50–78%（窄模型低）；逐行 attention 与 reduction 合计 18–39%，是编译器侧下一步（attention 批处理、norm 融合）的目标。
+- 尚未计入：attention 的 MAC（`dispatch_stats.py` 对动态维不计）。
 
 ### 17.1 问题 6 的现有答案（2026-10-12）
 
