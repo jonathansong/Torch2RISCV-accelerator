@@ -452,6 +452,9 @@ def load(model_dir, max_len=256, quant=False, rope=False, attn=False, kv_scales=
     if rope:
         print("  rope_rewrite:", rope_rewrite(m, max_len))
         print("  norm_rewrite:", norm_rewrite(m))
+        n = act_rewrite(m)
+        if n:
+            print("  act_rewrite:", n)
     kv = None
     if attn and kv_scales is not None:    # given (e.g. qhf's, for a bit-exact comparison): a .npy or an array
         kv = (np.load(kv_scales) if isinstance(kv_scales, str) else np.asarray(kv_scales)).astype(np.float32)
@@ -671,6 +674,38 @@ def norm_rewrite(model):
             if type(child).__name__.endswith("RMSNorm") and getattr(child, "weight", None) is not None:
                 setattr(mod, cname, SaRMSNorm(child))
                 n += 1
+    return n
+
+
+class SaGELUTanh(torch.nn.Module):
+    """GELU's tanh approximation as the sa device computes it: x * 0.5 * (1 +
+    tanh(u)) = x * sigmoid(2u) = x * 1 / (1 + exp(z)), z = -2u = x * (a + b * x * x)
+    (u = sqrt(2 / pi) * (x + 0.044715 * x^3)); multiplies, adds, EXP and RECIP
+    only (the VE has no tanh, VMVX no fpowi). Large negative x: EXP saturates to
+    inf, RECIP to 0, the result -0 (torch: -0 as well)."""
+    A = _f32c(-2.0 * np.sqrt(2.0 / np.pi))
+    B = _f32c(-2.0 * np.sqrt(2.0 / np.pi) * 0.044715)
+
+    def forward(self, x):
+        z = x * (self.A + (x * x) * self.B)
+        return x * torch.reciprocal(torch.exp(z) + 1.0)
+
+
+def act_rewrite(model):
+    """Activation modules whose class name has GELU -> SaGELUTanh when the module
+    is the tanh approximation (found by running it; the exact erf form and any
+    other is refused, not approximated)."""
+    n = 0
+    x = torch.linspace(-8.0, 8.0, 257)
+    want = torch.nn.functional.gelu(x, approximate="tanh")
+    for mod in list(model.modules()):
+        for cname, child in list(mod.named_children()):
+            if "GELU" not in type(child).__name__.upper():
+                continue
+            if not torch.allclose(child(x), want, rtol=1e-5, atol=1e-6):
+                raise NotImplementedError(f"{type(child).__name__}: a GELU other than the tanh approximation")
+            setattr(mod, cname, SaGELUTanh())
+            n += 1
     return n
 
 

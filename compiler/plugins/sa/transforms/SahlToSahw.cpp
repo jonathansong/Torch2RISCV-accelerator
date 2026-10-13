@@ -24,8 +24,11 @@ namespace lower {
 bool Lowerer::run() {
   // the micro-kernels are written out by sahl-expand-kernels; one left has a
   // form it does not cover (the dispatch then runs on the host)
-  for (auto k : f.getBody().front().getOps<sahl::KernelOp>())
-    return fail("sahl.kernel \"" + k.getKind().str() + "\" not expanded by sahl-expand-kernels");
+  for (auto k : f.getBody().front().getOps<sahl::KernelOp>()) {
+    auto why = k->getAttrOfType<StringAttr>("sa.unexpanded");
+    return fail("sahl.kernel \"" + k.getKind().str() + "\" not expanded by sahl-expand-kernels" +
+                (why ? " (" + why.getValue().str() + ")" : std::string()));
+  }
   return lowerBlock(f.getBody().front());
 }
 

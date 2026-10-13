@@ -484,34 +484,41 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   return true;
 }
 
+// A kernel left unexpanded: the check that refused it (this file's line) as
+// sa.unexpanded, which sahl-to-sahw's report prints (the fallback's reason).
+static bool notExpanded(sahl::KernelOp k, int line) {
+  k->setAttr("sa.unexpanded", StringAttr::get(k.getContext(), "SahlExpandKernels.cpp:" + std::to_string(line)));
+  return false;
+}
+
 // A generic contraction (ContractPlan): false when it has a form not written
 // out here (the lowering). A dynamic K or N (the cache's T: attention's
 // batch_matmuls in prefill) has one K block and one chunk; rows of x of a
 // dynamic length, or results of a dynamic length, are walked with the row cursor.
 bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, const ::sa::Layout &lay, int64_t d) {
   auto rr = km.loopRanges(p.op);
-  if (!rr) return false;
+  if (!rr) return notExpanded(k, __LINE__);
   auto ranges = *rr;
   Range B = p.bLoop >= 0 ? ranges[p.bLoop] : Range{}, Gr = p.gLoop >= 0 ? ranges[p.gLoop] : Range{};
   Range Kr = ranges[p.kLoop], Nr = ranges[p.nLoop];
-  if (B.dyn || Gr.dyn || (Kr.dyn && Nr.dyn)) return false;
+  if (B.dyn || Gr.dyn || (Kr.dyn && Nr.dyn)) return notExpanded(k, __LINE__);
   const int64_t K = Kr.size, N = Nr.size * (p.laneLoop >= 0 ? d : 1), H = B.size, G = Gr.size;
   const bool xRows = (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0) || (p.gLoop >= 0 && p.x.coef[p.gLoop] < 0);
   const bool dyn = Kr.dyn || Nr.dyn;
-  if (xRows != bool(Kr.dyn)) return false;          // (x of a dynamic K: its rows a dynamic stride apart)
-  if (dyn && (p.laneLoop >= 0 || p.layout == MatLayout::Packed)) return false;
-  if (Kr.dyn && p.layout == MatLayout::RowsK) return false;
-  if (Nr.dyn && p.layout != MatLayout::RowsK) return false;
-  if (K % d || N % d) return false;
+  if (xRows != bool(Kr.dyn)) return notExpanded(k, __LINE__);          // (x of a dynamic K: its rows a dynamic stride apart)
+  if (dyn && (p.laneLoop >= 0 || p.layout == MatLayout::Packed)) return notExpanded(k, __LINE__);
+  if (Kr.dyn && p.layout == MatLayout::RowsK) return notExpanded(k, __LINE__);
+  if (Nr.dyn && p.layout != MatLayout::RowsK) return notExpanded(k, __LINE__);
+  if (K % d || N % d) return notExpanded(k, __LINE__);
   const int64_t sb = lay.sbank, nt = N / d;
   Type accT = cast<MemRefType>(p.op.getDpsInits()[0].getType()).getElementType();
-  if (!accT.isInteger(32) && !accT.isInteger(64)) return false;
+  if (!accT.isInteger(32) && !accT.isInteger(64)) return notExpanded(k, __LINE__);
   // which input is x (the other is the matrix), their maps; the output map
   auto maps = p.op.getIndexingMapsArray();
   auto a0 = km.operandOf(p.op, 0), a1 = km.operandOf(p.op, 1);
-  if (!a0 || !a1) return false;
+  if (!a0 || !a1) return notExpanded(k, __LINE__);
   const bool x0 = a0->coef == p.x.coef && a1->coef == p.m.coef, x1 = a1->coef == p.x.coef && a0->coef == p.m.coef;
-  if (x0 == x1) return false;                     // (which is x must be unambiguous)
+  if (x0 == x1) return notExpanded(k, __LINE__);                     // (which is x must be unambiguous)
   const int ix = x0 ? 0 : 1;
   (void)ix;
   // each DDR operand's dimension -> loop map from its strides and the
@@ -524,11 +531,11 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
     if (failed(mt.getStridesAndOffset(st, off))) return std::nullopt;
     SmallVector<AffineExpr> rs;
     for (int64_t r = 0; r < mt.getRank(); ++r) {
-      if (ShapedType::isDynamic(st[r])) return std::nullopt;
-      if (mt.getDimSize(r) == 1) {
+      if (mt.getDimSize(r) == 1) {                // (index 0 whatever its stride: one KV head's batch)
         rs.push_back(getAffineConstantExpr(0, k.getContext()));
         continue;
       }
+      if (ShapedType::isDynamic(st[r])) return std::nullopt;
       int found = -1;
       for (int L = 0; L < int(coef.size()); ++L)
         if (coef[L] == st[r] && (mt.isDynamicDim(r) ? bool(ranges[L].dyn) : ranges[L].size == mt.getDimSize(r))) {
@@ -542,12 +549,12 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   };
   // (rows of x a dynamic stride apart: through the row cursor, no map)
   auto xm = xRows ? std::optional<AffineMap>(AffineMap()) : viewMap(p.x.view, p.x.coef), mm = viewMap(p.m.view, p.m.coef);
-  if (!xm || !mm) return false;
+  if (!xm || !mm) return notExpanded(k, __LINE__);
   AffineMap xMap = *xm, mMap = *mm, outMap = maps[2];
-  if (xRows && Expander::rowDim(cast<MemRefType>(p.x.view.getType())) < 0) return false;
+  if (xRows && Expander::rowDim(cast<MemRefType>(p.x.view.getType())) < 0) return notExpanded(k, __LINE__);
   // results of a dynamic length: rows back to back
-  if (Nr.dyn && Expander::rowDim(cast<MemRefType>(p.store.getDst().getType())) < 0) return false;
-  if (int64_t(outMap.getNumResults()) != cast<MemRefType>(p.store.getDst().getType()).getRank()) return false;
+  if (Nr.dyn && Expander::rowDim(cast<MemRefType>(p.store.getDst().getType())) < 0) return notExpanded(k, __LINE__);
+  if (int64_t(outMap.getNumResults()) != cast<MemRefType>(p.store.getDst().getType()).getRank()) return notExpanded(k, __LINE__);
   auto outPos = [&](int L) -> int {
     if (L < 0) return -1;
     for (unsigned i = 0; i < outMap.getNumResults(); ++i)
@@ -555,7 +562,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
     return -1;
   };
   int eb = outPos(p.bLoop), eg = outPos(p.gLoop), en = outPos(p.nLoop), el = outPos(p.laneLoop);
-  if ((eb >= 0 && eg >= 0 && eb > eg) || (eg >= 0 && eg > en) || (eb >= 0 && eb > en)) return false;
+  if ((eb >= 0 && eg >= 0 && eb > eg) || (eg >= 0 && eg > en) || (eb >= 0 && eb > en)) return notExpanded(k, __LINE__);
   // epilogue inputs (the lowering's classes): 1 per element, 2 per column, 3 per (batch, row), 4 scalar
   linalg::GenericOp epi = p.epi;
   struct EpiIn {
@@ -566,7 +573,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   };
   llvm::DenseMap<int, EpiIn> epiIn;
   if (epi) {
-    if (!epi.getRegion().front().getOps<linalg::IndexOp>().empty()) return false;
+    if (!epi.getRegion().front().getOps<linalg::IndexOp>().empty()) return notExpanded(k, __LINE__);
     auto emaps = epi.getIndexingMapsArray();
     for (auto &[i, src] : p.epiLoads) {
       auto mt = cast<MemRefType>(epi.getDpsInputs()[i].getType());
@@ -575,17 +582,18 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       e.src = src;
       e.map = em;
       if (em.isIdentity()) {
-        if (Nr.dyn || !(mt.getElementType().isF32() || mt.getElementType().isInteger(32))) return false;
+        if (Nr.dyn || !(mt.getElementType().isF32() || mt.getElementType().isInteger(32))) return notExpanded(k, __LINE__);
         e.kind = 1;
         epiIn[i] = e;
         continue;
       }
       SmallVector<int64_t> st;
       int64_t off;
-      if (!mt.hasStaticShape() || failed(mt.getStridesAndOffset(st, off))) return false;
+      if (!mt.hasStaticShape() || failed(mt.getStridesAndOffset(st, off))) return notExpanded(k, __LINE__);
       bool onlyRow = true, onlyCol = true;
       int64_t sn = 0, sl = 0;
       for (unsigned r = 0; r < em.getNumResults(); ++r) {
+        if (mt.getDimSize(r) == 1) continue;      // (index 0: a unit loop, e.g. one KV head's batch)
         if (auto de = dyn_cast<AffineDimExpr>(em.getResult(r))) {
           int pos = int(de.getPosition());
           if (pos == eb) e.sb = st[r], onlyCol = false;
@@ -602,60 +610,60 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
         epiIn[i] = e;
         continue;
       }
-      if (!onlyRow) return false;
+      if (!onlyRow) return notExpanded(k, __LINE__);
       e.kind = (e.sb || e.sg) ? 3 : 4;
       epiIn[i] = e;
     }
     for (int i = 0; i < epi.getNumDpsInputs(); ++i)
-      if (epi.getDpsInputs()[i] != p.op.getDpsInits()[0] && !epiIn.count(i)) return false;
+      if (epi.getDpsInputs()[i] != p.op.getDpsInits()[0] && !epiIn.count(i)) return notExpanded(k, __LINE__);
     Type oet = cast<MemRefType>(epi.getDpsInits()[0].getType()).getElementType();
-    if (!oet.isF32() && !oet.isInteger(32) && !oet.isInteger(8)) return false;
-    if (oet.isInteger(8) && Nr.dyn) return false;
+    if (!oet.isF32() && !oet.isInteger(32) && !oet.isInteger(8)) return notExpanded(k, __LINE__);
+    if (oet.isInteger(8) && Nr.dyn) return notExpanded(k, __LINE__);
   } else if (Nr.dyn) {
-    return false;
+    return notExpanded(k, __LINE__);
   }
   // x's place; K blocks (the strip of a block in one bank, its B tile in one DMA row); chunks
   const bool xI32 = p.x.et.isInteger(32), xInRaw = !xI32 && p.layout != MatLayout::RowsK;
-  if (!xI32 && p.layout == MatLayout::RowsK) return false;
-  if (xInRaw && K / d > sb) return false;
+  if (!xI32 && p.layout == MatLayout::RowsK) return notExpanded(k, __LINE__);
+  if (xInRaw && K / d > sb) return notExpanded(k, __LINE__);
   // x in ACC: where the lowering will allocate it (the K blocks depend on it):
   // the allocator replayed over what comes before x, from a fresh state (the
   // kernel the first operation that emits commands; otherwise the lowering)
   int64_t xAt = sb;
   if (!xInRaw) {
-    if (!firstToEmit(k)) return false;
+    if (!firstToEmit(k)) return notExpanded(k, __LINE__);
     LocalMemory mem(lay);
     auto words = [&](int64_t n) { return uint32_t(std::max<int64_t>((n + d - 1) / d, 1)); };
     for (auto &[i, src] : p.epiLoads) {
       const EpiIn &ei = epiIn[i];
       if (ei.kind < 3) continue;
       int64_t n = cast<MemRefType>(epi.getDpsInputs()[i].getType()).getNumElements();
-      if (!mem.allocAcc(words(n))) return false;                     // the values
+      if (!mem.allocAcc(words(n))) return notExpanded(k, __LINE__);                     // the values
       if (ei.kind == 4) {
-        if (!mem.allocAcc(1)) return false;                           // their broadcast word
+        if (!mem.allocAcc(1)) return notExpanded(k, __LINE__);                           // their broadcast word
       } else {
         int64_t w = (n + d - 1) / d;
-        if (!mem.allocAcc(uint32_t(w * d)) || !mem.allocAcc(uint32_t(w * d))) return false;   // replicated, transposed
+        if (!mem.allocAcc(uint32_t(w * d)) || !mem.allocAcc(uint32_t(w * d))) return notExpanded(k, __LINE__);   // replicated, transposed
       }
     }
     auto xw = mem.allocAcc(words(K));
-    if (!xw) return false;
+    if (!xw) return notExpanded(k, __LINE__);
     xAt = *xw;
   }
   const int64_t xDepth = xInRaw ? 2 * sb : 2 * int64_t(lay.cbank);
   int64_t kmax = std::min<int64_t>(sb, 65535 / d / d * d);
   kmax = std::min<int64_t>(kmax, (xDepth - xAt - K / d) / d * d);
-  if (kmax < d) return false;
+  if (kmax < d) return notExpanded(k, __LINE__);
   const int64_t kc = K > kmax ? kmax : K, nk = (K + kc - 1) / kc;
-  if (nk > 1 && (G != 1 || dyn)) return false;
+  if (nk > 1 && (G != 1 || dyn)) return notExpanded(k, __LINE__);
   int64_t nc = nt;
   if (!Nr.dyn) {
     int64_t cap = std::max<int64_t>(sb / kc, 1);
     for (nc = std::min(cap, nt); nc > 1 && nt % nc; --nc) {
     }
   }
-  if (kc * nc > sb) return false;
-  if (xRows && nc != nt) return false;
+  if (kc * nc > sb) return notExpanded(k, __LINE__);
+  if (xRows && nc != nt) return notExpanded(k, __LINE__);
 
   Expander e{OpBuilder(k), k.getLoc(), d};
   MLIRContext *ctx = k.getContext();
@@ -1007,6 +1015,7 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
           if (!c || !o.hasAttr("sahl.anchor")) continue;
           KernelMatcher km(cfg);
           if (km.matchContraction(c)) expandContraction(k, km.contracts[c.getOperation()], km, lay, cfg.d);
+          else notExpanded(k, __LINE__);
           break;
         }
         continue;
