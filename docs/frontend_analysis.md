@@ -1,5 +1,7 @@
 # 编译器前端分析:现状、业界对照与通用化缺口
 
+> English version: [`frontend_analysis.en.md`](frontend_analysis.en.md) (translated 2026-10-13; this Chinese document is the authoritative one).
+
 状态:2026-10-03,基于对 `compiler/frontend/` 与 `docs/iree_compiler_plan.md` 的阅读。没有在其他模型上实际运行验证,标注"推断"的地方是读代码的结论。
 
 相关文档:[`iree_compiler_plan.md`](iree_compiler_plan.md)(§3 前端、§8.9 HuggingFace 导入、§8.16 前端通用化)、[`../compiler/README.md`](../compiler/README.md)。

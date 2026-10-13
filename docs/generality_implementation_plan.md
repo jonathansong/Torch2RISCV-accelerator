@@ -1,5 +1,7 @@
 # 4 口 GEMV 之后：通用性与量化质量实现方案
 
+> English version: [`generality_implementation_plan.en.md`](generality_implementation_plan.en.md) (translated 2026-10-13; this Chinese document is the authoritative one).
+
 状态：实施版草案（2026-10-10 按代码与四口板上结果复核：WP0、WP1 基本完成，WP5 的 EX 基线已存在，WP6 只差编译器接入）。**2026-10-12 进度**：WP2、WP3（SmolLM2）、WP7（Llama-3.2-1B）板上验收；WP4 Qwen3 K 按通道板上验收；WP9 第一版完成（§13.1：统计、板上 teacher forcing、decode / prefill 分解；V 投影走 GEMV、attention 按实际长度后 Qwen3 decode 6.88 tok/s、prefill 20.5 tok/s）；WP6 开关与边界测试完成；WP6 decode K 分块已接入编译器；SmolLM2 KV 按通道评估完成（kch 28.82 / 87.7%），SmolLM2 全模型 kch + 按实际长度板上验收（decode 22.17、prefill 60.09 tok/s，板上 PPL 28.55，§7）。**2026-10-13 进度**：Llama-3.2-1B K per-channel 重建板上验收（4.04 / 14.97 tok/s，§11）；4 口性能模型重新校准，§17.1 回答问题 6（下一项硬件投资 W4A8）；**WP8 Gemma-3-270M 全模型板上验收**（790 个 executable 全在加速器，17/17 逐位一致，decode 14.96、prefill 62.5 tok/s，板上 PPL 158.5，§12.4），§13.2 主表四行齐全，§17.2 回答问题 4；Gemma 质量损失定位到 int8 注意力概率，改为按量化后的和归一化（qsum，1a0ba3d）：Gemma、SmolLM2、Qwen3 重建后板上验收，板上 KL −25% / −31% / −29%（Gemma PPL 158.5 → 142.8），速度不变（§12.4）；Llama 重建中  
 日期：2026-10-10（2026-10-12 更新）  
 基线：`main@b42fec6`（四口验收 `fb01909`）  

@@ -1,5 +1,7 @@
 # LLM 推理：架构方案与实施步骤
 
+> English version: [`llm_inference_plan.en.md`](llm_inference_plan.en.md) (translated 2026-10-13; this Chinese document is the authoritative one).
+
 > **PYNQ-Z1 的路径**：本文记录的是在 PYNQ-Z1 上完成的工作。文中的 `RISCV-on-PYNQ-Z1/...`（block design、约束）、`bitstreams/...`（板上验证过的构建）和 `iree-sa/l0` 都在 `pynq-z1` 分支（tag `v1.0-pynq-z1`）上；main 上 PicoRV32 与它的 IP 在 `rtl/picorv32/`、`rtl/ip/`，当前的 overlay 在 `boards/kv260/`。
 
 状态：**L0–L5 和 L5b 已完成并上板验证**。stories15M 全部在设备上运行，逐位等于参考模型：

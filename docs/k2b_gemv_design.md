@@ -1,5 +1,7 @@
 # K2b / H4：2 口读入 + 流式 GEMV 单元的微结构
 
+> English version: [`k2b_gemv_design.en.md`](k2b_gemv_design.en.md) (translated 2026-10-13; this Chinese document is the authoritative one).
+
 （2026-10-09；**状态 2026-10-10：G1–G5 全部完成，4 口板上验收，Qwen3 decode 6.28 token/s、SmolLM2 17.04**，见 §8 / §8.1。依据：`kv260_upgrade_plan.md` K2b 第 1 步的性能模型，`compiler/tests/perf_model.py`。）
 
 ## 1. 目标

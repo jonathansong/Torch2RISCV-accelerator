@@ -1,5 +1,7 @@
 # PYNQ-Z1 → Kria KV260 升级方案
 
+> English version: [`kv260_upgrade_plan.en.md`](kv260_upgrade_plan.en.md) (translated 2026-10-13; this Chinese document is the authoritative one).
+
 状态：草案（2026-10-02，按三轮实现前评审修订：K1 拆为 50 / 100 MHz 两步，K2 改为 DMA 与片上存储接口重构，K4 拆为正确性与性能两步验收）。**2026-10-04：Z1 已冻结**（§7.2 完成：tag `v1.0-pynq-z1`、分支 `pynq-z1`、基线文件 `tests/baselines/pynq-z1/`，含实测的耗时分解 `z1_profile.md`）；之后的所有优化都在 KV260 上做，包括编译器的带生存期内存规划（K2b 的编译器工作项）。**2026-10-08：K1 验收完成**（K1a 50 MHz、K1b 100 MHz，板上 token 序列与 Z1 基线完全相同；100 MHz 下 stories15M 35.44 token/s、SmolLM2 4.43 token/s），`kv260` 分支合入 main，main 从此是 KV260 版本（§7.3）。**2026-10-10：K2b 以 100 MHz 流式 GEMV（H4）+ 4 个读口验收**（D = 16 不变，不再以 D = 32 为前提；设计见 [`k2b_gemv_design.md`](k2b_gemv_design.md)）：decode Qwen3-0.6B 2.22 → **6.28 token/s**、SmolLM2 7.71 → 17.04，prefill 不变；K5-M 第 1 步（启动时保留的 1280 MiB 加速器内存池）完成。本文给出从 PYNQ-Z1（Zynq-7020）迁移到 Kria KV260（K26 SOM，Zynq UltraScale+）的完整计划：分阶段目标、每个模块的改动、验收标准和风险。性能数字除"实测"外均为估算，需在板上验证。
 
 相关文档：[`iree_compiler_plan.md`](iree_compiler_plan.md) §8.18（FPGA 规模估计）、[`double_buffer_design.md`](double_buffer_design.md)（加速器架构）、[`memory_model.md`](memory_model.md)（地址与一致性）。
