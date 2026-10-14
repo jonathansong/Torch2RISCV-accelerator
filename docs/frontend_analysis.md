@@ -149,7 +149,7 @@ Depends on 5.x internal interfaces: `StaticCache.layers`, `layer.update`, `layer
 ### 4.5 Export and shapes
 
 - batch fixed at 1; decode is `[1,1]`, prefill a block of fixed M.
-- `max_len` is static per build (`--max-len`, default 256; the export also sets the compiler's `--iree-sa-max-dynamic`); long contexts are limited by on-chip capacity: on the KV260 (D = 16) the decode attention holds T × head_dim in one SPAD_B bank, so T ≤ 256 for Gemma-3 (head_dim 256), 512 for Qwen3 (128), 1024 for Llama-3.2 / SmolLM2 (64), until the T tiling of `iree_compiler_plan.md` §8.22 (C6.5).
+- `max_len` is static per build (`--max-len`, default 256; the export also sets the compiler's `--iree-sa-max-dynamic`); long contexts are limited by on-chip capacity: on the KV260 (D = 16) the decode attention holds T × head_dim in one SPAD_B bank, so T ≤ 256 for Gemma-3 (head_dim 256), 512 for Qwen3 (128), 1024 for Llama-3.2 / SmolLM2 (64), before the T tiling of `iree_compiler_plan.md` §8.22 (C6.5 / C6.5b, done 2026-10-14): now Qwen3 compiles for 2048 (and 4096 but for one dispatch) and Gemma for 512 (its sliding window) with everything on the accelerator, checked on the board.
 - All layers share one K and one V buffer to work around the mutable-global merge problem of IREE 3.11 (`compiler/tests/iree_global_merge_repro.py`); a workaround for an upstream defect.
 
 ### 4.6 Backend coverage

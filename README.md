@@ -267,7 +267,7 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 | 5 | MLIR dialect + instruction-level lowering | ✅ superseded | done as the IREE compiler (`sahl` / `sahw` dialects → descriptor lists, [`compiler/`](compiler/README.md)) instead of `.insn` firmware |
 | 6 | Loose- vs tight-coupling benchmark | 🟡 partial | Phase 3 vs 4 board numbers exist; write-up pending |
 | 7 | Vector unit | ✅ done in M3 | fused int8 epilogue + standalone vector ops |
-| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T (C6.5 / C6.5b, sim: Gemma 512, Qwen3 2048, a 1104-token prompt end to end; board check staged; [plan §8.22](docs/iree_compiler_plan.md)) |
+| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T (C6.5 / C6.5b, sim: Gemma 512, Qwen3 2048, a 1104-token prompt end to end; on the board 2026-10-14: whole Qwen3 at 2048 / Gemma at 512, prefill vs decode only bit-exact over a 2032-token prompt, Qwen3 decode 1.60 tok/s at T = 2048; [plan §8.22](docs/iree_compiler_plan.md)) |
 | 9 | Documentation and write-up | 🟡 in progress | `docs/` (design doc, learning path) |
 
 The accelerator rebuild replaced the Phase 2–4 unit with a double-buffered
