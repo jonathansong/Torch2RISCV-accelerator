@@ -9,7 +9,11 @@
 //     sahl.reserve and its fill done once);
 //   row pieces: every operation row by row over [R, C] or [R, C1, C2, ...]
 //     (an even number of rows per piece; two rows whose generics are lowered
-//     one row at a time, sahl.row_by_row, when not even two fit).
+//     one row at a time, sahl.row_by_row, when not even two fit); also over
+//     [R, ?], rows of a dynamic length T (C6.5b, docs/iree_compiler_plan.md
+//     §8.22: the attention probabilities over the cache; estimated at
+//     max_dynamic, the pieces' DDR views a static row offset into the rows of
+//     a [R, ?] binding, which the lowering reaches with its row offset PARAM).
 // The ACC estimate is the lowering's (an upper bound: every buffer, a temp per
 // fp32 operation); sahl-plan-memory replaces it (R4).
 #include "SahlDialect.h"
@@ -30,6 +34,13 @@ namespace {
 struct Decider {
   func::FuncOp f;
   int64_t d;
+  int64_t maxDynamic;
+  // elements of a row's shape (a dynamic length at max_dynamic)
+  int64_t rowElems(ArrayRef<int64_t> T) {
+    int64_t n = 1;
+    for (int64_t t : T) n *= ShapedType::isDynamic(t) ? maxDynamic : t;
+    return n;
+  }
   // A dispatch whose operations go row by row over [R, C] (R != C) or
   // [R, C1, C2, ...] (a row's shape T = [C] or [C1, C2, ...]): generics over all
   // the dimensions with maps (r, c...), (r), (c...) or () (reductions over c...
@@ -41,17 +52,19 @@ struct Decider {
     SmallVector<int64_t> T;
     for (Operation &op : f.getBody().front())
       for (Value v : op.getOperands())
-        if (auto mt = dyn_cast<MemRefType>(v.getType()); mt && mt.hasStaticShape() && mt.getRank() >= 2 && R < 0 &&
+        if (auto mt = dyn_cast<MemRefType>(v.getType()); mt && staticOrRows(mt) && mt.getRank() >= 2 && R < 0 &&
                                                             isa<linalg::GenericOp, sahl::LoadOp, sahl::StoreOp>(op)) {
           R = mt.getDimSize(0);
           T.assign(mt.getShape().begin() + 1, mt.getShape().end());
         }
-    if (R <= 1 || T.empty() || llvm::product_of(T) <= 1 || (T.size() == 1 && R == T[0])) return std::nullopt;
+    if (R <= 1 || T.empty() || rowElems(T) <= 1 || (T.size() == 1 && R == T[0])) return std::nullopt;
+    // ([R, ?]: a dynamic length only as the whole row)
+    if (llvm::any_of(T, ShapedType::isDynamic) && T.size() != 1) return std::nullopt;
     const unsigned rank = T.size() + 1;
     auto shapeOk = [&](Value v) {
       auto mt = dyn_cast<MemRefType>(v.getType());
-      if (!mt || !mt.hasStaticShape()) return false;
-      if (mt.getNumElements() == 1) return true;
+      if (!mt || !staticOrRows(mt)) return false;
+      if (mt.hasStaticShape() && mt.getNumElements() == 1) return true;
       ArrayRef<int64_t> sh = mt.getShape();
       if (sh.size() == rank) return sh[0] == R && sh.drop_front() == ArrayRef<int64_t>(T);
       return (sh.size() == 1 && sh[0] == R) || sh == ArrayRef<int64_t>(T);
@@ -92,13 +105,21 @@ struct Decider {
           return std::nullopt;
         }
       } else if (!isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CastOp,
-                      IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp, func::ReturnOp,
-                      arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp, arith::OrIOp>(op) &&
-                 !(op.getDialect() && op.getDialect()->getNamespace() == "util")) {
+                      memref::DimOp, IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp,
+                      func::ReturnOp, arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp,
+                      arith::OrIOp>(op) &&
+                 !(op.getDialect() && (op.getDialect()->getNamespace() == "util" ||
+                                       op.getDialect()->getNamespace() == "iree_tensor_ext"))) {
         return std::nullopt;
       }
     }
     return std::make_pair(R, T);
+  }
+  // a static shape, or [R, ?] (a dynamic innermost length only)
+  static bool staticOrRows(MemRefType mt) {
+    for (int64_t i = 0; i + 1 < mt.getRank(); ++i)
+      if (mt.isDynamicDim(i)) return false;
+    return true;
   }
   // ACC words such a dispatch may need at once: every [R, T] buffer, a temp per
   // fp32 operation of a generic over all the dimensions (with more than one
@@ -112,8 +133,9 @@ struct Decider {
     for (Operation &op : f.getBody().front()) {
       if (auto a = dyn_cast<memref::AllocOp>(&op)) {
         auto mt = cast<MemRefType>(a.getType());
-        if (mt.getElementType().isInteger(8) || !mt.hasStaticShape()) continue;
+        if (mt.getElementType().isInteger(8)) continue;
         if (mt.getRank() == int64_t(rank) && mt.getDimSize(0) == R) ++bufs;
+        else if (!mt.hasStaticShape()) continue;
         else if (rank > 2) fixed += (mt.getNumElements() + d - 1) / d;
       } else if (auto g = dyn_cast<linalg::GenericOp>(&op); g && g.getNumLoops() == rank) {
         // the values that vary within a row: from an operand mapped to more than d0
@@ -135,7 +157,7 @@ struct Decider {
         }
       }
     }
-    return {bufs * ((R * llvm::product_of(T) + d - 1) / d), fixed};
+    return {bufs * ((R * rowElems(T) + d - 1) / d), fixed};
   }
 
   // An element-wise dispatch (static contiguous loads / stores, generics with
@@ -294,8 +316,8 @@ void rowPieces(func::FuncOp f, int64_t R, ArrayRef<int64_t> T, int64_t rn, bool 
   OpBuilder b(blk.getTerminator());
   auto byRow = [&](Value v) {
     auto mt = dyn_cast<MemRefType>(v.getType());
-    return mt && mt.hasStaticShape() && mt.getRank() >= 1 && mt.getDimSize(0) == R &&
-           (mt.getRank() == 1 || mt.getShape().drop_front() == T);
+    return mt && mt.getRank() >= 1 && !mt.isDynamicDim(0) && mt.getDimSize(0) == R &&
+           (mt.getRank() == 1 ? mt.hasStaticShape() : mt.getShape().drop_front() == T);
   };
   for (int64_t r0 = 0; r0 < R; r0 += rn) {
     int64_t n = std::min(rn, R - r0);
@@ -311,11 +333,16 @@ void rowPieces(func::FuncOp f, int64_t R, ArrayRef<int64_t> T, int64_t rn, bool 
         shape[0] = n;
         Value r;
         if (!ddrRoot(v)) {
-          r = memref::AllocOp::create(ib, v.getLoc(), MemRefType::get(shape, mt.getElementType()));
+          // ([n, ?]: the length of the buffer it replaces)
+          auto a = v.getDefiningOp<memref::AllocOp>();
+          r = memref::AllocOp::create(ib, v.getLoc(), MemRefType::get(shape, mt.getElementType()),
+                                      a ? a.getDynamicSizes() : ValueRange{});
         } else {
           SmallVector<OpFoldResult> offs(mt.getRank(), ib.getIndexAttr(0)), sizes, strides(mt.getRank(), ib.getIndexAttr(1));
           offs[0] = ib.getIndexAttr(r0);
-          for (int64_t s : shape) sizes.push_back(ib.getIndexAttr(s));
+          for (auto [i, s] : llvm::enumerate(shape))
+            sizes.push_back(ShapedType::isDynamic(s) ? OpFoldResult(memref::DimOp::create(ib, v.getLoc(), v, int64_t(i)).getResult())
+                                                     : OpFoldResult(ib.getIndexAttr(s)));
           r = memref::SubViewOp::create(ib, v.getLoc(), v, offs, sizes, strides);
         }
         map.map(v, r);
@@ -345,14 +372,17 @@ struct SahlTilePass : public PassWrapper<SahlTilePass, OperationPass<func::FuncO
       cfg.d = optD;
       cfg.spadBytes = optSpadKB * 1024;
       cfg.accBytes = optAccKB * 1024;
+      cfg.maxDynamic = optMaxDynamic;
+      cfg.tileShrink = optTileShrink;
     }
     func::FuncOp f = getOperation();
     if (!f.getBody().front().getOps<sahl::KernelOp>().empty()) return;   // (kernels tile themselves)
     ::sa::Layout lay(uint32_t(cfg.d), uint32_t(cfg.spadBytes), uint32_t(cfg.accBytes));
     // (tileShrink: SaCodegen's retry after ACC full, the estimate being too optimistic)
-    const int64_t cap = (2 * (lay.cbank - lay.scr)) >> cfg.tileShrink, d = cfg.d;
-    Decider dc{f, d};
-    if (auto n = dc.pieceable(); n && dc.pieceWords(*n) > cap) {
+    const int64_t capAll = (2 * (lay.cbank - lay.scr)) >> cfg.tileShrink, d = cfg.d;
+    Decider dc{f, d, cfg.maxDynamic};
+    if (auto n = dc.pieceable(); n && dc.pieceWords(*n) > capAll) {
+      const int64_t cap = capAll;
       int64_t pieces = (dc.pieceWords(*n) + cap - 1) / cap;
       int64_t len = ((*n + pieces - 1) / pieces + d - 1) / d * d;
       flatPieces(f, *n, len);
@@ -361,6 +391,14 @@ struct SahlTilePass : public PassWrapper<SahlTilePass, OperationPass<func::FuncO
     if (auto rt = dc.rowPieceable()) {
       auto &[R, T] = *rt;
       auto [words, fixed] = dc.pieceWordsRows(R, T);
+      // rows of a dynamic length: the estimate at max_dynamic is far above what
+      // the lowering takes (all of [16, 1024] fits), so only on SaCodegen's retry
+      // after ACC full, then for ACC as estimated (the first retry: no shrink)
+      int64_t cap = capAll;
+      if (llvm::any_of(T, ShapedType::isDynamic)) {
+        if (cfg.tileShrink == 0) return;
+        cap = (2 * (lay.cbank - lay.scr)) >> (cfg.tileShrink - 1);
+      }
       if (words + fixed > cap) {
         // rows per piece: even (the per-row vectors' DMAs stay 8-byte aligned); if
         // not even two fit, two whose generics the lowering takes one row at a time
@@ -379,6 +417,10 @@ struct SahlTilePass : public PassWrapper<SahlTilePass, OperationPass<func::FuncO
   Option<int64_t> optD{*this, "d", llvm::cl::desc("array size D"), llvm::cl::init(8)};
   Option<int64_t> optSpadKB{*this, "spad-kb", llvm::cl::desc("SPAD size (KB, two banks)"), llvm::cl::init(128)};
   Option<int64_t> optAccKB{*this, "acc-kb", llvm::cl::desc("ACC size (KB, two banks)"), llvm::cl::init(256)};
+  Option<int64_t> optMaxDynamic{*this, "max-dynamic", llvm::cl::desc("upper bound of a dynamic dimension"),
+                                llvm::cl::init(256)};
+  Option<int64_t> optTileShrink{*this, "tile-shrink", llvm::cl::desc("SaCodegen's retry after ACC full (0: none)"),
+                                llvm::cl::init(0)};
 };
 
 }  // namespace

@@ -358,6 +358,23 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
 std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
   auto mt = cast<MemRefType>(v.getType());
   std::optional<Lin> dynRows;
+  if (auto sv = v.getDefiningOp<memref::SubViewOp>();
+      sv && mt.getRank() == 2 && !mt.isDynamicDim(0) && mt.isDynamicDim(1)) {
+    // rows [r0, r0 + n) of a [H, ?] binding, whole rows (sahl-tile's row pieces, C6.5b)
+    auto st = cast<MemRefType>(sv.getSource().getType());
+    auto o = sv.getStaticOffsets(), str = sv.getStaticStrides();
+    auto dim = sv.getSizes().empty() ? memref::DimOp() : sv.getSizes()[0].getDefiningOp<memref::DimOp>();
+    if (st.getRank() != 2 || !st.isDynamicDim(1) || ShapedType::isDynamic(o[0]) || o[1] != 0 || str[0] != 1 ||
+        str[1] != 1 || !dim || dim.getSource() != sv.getSource() || dim.getConstantIndex() != 1)
+      return fail("dynamic DDR view other than whole rows of a [H, ?] binding"), std::nullopt;
+    auto r = ddrOf(sv.getSource(), allowPitch);
+    if (!r) return std::nullopt;
+    if (!r->dyn || r->rowSkip) return fail("rows of a dynamic DDR view"), std::nullopt;
+    r->rowSkip = o[0];
+    r->rows = mt.getDimSize(0);
+    r->n = cfg.maxDynamic * r->rows;
+    return r;
+  }
   if (!mt.hasStaticShape() && v.getDefiningOp<memref::SubViewOp>() && mt.isDynamicDim(0)) {
     // a view of rows whose count is dynamic (an expanded kernel's cache rows):
     // the fields at the bound (max_dynamic rows), the count kept for a dynamic field
@@ -485,11 +502,11 @@ bool Lowerer::dynamicDma(const Ddr &r, const LocalBuf &l, bool isLoad) {
     if (isLoad) dynDma(sahw::LdOp::create(bb, loc, r.base, r.off, la, 1, maxBytes, maxBytes, 0, dv), acc, bp);
     else dynDma(sahw::StOp::create(bb, loc, r.base, r.off, la, 1, maxBytes, maxBytes, dv), acc, bp);
   };
-  if (r.rows == 1) {
+  if (r.rows == 1 && !r.rowSkip) {
     one(0, Value());
     return true;
   }
-  rowLoop(r.rows, bp, [&](int64_t row) { one(row, rowAcc); });
+  rowLoop(r.rows, bp, [&](int64_t row) { one(row, rowAcc); }, r.rowSkip);
   return true;
 }
 
@@ -949,6 +966,7 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
       cfg.accBytes = optAccKB * 1024;
       cfg.gemvPorts = optGemvPorts;
       cfg.ukernels = optUkernels;
+      cfg.maxDynamic = optMaxDynamic;
     }
     ModuleOp m = getOperation();
     SmallVector<func::FuncOp> funcs(m.getOps<func::FuncOp>());
@@ -977,6 +995,8 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
                                   llvm::cl::init("all")};
   Option<int64_t> optGemvPorts{*this, "gemv-ports", llvm::cl::desc("read ports of the GEMV unit (0: none)"),
                                llvm::cl::init(0)};
+  Option<int64_t> optMaxDynamic{*this, "max-dynamic", llvm::cl::desc("upper bound of a dynamic dimension"),
+                                llvm::cl::init(256)};
 };
 
 }  // namespace

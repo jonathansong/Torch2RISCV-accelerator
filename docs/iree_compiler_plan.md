@@ -1454,7 +1454,15 @@ Everything is integer except the fp32 max over T, so tiled results are bit-ident
 
 Gemma end to end with a 320-token prompt (past the old 256 limit, `--max-len 512`, prefill 16): 324 steps against the torch W8A8 model, min corr 0.9979, 0 dispatches on the host; teacher forcing over 40 positions device top-1 37/40 = torch W8A8 37/40, device vs torch argmax differs at 0; prefill vs decode only 5/5 rows bit-exact.
 
-**Limits now.** Gemma 512 (its sliding window, out of scope above); Qwen3 1024. At 2048 Qwen3's decode QKᵀ fits, but 17 dispatches go to the host: the row-mode reductions over T (`reduction_16xD`, the qsum Σp in decode and prefill) allocate [16, max T] buffers and `sahl-tile` skips dynamic shapes ("ACC full"). That is the next step, **C6.5b**: `sahl-tile` row pieces for dynamic-length [R, T] rows (the DDR row offset r0 · T needs the PARAM / cursor mechanism). Not started.
+**Limits after C6.5.** Gemma 512 (its sliding window, out of scope above); Qwen3 1024. At 2048 Qwen3's decode QKᵀ fits, but 17 dispatches went to the host: the attention probabilities over T (`reduction_16xD`: the masked max over T, then p = i8(exp(s − max) · 127), one decode dispatch and one per prefill row) hold [16, max T] fp32 buffers and their temps in ACC, and `sahl-tile` skipped dynamic shapes ("ACC full").
+
+**C6.5b (2026-10-14): row pieces over dynamic-length rows.**
+- `sahl-tile` accepts [R, ?] (a dynamic innermost length as the whole row; T estimated at max_dynamic): the pieces are scopes over rows [r0, r0 + n), with local [n, ?] buffers and DDR views `subview %b[r0, 0] [n, dim(%b, 1)]` of the [R, ?] bindings.
+- The lowering (`ddrOf`) reads such a view as the binding's dynamic rows with a static row skip. A [H, ?] binding was already moved row by row (the row offset PARAM accumulating T · element bytes with `SETREG +=`, each DMA with two dynamic fields, address and row bytes); a piece starts by adding the bytes per row r0 times. No new PARAMs, no shared cursor between the input (fp32, 4T bytes per row) and the output (int8, T bytes per row): each DMA sequence resets the offset first.
+- The estimate at max_dynamic is far above what the lowering takes (the untiled [16, 1024] form compiles), so dynamic rows are split only on `SaCodegen`'s retry after ACC full, then for ACC as estimated (no shrink on that first retry). Every dispatch that compiled before is byte-identical (golden corpus).
+- Tests: lit `sahl_tile_rows_dyn.mlir` (the pieces, untouched without the retry, the lowered row skips); `run_tests.sh longctxq2k` (Qwen3 2 layers at `--max-len 2048`: 202 executables on the accelerator, 0 on the host; per-dispatch checks OK at T = 16, 1024, 1040, 2032, 2048); golden case `qwen3_t2048`.
+
+**Limits now.** Qwen3 (and by the same rule SmolLM2 / Llama, head_dim 64) compile for 2048 with everything on the accelerator; Gemma stays at 512 (sliding window). The target check `spadBytes / d ≥ 2 · max_dynamic` allows max_dynamic up to 4096 at D = 16; above 2048 nothing has been tried, and device memory bounds Llama at about 2200 positions (generality plan §9.3). Not yet run on the board.
 
 ## 9. Verification system
 

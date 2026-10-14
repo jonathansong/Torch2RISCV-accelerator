@@ -240,9 +240,9 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   sa_packed.irpa]` (device memory against the 1280 MiB pool);
   `perf_model.py` (`--whatif`). Context length: decode attention goes over T
   in blocks (C6.5, docs/iree_compiler_plan.md §8.22); checked on the sim up
-  to T = 512 for Gemma (its sliding window) and 1024 for Qwen3
-  (`tests/test_long_context.py`, run_tests.sh `longctx` / `longctxq`); 2048
-  waits for C6.5b (row-mode reductions over dynamic T).
+  to T = 512 for Gemma (its sliding window) and 2048 for Qwen3 (C6.5b: row
+  pieces over dynamic-length rows; `tests/test_long_context.py`, run_tests.sh
+  `longctx` / `longctxq` / `longctxq2k`).
 
   ```sh
   compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)

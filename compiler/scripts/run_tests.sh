@@ -41,9 +41,11 @@ declare -A cmd=(
   [gemvk]="$SA_PY compiler/frontend/synth_hf.py --out build/ct_synth/k8k --tokenizer build/llm_cache/SmolLM2-135M --arch LlamaForCausalLM --dim 256 --hidden 8192 --layers 2 --heads 4 --kv-heads 2 && SA_D=16 SA_GEMV_PORTS=4 $SA_PY -u $T/test_hf_generic.py --model build/ct_synth/k8k --out build/ct_synth/k8k_out --quant --rope --attn --prefill 16 --mb 200"
   # WP6 boundaries: one decode linear layer at K = 4080 / 4096 / 4112 / 8192 and the worst case, K split on / off
   [gemvks]="$SA_PY -u $T/test_gemv_ksplit.py"
-  # C6.5: a KV cache longer than one SPAD_B bank (q . K^T over T in blocks): Gemma-3 (head_dim 256) at 512, Qwen3 (128) at 1024
+  # C6.5: a KV cache longer than one SPAD_B bank (q . K^T over T in blocks): Gemma-3 (head_dim 256) at 512, Qwen3 (128) at 1024;
+  # C6.5b: Qwen3 at 2048 (row pieces over dynamic-length rows)
   [longctx]="$SA_PY -u $T/test_long_context.py"
   [longctxq]="$SA_PY -u $T/test_long_context.py --model build/llm_cache/Qwen3-0.6B-W8A8 --max-len 1024 --out build/hfgen/qwen3_l2_t1024 --t 16,496,512,528,1024"
+  [longctxq2k]="$SA_PY -u $T/test_long_context.py --model build/llm_cache/Qwen3-0.6B-W8A8 --max-len 2048 --out build/hfgen/qwen3_l2_t2048lc --t 16,1024,1040,2032,2048"
   [c3]="$SA_PY -u $T/test_c3.py --skip-export --out build/c4/fuse"
   [c5]="$SA_PY -u $T/test_c5.py"
   [c5cfg]="$SA_PY -u $T/test_c5.py --configs"

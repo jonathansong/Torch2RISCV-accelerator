@@ -170,18 +170,20 @@ private:
     int64_t rows = 1;
     int64_t pitch = 0;         // static rows `pitch` bytes apart (a column slice), 0: contiguous
     std::optional<Lin> dynRows;  // a view of a dynamic number of rows (the fields at max_dynamic rows)
+    int64_t rowSkip = 0;       // with dyn: the view starts this many rows (of the dynamic length) in
   };
   std::optional<Ddr> ddrOf(Value v, bool allowPitch = false);
 
   // rows of a dynamic length T (bytes per row = f(T)): row r at DDR offset
   // r * bytes; a PARAM accumulates the offset on the device (SETREG PARAM +=
   // PARAM), so each DMA has two dynamic fields (address, bytes)
+  // (starting `skip` rows in: a row piece of sahl-tile)
   template <typename F>
-  void rowLoop(int64_t H, Value bytesParam, F dma) {
+  void rowLoop(int64_t H, Value bytesParam, F dma, int64_t skip = 0) {
     if (!rowAcc) rowAcc = privateParam();
     sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 0, ValueRange{});
-    for (int64_t r = 0; r < H; ++r) {
-      dma(r);
+    for (int64_t r = -skip; r < H; ++r) {
+      if (r >= 0) dma(r);
       if (r + 1 < H) {
         auto s = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{bytesParam});
         s.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});

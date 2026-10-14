@@ -53,6 +53,8 @@ CASES = [
     # C6.5: decode attention over T in blocks (a KV cache longer than one SPAD_B bank)
     ("gemma_t512", "build/hfgen/gemma_l2_t512/sa_sources", ["--iree-sa-max-dynamic=512"]),
     ("qwen3_t1024", "build/hfgen/qwen3_l2_t1024/sa_sources", ["--iree-sa-max-dynamic=1024"]),
+    # C6.5b: row-mode pieces over dynamic-length rows (the attention probabilities at T = 2048)
+    ("qwen3_t2048", "build/hfgen/qwen3_l2_t2048lc/sa_sources", ["--iree-sa-max-dynamic=2048"]),
 ]
 
 
