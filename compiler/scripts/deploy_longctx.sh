@@ -7,6 +7,7 @@
 # length: prefill vs decode only on the device, PPL by position) and board_teacher.py.
 #   compiler/scripts/deploy_longctx.sh qwen3|gemma     -> build/deploy_hfgen_<model>_lc<max len>
 #   LC_MAX_LEN=<n>: another length (default qwen3 2048, gemma 512: its sliding window)
+#   LC_LAYERS=<n>: a truncated model (a dry run of the whole flow: <tag>_l<n>, ~40 min)
 # Runs for hours (the export, the compile, the sim's 40-token runs: Qwen3 ~2.5 h);
 # under systemd-run -p MemoryMax=10G. A bundle compiled for more than 512
 # positions is slower at short contexts (§8.22): its own directory, the
@@ -20,16 +21,17 @@ case "${1:-}" in
   gemma) MODEL=gemma-3-270m REF=gemma-3-270m LEN=${LC_MAX_LEN:-512} EXTRA=--prefill-all ;;
   *) echo "usage: $0 qwen3|gemma" >&2; exit 2 ;;
 esac
-TAG=$1_lc$LEN
+TAG=$1_lc$LEN${LC_LAYERS:+_l$LC_LAYERS}
+LAYERS=${LC_LAYERS:+--layers $LC_LAYERS}
 O=$SA_REPO/build/hfgen/$TAG
 "$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/$MODEL" --out "$O" \
   $([ -f "$O/sa.vmfb" ] && echo --skip-export) --quant --rope --attn --prefill "$SA_D" $EXTRA --max-len "$LEN" \
-  --kv-channel k --kv-calib "$SA_REPO/build/llm_cache/wikitext-2-raw-v1-train.txt:1024" --board-bundle "${O}_bundle"
+  --kv-channel k --kv-calib "$SA_REPO/build/llm_cache/wikitext-2-raw-v1-train.txt:1024" --board-bundle "${O}_bundle" $LAYERS
 HFGEN_TAG=$TAG HFGEN_BUNDLE=${O}_bundle "$SA_COMPILER/scripts/deploy_hfgen.sh"
 D=$SA_REPO/build/deploy_hfgen_$TAG
 # the teacher-forcing windows: two of the context length (WikiText-2 test, from token 0)
 "$SA_PY" -u "$SA_COMPILER/tests/board_quality.py" prep --model "$SA_REPO/build/llm_cache/$REF" --bundle "$D" \
-  --tokens $((2 * LEN)) --window "$LEN"
+  --tokens $((2 * LEN)) --window "$LEN" $LAYERS
 if [ "$1" = gemma ]; then                        # (prefill_all's logits chunks: the window of the qs bundle, §12.4)
   read -r -a B < "$D/board.txt"
   [ "${B[-1]}" -ge 640 ] || { B[-1]=640; echo "${B[*]}" > "$D/board.txt"; }

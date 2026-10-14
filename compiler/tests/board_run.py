@@ -33,7 +33,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = {"llm": "board_llm.py", "teacher": "board_teacher.py", "profile": "board_profile.py",
            "generate": "board_generate.py", "longctx": "board_longctx.py"}
-OUTPUTS = {"llm": ["tokens_board.txt"], "teacher": ["tf_board.npz"], "longctx": ["longctx_board.npz"]}
+OUTPUTS = {"llm": ["tokens_board.txt"], "teacher": ["tf_board.npz"], "longctx": ["longctx_board.npz", "longctx_sweep_board.json"]}
 
 
 def version():

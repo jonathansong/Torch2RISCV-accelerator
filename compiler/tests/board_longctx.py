@@ -18,12 +18,23 @@ The full model has no sim reference at these lengths (the 2-layer sim run of
 two different kernel sets (prefill's [M, T] attention, decode's T loop) plus
 the quality against fp32. Writes longctx_board.npz.
 
+--sweep T1,T2,...: the speed by context length instead (the baseline of the
+§8.22 plan a-e): for each T a prompt of T - S tokens (the window's, repeated
+when shorter) prefilled, then S decode steps (--steps, default 8) at positions
+T - S .. T - 1, with SA_PROFILE=batch: per decode step the wall and device
+time, per prefill chunk the device time. Run on a bundle compiled for 256
+and on one compiled for 2048 at the same short T, it shows the static block
+size's cost at short contexts. Writes longctx_sweep_board.json.
+
     sudo bash -c 'source /etc/profile.d/pynq_venv.sh; source /etc/profile.d/xrt_setup.sh 2>/dev/null; \\
         cd <bundle> && python3 board_longctx.py [--len P] [--generate G]'
+    sudo bash -c '... cd <bundle> && python3 board_longctx.py --sweep 64,256,512,1024,2048'
     compiler/tests/board_longctx.py --sim --bundle <dir> --len 48 --generate 4     (on the host: the sim)
 """
 import argparse
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -37,12 +48,78 @@ from board_teacher import log_softmax_rows, run_streamed  # noqa: E402
 RANGES = (0, 256, 512, 1024, 2048, 4096)
 
 
+def device_runner(args, b):
+    """(sa-llm-run's path, run(cmd, env extra) -> CompletedProcess, stop()): the
+    board through the launcher, or a fresh sim server per run"""
+    mb = int(open(os.path.join(b, "board.txt")).read().split()[-1])
+    if args.sim:
+        repo = os.path.abspath(os.path.join(HERE, "..", ".."))
+        exe = os.path.join(repo, "build/iree/build-sa-host/runtime/plugins/hal/drivers/sa/sa-llm-run")
+
+        def run(cmd, extra_env):
+            sock = f"/tmp/sa_lc_{os.getpid()}.sock"
+            srv = subprocess.Popen([sys.executable, os.path.join(HERE, "..", "sim", "sa_sim_server.py"), "--d",
+                                    os.environ.get("SA_D", "16"), "--mb", str(mb), "--socket", sock, "--once"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(3)
+            try:
+                return subprocess.run([exe] + cmd, capture_output=True, text=True,
+                                      env=dict(os.environ, SA_SIM_SOCKET=sock, **extra_env))
+            finally:
+                srv.wait(timeout=120)
+        return run, lambda: None
+    import board_launcher as BL
+    mm, buf, env = BL.start(os.path.join(b, "picorv32.bit"), os.path.join(b, "rt_fw.bin"), mb=mb, ring=16)
+    exe = os.path.join(b, "sa-llm-run")
+    return (lambda cmd, extra_env: subprocess.run([exe] + cmd, capture_output=True, text=True,
+                                                  env=dict(env, **extra_env))), lambda: BL.stop(mm, buf)
+
+
+def sweep(args, b, extra, vlen, M, win):
+    S = args.steps
+    Ts = [int(t) for t in args.sweep.split(",")]
+    bad = [t for t in Ts if t - S < M or t > vlen]
+    if bad:
+        print(f"lengths {bad}: need M + steps = {M + S} <= T <= valid_len {vlen}")
+        return 1
+    toks = np.resize(win, max(Ts))
+    run, stop = device_runner(args, b)
+    rows = []
+    try:
+        for T in Ts:
+            cmd = ["--device=sa", f"--module={b}/sa.vmfb", f"--parameters=model={b}/sa_packed.irpa",
+                   "--tokens=" + ",".join(str(int(t)) for t in toks[:T - S]), f"--generate={S}"] + extra
+            t0 = time.time()
+            r = run(cmd, {"SA_PROFILE": "batch", "SA_STATS": "1"})
+            if r.returncode:
+                print(f"T = {T}: sa-llm-run failed ({r.returncode})\n{r.stdout[-2000:]}\n{r.stderr[-3000:]}")
+                return 1
+            out = r.stdout
+            num = lambda pat: float(m.group(1)) if (m := re.search(pat, out)) else None  # noqa: E731
+            row = {"T": T, "decode_ms": num(r"decode steps, ([\d.]+) ms per step"),
+                   "decode_device_ms": num(r"per step \(decode after the prefill\):[^,]*, device ([\d.]+) ms"),
+                   "prefill_chunk_device_ms": num(r"prefill per chunk[^:]*: [^,]*, device ([\d.]+) ms"),
+                   "host": [l for l in r.stderr.splitlines() if l.startswith("sa:")][-1:], "seconds": time.time() - t0}
+            rows.append(row)
+            f = lambda v: f"{v:8.1f}" if v is not None else "       -"  # noqa: E731
+            print(f"T = {T:5d}: decode {f(row['decode_ms'])} ms/step (device {f(row['decode_device_ms'])} ms), "
+                  f"prefill {f(row['prefill_chunk_device_ms'])} ms/chunk of {M} (device); "
+                  f"{row['host'][0] if row['host'] else ''}", flush=True)
+    finally:
+        stop()
+    with open(os.path.join(b, "longctx_sweep_sim.json" if args.sim else "longctx_sweep_board.json"), "w") as fo:
+        json.dump({"valid_len": vlen, "steps": S, "prefill": M, "rows": rows}, fo, indent=1)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--len", type=int, help="prompt tokens (default: valid_len - generate)")
     ap.add_argument("--generate", type=int, default=16)
     ap.add_argument("--bundle", default=HERE)
     ap.add_argument("--sim", action="store_true", help="the functional simulator (x86 sa-llm-run) instead of the board")
+    ap.add_argument("--sweep", help="T1,T2,...: decode / prefill speed at these context lengths")
+    ap.add_argument("--steps", type=int, default=8, help="--sweep: decode steps per length")
     args = ap.parse_args()
     b, G = os.path.abspath(args.bundle), args.generate
     extra = open(os.path.join(b, "sa_args.txt")).read().split()
@@ -53,6 +130,8 @@ def main():
         return 1
     V = np.load(os.path.join(b, "expected_logits.npy"), mmap_mode="r").shape[1]
     win = np.load(os.path.join(b, "tf_tokens.npy"))[0]
+    if args.sweep:
+        return sweep(args, b, extra, vlen, M, win)
     P = args.len or min(len(win), vlen) - G
     if P + G > vlen or P > len(win) or P < M:
         print(f"prompt {P} + {G} generated: needs M = {M} <= P <= {len(win)} (tf_tokens) and P + G <= {vlen} (valid_len)")
