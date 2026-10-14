@@ -1493,7 +1493,7 @@ Gemma end to end with a 320-token prompt (past the old 256 limit, `--max-len 512
     | all | 14.65 (14.17) | 88.9% | 35.20 (31.17) | 83.5% |
 
     Qwen3 holds fp32's PPL up to 1024 positions; past 1024 the gap grows to +7% (top-1 86.8%). Not yet attributed; a candidate is the int8 attention probabilities (qsum, i8(e · 127)): with the mass spread over more positions, more of them round to 0.
-  - `board_teacher.py`, two windows of the context length (WikiText-2 test from token 0): Qwen3 through decode (no prefill_all in this module; 384.8 ms per step) PPL **18.990 against fp32 18.767** (+1.2%); Gemma through prefill_all (20 tok/s) PPL **43.59 against fp32 43.98**. (`tf_board.npz` for top-1 / KL via `board_quality.py score`.)
+  - `board_teacher.py`, two windows of the context length (WikiText-2 test from token 0): Qwen3 through decode (no prefill_all in this module; 384.8 ms per step) PPL **18.990 against fp32 18.767** (+1.2%); Gemma through prefill_all (20 tok/s) PPL **43.59 against fp32 43.98**. Scored (`board_quality.py score`, `build/quality/{qwen3_lc2048,gemma_lc512}_board.json`): Qwen3 top-1 vs fp32 86.8%, KL(fp32 || device) over the top 64 0.073; Gemma 76.9%, 0.213. Against the same models' 256-token windows (generality plan §12.4, qsum: Qwen3 88.1% / 0.038, Gemma 80.3% / 0.157) KL is 1.9× / 1.35× higher: the loss grows with the context, consistent with the per-range table above (Qwen3 past 1024). Gemma's PPL below fp32 is noise over 1024 positions with a 262k vocabulary; its KL is the measure.
   - `--sweep` (wall / device ms per decode step, device ms per 16-token prefill chunk):
 
     | T | Qwen3 decode | Qwen3 prefill chunk | Gemma decode | Gemma prefill chunk |
