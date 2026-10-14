@@ -24,8 +24,19 @@ esac
 TAG=$1_lc$LEN${LC_LAYERS:+_l$LC_LAYERS}
 LAYERS=${LC_LAYERS:+--layers $LC_LAYERS}
 O=$SA_REPO/build/hfgen/$TAG
-"$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/$MODEL" --out "$O" \
-  $([ -f "$O/sa.vmfb" ] && echo --skip-export) --quant --rope --attn --prefill "$SA_D" $EXTRA --max-len "$LEN" \
+HF=("$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/$MODEL" --out "$O")
+# the export, the compile and the checks each in its own process: Qwen3's
+# compile at 2048 peaks at 7.5 GB, next to the exporting process it hit 10 GB
+if [ ! -s "$O/sa.vmfb" ]; then
+  "${HF[@]}" --export-only --quant --rope --attn --prefill "$SA_D" $EXTRA --max-len "$LEN" \
+    --kv-channel k --kv-calib "$SA_REPO/build/llm_cache/wikitext-2-raw-v1-train.txt:1024" $LAYERS
+  T0=$SECONDS
+  SA_COMPILE_FLAGS=--iree-sa-codegen-report "$SA_COMPILER/scripts/compile_sa.sh" "$O" 2> "$O/compile.log" \
+    || { tail -c 3000 "$O/compile.log"; rm -f "$O/sa.vmfb"; exit 1; }
+  echo "compiled in $((SECONDS - T0)) s: $(grep -c ': ok$' "$O/compile.log" || true) executables for the accelerator," \
+    "$(grep -c ': on the host' "$O/compile.log" || true) for the host"
+fi
+"${HF[@]}" --skip-export --quant --rope --attn --prefill "$SA_D" $EXTRA --max-len "$LEN" \
   --kv-channel k --kv-calib "$SA_REPO/build/llm_cache/wikitext-2-raw-v1-train.txt:1024" --board-bundle "${O}_bundle" $LAYERS
 HFGEN_TAG=$TAG HFGEN_BUNDLE=${O}_bundle "$SA_COMPILER/scripts/deploy_hfgen.sh"
 D=$SA_REPO/build/deploy_hfgen_$TAG

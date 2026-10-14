@@ -77,6 +77,8 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-export", action="store_true")
+    ap.add_argument("--export-only", action="store_true", help="stop after the export (the compile then in its "
+                    "own process: a long context's compile next to this process's memory exceeds 10 GB)")
     ap.add_argument("--mb", type=int, default=1100, help="sim window (the fp32 weights: ~4 bytes per parameter)")
     ap.add_argument("--prompt", default="1,504,3144,17,1812")
     ap.add_argument("--generate", type=int, default=4)
@@ -147,6 +149,9 @@ def main():
         H.export(w, args.out, args.prefill, args.prefill_all, args.dyn_len)
         del w                            # (freed before the compile and the reload below)
         gc.collect()
+        if args.export_only:
+            print(f"exported to {args.out}")
+            return 0
         t0 = time.time()
         log = subprocess.run([os.path.join(COMPILER, "scripts", "compile_sa.sh"), args.out],
                              capture_output=True, text=True, env=dict(os.environ, SA_COMPILE_FLAGS="--iree-sa-codegen-report"))
