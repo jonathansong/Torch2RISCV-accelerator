@@ -22,7 +22,7 @@ an `sa` HAL driver through the command ring.
 | `frontend/` | `qllama.py` (the quantized llama, step for step `DeviceModel`), `export.py` (iree-turbine export, compile, compare, dispatch inventory, board bundle), `inventory/` (the dispatch inventories); `qhf.py` (HuggingFace Llama / Qwen3 decoders: config, safetensors, BPE tokenizer, fp32 and quantized models), `export_hf.py` (their export), `synth_hf.py` (random-weight HF models of any shape), `hf_tokenizer.py` (the BPE tokenizer, standard library only: also on the board) | C0, C5.5 |
 | `runtime/` | `sa/`: the `sa` HAL driver (C; IREE external HAL driver) with `board` and `sim` transports; its own device and command buffer (C4) record a command buffer's dispatches and build one descriptor list per command buffer. `tools/`: sa-desc writer / reader (`sadesc.py`, format versions 1–3), the C1 test executable (`make_test_exec.py`). `test/`: `sa_hal_test.c` (HAL API test), `board_launcher.py` (PYNQ side on the board) | C1 |
 | `sim/` | `sa_sim_server.py` (the `sim` transport's device: `llm/sa_funcsim.py` on a shared-memory DDR), `sa_board_emu.py` (rt_fw's ring emulated on the host, for the `board` transport) | C1 |
-| `tests/` | `test_c2.py` / `test_c3.py` / `test_c5.py` / `test_c55.py` (host), `board_c2.py` / `board_llm.py` / `board_generate.py` (interactive) / `board_profile.py` (board); `oracle.py` (reference interpreter of dispatch IR with the device's numerics), `dispatch_check.py` (per-dispatch differential test), `summarize.py` | C2– |
+| `tests/` | `test_c2.py` / `test_c3.py` / `test_c5.py` / `test_c55.py` (host), `board_c2.py` / `board_llm.py` / `board_generate.py` (interactive, `--chat`) / `board_profile.py` / `board_teacher.py` / `board_longctx.py` / `board_run.py` (board), `stage_model_json.py` (`model.json` for `board_generate.py`); `oracle.py` (reference interpreter of dispatch IR with the device's numerics), `dispatch_check.py` (per-dispatch differential test), `summarize.py` | C2– |
 
 ## Environment
 
@@ -242,12 +242,24 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   in blocks (C6.5, docs/iree_compiler_plan.md §8.22); checked on the sim up
   to T = 512 for Gemma (its sliding window) and 2048 for Qwen3 (C6.5b: row
   pieces over dynamic-length rows; `tests/test_long_context.py`, run_tests.sh
-  `longctx` / `longctxq` / `longctxq2k`).
+  `longctx` / `longctxq` / `longctxq2k`; a 1104-token Qwen3 prompt end to end).
+  Board check of long contexts: `scripts/deploy_longctx.sh qwen3|gemma` (the
+  whole model at 2048 / 512 with teacher-forcing windows of that length), then
+  on the board `board_longctx.py` (prefill vs decode only over a prompt of the
+  context length, PPL by position against fp32) and `board_teacher.py` (the
+  logits streamed through a FIFO).
+  Interactive generation on the board for these bundles: `board_generate.py
+  [--chat]` with `model.json` (`tests/stage_model_json.py`, written by
+  `--board-bundle`): multi-turn chat in the model's template (Llama-3.2-1B-
+  Instruct; Qwen3 with the built-in ChatML format), `/new` starts over.
 
   ```sh
   compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)
   compiler/scripts/run_tests.sh -m 12G '$SA_PY -u compiler/tests/test_hf_generic.py --model build/llm_cache/SmolLM2-135M --out build/hfgen/smollm2_p8 --quant --rope --attn --prefill 8 --mb 400'
   compiler/scripts/deploy_hfgen.sh                     # board bundle build/deploy_hfgen (board_llm.py)
+  #   board: python3 board_generate.py --chat --max-new 128   (multi-turn chat: Llama-3.2-1B-Instruct, Qwen3; /new, q)
+  compiler/scripts/deploy_longctx.sh qwen3             # long context: build/deploy_hfgen_qwen3_lc2048 (hours, MemoryMax=10G)
+  #   board: python3 board_longctx.py; python3 board_teacher.py
   ```
 
   Every bundle carries `VERSION` (commit, overlay, compiler, run parameters).

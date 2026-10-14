@@ -215,7 +215,9 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   command ring, in stages C0-C7. Done: a full MLIR code generator (the `sahl`
   / `sahw` dialects, templates as micro-kernels); stories15M (17.7 tok/s) and
   HuggingFace SmolLM2-135M (2.22 tok/s) run on the board bit-exact with the
-  references, and generate text interactively there; larger models are the
+  references, and generate text interactively there (on the KV260 also the
+  generic bundles, with multi-turn chat for Llama-3.2-1B-Instruct and Qwen3);
+  larger models are the
   current stage (C6, on sim: Qwen3-0.6B with all 28 layers compiles bit-exact
   per dispatch and generates correct text end to end). A model now compiles
   with both prefill and decode: on the board the prompt is processed 8 tokens
@@ -265,7 +267,7 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 | 5 | MLIR dialect + instruction-level lowering | ✅ superseded | done as the IREE compiler (`sahl` / `sahw` dialects → descriptor lists, [`compiler/`](compiler/README.md)) instead of `.insn` firmware |
 | 6 | Loose- vs tight-coupling benchmark | 🟡 partial | Phase 3 vs 4 board numbers exist; write-up pending |
 | 7 | Vector unit | ✅ done in M3 | fused int8 epilogue + standalone vector ops |
-| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T (C6.5 / C6.5b, sim: Gemma 512, Qwen3 2048; [plan §8.22](docs/iree_compiler_plan.md)) |
+| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T (C6.5 / C6.5b, sim: Gemma 512, Qwen3 2048, a 1104-token prompt end to end; board check staged; [plan §8.22](docs/iree_compiler_plan.md)) |
 | 9 | Documentation and write-up | 🟡 in progress | `docs/` (design doc, learning path) |
 
 The accelerator rebuild replaced the Phase 2–4 unit with a double-buffered
