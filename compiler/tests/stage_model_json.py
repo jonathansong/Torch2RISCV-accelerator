@@ -4,8 +4,9 @@ bundles, iree_compiler_plan.md §8.7) in a generic-frontend bundle
 (test_hf_generic.py --board-bundle, deploy_hfgen.sh): the tokenizer, the BOS
 the HF tokenizer prepends, the end tokens (generation_config's and the
 tokenizer's), the context (sa_args.txt --valid_len, else 256), and for a model
-with a chat template the token ids around one user message (board_generate.py
---chat; the board has no jinja). A checkpoint without a template (the local
+with a chat template the token ids around one user message and, from a
+two-turn rendering, those around an earlier turn's answer (board_generate.py
+--chat, a conversation; the board has no jinja). A checkpoint without a template (the local
 Qwen3-0.6B ones) gets its family's from CHAT.
 
     compiler/tests/stage_model_json.py --model build/llm_cache/Qwen3-0.6B-W8A8 --bundle build/deploy_hfgen_qwen3_qs
@@ -16,10 +17,13 @@ import os
 import sys
 
 # chat formats of model families whose local checkpoints lack the template: the
-# text the official template renders for one user message (no system prompt)
-# and the generation prompt; Qwen3 non-thinking (enable_thinking=False: an empty
-# think block)
-CHAT = {"qwen3": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")}
+# text the official template renders before the first user message (no system
+# prompt), after the last one (the generation prompt), and around an earlier
+# turn's answer (between the user message and it, after it); Qwen3 non-thinking
+# (enable_thinking=False: an empty think block; the earlier answers without one,
+# as its template renders them)
+CHAT = {"qwen3": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                  "<|im_end|>\n<|im_start|>assistant\n", "<|im_end|>\n<|im_start|>user\n")}
 
 
 def model_json(model_dir, bundle):
@@ -39,16 +43,25 @@ def model_json(model_dir, bundle):
     ctx = int(next((a.split("=")[1] for a in extra if a.startswith("--valid_len=")), 256))
     cfg = {"tokenizer": "hf", "bos": bos, "stop": stops[0] if stops else None, "stops": stops, "context": ctx}
     if tok.chat_template:
-        mark = "\x01MSG\x01"
+        m1, a1, m2 = "\x01M1\x01", "\x01A1\x01", "\x01M2\x01"
         kw = {"enable_thinking": False}  # (Qwen3: an empty think block; the other templates ignore it)
-        text = tok.apply_chat_template([{"role": "user", "content": mark}], tokenize=False,
-                                       add_generation_prompt=True, **kw)
-        pre, suf = text.split(mark)
+        render = lambda msgs: tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, **kw)  # noqa: E731
+        pre, suf = render([{"role": "user", "content": m1}]).split(m1)
+        two = render([{"role": "user", "content": m1}, {"role": "assistant", "content": a1},
+                      {"role": "user", "content": m2}])
+        p2, rest = two.split(m1)
+        hist, rest = rest.split(a1)
+        nxt, suf2 = rest.split(m2)
+        if p2 != pre or suf2 != suf:     # (a template whose turns are not a plain concatenation)
+            hist = nxt = None
     else:
         mc = AutoConfig.from_pretrained(model_dir)
-        pre, suf = CHAT.get(getattr(mc, "text_config", mc).model_type, (None, None))
+        pre, suf, hist, nxt = CHAT.get(getattr(mc, "text_config", mc).model_type, (None,) * 4)
+    ids = lambda t: tok(t, add_special_tokens=False).input_ids  # noqa: E731
     if pre is not None:
-        cfg["chat"] = [tok(pre, add_special_tokens=False).input_ids, tok(suf, add_special_tokens=False).input_ids]
+        cfg["chat"] = [ids(pre), ids(suf)]
+    if hist is not None:
+        cfg["chat_turn"] = [ids(hist), ids(nxt)]
     return cfg
 
 
@@ -60,8 +73,8 @@ def main():
     cfg = model_json(args.model, args.bundle)
     with open(os.path.join(args.bundle, "model.json"), "w") as f:
         json.dump(cfg, f)
-    print(f"{args.bundle}/model.json: {json.dumps({k: v for k, v in cfg.items() if k != 'chat'})}"
-          f"{', chat template' if 'chat' in cfg else ''}")
+    print(f"{args.bundle}/model.json: {json.dumps({k: v for k, v in cfg.items() if not k.startswith('chat')})}"
+          f"{', chat template' if 'chat' in cfg else ''}{' (multi-turn)' if 'chat_turn' in cfg else ''}")
     return 0
 
 

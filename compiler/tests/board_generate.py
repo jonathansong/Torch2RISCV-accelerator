@@ -5,13 +5,18 @@ sa device (the C3 / C5.5 board bundles), run by the aarch64 sa-llm-run.
 The overlay and rt_fw are started once; then each prompt is tokenized on the
 ARM, fed to sa-llm-run (a fresh KV cache per prompt), and the generated text is
 printed as the tokens arrive (greedy, until the model's end token, --max-new or
-the context length).
+the context length). --chat: a conversation in the model's chat template, the
+earlier turns (their generated ids) resent with each message (a fresh KV cache
+per message, so the whole conversation is prefilled again); the oldest turns
+are dropped when the context is full; "/new" starts over.
 
 Files (the board bundle): this script, board_launcher.py, pynq_matmul.py,
 picorv32.bit / .hwh, rt_fw.bin, sa-llm-run, sa.vmfb, sa_packed.irpa,
 model.json ({"tokenizer": "hf" | "llama2", "bos": id or null, "stop": id or
-null, "context": n, optional "stops": [ids] (every end token) and "chat":
-[ids before, ids after] one user message; the generic-frontend bundles':
+null, "context": n, optional "stops": [ids] (every end token), "chat":
+[ids before, ids after] one user message and "chat_turn": [ids between a user
+message and the assistant's answer, ids between the answer and the next user
+message] for the earlier turns; the generic-frontend bundles':
 stage_model_json.py}), the tokenizer (tokenizer.json + hf_tokenizer.py, or
 tokenizer.bin + tokenizer.py), optional board.txt (window MB, last field) and
 sa_args.txt (extra sa-llm-run arguments).
@@ -44,7 +49,8 @@ def load_tokenizer(cfg):
 
 
 def generate(prompt_ids, max_new, cfg, decode, env, extra):
-    """Runs sa-llm-run, printing the text as it comes; returns its stats line.
+    """Runs sa-llm-run, printing the text as it comes; returns (its stats line,
+    the generated ids without the end token).
     sa-llm-run stops at "stop"; another of "stops" (e.g. Qwen3's <|endoftext|>
     besides <|im_end|>) ends it here."""
     stops = set(cfg.get("stops") or []) | ({cfg["stop"]} if cfg.get("stop") is not None else set())
@@ -102,28 +108,44 @@ def generate(prompt_ids, max_new, cfg, decode, env, extra):
     err = p.stderr.read().decode(errors="replace")
     p.wait()
     print()
+    gen = [t for t in ids[len(prompt_ids):] if t not in stops]
     if ended:
-        n = len(ids) - len(prompt_ids) - 1          # (the end token not counted)
-        return f"{n} tokens in {time.time() - t0:.1f} s, stopped at an end token"
+        return f"{len(gen)} tokens in {time.time() - t0:.1f} s, stopped at an end token", gen
     if p.returncode:
         print(f"sa-llm-run failed ({p.returncode}): {err[-2000:]}")
-        return None
+        return None, gen
     lines = out.decode(errors="replace").strip().splitlines()
     wait = f"; first token after {first - t0:.1f} s (loading the module and parameters)" if first else ""
-    return (lines[1] if len(lines) > 1 else "") + wait
+    return (lines[1] if len(lines) > 1 else "") + wait, gen
+
+
+def conversation(cfg, turns, msg):
+    """The chat's ids: the earlier turns [(user ids, answer ids)] and the new
+    message; without "chat_turn" (a template that gave no multi-turn form) the
+    message alone."""
+    pre, gen = cfg["chat"]
+    hist, nxt = cfg.get("chat_turn") or (None, None)
+    ids = list(pre)
+    for u, a in (turns if hist is not None else []):
+        ids += u + hist + a + nxt
+    return ids + msg + gen
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--prompt", help="one prompt, then exit (default: read prompts interactively)")
     ap.add_argument("--max-new", type=int, default=64, help="tokens to generate at most")
-    ap.add_argument("--chat", action="store_true", help="each prompt as one user message in the model's chat "
-                    "template (model.json \"chat\"; default: plain text continued)")
+    ap.add_argument("--chat", action="store_true", help="a conversation in the model's chat template (model.json "
+                    "\"chat\"; default: plain text continued); /new starts over")
     args = ap.parse_args()
     cfg = json.load(open(os.path.join(HERE, "model.json")))
     if args.chat and not cfg.get("chat"):
         print("model.json has no chat template (a base model): plain text")
         args.chat = False
+    if args.chat:   # the end of an assistant turn (Llama <|eot_id|>, Qwen3 <|im_end|>) as sa-llm-run's own stop
+        end = (cfg.get("chat_turn") or [None, cfg["chat"][1]])[1][:1]
+        if end and end[0] in (cfg.get("stops") or []):
+            cfg = dict(cfg, stop=end[0])
     mb = 64
     if os.path.exists(os.path.join(HERE, "board.txt")):
         mb = int(open(os.path.join(HERE, "board.txt")).read().split()[-1])
@@ -136,6 +158,10 @@ def main():
     mm, buf, env = BL.start(os.path.join(HERE, "picorv32.bit"), os.path.join(HERE, "rt_fw.bin"), mb=mb, ring=16)
     try:
         encode, decode = load_tokenizer(cfg)
+        turns = []                                     # (--chat: [(user ids, answer ids)])
+        if args.chat:
+            print("chat: " + ("each message with the earlier turns, /new starts over" if cfg.get("chat_turn")
+                              else "one message at a time (no multi-turn form in model.json)"))
         while True:
             if args.prompt is not None:
                 text = args.prompt
@@ -148,8 +174,20 @@ def main():
                     if text.strip():
                         break
                     continue
+                if args.chat and text.strip() == "/new":
+                    turns = []
+                    print("(a new conversation)")
+                    continue
             if args.chat:                              # (the template's ids carry the BOS)
-                ids = cfg["chat"][0] + encode(text)[1 if cfg.get("bos") is not None else 0:] + cfg["chat"][1]
+                msg = encode(text)[1 if cfg.get("bos") is not None else 0:]
+                ids = conversation(cfg, turns, msg)
+                dropped = 0
+                while turns and len(ids) + min(args.max_new, 64) > ctx:   # (room for an answer)
+                    turns = turns[1:]
+                    dropped += 1
+                    ids = conversation(cfg, turns, msg)
+                if dropped:
+                    print(f"(the context of {ctx} is full: the oldest {dropped} turn{'s' * (dropped > 1)} dropped)")
             else:
                 ids = encode(text)
             if len(ids) >= ctx:
@@ -159,9 +197,11 @@ def main():
             if not args.chat:                          # (the text continued: the prompt first)
                 sys.stdout.write(decode(ids))
                 sys.stdout.flush()
-            stats = generate(ids, n, cfg, decode, env, extra)
+            stats, answer = generate(ids, n, cfg, decode, env, extra)
             if stats:
-                print(f"[{len(ids)} prompt tokens; {stats}]")
+                print(f"[{len(ids)} prompt tokens{f' ({len(turns)} earlier turns)' if args.chat and turns else ''}; {stats}]")
+            if args.chat and stats:
+                turns.append((msg, answer))
             if args.prompt is not None:
                 break
     except KeyboardInterrupt:
