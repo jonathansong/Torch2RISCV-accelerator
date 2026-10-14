@@ -135,7 +135,7 @@ bool Lowerer::lowerBlock(Block &block) {
     if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp, arith::OrIOp, arith::ShRUIOp,
             arith::DivUIOp>(op))
       continue;
-    if (isa<arith::AddIOp>(op) && op->hasAttr("sa.index")) continue;   // (an expanded kernel's count: its Lin used)
+    if (isa<arith::AddIOp, arith::MulIOp>(op) && op->hasAttr("sa.index")) continue;   // (an expanded kernel's count: its Lin used)
     if (auto l = dyn_cast<sahl::LoadOp>(op)) {
       if (!load(l)) return false;
       continue;

@@ -57,9 +57,11 @@
 // the count a dynamic field).
 // The cache's T beyond one SPAD_B bank (C6.5, docs/iree_compiler_plan.md
 // §8.22): a contraction whose dynamic N is T (q . K^T, K's rows transposed)
-// goes over T in blocks of Tb rows (Tb x K in one bank) in a sahl.loop whose
-// count comes from T (T >> log2 Tb, + 1: at least one block; a T that is a
-// multiple of Tb computes one block of scores past T, not stored): per block
+// goes over T in blocks of Tb rows (128 by default, --iree-sa-attn-block; Tb x K
+// within one bank) in a sahl.loop whose
+// count comes from T (ceil(T / Tb), T a multiple of D: ((T (M - 1)) >> log2(M Tb))
+// + 1 within the setup entry's 15-bit shift, else T >> log2 Tb, + 1: a T that is a
+// multiple of Tb then computes one block of scores past T, not stored): per block
 // the rows loaded and transposed, one EX per row of x (the strips of all rows
 // made before the loop), the DMA moving on with the loop; then per row the
 // epilogue over T and the store. An EX writes its D output rows one after the
@@ -510,7 +512,8 @@ static bool notExpanded(sahl::KernelOp k, int line) {
 // out here (the lowering). A dynamic K or N (the cache's T: attention's
 // batch_matmuls in prefill) has one K block and one chunk; rows of x of a
 // dynamic length, or results of a dynamic length, are walked with the row cursor.
-bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, const ::sa::Layout &lay, int64_t d) {
+bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, const ::sa::Layout &lay, int64_t d,
+                       int64_t attnBlock, int64_t maxDyn) {
   auto rr = km.loopRanges(p.op);
   if (!rr) return notExpanded(k, __LINE__);
   auto ranges = *rr;
@@ -683,6 +686,10 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   if (kc * nc > sb) {
     if (!(Nr.dyn && p.layout == MatLayout::RowsK && !xRows && nk == 1 && epi)) return notExpanded(k, __LINE__);
     nb = int64_t(llvm::bit_floor(uint64_t(sb / kc)));
+    // blocks of 128 rows by default (§8.22 step a: the cycle model over T = 16..2048,
+    // Qwen3 and Gemma, against 32..512: short T pays for a whole block)
+    const int64_t blk = attnBlock > 0 ? attnBlock : 128;
+    nb = std::min(nb, std::max<int64_t>(int64_t(llvm::bit_floor(uint64_t(std::max<int64_t>(blk / d, 1)))), 1));
     if (nb < 1 || G * K > sb) return notExpanded(k, __LINE__);   // (the strips of all rows of x in bank 0)
   }
   int64_t rowPitch = 0;                            // (the tiled form: bytes between the matrix's rows of T)
@@ -884,9 +891,22 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       Value scratch = accBuf((G - 1 + d) * tb);
       SmallVector<Value> rowsAcc;
       for (int64_t g = 0; g < G; ++g) rowsAcc.push_back(accBuf(rowElems));
-      Value sh = arith::ShRUIOp::create(e.b, e.loc, Nv,
-                                        arith::ConstantIndexOp::create(e.b, e.loc, int64_t(llvm::Log2_64(uint64_t(tb)))));
-      auto cnt = arith::AddIOp::create(e.b, e.loc, sh, arith::ConstantIndexOp::create(e.b, e.loc, 1));
+      // the block count: T is a multiple of D (the runtime pads it), so
+      // ceil(T / Tb) = ((T * (M - 1)) >> log2(M Tb)) + 1 for a power of two
+      // M >= max_dynamic / D (the setup entry's shift: at most 15 bits); else
+      // (T >> log2 Tb) + 1, one block past T when T is a multiple of Tb
+      const int64_t lgTb = int64_t(llvm::Log2_64(uint64_t(tb)));
+      const int64_t M = int64_t(llvm::bit_ceil(uint64_t(std::max<int64_t>(maxDyn / d, 2))));
+      Value tv = Nv;
+      int64_t sh = lgTb;
+      if (lgTb + int64_t(llvm::Log2_64(uint64_t(M))) <= 15) {
+        auto mul = arith::MulIOp::create(e.b, e.loc, Nv, arith::ConstantIndexOp::create(e.b, e.loc, M - 1));
+        mul->setAttr("sa.index", e.b.getUnitAttr());
+        tv = mul;
+        sh += int64_t(llvm::Log2_64(uint64_t(M)));
+      }
+      Value shv = arith::ShRUIOp::create(e.b, e.loc, tv, arith::ConstantIndexOp::create(e.b, e.loc, sh));
+      auto cnt = arith::AddIOp::create(e.b, e.loc, shv, arith::ConstantIndexOp::create(e.b, e.loc, 1));
       cnt->setAttr("sa.index", e.b.getUnitAttr());
       auto lp = sahl::LoopOp::create(e.b, e.loc, blocks, ArrayRef<int64_t>{tb * rowPitch, nb}, cnt);
       {
@@ -1109,7 +1129,7 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
           auto c = dyn_cast<linalg::LinalgOp>(&o);
           if (!c || !o.hasAttr("sahl.anchor")) continue;
           KernelMatcher km(cfg);
-          if (km.matchContraction(c)) expandContraction(k, km.contracts[c.getOperation()], km, lay, cfg.d);
+          if (km.matchContraction(c)) expandContraction(k, km.contracts[c.getOperation()], km, lay, cfg.d, cfg.attnBlock, cfg.maxDynamic);
           else notExpanded(k, __LINE__);
           break;
         }

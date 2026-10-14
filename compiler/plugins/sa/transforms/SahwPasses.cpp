@@ -23,6 +23,7 @@ TargetConfig TargetConfig::fromAttr(DictionaryAttr config) {
   get("params", c.params);
   get("gemv_ports", c.gemvPorts);
   get("gemv_ksplit", c.gemvKSplit);
+  get("attn_block", c.attnBlock);
   return c;
 }
 
@@ -48,6 +49,7 @@ void TargetConfig::addTo(Builder &b, SmallVectorImpl<NamedAttribute> &attrs) con
   add("params", params);
   if (gemvPorts) add("gemv_ports", gemvPorts);
   if (!gemvKSplit) add("gemv_ksplit", 0);
+  if (attnBlock) add("attn_block", attnBlock);
 }
 
 bool TargetConfig::ukernel(StringRef name) const {

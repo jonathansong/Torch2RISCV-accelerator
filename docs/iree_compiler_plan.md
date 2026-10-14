@@ -1550,17 +1550,36 @@ The blocked form costs more at every T it shares with the untiled one, not only 
 
 So the tiles can alternate between SPAD_B banks 0 and 1 at no capacity cost; the raw block cannot be double-buffered within the four SPAD banks (5 roles: strips, raw × 2, tiles × 2). A smaller Tb does not change that (it is the bank count, not the size). The LD cannot transpose (INTERLEAVE places D-byte chunks of a row, `double_buffer_design.md` §5.3), so the VE transpose and its raw block stay.
 
-*Plan (in this order; none done):*
+*Plan (in this order; step a done 2026-10-14, below the table):*
 
 | Step | Content | Expected (model) | Estimate |
 |---|---|---|---|
-| a | **Smaller Tb** (e.g. 128 rows): the waste is at most one block, the block past T of a multiple of Tb shrinks too; the extra commands per block (one LD, one transpose, the EXs and copies, `LOOP_END`) cost little | removes the short-T regression | ½ day |
+| a (**done**) | **Smaller Tb** (e.g. 128 rows): the waste is at most one block, the block past T of a multiple of Tb shrinks too; the extra commands per block (one LD, one transpose, the EXs and copies, `LOOP_END`) cost little | removes the short-T regression | ½ day |
 | b | **The G query rows in one strip** (rows g in lanes 0..G − 1 of the A strip), one EX per block for all rows (its output rows 0..G − 1), instead of one EX per row; the scratch slots go away | q · Kᵀ EX time ÷ G | 1–1.5 days |
 | c | **Double buffering of the T loop**: tiles alternating SPAD_B banks 0 / 1, the loop body reordered (software pipelining, in-order dispatch: block i + 1's LD and transpose issued before block i's EXs / copies, the copies of block i not ahead of the next transpose on the VE queue) | after b, EX and LD are comparable: q · Kᵀ about 629k → 210k at T = 2048 | 1 day |
 | d | **p · V**: the G rows of p in one strip as in b, no VE copies of p over the D rows | the largest item at long T | 1–2 days |
 | e (optional, larger) | **q · Kᵀ on the GEMV unit**: the cache's rows are the weight rows of a GEMV (scores[t] = Σₖ K[t, k] q[k]), streamed through the four read ports (about 58 B/cycle), no transpose, no raw block; needs a check that the GEMV unit takes a dynamic row count T and G rows of x | possibly an order of magnitude on q · Kᵀ | to be evaluated |
 
 Each step's acceptance: the golden corpus (byte-identical outside the changed kernels, the changed ones re-recorded after review), `run_tests.sh longctx / longctxq / longctxq2k` per-dispatch checks, the cycle model as above, then the board.
+
+**Step a done (2026-10-14).** Two changes to the tiled q · Kᵀ:
+- **Block size** `--iree-sa-attn-block` (target config `attn_block`, `TargetConfig::attnBlock`): rows of T per block, default 0 = **128**, at most what one SPAD_B bank holds (Qwen3 was 512, Gemma 256).
+- **Exact block count.** The count was `(T >> log2 Tb) + 1`, one block too many whenever T is a multiple of Tb (T = 2048 ran 5 blocks of 512). T is a multiple of D (the runtime pads it, the untiled form already relies on it: its tile count is T >> log2 D), so ceil(T / Tb) = `((T · (M − 1)) >> log2(M · Tb)) + 1` with M = bit_ceil(max_dynamic / D): for T = k · Tb the product is k · Tb − k · Tb / M, just under k · Tb (k ≤ M); for any other multiple of D it stays at or above the next lower multiple of Tb (M · D ≥ T). The existing `Lin` (mul, shift, add) expresses it with no loader change, within the setup entry's 4-bit shift (log2(M · Tb) ≤ 15; else the old form). `arith.muli` marked `sa.index` is now accepted by `sahl-to-sahw` like the count's `addi`.
+
+The choice of Tb (`attn_cycles.py --attn-block 32,64,128,256`, all 200 + 128 runs OK against the oracle; build/perfmodel/attn_block_sweep2.json, attn_block_gemma.json). Qwen3 (2 layers compiled for 2048), the four attention dispatches per token (28 layers), ms:
+
+| T | Tb 512 (before) | Tb 32 | Tb 64 | **Tb 128** | Tb 256 | compiled for 512 (untiled) |
+|---|---|---|---|---|---|---|
+| 16 | 45.5 | 14.8 | 16.8 | **20.9** | 29.1 | 10.4 |
+| 128 | 59.1 | 38.4 | 35.8 | **34.5** | 42.7 | 26.7 |
+| 256 | 74.9 | 67.4 | 62.3 | **59.7** | 58.5 | 45.5 |
+| 512 | 140.5 | 125.4 | 115.2 | **110.1** | 107.6 | 83.1 |
+| 1024 | 237.5 | 241.5 | 221.1 | **211.0** | 205.9 | — |
+| 2048 | 431.6 | 473.6 | 433.0 | **412.7** | 402.6 | — |
+
+The q · Kᵀ dispatch alone at T = 16: 128.5k → 40.6k cycles per layer; at T = 2048 629k → 562k (the extra block gone). Smaller blocks win at short T, larger ones at long T (the per-block LD, transpose, `LOOP_END` and VE copies); 128 is the best at T = 128 and within 3% of the best from 256 up and saves 25 ms per token at T = 16 against the 512 blocks. Gemma (18 layers, Tb 256 before): T = 16 6.4 → 4.4 ms, T = 512 25.2 → 21.2 ms. What remains of the short-T regression against the untiled form (20.9 against 10.4 ms at T = 16) is about 60% q · Kᵀ (one block of 128 against 16 rows) and 40% p · V (26.5k against 12.4k cycles per layer: its output tiles in several N chunks at max_dynamic 2048, step d).
+
+Checks: golden corpus 7658 of 7664 dispatches byte-identical, the 6 changed are exactly the tiled q · Kᵀ of `gemma_t512`, `qwen3_t1024`, `qwen3_t2048` (2 layers each; re-recorded); per-dispatch checks around the new block boundaries all OK (Gemma 512 at T = 16, 112, 128, 144, 240, 256, 272, 496, 512; Qwen3 1024 at 16, 128, 144, 496, 512, 528, 1024; Qwen3 2048 at 16, 128, 144, 1024, 1040, 2032, 2048). Bundles compiled for 256 are unchanged (the tiled form only applies past one bank). Not yet rebuilt for the board.
 
 ## 9. Verification system
 

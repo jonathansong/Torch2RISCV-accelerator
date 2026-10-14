@@ -63,6 +63,8 @@ struct SAOptions {
   int gemvPorts = 0;
   // WP6: decode's GEMV over K > 4080 in K blocks (off: those layers on EX, the ablation's baseline).
   bool gemvKSplit = true;
+  // C6.5: rows of T per block of the tiled decode q . K^T (0: 128, at most what one SPAD_B bank holds).
+  int attnBlock = 0;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -87,6 +89,8 @@ struct SAOptions {
                     llvm::cl::desc("Read ports of the streaming GEMV unit (K2b; 0: none): decode's linear layers use it."));
     binder.opt<bool>("iree-sa-gemv-k-split", gemvKSplit, llvm::cl::cat(category),
                      llvm::cl::desc("Decode's GEMV over a K beyond 4080 in K blocks (WP6; false: such layers on EX)."));
+    binder.opt<int>("iree-sa-attn-block", attnBlock, llvm::cl::cat(category),
+                    llvm::cl::desc("Rows of T per block of the tiled decode attention (C6.5; 0: 128, at most one SPAD_B bank)."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -103,6 +107,7 @@ getSAExecutableTarget(MLIRContext *context, const SAOptions &options) {
   tc.accBytes = int64_t(options.accKB) << 10;
   tc.gemvPorts = options.gemvPorts;
   tc.gemvKSplit = options.gemvKSplit;
+  tc.attnBlock = options.attnBlock;
   tc.addTo(b, config);
   return b.getAttr<IREE::HAL::ExecutableTargetAttr>(
       b.getStringAttr("sa"), b.getStringAttr("sa-desc-v1"),

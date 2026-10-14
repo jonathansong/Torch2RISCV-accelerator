@@ -13,10 +13,12 @@ of each kind is measured; the total per layer is their sum, per token x --layers
 --max-dynamic N1,N2: the same dispatches also recompiled for those
 max_dynamic (golden.compile_one on the source with its attribute replaced),
 so one table shows the static block size's cost at short T (a model compiled
-for 2048 against one compiled for 256 at the same T).
+for 2048 against one compiled for 256 at the same T). --attn-block B1,B2: the
+dispatches recompiled at the build's own max_dynamic with those rows of T per
+block of the tiled q . K^T (--iree-sa-attn-block, step a of §8.22).
 
     compiler/tests/attn_cycles.py build/hfgen/qwen3_l2_t2048lc [--t 16,128,256,512,1024,2048]
-        [--max-dynamic 256] [--layers 28] [--json out.json]
+        [--max-dynamic 256] [--attn-block 64,128] [--layers 28] [--json out.json]
 """
 import argparse
 import collections
@@ -94,6 +96,7 @@ def main():
     ap.add_argument("build", help="a test_long_context.py build (sa_sources, sa_bins, compile_flags.txt)")
     ap.add_argument("--t", default="16,128,256,512,1024,2048")
     ap.add_argument("--max-dynamic", default="", help="also recompiled for these max_dynamic (comma-separated)")
+    ap.add_argument("--attn-block", default="", help="also recompiled with these blocks of T (comma-separated)")
     ap.add_argument("--layers", type=int, default=28, help="per token: the model's layers (Qwen3-0.6B 28)")
     ap.add_argument("--cal", default=os.path.join(REPO, "build/perfmodel/qwen3_dyn_cal.json"))
     ap.add_argument("--json")
@@ -107,22 +110,27 @@ def main():
         print(f"no decode dispatch over a dynamic length in {args.build}/sa_sources")
         return 1
     Ts = [int(t) for t in args.t.split(",")]
-    variants = [own] + [int(m) for m in args.max_dynamic.split(",") if m and int(m) != own]
+    # (max_dynamic, block of T; 0: the build's own)
+    variants = [(own, 0)] + [(int(m), 0) for m in args.max_dynamic.split(",") if m and int(m) != own] \
+        + [(own, int(b)) for b in args.attn_block.split(",") if b]
     tmp = tempfile.mkdtemp(prefix="attn_cycles_")
     rows, fails = [], 0
     print(f"{args.build}: compiled for {own}; dispatches over T: " + ", ".join(f"#{n} {k}" for k, (n, _) in kinds.items()))
-    for md in variants:
+    for md, blk in variants:
+        tag = f"{md}" + (f"_b{blk}" if blk else "")
         for kind, (n, name) in kinds.items():
             src = os.path.join(args.build, "sa_sources", f"module_main$async_dispatch_{n}.mlir")
-            if md == own:
+            if md == own and not blk:
                 blob = open(os.path.join(args.build, "sa_bins", f"module_main$async_dispatch_{n}_sa_desc_v1.sadesc"), "rb").read()
             else:
-                text = re.sub(r"max_dynamic = \d+", f"max_dynamic = {md}", G.sa_only(open(src).read()))
-                src = os.path.join(tmp, f"d{n}_{md}.mlir")
+                text = re.sub(r"max_dynamic = \d+", f"max_dynamic = {md}" + (f", attn_block = {blk}" if blk else ""),
+                              G.sa_only(open(src).read()))
+                src = os.path.join(tmp, f"d{n}_{tag}.mlir")
                 open(src, "w").write(text)
-                blob, err = G.compile_one(src, [f"--iree-sa-max-dynamic={md}"], os.path.join(tmp, f"d{n}_{md}.sadesc"))
+                blob, err = G.compile_one(src, [f"--iree-sa-max-dynamic={md}"] + ([f"--iree-sa-attn-block={blk}"] if blk else []),
+                                          os.path.join(tmp, f"d{n}_{tag}.sadesc"))
                 if blob is None:
-                    print(f"  #{n} at max_dynamic {md}: compile failed: {err}")
+                    print(f"  #{n} at {tag}: compile failed: {err}")
                     fails += 1
                     continue
             for t in Ts:
@@ -130,15 +138,16 @@ def main():
                     continue
                 res, cyc, busy, cnt = measure(a, src, blob, t, d)
                 fails += not ok(res)
-                rows.append({"max_dynamic": md, "T": t, "dispatch": n, "kind": kind, "check": "OK" if ok(res) else str(res),
+                rows.append({"max_dynamic": md, "attn_block": blk, "T": t, "dispatch": n, "kind": kind, "check": "OK" if ok(res) else str(res),
                              "cycles": cyc, "busy": busy, "commands": dict(cnt)})
     # the table: per variant and T, each kind's cycles (busy LD / EX / VE), the layer's total, per token
-    for md in variants:
-        print(f"\nmax_dynamic {md}  (cycles at {a.mhz:.0f} MHz; busy LD / EX / VE in thousands)")
-        names = [k for k in kinds if any(r["kind"] == k and r["max_dynamic"] == md for r in rows)]
+    for md, blk in variants:
+        print(f"\nmax_dynamic {md}{f', block of T {blk}' if blk else ''}  (cycles at {a.mhz:.0f} MHz; busy LD / EX / VE in thousands)")
+        mine = [r for r in rows if r["max_dynamic"] == md and r["attn_block"] == blk]
+        names = [k for k in kinds if any(r["kind"] == k for r in mine)]
         print(f"{'T':>6}  " + "  ".join(f"{k[:30]:>30}" for k in names) + f"  {'layer':>9}  {'ms/token':>9}")
         for t in Ts:
-            rs = {r["kind"]: r for r in rows if r["max_dynamic"] == md and r["T"] == t}
+            rs = {r["kind"]: r for r in mine if r["T"] == t}
             if not rs:
                 continue
             cell = lambda r: (f"{r['cycles'] / 1e3:7.1f}k ({r['busy']['LD'] / 1e3:.0f}/{r['busy']['EX'] / 1e3:.0f}/"  # noqa: E731
