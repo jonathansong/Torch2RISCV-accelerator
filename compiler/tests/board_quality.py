@@ -76,34 +76,30 @@ def sim(args):
     mb = int(open(os.path.join(b, "board.txt")).read().split()[-1])
     extra = open(os.path.join(b, "sa_args.txt")).read().split()
     decode = args.decode or not any(a.startswith("--prefill=") for a in extra)
-    from board_teacher import run_args
+    from board_teacher import run_args, run_streamed, score_rows
     d = os.environ.get("SA_D", "16")
     repo = os.path.abspath(os.path.join(HERE, "..", ".."))
     run = os.path.join(repo, "build/iree/build-sa-host/runtime/plugins/hal/drivers/sa/sa-llm-run")
+    V = np.load(os.path.join(b, "expected_logits.npy"), mmap_mode="r").shape[1]
     argmax = np.zeros((W, L), np.int32)
     nll = np.zeros((W, L - 1), np.float32)
     lp_k = np.zeros(topk.shape, np.float32)
-    out = os.path.join(b, "logits_all_sim.f32")
     for w in range(W):
         sock = f"/tmp/sa_bq_{os.getpid()}.sock"
         srv = subprocess.Popen([sys.executable, os.path.join(HERE, "..", "sim", "sa_sim_server.py"), "--d", d,
                                 "--mb", str(mb), "--socket", sock, "--once"], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
         time.sleep(3)
-        r = subprocess.run([run, "--device=sa", f"--module={b}/sa.vmfb", f"--parameters=model={b}/sa_packed.irpa",
-                            "--tokens=" + ",".join(map(str, wins[w])), "--generate=0"]
-                           + run_args(extra, L, decode, out), capture_output=True, text=True, env=dict(os.environ, SA_SIM_SOCKET=sock))
+        a_, flag = run_args(extra, L, decode)
+        rc, _, err, n = run_streamed([run, "--device=sa", f"--module={b}/sa.vmfb", f"--parameters=model={b}/sa_packed.irpa",
+                                      "--tokens=" + ",".join(map(str, wins[w])), "--generate=0"] + a_, flag, V,
+                                     score_rows(wins[w], topk[w], argmax[w], nll[w], lp_k[w]),
+                                     env=dict(os.environ, SA_SIM_SOCKET=sock))
         srv.wait(timeout=120)
-        if r.returncode:
-            print(r.stderr[-3000:])
+        if rc or n != L:
+            print(f"sa-llm-run failed ({rc}, {n}/{L} rows)\n{err[-3000:]}")
             return 1
-        lg = np.fromfile(out, np.float32).reshape(L, -1)
-        lp = log_softmax_rows(lg)
-        argmax[w] = lg.argmax(1)
-        lp_k[w] = np.take_along_axis(lp, topk[w].astype(np.int64), 1)
-        nll[w] = -lp[np.arange(L - 1), wins[w, 1:]]
         print(f"window {w + 1}/{W} (sim{', decode' if decode else ''})", flush=True)
-    os.remove(out)
     name = args.out or "tf_sim.npz"
     np.savez(os.path.join(b, name), argmax=argmax, nll=nll, lp_topk=lp_k)
     print(f"-> {b}/{name} (score --which {name[3:-4]})")

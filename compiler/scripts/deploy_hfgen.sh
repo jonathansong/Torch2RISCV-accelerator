@@ -33,7 +33,7 @@ fi
 stage_runtime "$D"
 # the board's ARM runs the dispatches left to the host: bit-exact with the sim there too (qemu)
 "$SA_COMPILER/scripts/check_bundle_aarch64.sh" "$D" 2 "$SA_D"
-cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/tests/board_teacher.py" "$SA_COMPILER/tests/board_profile.py" "$SA_COMPILER/runtime/test/board_launcher.py" \
+cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_generate.py" "$SA_COMPILER/tests/board_teacher.py" "$SA_COMPILER/tests/board_longctx.py" "$SA_COMPILER/tests/board_profile.py" "$SA_COMPILER/runtime/test/board_launcher.py" \
    "$SA_REPO/driver/pynq_matmul.py" "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"
 stage_overlay "$D"
 ls -la "$D"

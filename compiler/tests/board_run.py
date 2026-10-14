@@ -18,7 +18,8 @@ tf_board.npz, the profile's perf CSV). A later run of the same mode goes to
 
 Modes: llm (board_llm.py: prefill + decode, bit-exact with the sim), teacher
 (board_teacher.py), profile (board_profile.py; --batch: the batched lists, the
-mode then is profile_batch), generate (board_generate.py).
+mode then is profile_batch), generate (board_generate.py), longctx
+(board_longctx.py: a prompt of the context length, prefill vs decode only).
 """
 import glob
 import hashlib
@@ -31,8 +32,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = {"llm": "board_llm.py", "teacher": "board_teacher.py", "profile": "board_profile.py",
-           "generate": "board_generate.py"}
-OUTPUTS = {"llm": ["tokens_board.txt"], "teacher": ["tf_board.npz"]}
+           "generate": "board_generate.py", "longctx": "board_longctx.py"}
+OUTPUTS = {"llm": ["tokens_board.txt"], "teacher": ["tf_board.npz"], "longctx": ["longctx_board.npz"]}
 
 
 def version():

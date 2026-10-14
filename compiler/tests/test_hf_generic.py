@@ -9,6 +9,7 @@ the split between the accelerator and the host (SA_STATS).
 """
 import argparse
 import gc
+import json
 import math
 import os
 import subprocess
@@ -278,8 +279,8 @@ def stage(args, prompt, run):
     """The board bundle (board_llm.py): module, packed parameters, the sim's
     decode-only run over the prompt and --board-generate tokens (the board runs
     prefill + decode: compared with the rows from the prompt's last position),
-    the tokenizer, sa_args.txt (--abi=hf[v] [--pad=D] --prefill=M), board.txt (the
-    reference, the window in MB)."""
+    the tokenizer, sa_args.txt (--abi=hf[v] [--pad=D] --prefill=M), model.json
+    (board_generate.py), board.txt (the reference, the window in MB)."""
     import shutil
     dst = args.board_bundle
     os.makedirs(dst, exist_ok=True)
@@ -300,6 +301,9 @@ def stage(args, prompt, run):
                 f"command {' '.join(sys.argv[1:])}\n")
     with open(os.path.join(dst, "sa_args.txt"), "w") as f:
         f.write(" ".join(ABI) + f" --prefill={args.prefill}\n")
+    from stage_model_json import model_json      # (board_generate.py: interactive generation)
+    with open(os.path.join(dst, "model.json"), "w") as f:
+        json.dump(model_json(args.model, dst), f)
     # the window: the runtime's peak is the packed parameters + the int8 KV
     # cache + a few MiB (calibrated on the board, compiler/tests/mem_preflight.py);
     # the 4-port overlay's pool is 1280 MiB (K5-M M1)

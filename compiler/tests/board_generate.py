@@ -10,7 +10,9 @@ the context length).
 Files (the board bundle): this script, board_launcher.py, pynq_matmul.py,
 picorv32.bit / .hwh, rt_fw.bin, sa-llm-run, sa.vmfb, sa_packed.irpa,
 model.json ({"tokenizer": "hf" | "llama2", "bos": id or null, "stop": id or
-null, "context": n}), the tokenizer (tokenizer.json + hf_tokenizer.py, or
+null, "context": n, optional "stops": [ids] (every end token) and "chat":
+[ids before, ids after] one user message; the generic-frontend bundles':
+stage_model_json.py}), the tokenizer (tokenizer.json + hf_tokenizer.py, or
 tokenizer.bin + tokenizer.py), optional board.txt (window MB, last field) and
 sa_args.txt (extra sa-llm-run arguments).
 
@@ -42,7 +44,10 @@ def load_tokenizer(cfg):
 
 
 def generate(prompt_ids, max_new, cfg, decode, env, extra):
-    """Runs sa-llm-run, printing the text as it comes; returns its stats line."""
+    """Runs sa-llm-run, printing the text as it comes; returns its stats line.
+    sa-llm-run stops at "stop"; another of "stops" (e.g. Qwen3's <|endoftext|>
+    besides <|im_end|>) ends it here."""
+    stops = set(cfg.get("stops") or []) | ({cfg["stop"]} if cfg.get("stop") is not None else set())
     cmd = [os.path.join(HERE, "sa-llm-run"), "--device=sa", f"--module={HERE}/sa.vmfb",
            f"--parameters=model={HERE}/sa_packed.irpa", "--tokens=" + ",".join(map(str, prompt_ids)),
            f"--generate={max_new}"] + extra
@@ -55,6 +60,7 @@ def generate(prompt_ids, max_new, cfg, decode, env, extra):
     shown = decode(prompt_ids)
     t0 = time.time()
     first = None
+    ended = False
     state = 0                                          # 0: before "tokens:", 1: the token list, 2: after it
     while True:
         c = p.stdout.read(1)
@@ -76,9 +82,14 @@ def generate(prompt_ids, max_new, cfg, decode, env, extra):
         ids.append(int(cur))
         cur = b""
         gen = ids[len(prompt_ids):]
-        if gen and cfg.get("stop") is not None and gen[-1] == cfg["stop"]:
+        if gen and gen[-1] in stops:
+            if gen[-1] != cfg.get("stop"):           # (not sa-llm-run's own: it would go on)
+                p.terminate()
+                ended = True
             gen = gen[:-1]
         if not gen:
+            if ended:
+                break
             continue
         first = first or time.time()
         text = decode(prompt_ids + gen)
@@ -86,9 +97,14 @@ def generate(prompt_ids, max_new, cfg, decode, env, extra):
             sys.stdout.write(text[len(shown):])
             sys.stdout.flush()
             shown = text
+        if ended:
+            break
     err = p.stderr.read().decode(errors="replace")
     p.wait()
     print()
+    if ended:
+        n = len(ids) - len(prompt_ids) - 1          # (the end token not counted)
+        return f"{n} tokens in {time.time() - t0:.1f} s, stopped at an end token"
     if p.returncode:
         print(f"sa-llm-run failed ({p.returncode}): {err[-2000:]}")
         return None
@@ -101,8 +117,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--prompt", help="one prompt, then exit (default: read prompts interactively)")
     ap.add_argument("--max-new", type=int, default=64, help="tokens to generate at most")
+    ap.add_argument("--chat", action="store_true", help="each prompt as one user message in the model's chat "
+                    "template (model.json \"chat\"; default: plain text continued)")
     args = ap.parse_args()
     cfg = json.load(open(os.path.join(HERE, "model.json")))
+    if args.chat and not cfg.get("chat"):
+        print("model.json has no chat template (a base model): plain text")
+        args.chat = False
     mb = 64
     if os.path.exists(os.path.join(HERE, "board.txt")):
         mb = int(open(os.path.join(HERE, "board.txt")).read().split()[-1])
@@ -127,13 +148,17 @@ def main():
                     if text.strip():
                         break
                     continue
-            ids = encode(text)
+            if args.chat:                              # (the template's ids carry the BOS)
+                ids = cfg["chat"][0] + encode(text)[1 if cfg.get("bos") is not None else 0:] + cfg["chat"][1]
+            else:
+                ids = encode(text)
             if len(ids) >= ctx:
                 print(f"(the prompt has {len(ids)} tokens: keeping the last {ctx // 2})")
                 ids = ids[-(ctx // 2):]
             n = max(0, min(args.max_new, ctx - len(ids)))
-            sys.stdout.write(decode(ids))
-            sys.stdout.flush()
+            if not args.chat:                          # (the text continued: the prompt first)
+                sys.stdout.write(decode(ids))
+                sys.stdout.flush()
             stats = generate(ids, n, cfg, decode, env, extra)
             if stats:
                 print(f"[{len(ids)} prompt tokens; {stats}]")
