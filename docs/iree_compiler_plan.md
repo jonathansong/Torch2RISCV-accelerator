@@ -1464,6 +1464,45 @@ Gemma end to end with a 320-token prompt (past the old 256 limit, `--max-len 512
 
 **Limits now.** Qwen3 (and by the same rule SmolLM2 / Llama, head_dim 64) compile for 2048 with everything on the accelerator; Gemma stays at 512 (sliding window). The target check `spadBytes / d ≥ 2 · max_dynamic` allows max_dynamic up to 4096 at D = 16; above 2048 nothing has been tried, and device memory bounds Llama at about 2200 positions (generality plan §9.3). Not yet run on the board.
 
+**Performance at long T and double buffering of the T loop (analysis 2026-10-14; not implemented).** The method: the attention dispatches of the 2-layer Qwen3 (`build/hfgen/qwen3_l2_t2048lc`) were run per dispatch on the functional simulator (`dispatch_check.py`, `sim.trace`), and the commands as executed were timed with `perf_model.py`'s `run_list` (four-port overlay, the `qwen3_dyn_cal.json` calibration). The figures are model cycles per layer (8 KV heads, 100 MHz), not board measurements.
+
+| Dispatch (per layer) | T = 2048 total | LD busy | EX busy | VE busy |
+|---|---|---|---|---|
+| q · Kᵀ (the C6.5 T loop) | 629k | 168k | 404k | 48k |
+| p · V | 788k | 187k | 266k | 333k |
+| attention probabilities (qsum) | 100k | 9k | 0 | 90k |
+
+At T = 2048 attention alone is about 15 ms per layer, about 425 ms per token for Qwen3's 28 layers (decode about 2 tok/s, against 6.88 at short T on the board).
+
+*Findings.*
+1. **EX, not LD, bounds the T loop.** Decode has G query rows per KV head (Qwen3 2, Gemma / Llama 4, SmolLM2 3), and each row is its own EX over a strip of the row replicated over the D rows: 1 of D output rows is used. Even perfect overlap of LD, transpose and EX only brings q · Kᵀ from 629k to its EX busy time, about 404k (−36%).
+2. **p · V costs more than q · Kᵀ at long T**, mostly VE (p copied over the D rows, per chunk of output tiles), which the T loop does not touch.
+3. **Regression at short T: the block size is static.** Every block is computed at full Tb (Qwen3 512 rows: EX repeat nb = 32 tiles), however short T is; the untiled form's EX repeat is dynamic. Per layer, the same q · Kᵀ dispatch compiled for max_dynamic 256 / 2048: T = 16 16k / 128k cycles, T = 128 42k / 129k; p · V at T = 128 38k / 68k (several N chunks). A Qwen3 compiled with `--max-len` 2048 would decode at short contexts about 33 ms (+23%) slower per token. The board bundles (compiled for 256) are not affected: the tiled form applies only when T × head_dim exceeds one SPAD_B bank (Qwen3 above 512, Gemma above 256).
+
+*On-chip memory for double buffering.* The scoreboard tracks hazards per bank (`double_buffer_design.md` §7: two buffers on disjoint addresses of one bank still wait for each other; EX and VE also conflict on any common bank of SPAD_B / ACC), so double-buffered blocks need different banks, not just room. In the T loop:
+
+| Memory | Use per block now | Double buffering |
+|---|---|---|
+| SPAD_A bank 0 (4096 words) | the strips of x, G · K words (Qwen3 256, Gemma 1024) | — |
+| SPAD_A bank 1 | the raw block of cache rows (Tb × K bytes: the whole bank) | a second raw block has no free bank: in bank 0 the LD waits for the EXs reading the strips |
+| SPAD_B bank 0 | the transposed tiles (the whole bank) | — |
+| SPAD_B bank 1 | free | the tiles' second buffer fits |
+| ACC (4096 words) | scratch (G − 1 + D) · Tb and the rows' score buffers: a few hundred words | ample |
+
+So the tiles can alternate between SPAD_B banks 0 and 1 at no capacity cost; the raw block cannot be double-buffered within the four SPAD banks (5 roles: strips, raw × 2, tiles × 2). A smaller Tb does not change that (it is the bank count, not the size). The LD cannot transpose (INTERLEAVE places D-byte chunks of a row, `double_buffer_design.md` §5.3), so the VE transpose and its raw block stay.
+
+*Plan (in this order; none done):*
+
+| Step | Content | Expected (model) | Estimate |
+|---|---|---|---|
+| a | **Smaller Tb** (e.g. 128 rows): the waste is at most one block, the block past T of a multiple of Tb shrinks too; the extra commands per block (one LD, one transpose, the EXs and copies, `LOOP_END`) cost little | removes the short-T regression | ½ day |
+| b | **The G query rows in one strip** (rows g in lanes 0..G − 1 of the A strip), one EX per block for all rows (its output rows 0..G − 1), instead of one EX per row; the scratch slots go away | q · Kᵀ EX time ÷ G | 1–1.5 days |
+| c | **Double buffering of the T loop**: tiles alternating SPAD_B banks 0 / 1, the loop body reordered (software pipelining, in-order dispatch: block i + 1's LD and transpose issued before block i's EXs / copies, the copies of block i not ahead of the next transpose on the VE queue) | after b, EX and LD are comparable: q · Kᵀ about 629k → 210k at T = 2048 | 1 day |
+| d | **p · V**: the G rows of p in one strip as in b, no VE copies of p over the D rows | the largest item at long T | 1–2 days |
+| e (optional, larger) | **q · Kᵀ on the GEMV unit**: the cache's rows are the weight rows of a GEMV (scores[t] = Σₖ K[t, k] q[k]), streamed through the four read ports (about 58 B/cycle), no transpose, no raw block; needs a check that the GEMV unit takes a dynamic row count T and G rows of x | possibly an order of magnitude on q · Kᵀ | to be evaluated |
+
+Each step's acceptance: the golden corpus (byte-identical outside the changed kernels, the changed ones re-recorded after review), `run_tests.sh longctx / longctxq / longctxq2k` per-dispatch checks, the cycle model as above, then the board.
+
 ## 9. Verification system
 
 | Level | Content | Tools |
