@@ -49,6 +49,8 @@ def main():
     subprocess.run(["rm", "-rf", bins], check=True)
     r = subprocess.run([os.path.join(COMPILER, "scripts", "compile_sa.sh"), out], capture_output=True, text=True,
                        env=dict(env, SA_COMPILE_FLAGS=f"--iree-sa-codegen-report --iree-hal-dump-executable-binaries-to={bins}"))
+    with open(os.path.join(out, "compile_report.txt"), "w") as f:     # (every executable's line, the host ones in full)
+        f.write(r.stderr)
     if r.returncode:
         print(r.stderr[-3000:])
         return 1

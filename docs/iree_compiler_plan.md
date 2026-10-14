@@ -1470,9 +1470,9 @@ Gemma end to end with a 320-token prompt (past the old 256 limit, `--max-len 512
 - Dry run of the whole flow (2026-10-14, `LC_LAYERS=2`): Qwen3 at 2048 (202 executables on the accelerator, `--valid_len=2048` in `sa_args.txt`, `model.json` context 2048, qemu 3/3, two 2048-token windows) and Gemma at 512 (215 executables, prefill_all 40/40, window 640) staged without errors; `--sweep` checked on the sim. Device memory of the whole models (`mem_preflight.py`): Qwen3 at 2048 824 MiB, Gemma at 512 297 MiB of the 1280 MiB pool.
 - Checked on the sim with the 2-layer Qwen3 at 2048 (48-token prompt, 4 generated): prefill vs decode only 5/5 rows bit-exact, 0 dispatches on the host; `board_longctx.py`'s scores equal `board_quality.py sim`'s for the same positions.
 
-**Limits now.** Qwen3 (and by the same rule SmolLM2 / Llama, head_dim 64) compile for 2048 with everything on the accelerator; Gemma stays at 512 (sliding window). The target check `spadBytes / d ≥ 2 · max_dynamic` allows max_dynamic up to 4096 at D = 16; above 2048 nothing has been tried, and device memory bounds Llama at about 2200 positions (generality plan §9.3). Not yet run on the board.
+**Limits now.** Qwen3 (and by the same rule SmolLM2 / Llama, head_dim 64) compile for 2048 with everything on the accelerator; Gemma stays at 512 (sliding window). The target check `spadBytes / d ≥ 2 · max_dynamic` allows max_dynamic up to 4096 at D = 16. **Checked at 4096 (2026-10-14, 2-layer Qwen3, `test_long_context.py --max-len 4096`, report in `build/hfgen/qwen3_l2_t4096/compile_report.txt`)**: 200 executables on the accelerator, 2 on the host, the decode p · V of both layers (`batch_matmul_8x2x128xD`: `SahlExpandKernels.cpp:673`, the dynamic contraction length above kmax = 4080 needs a K split); prefill (row attention) and everything else pass, the other 200 OK in the per-dispatch checks at T = 16, 2064, 4096. So 4096 needs only the p · V dynamic K split. Device memory bounds Llama at about 2200 positions (generality plan §9.3); Qwen3's whole model at 4096 fits (`mem_preflight.py`: T ≤ 6213). Not yet run on the board.
 
-**Performance at long T and double buffering of the T loop (analysis 2026-10-14; not implemented).** The method: the attention dispatches of the 2-layer Qwen3 (`build/hfgen/qwen3_l2_t2048lc`) were run per dispatch on the functional simulator (`dispatch_check.py`, `sim.trace`), and the commands as executed were timed with `perf_model.py`'s `run_list` (four-port overlay, the `qwen3_dyn_cal.json` calibration). The figures are model cycles per layer (8 KV heads, 100 MHz), not board measurements.
+**Performance at long T and double buffering of the T loop (analysis 2026-10-14; not implemented).** The method (`compiler/tests/attn_cycles.py`, 2026-10-14; first done with scratch scripts): the decode dispatches over T of the 2-layer Qwen3 (`build/hfgen/qwen3_l2_t2048lc`) are run per dispatch on the functional simulator (`dispatch_check.py`, so each run is also checked against the oracle, `sim.trace` capturing the commands as executed), and timed with `perf_model.py`'s `run_list` (four-port overlay, the `qwen3_dyn_cal.json` calibration); `--max-dynamic` recompiles the same dispatches for other bounds. The figures are model cycles per layer (8 KV heads, 100 MHz), not board measurements.
 
 | Dispatch (per layer) | T = 2048 total | LD busy | EX busy | VE busy |
 |---|---|---|---|---|
@@ -1480,12 +1480,25 @@ Gemma end to end with a 320-token prompt (past the old 256 limit, `--max-len 512
 | p · V | 788k | 187k | 266k | 333k |
 | attention probabilities (qsum) | 100k | 9k | 0 | 90k |
 
-At T = 2048 attention alone is about 15 ms per layer, about 425 ms per token for Qwen3's 28 layers (decode about 2 tok/s, against 6.88 at short T on the board).
+At T = 2048 attention alone is about 15 ms per layer, about 430 ms per token for Qwen3's 28 layers (decode about 2 tok/s, against 6.88 at short T on the board).
+
+By T, the four dispatches together (q · Kᵀ, the masked max / exp, the sum, p · V; per layer and × 28 per token), compiled for 2048 against compiled for 256 / 512 (`attn_cycles.py build/hfgen/qwen3_l2_t2048lc --max-dynamic 256,512`; all 52 runs OK against the oracle):
+
+| T | compiled for 2048: per layer | ms / token | compiled for 512 (256 the same up to 256): per layer | ms / token |
+|---|---|---|---|---|
+| 16 | 163k | 45.5 | 37k | 10.4 |
+| 128 | 211k | 59.1 | 95k | 26.7 |
+| 256 | 267k | 74.9 | 162k | 45.5 |
+| 512 | 502k | 140.5 | 297k | 83.1 |
+| 1024 | 848k | 237.5 | — | — |
+| 2048 | 1541k | 431.6 | — | — |
+
+The blocked form costs more at every T it shares with the untiled one, not only at short T: at T = 512 1.69× (q · Kᵀ 254k against 132k, p · V 212k against 128k).
 
 *Findings.*
 1. **EX, not LD, bounds the T loop.** Decode has G query rows per KV head (Qwen3 2, Gemma / Llama 4, SmolLM2 3), and each row is its own EX over a strip of the row replicated over the D rows: 1 of D output rows is used. Even perfect overlap of LD, transpose and EX only brings q · Kᵀ from 629k to its EX busy time, about 404k (−36%).
 2. **p · V costs more than q · Kᵀ at long T**, mostly VE (p copied over the D rows, per chunk of output tiles), which the T loop does not touch.
-3. **Regression at short T: the block size is static.** Every block is computed at full Tb (Qwen3 512 rows: EX repeat nb = 32 tiles), however short T is; the untiled form's EX repeat is dynamic. Per layer, the same q · Kᵀ dispatch compiled for max_dynamic 256 / 2048: T = 16 16k / 128k cycles, T = 128 42k / 129k; p · V at T = 128 38k / 68k (several N chunks). A Qwen3 compiled with `--max-len` 2048 would decode at short contexts about 33 ms (+23%) slower per token. The board bundles (compiled for 256) are not affected: the tiled form applies only when T × head_dim exceeds one SPAD_B bank (Qwen3 above 512, Gemma above 256).
+3. **Regression at short T: the block size is static.** Every block is computed at full Tb (Qwen3 512 rows: EX repeat nb = 32 tiles), however short T is; the untiled form's EX repeat is dynamic. Per layer, the same q · Kᵀ dispatch compiled for max_dynamic 256 / 2048: T = 16 16k / 128k cycles, T = 128 42k / 129k; p · V at T = 128 38k / 68k (several N chunks). A Qwen3 compiled with `--max-len` 2048 would decode at short contexts about 33–35 ms (+23%) slower per token (table above: 45.5 against 10.4 ms of attention at T = 16). The board bundles (compiled for 256) are not affected: the tiled form applies only when T × head_dim exceeds one SPAD_B bank (Qwen3 above 512, Gemma above 256).
 
 *On-chip memory for double buffering.* The scoreboard tracks hazards per bank (`double_buffer_design.md` §7: two buffers on disjoint addresses of one bank still wait for each other; EX and VE also conflict on any common bank of SPAD_B / ACC), so double-buffered blocks need different banks, not just room. In the T loop:
 
