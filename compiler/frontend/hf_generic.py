@@ -53,6 +53,12 @@ class PositionedCache(StaticCache):
 # "kv": the KV cache in fp32; "q": the attention's query not quantized; "probs":
 # the attention probabilities not quantized to int8.
 SA_FP32 = set()
+# Feasibility (iree_compiler_plan.md §8.22, p . V on the GEMV unit): the V cache
+# packed, [L, kv_heads * hd / 16, max_len, 16] (per head, 16-channel groups,
+# each a [T, 16] block: the GEMV unit's weight layout) instead of [L * max_len,
+# kv_dim]; the same int8 values, so the same logits.
+V_PACKED = os.environ.get("SA_V_PACKED", "") == "1"
+VP_LANES = 16
 
 
 def _at(layer, pos):
@@ -198,8 +204,18 @@ class SaCache(StaticCache):
                 for m in range(kr.shape[0]):          # row by row: a scalar position each (a decode step's write)
                     row = cache.positions[m:m + 1] + i * T
                     owner.kc.index_copy_(0, row, kq[m:m + 1])
-                    owner.vc.index_copy_(0, row, vq[m:m + 1])
+                    if V_PACKED:                      # (the row's 16-channel groups, each at its block's row)
+                        # (a slice at the position as an integer: a strided store at a
+                        # dynamic offset; a tensor index becomes an element scatter)
+                        pv = cache.positions[m].item()
+                        torch._check(pv >= 0)
+                        torch._check(pv < T)
+                        owner.vc[i, :, pv:pv + 1] = vq[m:m + 1].reshape(-1, 1, VP_LANES)
+                    else:
+                        owner.vc.index_copy_(0, row, vq[m:m + 1])
                 n = T if cache.T is None else cache.T    # (the first n rows: the positions attended)
+                if V_PACKED:
+                    return owner.kc[i * T:i * T + n], owner.vc[i, :, :n]
                 return owner.kc[i * T:i * T + n], owner.vc[i * T:i * T + n]
             return update
         for i, layer in enumerate(self.layers):
@@ -225,7 +241,10 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
     Hk = key.shape[1] // hd
     G = H // Hk
     kh = key.to(torch.int32).reshape(T, Hk, hd).permute(1, 2, 0)                  # (Hk, hd, T)
-    vh = value.to(torch.int32).reshape(T, Hk, hd).permute(1, 0, 2)                # (Hk, T, hd)
+    if V_PACKED:                                                                 # (Hk, hd / 16, T, 16)
+        vh = value.to(torch.int32).unflatten(0, (Hk, hd // VP_LANES))          # (T not reshaped: no export guard)
+    else:
+        vh = value.to(torch.int32).reshape(T, Hk, hd).permute(1, 0, 2)            # (Hk, T, hd)
     # the query rows as [M, H, hd] (HF's transpose undone: each row contiguous)
     qr = query[0].transpose(0, 1)
     outs = []
@@ -247,7 +266,12 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
         e = torch.where(mask, torch.exp(sc - mx), torch.tensor(0.0))
         eq = _to_i8(e * 127.0)
         pq = eq.to(torch.int32).reshape(Hk, G, T)
-        att = torch.matmul(pq, vh)                                               # (Hk, G, hd) int32
+        if V_PACKED:                         # sum_t (Hk, G, 1, T, 1) * (Hk, 1, hd / 16, T, 16) -> (Hk, G, hd)
+            # (one contraction, x (h, g, t) and V (h, c, t, j), the output in
+            # (h, g, c, j) order: no broadcast of p, no transpose after)
+            att = (pq[:, :, None, :, None] * vh[:, None]).sum(dim=3, dtype=torch.int32).reshape(Hk, G, hd)
+        else:
+            att = torch.matmul(pq, vh)                                           # (Hk, G, hd) int32
         # sum(eq) in fp32 straight from the int8 (exact: at most 127 T)
         rq = torch.reciprocal(torch.sum(eq.to(torch.float32), dim=-1, keepdim=True)).reshape(Hk, G, 1) * 127.0
         outs.append(((att.to(torch.float32) * rq) * cache.a_v[l]).reshape(1, 1, H, hd))  # (a_v: a scalar or [Hk, G, hd])
@@ -387,7 +411,12 @@ class SaDecoder(HFDecoder):
         # read after they are written: the attention masks later positions)
         L = len(self.cache.layers)
         self.register_buffer("kc", torch.zeros(L * max_len, kv_dim, dtype=torch.int8))
-        self.register_buffer("vc", torch.ones(L * max_len, kv_dim, dtype=torch.int8))
+        if V_PACKED:
+            # (16 positions more than attended: a slice [:, :T] is never the whole
+            # block, so the export does not guard T != max_len on its layout)
+            self.register_buffer("vc", torch.ones(L, kv_dim // VP_LANES, max_len + VP_LANES, VP_LANES, dtype=torch.int8))
+        else:
+            self.register_buffer("vc", torch.ones(L * max_len, kv_dim, dtype=torch.int8))
         for mod in model.modules():
             if hasattr(mod, "layer_idx") and hasattr(mod, "q_proj"):
                 mod.sa_cache = self.cache

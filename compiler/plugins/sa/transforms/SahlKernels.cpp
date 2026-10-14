@@ -476,7 +476,11 @@ bool KernelMatcher::matchContraction(linalg::LinalgOp op) {
   if (xRows && !(*ranges)[p.kLoop].dyn) return false;
   int64_t K = (*ranges)[p.kLoop].size;
   if (p.laneLoop >= 0) {
-    if ((*ranges)[p.laneLoop].size != d || p.m.coef[p.kLoop] != d || p.m.coef[p.nLoop] != K * d) return false;
+    // (a dynamic K: the blocks of the packed V cache a pitch of at least max_dynamic rows apart)
+    const bool dk = bool((*ranges)[p.kLoop].dyn);
+    if ((*ranges)[p.laneLoop].size != d || p.m.coef[p.kLoop] != d ||
+        (dk ? p.m.coef[p.nLoop] < K * d || p.m.coef[p.nLoop] % d : p.m.coef[p.nLoop] != K * d))
+      return false;
     p.layout = MatLayout::Packed;
   } else if (p.m.coef[p.kLoop] == 1) {
     p.layout = MatLayout::RowsK;

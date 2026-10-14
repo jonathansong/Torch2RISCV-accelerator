@@ -375,6 +375,18 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
     r->n = cfg.maxDynamic * r->rows;
     return r;
   }
+  std::optional<Lin> dynMid;
+  if (auto sv = v.getDefiningOp<memref::SubViewOp>();
+      sv && mt.getRank() == 3 && !mt.isDynamicDim(0) && mt.isDynamicDim(1) && !mt.isDynamicDim(2)) {
+    // [R, ?, C]: R blocks of a dynamic number of contiguous rows of C, a static
+    // pitch apart (the packed V cache's 16-channel groups, p . V on the GEMV
+    // unit, plan §8.22): the fields at the bound, the length kept for a dynamic field
+    dynMid = dynLin(sv.getSizes()[0]);
+    if (!dynMid) return fail("dynamic DDR view size"), std::nullopt;
+    SmallVector<int64_t> shape(mt.getShape());
+    shape[1] = cfg.maxDynamic;
+    mt = MemRefType::get(shape, mt.getElementType(), mt.getLayout(), mt.getMemorySpace());
+  }
   if (!mt.hasStaticShape() && v.getDefiningOp<memref::SubViewOp>() && mt.isDynamicDim(0)) {
     // a view of rows whose count is dynamic (an expanded kernel's cache rows):
     // the fields at the bound (max_dynamic rows), the count kept for a dynamic field
@@ -476,6 +488,7 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
     r.off = (off.isConst() ? off.add : 0) + elem * es;
     r.n = mt.getNumElements();
     r.dynRows = dynRows;
+    r.dynMid = dynMid;
     if (pitchElems) {
       if (!allowPitch) return fail("non-contiguous DDR view"), std::nullopt;
       r.rows = mt.getDimSize(0);
@@ -807,15 +820,31 @@ bool Lowerer::gemv(sahl::GemvOp g) {
   if ((x->la >> 28) != uint32_t(::sa::MEM_SPAD_A) || x->vt != ::sa::VT_I8 || x->dyn) return fail("gemv: x");
   if ((c->la >> 28) != uint32_t(::sa::MEM_ACC)) return fail("gemv: accumulator");
   auto wt = cast<MemRefType>(g.getW().getType());
-  if (wt.getRank() != 3 || !wt.hasStaticShape() || wt.getDimSize(2) != d) return fail("gemv: weights [nc, K, D]");
+  // (a dynamic K: the packed V cache's [nc, T, D] in p . V, rows bytes T * D a dynamic field)
+  if (wt.getRank() != 3 || wt.isDynamicDim(0) || wt.isDynamicDim(2) || wt.getDimSize(2) != d)
+    return fail("gemv: weights [nc, K, D]");
   auto r = ddrOf(g.getW(), /*allowPitch=*/true);
   if (!r) return false;
-  const int64_t nc = wt.getDimSize(0), k = wt.getDimSize(1), rb = k * d, pitch = leadingPitch(g.getW(), rb);
+  if (wt.isDynamicDim(1) != bool(r->dynMid)) return fail("gemv: dynamic K");
+  const int64_t nc = wt.getDimSize(0), k = r->dynMid ? cfg.maxDynamic : wt.getDimSize(1), rb = k * d;
+  const int64_t pitch = r->dynMid ? r->pitch : leadingPitch(g.getW(), rb);
   if (r->dyn || r->dynRows || r->off % 16 || pitch % 16 || rb > 65535 || k % d || nc < 1 || nc > 8)
     return fail("gemv: weight strips");
   Value adv = advanceOf(g);
+  if (r->dynMid && adv) return fail("gemv: dynamic K in a loop");
+  Value dk;
+  if (r->dynMid) {
+    Lin l = *r->dynMid;
+    l.mul *= d;
+    l.add *= d;
+    dk = paramFor(l);
+  }
   auto ld = sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(c->la), nc, rb, pitch, ::sa::LD_GEMV,
-                               adv ? ValueRange{adv} : ValueRange{});
+                               dk ? ValueRange{dk} : adv ? ValueRange{adv} : ValueRange{});
+  if (dk) {
+    ld.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_ROW_BYTES});
+    ld.setDynAdd(ArrayRef<bool>{false});
+  }
   ld.setXword(int64_t(x->la & 0xFFFF));
   ld.setCstep(1);
   if (g.getAccumulate()) ld.setGemvAcc(true);
@@ -925,6 +954,31 @@ LocalBuf Lowerer::packBcast(const LocalBuf &b) {
 
 bool Lowerer::scatter(sahl::ScatterOp sc) {
   Value upd = sc.getUpdates(), idx = sc.getIndices(), orig = sc.getDest();
+  if (auto dim = sc->getAttrOfType<IntegerAttr>("sa.dim")) {
+    // along dimension 1 of [R, N, C] (the packed V cache: R blocks of N rows of
+    // C bytes): R rows of C bytes, a pitch of N * C apart, at index * C
+    auto dT = cast<MemRefType>(orig.getType());
+    SmallVector<int64_t> st;
+    int64_t off0;
+    if (dim.getInt() != 1 || dT.getRank() != 3 || !dT.hasStaticShape() || failed(dT.getStridesAndOffset(st, off0)))
+      return fail("scatter along a dimension: [R, N, C]");
+    uint32_t es = esize(dT.getElementType());
+    int64_t rows = dT.getDimSize(0), rb = dT.getDimSize(2) * es, pitch = st[0] * es;
+    if (st[2] != 1 || st[1] != dT.getDimSize(2) || rb % 8 || pitch % 8 || rb > 0xFFFF ||
+        cast<MemRefType>(upd.getType()).getNumElements() != rows * dT.getDimSize(2))
+      return fail("scatter along a dimension: layout");
+    auto u = materialize(upd);
+    auto ir = ddrOf(idx);
+    auto orr = ddrOf(orig);
+    if (!u || !ir || !orr) return false;
+    if (orr->off % 8) return fail("scatter target not 8-byte aligned");
+    Value p = privateParam();
+    sahw::LdParamOp::create(bb, loc, ir->base, p, ir->off, rb, 0, ValueRange{});
+    auto s = sahw::StOp::create(bb, loc, orr->base, orr->off, int64_t(u->la), rows, rb, pitch, ValueRange{p});
+    s.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
+    s.setDynAdd(ArrayRef<bool>{true});
+    return err.empty();
+  }
   auto uT = cast<MemRefType>(upd.getType());
   uint32_t es = esize(uT.getElementType());
   uint32_t rowBytes = uint32_t(uT.getNumElements() * es);

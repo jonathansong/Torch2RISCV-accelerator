@@ -513,7 +513,7 @@ static bool notExpanded(sahl::KernelOp k, int line) {
 // batch_matmuls in prefill) has one K block and one chunk; rows of x of a
 // dynamic length, or results of a dynamic length, are walked with the row cursor.
 bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, const ::sa::Layout &lay, int64_t d,
-                       int64_t attnBlock, int64_t maxDyn) {
+                       int64_t attnBlock, int64_t maxDyn, int64_t gemvPorts) {
   auto rr = km.loopRanges(p.op);
   if (!rr) return notExpanded(k, __LINE__);
   auto ranges = *rr;
@@ -524,7 +524,11 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   const bool xRows = (p.bLoop >= 0 && p.x.coef[p.bLoop] < 0) || (p.gLoop >= 0 && p.x.coef[p.gLoop] < 0);
   const bool dyn = Kr.dyn || Nr.dyn;
   if (xRows != bool(Kr.dyn)) return notExpanded(k, __LINE__);          // (x of a dynamic K: its rows a dynamic stride apart)
-  if (dyn && (p.laneLoop >= 0 || p.layout == MatLayout::Packed)) return notExpanded(k, __LINE__);
+  // p . V over the packed V cache (a dynamic K, the matrix [n, T, D] blocks): on
+  // the GEMV unit, one command per row of x (plan §8.22, feasibility)
+  const bool gemvDyn = gemvPorts && Kr.dyn && !Nr.dyn && p.layout == MatLayout::Packed && p.laneLoop >= 0 &&
+                       N / d <= 8 && p.x.et.isInteger(8) && K * d <= 65535;
+  if (dyn && !gemvDyn && (p.laneLoop >= 0 || p.layout == MatLayout::Packed)) return notExpanded(k, __LINE__);
   if (Kr.dyn && p.layout == MatLayout::RowsK) return notExpanded(k, __LINE__);
   if (Nr.dyn && p.layout != MatLayout::RowsK) return notExpanded(k, __LINE__);
   if (K % d || N % d) return notExpanded(k, __LINE__);
@@ -675,7 +679,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   const int64_t kc = K > kmax ? kmax : K, nk = (K + kc - 1) / kc;
   if (nk > 1 && (G != 1 || dyn)) return notExpanded(k, __LINE__);
   int64_t nc = nt;
-  if (!Nr.dyn) {
+  if (!Nr.dyn && !gemvDyn) {
     int64_t cap = std::max<int64_t>(sb / kc, 1);
     for (nc = std::min(cap, nt); nc > 1 && nt % nc; --nc) {
     }
@@ -683,7 +687,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   // C6.5: q . K^T over the cache's T in blocks (nb tiles, a power of two: the
   // block count is T >> log2(nb D) + 1)
   int64_t nb = 0;
-  if (kc * nc > sb) {
+  if (kc * nc > sb && !gemvDyn) {               // (the GEMV unit streams the matrix: no SPAD_B)
     if (!(Nr.dyn && p.layout == MatLayout::RowsK && !xRows && nk == 1 && epi)) return notExpanded(k, __LINE__);
     nb = int64_t(llvm::bit_floor(uint64_t(sb / kc)));
     // blocks of 128 rows by default (§8.22 step a: the cycle model over T = 16..2048,
@@ -870,6 +874,27 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
     return true;
   };
   for (int64_t b = 0; b < H; ++b) {
+    if (gemvDyn) {
+      // per row of x (its T int8 at the cursor into SPAD_A): one GEMV over the
+      // n blocks of the batch's [n, T, D] (rows bytes T * D a dynamic field)
+      llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
+      if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
+      at[p.kLoop] = {0, K};
+      at[p.nLoop] = {0, nt};
+      at[p.laneLoop] = {0, d};
+      llvm::DenseMap<int, Value> dv;
+      dv[p.kLoop] = Kv;
+      for (int64_t g = 0; g < G; ++g) {
+        loadX(b, g);
+        auto scope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
+        OpBuilder::InsertionGuard guard(e.b);
+        e.b.setInsertionPointToEnd(&scope.getBody().emplaceBlock());
+        Value acc = e.alloc({nOut}, accT, "acc", "packed");
+        sahl::GemvOp::create(e.b, e.loc, xl, e.view(p.m.view, mMap, at, {p.bLoop}, dv), acc, false);
+        if (!finish(acc, b, g, 0)) return false;
+      }
+      continue;
+    }
     if (nb) {
       // C6.5: the strips of all rows of x (bank 0, K words each); the blocks of
       // T in a loop whose count is T >> log2(Tb) + 1; then per row its epilogue
@@ -1129,7 +1154,7 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
           auto c = dyn_cast<linalg::LinalgOp>(&o);
           if (!c || !o.hasAttr("sahl.anchor")) continue;
           KernelMatcher km(cfg);
-          if (km.matchContraction(c)) expandContraction(k, km.contracts[c.getOperation()], km, lay, cfg.d, cfg.attnBlock, cfg.maxDynamic);
+          if (km.matchContraction(c)) expandContraction(k, km.contracts[c.getOperation()], km, lay, cfg.d, cfg.attnBlock, cfg.maxDynamic, cfg.gemvPorts);
           else notExpanded(k, __LINE__);
           break;
         }
@@ -1160,7 +1185,9 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
     // SA_EXPAND_STATS: the kernels left to the old lowering (to drop it once none remain)
     if (getenv("SA_EXPAND_STATS"))
       f.walk([&](sahl::KernelOp k) {
-        llvm::errs() << "sa-expand: unexpanded " << k.getKind() << " kernel in " << f.getName() << "\n";
+        auto why = k->getAttrOfType<StringAttr>("sa.unexpanded");
+        llvm::errs() << "sa-expand: unexpanded " << k.getKind() << " kernel in " << f.getName()
+                     << (why ? " (" + why.getValue().str() + ")" : std::string()) << "\n";
       });
   }
 

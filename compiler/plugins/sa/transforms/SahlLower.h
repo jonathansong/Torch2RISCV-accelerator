@@ -171,6 +171,7 @@ private:
     int64_t pitch = 0;         // static rows `pitch` bytes apart (a column slice), 0: contiguous
     std::optional<Lin> dynRows;  // a view of a dynamic number of rows (the fields at max_dynamic rows)
     int64_t rowSkip = 0;       // with dyn: the view starts this many rows (of the dynamic length) in
+    std::optional<Lin> dynMid;   // an [R, ?, C] view: the middle length (the fields at max_dynamic; GEMV's K)
   };
   std::optional<Ddr> ddrOf(Value v, bool allowPitch = false);
 

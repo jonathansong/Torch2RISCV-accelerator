@@ -255,6 +255,69 @@ void replaceScatters(func::FuncOp f) {
   }
 }
 
+// A store into a DDR view at one dynamic offset that is a function of an i64
+// read from DDR (the packed V cache's row written at the position: a slice
+// [.., pos, ..] of the cache, plan §8.22) -> sahl.scatter along that dimension
+// (`sa.dim`). The function is torch's normalization of a slice start (a negative
+// index wrapped, then clamped to the size): only selects, compares, adds and
+// casts of the loaded value and constants; the position is taken as is (it is
+// in range: hf_generic checks it at export).
+void replaceDynStores(func::FuncOp f) {
+  SmallVector<sahl::StoreOp> sts;
+  f.walk([&](sahl::StoreOp s) { sts.push_back(s); });
+  for (auto st : sts) {
+    auto sv = st.getDst().getDefiningOp<memref::SubViewOp>();
+    if (!sv || !ddrRoot(sv.getSource())) continue;
+    int dim = -1;
+    Value off;
+    bool ok = true;
+    for (auto [i, o] : llvm::enumerate(sv.getMixedOffsets())) {
+      if (auto v = dyn_cast<Value>(o)) {
+        ok &= dim < 0;
+        dim = int(i), off = v;
+      } else {
+        ok &= getConstantIntValue(o) == 0;
+      }
+    }
+    if (!ok || dim != 1 || getConstantIntValue(sv.getMixedSizes()[dim]) != 1) continue;
+    for (auto s : sv.getMixedStrides()) ok &= getConstantIntValue(s) == 1;
+    if (!ok) continue;
+    // the offset's backward slice: one memref.load of an i64 in DDR, the rest arith on it and constants
+    memref::LoadOp ld;
+    SmallVector<Operation *> chain, work{off.getDefiningOp()};
+    llvm::SmallPtrSet<Operation *, 16> seen;
+    while (ok && !work.empty()) {
+      Operation *op = work.pop_back_val();
+      if (!op) { ok = false; break; }
+      if (!seen.insert(op).second) continue;
+      chain.push_back(op);
+      if (auto l = dyn_cast<memref::LoadOp>(op)) {
+        ok &= !ld && l.getIndices().empty() && ddrRoot(l.getMemRef()) && l.getType().isInteger(64);
+        ld = l;
+        continue;
+      }
+      if (!isa<arith::ConstantOp, arith::SelectOp, arith::CmpIOp, arith::AddIOp, arith::IndexCastOp,
+               arith::IndexCastUIOp>(op)) {
+        ok = false;
+        break;
+      }
+      for (Value v : op->getOperands()) work.push_back(v.getDefiningOp());
+    }
+    if (!ok || !ld) continue;
+    OpBuilder b(st);
+    auto sc = sahl::ScatterOp::create(b, st.getLoc(), st.getSrc(), ld.getMemRef(), sv.getSource());
+    sc->setAttr("sa.dim", b.getI64IntegerAttr(dim));
+    st.erase();
+    if (sv->use_empty()) sv.erase();
+    // the offset's computation, now unused (users first)
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (Operation *&op : chain)
+        if (op && op->use_empty()) op->erase(), op = nullptr, changed = true;
+    }
+  }
+}
+
 // Each to_i8 chain inside a linalg body -> one sahl.to_i8.
 void replaceToI8(func::FuncOp f) {
   SmallVector<arith::FPToSIOp> fps;
@@ -460,6 +523,7 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
       cfg.ukernels = optUkernels;
     }
     replaceScatters(f);
+    replaceDynStores(f);
     replaceToI8(f);
     replaceGathers(f, cfg);
     if (failed(groupKernels(f, cfg))) return signalPassFailure();

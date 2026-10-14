@@ -95,10 +95,12 @@ def binding_regions(func, interp):
         if op.name == "iree_tensor_ext.dispatch.tensor.store":
             written.add(op.operands[1])
     for op in ops_of(func):
-        interp.run_op(op) if op.name not in ("iree_tensor_ext.dispatch.tensor.load",
-                                              "iree_tensor_ext.dispatch.tensor.store", "linalg.generic",
-                                              "linalg.fill", "linalg.batch_matmul", "tensor.empty",
-                                              "iree_linalg_ext.scatter", "func.return") else None
+        # (ops on loaded data are not run: e.g. a position read from a tensor
+        # and its normalization, the packed V cache's store offset)
+        if op.name not in ("iree_tensor_ext.dispatch.tensor.load", "iree_tensor_ext.dispatch.tensor.store",
+                           "linalg.generic", "linalg.fill", "linalg.batch_matmul", "tensor.empty",
+                           "iree_linalg_ext.scatter", "func.return") and all(v in interp.env for v in op.operands):
+            interp.run_op(op)
         if op.name == "hal.interface.binding.subspan":
             _, b, off, dyn = interp.val(op.results[0])
             dims, et = interp._dispatch_type(op.results[0])
