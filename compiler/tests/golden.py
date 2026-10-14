@@ -50,6 +50,9 @@ CASES = [
     ("qwen3_gemv4", "build/c6p/qwen3_m16_d16_gemv4/sa_sources", []),
     ("smollm2_gemv4", "build/c6p/smollm2_m16_d16_gemv4/sa_sources", []),
     ("stories_gemv4", "build/c6p/stories_m16_d16_gemv4/sa_sources", []),
+    # C6.5: decode attention over T in blocks (a KV cache longer than one SPAD_B bank)
+    ("gemma_t512", "build/hfgen/gemma_l2_t512/sa_sources", ["--iree-sa-max-dynamic=512"]),
+    ("qwen3_t1024", "build/hfgen/qwen3_l2_t1024/sa_sources", ["--iree-sa-max-dynamic=1024"]),
 ]
 
 

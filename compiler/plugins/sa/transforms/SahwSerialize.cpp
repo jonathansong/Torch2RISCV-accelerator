@@ -81,6 +81,7 @@ struct Serializer {
         if (!emit(o.getRegion().front(), rows, tag)) return false;
         int k1 = regOf(o.getK1()), k2 = regOf(o.getK2());
         if (k1 < 0 || k2 < 0) return fail(op, "loop PARAM not assigned");
+        if (!header(op, Value(), o.getDyn(), o.getDynFields(), o.getDynAdd(), false, flags)) return false;
         w[1] = uint64_t(uint32_t(int32_t(start) - int32_t(tag)));
         w[2] = uint64_t(o.getCount()) | uint64_t(k1 & 7) << 16 | uint64_t(k2 & 7) << 19;
         w[3] = uint64_t(o.getS1()) & M32;

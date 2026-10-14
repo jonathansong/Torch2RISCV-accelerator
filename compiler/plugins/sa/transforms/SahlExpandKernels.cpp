@@ -55,6 +55,21 @@
 // interleaved into SPAD_B bank 1, EX, the scale, the head's row stored).
 // Dynamic sizes are views and buffers sized by T (the fields at the bound,
 // the count a dynamic field).
+// The cache's T beyond one SPAD_B bank (C6.5, docs/iree_compiler_plan.md
+// §8.22): a contraction whose dynamic N is T (q . K^T, K's rows transposed)
+// goes over T in blocks of Tb rows (Tb x K in one bank) in a sahl.loop whose
+// count comes from T (T >> log2 Tb, + 1: at least one block; a T that is a
+// multiple of Tb computes one block of scores past T, not stored): per block
+// the rows loaded and transposed, one EX per row of x (the strips of all rows
+// made before the loop), the DMA moving on with the loop; then per row the
+// epilogue over T and the store. An EX writes its D output rows one after the
+// other (Tb / D words each): row g's EX goes to slot g of a scratch of
+// G - 1 + D slots, its copies into slots g + 1, ... (each rewritten by its own
+// EX later in the block), and a VE copy moves slot g into row g's buffer at the
+// block's place (its destination moving on with the loop).
+// Only integer accumulations are split, so the scores are those of the
+// untiled form, bit for bit. A dynamic K (p . V) with several chunks of
+// output tiles walks the rows of x again per chunk (the cursor repositioned).
 // The order of the operations and of the first uses of the local buffers is
 // the order in which the lowering emitted the commands and allocated the
 // words before, so the descriptors are the same (the golden corpus).
@@ -471,7 +486,7 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   if (useLoop) {
     const int64_t pairs = (nch - 1) / 2;          // the prefetch of the last pair stays in range
     if (pairs) {
-      auto lp = sahl::LoopOp::create(e.b, e.loc, pairs, ArrayRef<int64_t>{2 * wbytes, 2 * fbytes});
+      auto lp = sahl::LoopOp::create(e.b, e.loc, pairs, ArrayRef<int64_t>{2 * wbytes, 2 * fbytes}, Value());
       OpBuilder::InsertionGuard guard(e.b);
       e.b.setInsertionPointToEnd(&lp.getBody().emplaceBlock());
       if (!chunkAt(0, true, true) || !chunkAt(1, true, true)) return false;
@@ -662,8 +677,25 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
     for (nc = std::min(cap, nt); nc > 1 && nt % nc; --nc) {
     }
   }
-  if (kc * nc > sb) return notExpanded(k, __LINE__);
-  if (xRows && nc != nt) return notExpanded(k, __LINE__);
+  // C6.5: q . K^T over the cache's T in blocks (nb tiles, a power of two: the
+  // block count is T >> log2(nb D) + 1)
+  int64_t nb = 0;
+  if (kc * nc > sb) {
+    if (!(Nr.dyn && p.layout == MatLayout::RowsK && !xRows && nk == 1 && epi)) return notExpanded(k, __LINE__);
+    nb = int64_t(llvm::bit_floor(uint64_t(sb / kc)));
+    if (nb < 1 || G * K > sb) return notExpanded(k, __LINE__);   // (the strips of all rows of x in bank 0)
+  }
+  int64_t rowPitch = 0;                            // (the tiled form: bytes between the matrix's rows of T)
+  if (nb) {
+    SmallVector<int64_t> mst;
+    int64_t moff;
+    if (failed(cast<MemRefType>(p.m.view.getType()).getStridesAndOffset(mst, moff))) return notExpanded(k, __LINE__);
+    for (unsigned r = 0; r < mMap.getNumResults(); ++r)
+      if (auto de = dyn_cast<AffineDimExpr>(mMap.getResult(r)); de && int(de.getPosition()) == p.nLoop) rowPitch = mst[r];
+    if (rowPitch <= 0 || ShapedType::isDynamic(rowPitch)) return notExpanded(k, __LINE__);
+    rowPitch *= int64_t(cast<MemRefType>(p.m.view.getType()).getElementTypeBitWidth() / 8);
+  }
+  if (xRows && nc != nt && G > 1 && H > 1 && H * G > 64) return notExpanded(k, __LINE__);
 
   Expander e{OpBuilder(k), k.getLoc(), d};
   MLIRContext *ctx = k.getContext();
@@ -763,13 +795,138 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
     else at[p.nLoop] = {c0 * d, nc * d};
     return e.view(v, m, at, {p.bLoop, p.gLoop});
   };
+  // a (batch, row, chunk)'s result: the epilogue over its accumulator, the store
+  auto finish = [&](Value acc, int64_t b, int64_t g, int64_t c0) -> bool {
+    const bool lastRow = b + 1 == H && g + 1 == G;
+    Value ys = Nv ? e.row0(y, Nv) : outView(y, outMap, b, g, c0);
+    if (!epi) {
+      sahl::StoreOp::create(e.b, e.loc, acc, ys);
+      return true;
+    }
+    Type oet = cast<MemRefType>(epi.getDpsInits()[0].getType()).getElementType();
+    Value out = e.alloc({nOut}, oet, oet.isInteger(8) ? "spad_a" : "acc", "packed");
+    sahl::ReserveOp::create(e.b, e.loc, out, false);
+    SmallVector<Value> ins;
+    SmallVector<AffineMap> m1;
+    AffineMap id1 = AffineMap::getMultiDimIdentityMap(1, ctx), none = AffineMap::get(1, 0, ctx);
+    for (int i = 0; i < epi.getNumDpsInputs(); ++i) {
+      if (epi.getDpsInputs()[i] == p.op.getDpsInits()[0]) {
+        ins.push_back(Nv ? e.prefix(acc, Nv) : acc), m1.push_back(id1);
+        continue;
+      }
+      const EpiIn &ei = epiIn[i];
+      if (ei.kind == 1 || ei.kind == 2) {
+        Type et = cast<MemRefType>(epi.getDpsInputs()[i].getType()).getElementType();
+        Value l = e.alloc({nOut}, et, "acc", "packed");
+        Value src;
+        if (ei.kind == 1) {
+          src = outView(ei.src, outMap, b, g, c0);
+        } else {
+          llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
+          if (p.laneLoop >= 0) at[en] = {c0, nc}, at[el] = {0, d};
+          else at[en] = {c0 * d, nc * d};
+          src = e.view(ei.src, ei.map, at, {});
+        }
+        sahl::LoadOp::create(e.b, e.loc, src, l);
+        ins.push_back(l), m1.push_back(id1);
+      } else if (ei.kind == 4) {
+        ins.push_back(bc[i]), m1.push_back(none);
+      } else {
+        // this (batch, row)'s word of the broadcast values
+        auto mt = cast<MemRefType>(bc[i].getType());
+        int64_t w = b * ei.sb + g * ei.sg;
+        SmallVector<int64_t> idx;
+        int64_t rem = w;
+        SmallVector<int64_t> st;
+        int64_t off0;
+        if (failed(mt.getStridesAndOffset(st, off0))) return false;
+        for (int64_t r = 0; r < mt.getRank(); ++r) idx.push_back(rem / st[r]), rem %= st[r];
+        SmallVector<OpFoldResult> o, sz, one;
+        for (int64_t r = 0; r < mt.getRank(); ++r)
+          o.push_back(e.b.getIndexAttr(idx[r])), sz.push_back(e.b.getIndexAttr(1)), one.push_back(e.b.getIndexAttr(1));
+        auto rt = memref::SubViewOp::inferRankReducedResultType({}, mt, o, sz, one);
+        ins.push_back(memref::SubViewOp::create(e.b, e.loc, cast<MemRefType>(rt), bc[i], o, sz, one));
+        m1.push_back(none);
+      }
+    }
+    m1.push_back(id1);
+    Value outv = Nv ? e.prefix(out, Nv) : out;
+    auto g1 = linalg::GenericOp::create(e.b, e.loc, TypeRange{}, ins, ValueRange{outv}, m1,
+                                        SmallVector<utils::IteratorType>{utils::IteratorType::parallel});
+    IRMapping map;
+    epi.getRegion().cloneInto(&g1.getRegion(), map);
+    auto st = sahl::StoreOp::create(e.b, e.loc, outv, ys);
+    if (Nv) {                                   // row (b, g) at the cursor, then the cursor on
+      st->setAttr("sa.cursor", e.b.getUnitAttr());
+      if (!lastRow) st->setAttr("sa.cursor_step", e.b.getUnitAttr());
+    }
+    return true;
+  };
   for (int64_t b = 0; b < H; ++b) {
+    if (nb) {
+      // C6.5: the strips of all rows of x (bank 0, K words each); the blocks of
+      // T in a loop whose count is T >> log2(Tb) + 1; then per row its epilogue
+      // (in a scope per batch: its accumulators released after it)
+      auto bscope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
+      OpBuilder::InsertionGuard bguard(e.b);
+      e.b.setInsertionPointToEnd(&bscope.getBody().emplaceBlock());
+      for (int64_t g = 0; g < G; ++g) {
+        loadX(b, g);
+        sahl::StripOp::create(e.b, e.loc, e.sub(xl, {0}, {K}), placedA({d, K}, g * K));
+      }
+      const int64_t tb = nb * d, blocks = N / tb + 1, rowElems = blocks * tb;
+      auto accBuf = [&](int64_t n) {
+        Value a = e.alloc({n}, accT, "acc", "packed");
+        if (accT.isInteger(64)) a.getDefiningOp()->setAttr("sa.accumulator", e.b.getUnitAttr());
+        sahl::ReserveOp::create(e.b, e.loc, a, false);
+        return a;
+      };
+      Value scratch = accBuf((G - 1 + d) * tb);
+      SmallVector<Value> rowsAcc;
+      for (int64_t g = 0; g < G; ++g) rowsAcc.push_back(accBuf(rowElems));
+      Value sh = arith::ShRUIOp::create(e.b, e.loc, Nv,
+                                        arith::ConstantIndexOp::create(e.b, e.loc, int64_t(llvm::Log2_64(uint64_t(tb)))));
+      auto cnt = arith::AddIOp::create(e.b, e.loc, sh, arith::ConstantIndexOp::create(e.b, e.loc, 1));
+      cnt->setAttr("sa.index", e.b.getUnitAttr());
+      auto lp = sahl::LoopOp::create(e.b, e.loc, blocks, ArrayRef<int64_t>{tb * rowPitch, nb}, cnt);
+      {
+        OpBuilder::InsertionGuard guard(e.b);
+        e.b.setInsertionPointToEnd(&lp.getBody().emplaceBlock());
+        Value raw = placedA({tb, K}, sb);
+        Value tiles = placedDyn({nb, K, d}, ValueRange{}, "spad_b", 0);
+        llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
+        if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
+        at[p.kLoop] = {0, K};
+        at[p.nLoop] = {0, tb};
+        auto l = sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}), raw);
+        l->setAttr("sa.rows", e.b.getUnitAttr());
+        l->setAttr("sa.advance", e.b.getI64IntegerAttr(0));
+        sahl::TransposeOp::create(e.b, e.loc, raw, tiles);
+        for (int64_t g = 0; g < G; ++g)
+          sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, g * K), tiles, e.sub(scratch, {g * tb}, {tb}), false);
+        for (int64_t g = 0; g < G; ++g) {
+          auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch, {g * tb}, {tb}), e.sub(rowsAcc[g], {0}, {tb}));
+          c->setAttr("sa.advance", e.b.getI64IntegerAttr(1));
+        }
+      }
+      for (int64_t g = 0; g < G; ++g) {
+        auto scope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
+        OpBuilder::InsertionGuard guard(e.b);
+        e.b.setInsertionPointToEnd(&scope.getBody().emplaceBlock());
+        if (!finish(rowsAcc[g], b, g, 0)) return false;
+      }
+      continue;
+    }
     if (G == 1) {
       loadX(b, 0);
       if (nk == 1) replicate(0, K);
     }
     step = 0;
     for (int64_t c0 = 0; c0 < nt; c0 += nc) {
+      if (xRows && G > 1 && c0 > 0) {               // the rows of x again: the cursor back to row (b, 0)
+        auto r = sahl::CursorResetOp::create(e.b, e.loc);
+        if (b) r->setAttr("sa.skip", e.b.getI64IntegerAttr(b * G));
+      }
       Value bk = nk == 1 ? loadB(b, c0, 0, K) : Value();
       for (int64_t g = 0; g < G; ++g) {
         if (G > 1) {
@@ -792,69 +949,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
             sahl::MmaOp::create(e.b, e.loc, placedA({d, kl}, 0), bt, acc, kb > 0);
           }
         }
-        const bool lastRow = b + 1 == H && g + 1 == G;
-        Value ys = Nv ? e.row0(y, Nv) : outView(y, outMap, b, g, c0);
-        if (!epi) {
-          sahl::StoreOp::create(e.b, e.loc, acc, ys);
-          continue;
-        }
-        Type oet = cast<MemRefType>(epi.getDpsInits()[0].getType()).getElementType();
-        Value out = e.alloc({nOut}, oet, oet.isInteger(8) ? "spad_a" : "acc", "packed");
-        sahl::ReserveOp::create(e.b, e.loc, out, false);
-        SmallVector<Value> ins;
-        SmallVector<AffineMap> m1;
-        AffineMap id1 = AffineMap::getMultiDimIdentityMap(1, ctx), none = AffineMap::get(1, 0, ctx);
-        for (int i = 0; i < epi.getNumDpsInputs(); ++i) {
-          if (epi.getDpsInputs()[i] == p.op.getDpsInits()[0]) {
-            ins.push_back(Nv ? e.prefix(acc, Nv) : acc), m1.push_back(id1);
-            continue;
-          }
-          const EpiIn &ei = epiIn[i];
-          if (ei.kind == 1 || ei.kind == 2) {
-            Type et = cast<MemRefType>(epi.getDpsInputs()[i].getType()).getElementType();
-            Value l = e.alloc({nOut}, et, "acc", "packed");
-            Value src;
-            if (ei.kind == 1) {
-              src = outView(ei.src, outMap, b, g, c0);
-            } else {
-              llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
-              if (p.laneLoop >= 0) at[en] = {c0, nc}, at[el] = {0, d};
-              else at[en] = {c0 * d, nc * d};
-              src = e.view(ei.src, ei.map, at, {});
-            }
-            sahl::LoadOp::create(e.b, e.loc, src, l);
-            ins.push_back(l), m1.push_back(id1);
-          } else if (ei.kind == 4) {
-            ins.push_back(bc[i]), m1.push_back(none);
-          } else {
-            // this (batch, row)'s word of the broadcast values
-            auto mt = cast<MemRefType>(bc[i].getType());
-            int64_t w = b * ei.sb + g * ei.sg;
-            SmallVector<int64_t> idx;
-            int64_t rem = w;
-            SmallVector<int64_t> st;
-            int64_t off0;
-            if (failed(mt.getStridesAndOffset(st, off0))) return false;
-            for (int64_t r = 0; r < mt.getRank(); ++r) idx.push_back(rem / st[r]), rem %= st[r];
-            SmallVector<OpFoldResult> o, sz, one;
-            for (int64_t r = 0; r < mt.getRank(); ++r)
-              o.push_back(e.b.getIndexAttr(idx[r])), sz.push_back(e.b.getIndexAttr(1)), one.push_back(e.b.getIndexAttr(1));
-            auto rt = memref::SubViewOp::inferRankReducedResultType({}, mt, o, sz, one);
-            ins.push_back(memref::SubViewOp::create(e.b, e.loc, cast<MemRefType>(rt), bc[i], o, sz, one));
-            m1.push_back(none);
-          }
-        }
-        m1.push_back(id1);
-        Value outv = Nv ? e.prefix(out, Nv) : out;
-        auto g1 = linalg::GenericOp::create(e.b, e.loc, TypeRange{}, ins, ValueRange{outv}, m1,
-                                            SmallVector<utils::IteratorType>{utils::IteratorType::parallel});
-        IRMapping map;
-        epi.getRegion().cloneInto(&g1.getRegion(), map);
-        auto st = sahl::StoreOp::create(e.b, e.loc, outv, ys);
-        if (Nv) {                                   // row (b, g) at the cursor, then the cursor on
-          st->setAttr("sa.cursor", e.b.getUnitAttr());
-          if (!lastRow) st->setAttr("sa.cursor_step", e.b.getUnitAttr());
-        }
+        if (!finish(acc, b, g, c0)) return false;
       }
     }
   }

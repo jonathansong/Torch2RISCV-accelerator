@@ -120,6 +120,7 @@ private:
   Operation *lastVe = nullptr;
   std::map<Lin, Value> params;
   Value rowAcc;                                  // the row loops' DDR offset
+  Value cursorBytes;                             // the last cursor DMA's bytes per row (a cursor reset's skip)
   Value curLen;                                  // row mode: the dynamic LEN of full-length VEs
   int64_t curLenStatic = -1;
   // A VE of a fixed size inside row mode (the w * D * D block of a per-row
@@ -157,6 +158,7 @@ private:
   Value advanceOf(Operation *op);
   void advanced(Operation *op, Value adv);
   SmallVector<Value> loopParams;
+  SmallVector<Value> loopPool;                   // the loops' PARAMs, shared by loops one after another
 
   // ------------------------------------------------------------ DDR
   struct Ddr {

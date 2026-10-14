@@ -115,8 +115,8 @@ FULL_I8 = False
 def fill(rng, et, n, t):
     if et == "f32":
         return rng.standard_normal(n).astype(np.float32).tobytes()
-    if et == "i8" and FULL_I8:         # imported checkpoints have -128 (WP2); a VE int8 output saturates to +-127
-        return rng.integers(-128, 128, n, dtype=np.int8).tobytes()
+    if et == "i8":                     # (--full-i8: -128 too, as imported checkpoints have (WP2); a VE int8 output saturates to +-127)
+        return rng.integers(-128 if FULL_I8 else -127, 128, n, dtype=np.int8).tobytes()
     if et in ("i32", "i16"):
         return rng.integers(-127, 128, n, dtype=O.NP[et]).tobytes()      # no int64 temporary
     if et == "i64":

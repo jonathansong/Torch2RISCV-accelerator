@@ -144,11 +144,14 @@ def Sahl_LoopOp : Sahl_Op<"loop", [SingleBlock, NoTerminator]> {
   let description = [{
     Each DMA of the body whose operation carries `sa.advance = j` moves on by
     `strides[j]` bytes per iteration (decode's linear layer: two chunks of
-    weights, two chunks of per-chunk inputs and results).
+    weights, two chunks of per-chunk inputs and results); an mma with
+    `sa.advance = j` moves its accumulator on by `strides[j]` ACC words.
+    `dyn_count` (an index from a push constant): the count is that value at run
+    time (LOOP_END's count from a PARAM; at least 1), `count` its bound.
   }];
-  let arguments = (ins I64Attr:$count, DenseI64ArrayAttr:$strides);
+  let arguments = (ins I64Attr:$count, DenseI64ArrayAttr:$strides, Optional<Index>:$dyn_count);
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat = "attr-dict-with-keyword $body";
+  let assemblyFormat = "(`count` `(` $dyn_count^ `)`)? attr-dict-with-keyword $body";
 }
 
 def Sahl_ClaimSpadOp : Sahl_Op<"claim_spad"> {

@@ -238,9 +238,11 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   does not fit, Llama-1B); `dispatch_stats.py` (per-dispatch-class time and
   MACs from a profile CSV); `mem_preflight.py [--t T] [--packed
   sa_packed.irpa]` (device memory against the 1280 MiB pool);
-  `perf_model.py` (`--whatif`). Context length: the decode attention needs
-  T x head_dim in one SPAD_B bank (T <= 256 for Gemma, 512 for Qwen3, 1024
-  for Llama / SmolLM2) until C6.5 (docs/iree_compiler_plan.md §8.22).
+  `perf_model.py` (`--whatif`). Context length: decode attention goes over T
+  in blocks (C6.5, docs/iree_compiler_plan.md §8.22); checked on the sim up
+  to T = 512 for Gemma (its sliding window) and 1024 for Qwen3
+  (`tests/test_long_context.py`, run_tests.sh `longctx` / `longctxq`); 2048
+  waits for C6.5b (row-mode reductions over dynamic T).
 
   ```sh
   compiler/scripts/run_tests.sh -m 14G hfgen          # test_hf_generic.py (sim)

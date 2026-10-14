@@ -65,9 +65,14 @@ def Sahw_BodyOp : Sahw_SectionOp<"body", "The rest of the export">;
 
 def Sahw_LoopOp : Sahw_Op<"loop", [SingleBlock, NoTerminator]> {
   let summary = "LOOP_END: runs the region `count` times, adding s1 to PARAM k1 and s2 to PARAM k2 each time";
-  let arguments = (ins I64Attr:$count, Sahw_ParamType:$k1, I64Attr:$s1, Sahw_ParamType:$k2, I64Attr:$s2);
+  let description = [{
+    A dynamic field DYN_LOOP_COUNT: the count from a PARAM (patched when the
+    LOOP_END is first reached; `count` is then its bound).
+  }];
+  let arguments = !con((ins I64Attr:$count, Sahw_ParamType:$k1, I64Attr:$s1, Sahw_ParamType:$k2, I64Attr:$s2),
+                       DynArgs);
   let regions = (region SizedRegion<1>:$region);
-  let assemblyFormat = "$count `,` $k1 `step` $s1 `,` $k2 `step` $s2 attr-dict-with-keyword $region";
+  let assemblyFormat = "$count `,` $k1 `step` $s1 `,` $k2 `step` $s2 (`dyn` `(` $dyn^ `)`)? attr-dict-with-keyword $region";
 }
 
 //===----------------------------------------------------------------------===//

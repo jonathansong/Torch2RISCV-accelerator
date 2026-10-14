@@ -113,7 +113,7 @@ def main():
     pr = [int(t) for t in args.prompt.split(",")]
     plain = H.hf_model(args.model, args.layers)
     full = plain(torch.tensor([pr])).logits[0]
-    wr = H.HFDecoder(plain, 256)
+    wr = H.HFDecoder(plain, max(256, args.max_len))
     dmax = max(float((wr(torch.tensor([[t]]), torch.tensor([[i]]))[0, -1] - full[i]).abs().max()) for i, t in enumerate(pr))
     print(f"HFDecoder vs plain HF (the whole prompt at once, fp32): max |diff| {dmax:.3g}")
     # the teacher-forced reference (plain HF fp32 on a fixed text), before any

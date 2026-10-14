@@ -1414,7 +1414,7 @@ After items 1 and 2 of §8.17 were done, the PYNQ-Z1 version was frozen at tag `
 
 Linear layers sit at the read floor (EX and LD overlap almost completely); fixed overhead is small; what is not hidden is VE / SFU work (linear-layer tails, RMSNorm / softmax reductions, attention) — of the generic path's 8.92M, linear-layer tails about 4.0M, attention 2.4M, reductions 2.6M. In prefill VE / SFU take 52–54% of each chunk. Once bandwidth goes up (the KV260's K2) this part becomes the main cost, the basis of the performance work there.
 
-### 8.22 C6.5 revised: attention tiled by T without online softmax (design, 2026-10-13)
+### 8.22 C6.5 revised: attention tiled by T without online softmax (design 2026-10-13, implemented 2026-10-14)
 
 **Why it is needed.** The compiler plans the SPAD for dynamic lengths up to `--iree-sa-max-dynamic` (default 256; the export now sets it from `--max-len`, generality plan §9.3). The decode attention contractions are the limit: `SahlExpandKernels.cpp:665` requires the whole K block of QKᵀ, T × head_dim bytes, in one SPAD_B bank (4096 words of 16 bytes at D = 16), and line 666 / `nk > 1 && dyn` forbid splitting a dynamic K (PV, whose K is T). Hence T ≤ 65536 / head_dim: Gemma-3 (256) 256, Qwen3 (128) 512, Llama-3.2 / SmolLM2 (64) 1024. Checked with 2-layer models at `--max-len 512` (generality plan §12.4): Qwen3 all on the accelerator, Gemma's decode QKᵀ and PV on the host. Prefill attention (row by row) is limited separately by `spadBytes / d ≥ 2 · maxDynamic` (T ≤ 2048 at D = 16) and is not part of this step.
 
@@ -1434,6 +1434,27 @@ Linear layers sit at the read floor (EX and LD overlap almost completely); fixed
 **Out of scope.** Gemma-3's sliding window beyond 512 tokens (a window mask on the local layers, or a ring-buffered KV cache) is a separate frontend item (`hf_generic.py` raises for `max_len` above the window). Prefill rows longer than 2048 would need the same tiling of the row-mode VEs.
 
 **Effect.** Gemma's limit goes from 256 to 512 (to the sliding window), and Qwen3 / Llama / SmolLM2 are then bound by prefill's 2048 and by device memory (Llama about 2200 positions, generality plan §9.3). Compiler and runtime only, no new bitstream; the K3 URAM evaluation of generality plan §16 waits until this is done.
+
+**Implementation (2026-10-14).** Done in the compiler only (no runtime, format or bitstream change); it differs from the design above in four places:
+- **Block count without a ceiling.** Instead of a pre-shift addend in the loader, the loop count is `(T >> log2 Tb) + 1`, which the existing `Lin` (mul, shift, add) expresses. When T is a multiple of Tb this computes one block past T; its scores are never stored and its K reads stay inside the cache allocation (max_len rows), so it costs one block of work and nothing else. Tb = nb · D rows with nb = bit_floor(SPAD_B bank words / head_dim words): Gemma Tb = 256, Qwen3 Tb = 512.
+- **`sahl.loop` / `sahw.loop` with a dynamic count** (`Optional<Index>:$dyn_count`, `DYN_LOOP_COUNT` = 1 in `DescList.h`, serialized into `LOOP_END`'s count slot from a PARAM). Sequential loops share their PARAM registers (`loopPool` in `SahlToSahw.cpp`): one fresh pair per loop overflowed the 8 PARAMs on Qwen3.
+- **QKᵀ (dynamic N = T over the K rows)** in `SahlExpandKernels`: per batch b (in a scope that releases ACC afterwards) the strips of all G query rows go to SPAD_A bank 0; each iteration loads Tb cache rows (`sa.rows`, DDR stride Tb × row pitch, `sa.advance`), transposes them into SPAD_B bank 0, runs G EXs into a scratch ACC area of (G − 1 + D) · Tb elements (an EX writes D output rows, so a block result cannot go straight into a per-row buffer without clobbering its neighbours), then G VE copies (`memref.copy` local → local, integer) move each row's block into its row buffer at a destination that advances by nb words per iteration (`DYN_VE_DST`). After the loop each row runs the existing epilogue and cursor store (`finish`).
+- **PV (dynamic K = T)** keeps the untiled form, now allowing several N chunks of the output; with G > 1 a `sahl.cursor_reset` with `sa.skip` = b · G repositions the cursor per chunk. The int32 accumulation over T was already within one bank at these lengths.
+
+Everything is integer except the fp32 max over T, so tiled results are bit-identical to the untiled oracle, as argued above.
+
+**Tests.** `compiler/tests/test_long_context.py` (run_tests.sh `longctx` / `longctxq`): a 2-layer model exported at `--max-len`, compiled with the bound from `compile_flags.txt`, 0 executables on the host required, then `dispatch_check.py` at T around the block boundaries (T is a multiple of D, the runtime pads it). Golden corpus cases `gemma_t512` and `qwen3_t1024` added; the 7046 earlier dispatches byte-identical. Fixed on the way: `dispatch_check.py` filled int8 inputs with zeros unless `--full-i8` (a regression since 6511ab0, 2026-10-10, which had hidden int8 path errors from the per-dispatch checks); inputs are now in [−127, 127] by default, [−128, 127] with `--full-i8` (where PV shows known differences from saturating −128 · −128, not a compiler bug). `test_c5.py --configs` passes again on all configurations with real data.
+
+**Results (sim).**
+
+| Model (2 layers) | `--max-dynamic` | executables (accelerator / host) | per-dispatch check |
+|---|---|---|---|
+| Gemma-3-270M | 512 | 214 / 0 (before: 4 decode attention dispatches on the host) | OK at T = 16, 240, 256, 272, 304, 496, 512 |
+| Qwen3-0.6B | 1024 | 202 / 0 | OK at T = 16, 496, 512, 528, 1024 |
+
+Gemma end to end with a 320-token prompt (past the old 256 limit, `--max-len 512`, prefill 16): 324 steps against the torch W8A8 model, min corr 0.9979, 0 dispatches on the host; teacher forcing over 40 positions device top-1 37/40 = torch W8A8 37/40, device vs torch argmax differs at 0; prefill vs decode only 5/5 rows bit-exact.
+
+**Limits now.** Gemma 512 (its sliding window, out of scope above); Qwen3 1024. At 2048 Qwen3's decode QKᵀ fits, but 17 dispatches go to the host: the row-mode reductions over T (`reduction_16xD`, the qsum Σp in decode and prefill) allocate [16, max T] buffers and `sahl-tile` skips dynamic shapes ("ACC full"). That is the next step, **C6.5b**: `sahl-tile` row pieces for dynamic-length [R, T] rows (the DDR row offset r0 · T needs the PARAM / cursor mechanism). Not started.
 
 ## 9. Verification system
 

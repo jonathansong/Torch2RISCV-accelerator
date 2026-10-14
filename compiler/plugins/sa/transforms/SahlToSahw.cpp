@@ -57,6 +57,14 @@ bool Lowerer::lowerBlock(Block &block) {
     if (isa<sahl::CursorResetOp>(op)) {
       if (!rowAcc) rowAcc = privateParam();
       sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 0, ValueRange{});
+      if (auto skip = op->getAttrOfType<IntegerAttr>("sa.skip")) {   // then on by `skip` rows (of the last cursor DMA's bytes)
+        if (!cursorBytes) return fail("cursor reset with a skip before any cursor DMA");
+        for (int64_t i = 0; i < skip.getInt(); ++i) {
+          auto s = sahw::SetRegOp::create(bb, loc, ValueRange{rowAcc}, ArrayRef<int64_t>{0}, 1, ValueRange{cursorBytes});
+          s.setDynFields(ArrayRef<int32_t>{::sa::DYN_SETREG_V0});
+          s.setDynAdd(ArrayRef<bool>{false});
+        }
+      }
       continue;
     }
     if (auto cs = dyn_cast<sahl::ClaimSpadOp>(op)) {
@@ -127,6 +135,7 @@ bool Lowerer::lowerBlock(Block &block) {
     if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp, arith::OrIOp, arith::ShRUIOp,
             arith::DivUIOp>(op))
       continue;
+    if (isa<arith::AddIOp>(op) && op->hasAttr("sa.index")) continue;   // (an expanded kernel's count: its Lin used)
     if (auto l = dyn_cast<sahl::LoadOp>(op)) {
       if (!load(l)) return false;
       continue;
@@ -152,6 +161,28 @@ bool Lowerer::lowerBlock(Block &block) {
     }
     if (auto sc = dyn_cast<sahl::ScatterOp>(op)) {
       if (!scatter(sc)) return false;
+      continue;
+    }
+    if (auto cp = dyn_cast<memref::CopyOp>(op)) {
+      // local -> local (an expanded kernel's step): one VE copy, exact (the
+      // integer VE for int32; sa.advance: the destination moving on with the loop, ACC words)
+      auto s = bufOf(cp.getSource()), t = bufOf(cp.getTarget());
+      if (!s || !t) return false;
+      if (s->vt != t->vt || s->n != t->n || s->dyn || t->dyn || s->bcast || t->bcast) return fail("local copy form");
+      SmallVector<Value> dv;
+      SmallVector<int32_t> df;
+      SmallVector<bool> da;
+      if (Value adv = advanceOf(cp)) dv.push_back(adv), df.push_back(::sa::DYN_VE_DST), da.push_back(true);
+      uint32_t len = uint32_t((s->n + d - 1) / d * d);
+      bool fp = s->vt == ::sa::VT_F32;
+      auto v = sahw::VeOp::create(bb, loc, int64_t(s->la), 0, int64_t(t->la), int64_t(len), int64_t(::sa::VOP_COPY),
+                                  int64_t(::sa::vtypes(s->vt, t->vt)), 0, fp, 0, 0, 0, 0, false, llvm::APFloat(0.0f),
+                                  llvm::APFloat(fp ? 1.0f : 0.0f), llvm::APFloat(fp ? NEG0 : 0.0f), 0, 0, 0, 1, 0, 0,
+                                  int64_t(INT32_MIN), int64_t(INT32_MAX), dv);
+      if (!df.empty()) {
+        v.setDynFields(df);
+        v.setDynAdd(da);
+      }
       continue;
     }
     return fail("unsupported operation " + op->getName().getStringRef().str());
@@ -512,6 +543,7 @@ bool Lowerer::cursorDma(Operation *op, bool isLoad, const Ddr &r, uint32_t la) {
   Value bp = paramFor(b);
   if (!rowAcc) rowAcc = privateParam();
   int64_t maxBytes = cfg.maxDynamic * es;
+  cursorBytes = bp;
   if (isLoad) dynDma(sahw::LdOp::create(bb, loc, r.base, r.off, int64_t(la), 1, maxBytes, maxBytes, 0, ValueRange{rowAcc, bp}), rowAcc, bp);
   else dynDma(sahw::StOp::create(bb, loc, r.base, r.off, int64_t(la), 1, maxBytes, maxBytes, ValueRange{rowAcc, bp}), rowAcc, bp);
   if (op->hasAttr("sa.cursor_step")) {
@@ -563,12 +595,14 @@ bool Lowerer::load(sahl::LoadOp l) {
     int64_t rows = st.isDynamicDim(0) ? cfg.maxDynamic : st.getDimSize(0), rb = r->n / rows * esize(r->et),
             pitch = leadingPitch(l.getSrc(), rb);
     if (r->dyn || r->off % 8 || rb > 65535) return fail("rows load");
+    if (r->dynRows && adv) return fail("rows load: dynamic rows in a loop");
     auto ld = sahw::LdOp::create(bb, loc, r->base, r->off, int64_t(dst->la), rows, rb, pitch, 0,
-                                 r->dynRows ? ValueRange{paramFor(*r->dynRows)} : ValueRange{});
+                                 r->dynRows ? ValueRange{paramFor(*r->dynRows)} : adv ? ValueRange{adv} : ValueRange{});
     if (r->dynRows) {
       ld.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_ROWS});
       ld.setDynAdd(ArrayRef<bool>{false});
     }
+    advanced(ld, adv);                             // (a block of the cache's rows moving on with the loop)
     return true;
   }
   if (adv) {                                       // a contiguous row moving on with the loop
@@ -666,15 +700,27 @@ void Lowerer::advanced(Operation *op, Value adv) {
 bool Lowerer::loop(sahl::LoopOp lp) {
   // LOOP_END: a private PARAM per stride (0 first), the body, the loop around it
   if (!loopParams.empty() || lp.getStrides().size() > 2 || lp.getStrides().empty()) return fail("sahl.loop form");
-  for (size_t j = 0; j < lp.getStrides().size(); ++j) loopParams.push_back(privateParam());
+  // (loops one after another, not nested: their PARAMs are shared, e.g. C6.5's loop per KV head)
+  while (loopPool.size() < lp.getStrides().size()) loopPool.push_back(privateParam());
+  for (size_t j = 0; j < lp.getStrides().size(); ++j) loopParams.push_back(loopPool[j]);
   SmallVector<int64_t> zeros(loopParams.size(), 0);
   sahw::SetRegOp::create(bb, loc, ValueRange(loopParams), zeros, 0, ValueRange{});
   Block *blk = bb.getInsertionBlock();
   Operation *before = blk->empty() ? nullptr : &blk->back();
   if (!lowerBlock(lp.getBody().front())) return false;
   ArrayRef<int64_t> st = lp.getStrides();
+  SmallVector<Value> dv;
+  if (Value dc = lp.getDynCount()) {               // the count from a PARAM (patched when first reached)
+    auto cl = linOf(dc);
+    if (!cl) return fail("sahl.loop: dynamic count not from a push constant");
+    dv.push_back(paramFor(*cl));
+  }
   auto l = sahw::LoopOp::create(bb, loc, lp.getCount(), loopParams[0], st[0],
-                                loopParams.size() > 1 ? loopParams[1] : Value(), st.size() > 1 ? st[1] : 0);
+                                loopParams.size() > 1 ? loopParams[1] : Value(), st.size() > 1 ? st[1] : 0, dv);
+  if (!dv.empty()) {
+    l.setDynFields(ArrayRef<int32_t>{::sa::DYN_LOOP_COUNT});
+    l.setDynAdd(ArrayRef<bool>{false});
+  }
   Block *lb = &l.getRegion().emplaceBlock();
   SmallVector<Operation *> moved;
   for (Operation *o = before ? before->getNextNode() : &blk->front(); o && o != l.getOperation(); o = o->getNextNode())
@@ -704,6 +750,12 @@ bool Lowerer::mma(sahl::MmaOp m) {
   const int64_t k = bt.isDynamicDim(1) ? cfg.maxDynamic : bt.getDimSize(1);
   SmallVector<Value> dv;
   SmallVector<int32_t> df;
+  SmallVector<bool> da;
+  if (Value adv = advanceOf(m)) {                  // the accumulator moving on with the loop (ACC words)
+    dv.push_back(adv);
+    df.push_back(::sa::DYN_EX_C);
+    da.push_back(true);
+  }
   if (bt.isDynamicDim(1)) {
     auto kl = sizeLin(1);
     if (!kl) return fail("mma: dynamic K");
@@ -711,18 +763,21 @@ bool Lowerer::mma(sahl::MmaOp m) {
     kt.shift += int(logd);
     dv.append({paramFor(kt), paramFor(*kl)});
     df.append({::sa::DYN_EX_KT, ::sa::DYN_EX_BSTEP});
+    da.append({false, false});
   }
   if (bt.isDynamicDim(0)) {
     auto nl = sizeLin(0);
     if (!nl) return fail("mma: dynamic tile count");
     dv.push_back(paramFor(*nl));
     df.push_back(::sa::DYN_EX_REPEAT);
+    da.push_back(false);
   }
   auto ex = sahw::ExOp::create(bb, loc, int64_t(a->la & 0xFFFFFFF), int64_t(b->la & 0xFFFFFFF),
                                int64_t(c->la & 0xFFFFFFF), k / d, m.getAccumulate(), nc, k, 1, nc, dv);
+  if (df.size() > 2) return fail("mma: more than two dynamic fields");
   if (!df.empty()) {
     ex.setDynFields(df);
-    ex.setDynAdd(SmallVector<bool>(df.size(), false));
+    ex.setDynAdd(da);
   }
   return true;
 }
