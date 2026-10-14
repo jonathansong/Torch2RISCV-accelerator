@@ -5,7 +5,8 @@ bundles, iree_compiler_plan.md §8.7) in a generic-frontend bundle
 the HF tokenizer prepends, the end tokens (generation_config's and the
 tokenizer's), the context (sa_args.txt --valid_len, else 256), and for a model
 with a chat template the token ids around one user message (board_generate.py
---chat; the board has no jinja).
+--chat; the board has no jinja). A checkpoint without a template (the local
+Qwen3-0.6B ones) gets its family's from CHAT.
 
     compiler/tests/stage_model_json.py --model build/llm_cache/Qwen3-0.6B-W8A8 --bundle build/deploy_hfgen_qwen3_qs
 """
@@ -14,9 +15,15 @@ import json
 import os
 import sys
 
+# chat formats of model families whose local checkpoints lack the template: the
+# text the official template renders for one user message (no system prompt)
+# and the generation prompt; Qwen3 non-thinking (enable_thinking=False: an empty
+# think block)
+CHAT = {"qwen3": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")}
+
 
 def model_json(model_dir, bundle):
-    from transformers import AutoTokenizer, GenerationConfig
+    from transformers import AutoConfig, AutoTokenizer, GenerationConfig
     tok = AutoTokenizer.from_pretrained(model_dir)
     with_sp, without = tok("a").input_ids, tok("a", add_special_tokens=False).input_ids
     bos = with_sp[0] if len(with_sp) > len(without) and with_sp[1:] == without else None
@@ -37,6 +44,10 @@ def model_json(model_dir, bundle):
         text = tok.apply_chat_template([{"role": "user", "content": mark}], tokenize=False,
                                        add_generation_prompt=True, **kw)
         pre, suf = text.split(mark)
+    else:
+        mc = AutoConfig.from_pretrained(model_dir)
+        pre, suf = CHAT.get(getattr(mc, "text_config", mc).model_type, (None, None))
+    if pre is not None:
         cfg["chat"] = [tok(pre, add_special_tokens=False).input_ids, tok(suf, add_special_tokens=False).input_ids]
     return cfg
 
