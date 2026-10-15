@@ -851,7 +851,7 @@ Verification: compile the same model with different configurations (D = 8 / 16, 
 
 - **C4 continued**: the fusions on hold, done on C5's scheduler and cost model. W13 + SiLU formed into one dispatch region by preprocessing and interleaved inside the template; the quantization chain merged into one dispatch; `enable-aggressive-reshape-movement`. The goal remains within ≤ 10% of the hand-written path.
 - Optional extensions (§10): batched decode, prefill, larger models.
-- **C7 RISC-V backend** (optional, any time after C5, not affecting the C5 / C6 main line):
+- **C7 RISC-V backend** (optional, any time after C5, not affecting the C5 / C6 main line; since 2026-10-15 pre-research for a future ASIC NPU, design and the KV260 facts in [`riscv_backend_design.md`](riscv_backend_design.md)):
   - the same accelerator commands can be issued in two ways: the ARM builds a descriptor list executed by the fetch unit, or PicoRV32 issues them one by one with PCPI custom instructions (custom-0, funct7 = 1 matrix / DMA, funct7 = 2 vector). The command fields are basically the same, so `sahw` can feed a second backend: `sahw` + scf / arith → LLVM dialect (commands as `.insn` inline assembly) → LLVM IR → riscv32 object files.
   - The value is flexibility: full control flow and scalar computation (data-dependent loops and branches, argmax / top-k sampling on the device), without the "at most 2 dynamic fields per command" limit; it also prepares for hardware with a stronger RISC-V core.
   - General computation the accelerator cannot do, which has to run on the RISC-V, does not take this path but reuses IREE's llvm-cpu backend (linalg → vector → LLVM, supporting riscv32 / riscv64).
