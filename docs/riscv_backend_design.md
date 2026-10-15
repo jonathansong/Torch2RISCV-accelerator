@@ -119,7 +119,20 @@ Six decode dispatches of SmolLM2-135M (2 layers, `build/hfgen/smollm2_l2_e2e_qf`
 - **Not modeled**: the board's DDR and HP0 latencies (the testbench's DMA model is idealized; the GEMV times are not the board's) and contention between the core's fetches and the unit's DMA. These are R1 on the board.
 - Testbench changes kept the other system tests passing (matmul, matmul_insn, gemm, vector, desc_run, rt; desc_run at D = 16 with GEMV).
 
-**On the board (staged, not yet run).** The same cases relocated: `rv_dispatch.py` writes the generated code relative to the window's base (`rvb_gen(W)`, W from the mailbox) and the list's contents (`rvb_list.json`: SETREG values, BASE ones relative to the window), `board_rvb.py` allocates the window wherever pynq places it, rebuilds the list there with the driver's `DescList`, loads `fw_bram.bin` or `fw_ddr.bin` + the position-independent `code.bin` (no PC-relative references), and compares as the testbench does (`compiler/scripts/deploy_rvb.sh` → `build/deploy_rvb_<config>`, `python3 board_run.py rvb`). The relocated form passes the testbench in both code placements; the rebuilt lists are byte-identical to the simulated ones at the simulated base. `compiler/scripts/build_board_bundles.sh` stages it with the long-context bundles of the `_pcpi` overlay.
+**On the board (2026-10-15, `_pcpi` overlay, `board_run.py rvb`): all 12 runs bit-identical**, the GEMV cases through `gemv_run` included. PCPI time as a multiple of the list's (rdcycle at 100 MHz):
+
+| Dispatch | List | BRAM | DDR |
+|---|---:|---:|---:|
+| RMSNorm reduction | 963 | 1.41 | 2.05 |
+| quantization | 763 | 2.02 | 3.56 |
+| q projection (GEMV) | 5851 | 1.03 | 1.08 |
+| q · Kᵀ | 8662 | 1.18 | 1.67 |
+| p · V (GEMV + VE) | 3305 | 2.02 | 3.82 |
+| up projection (GEMV + epilogue) | 23807 | 1.05 | 1.11 |
+
+The board is less favorable than the testbench (0.87–0.99 from BRAM there): its DMA is faster than the testbench's model, so the lists' times shrink while the core's issue time does not. From BRAM the GEMV-bound dispatches stay within 5%, the issue-bound ones take up to twice as long; from DDR up to 3.8×. The configuration writes per command are the cost an ASIC core must avoid (a one-instruction command, §8).
+
+**The board flow (staged as below).** The same cases relocated: `rv_dispatch.py` writes the generated code relative to the window's base (`rvb_gen(W)`, W from the mailbox) and the list's contents (`rvb_list.json`: SETREG values, BASE ones relative to the window), `board_rvb.py` allocates the window wherever pynq places it, rebuilds the list there with the driver's `DescList`, loads `fw_bram.bin` or `fw_ddr.bin` + the position-independent `code.bin` (no PC-relative references), and compares as the testbench does (`compiler/scripts/deploy_rvb.sh` → `build/deploy_rvb_<config>`, `python3 board_run.py rvb`). The relocated form passes the testbench in both code placements; the rebuilt lists are byte-identical to the simulated ones at the simulated base. `compiler/scripts/build_board_bundles.sh` stages it with the long-context bundles of the `_pcpi` overlay.
 
 So for an ASIC: a small in-order core issuing commands from a tightly coupled memory matches a descriptor DMA's rate on these kernels; from uncached DRAM it does not. The remaining lever is the configuration traffic per command (a one-instruction command format or a few command templates in registers).
 
