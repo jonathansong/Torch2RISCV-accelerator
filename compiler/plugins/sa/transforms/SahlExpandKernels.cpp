@@ -1194,6 +1194,8 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
       cfg.spadBytes = optSpadKB * 1024;
       cfg.accBytes = optAccKB * 1024;
       cfg.gemvPorts = optGemvPorts;
+      cfg.maxDynamic = optMaxDynamic;
+      cfg.attnBlock = optAttnBlock;
     }
     func::FuncOp f = getOperation();
     SmallVector<sahl::KernelOp> ks(f.getBody().front().getOps<sahl::KernelOp>());
@@ -1247,6 +1249,10 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
   Option<int64_t> optSpadKB{*this, "spad-kb", llvm::cl::desc("SPAD size (KB, two banks)"), llvm::cl::init(128)};
   Option<int64_t> optAccKB{*this, "acc-kb", llvm::cl::desc("ACC size (KB, two banks)"), llvm::cl::init(256)};
   Option<int64_t> optGemvPorts{*this, "gemv-ports", llvm::cl::desc("read ports of the GEMV unit (0: none)"),
+                               llvm::cl::init(0)};
+  Option<int64_t> optMaxDynamic{*this, "max-dynamic", llvm::cl::desc("upper bound of a dynamic dimension"),
+                                llvm::cl::init(256)};
+  Option<int64_t> optAttnBlock{*this, "attn-block", llvm::cl::desc("rows of T per block of the tiled q . K^T (0: 128)"),
                                llvm::cl::init(0)};
 };
 
