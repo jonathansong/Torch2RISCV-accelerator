@@ -12,7 +12,7 @@
 // "index <= scalar" to the VE's VALID count.
 //
 // Cheap producer: a linalg.generic with only parallel loops and identity
-// output maps whose inputs are all rank-0 tensors (none is fine).
+// output maps whose inputs are all rank-0 or unit-dimension tensors (none is fine).
 // Runs only when the module targets the sa device.
 #include "SAPasses.h"
 
@@ -31,7 +31,10 @@ bool isCheapProducer(linalg::GenericOp op) {
   if (!op.isAllParallelLoops() || op.getNumDpsInits() != 1 || op->getNumResults() != 1) return false;
   for (OpOperand *in : op.getDpsInputOperands()) {
     auto t = dyn_cast<RankedTensorType>(in->get().getType());
-    if (!t || t.getRank() != 0) return false;
+    // rank 0, or only unit dimensions (decode's per-token scalars, e.g. the
+    // activation scale absmax / 127 as [1, 1, 1] before IREE folds unit dims:
+    // otherwise a dispatch of its own per quantization, generality plan §13.4)
+    if (!t || !t.hasStaticShape() || llvm::any_of(t.getShape(), [](int64_t d) { return d != 1; })) return false;
   }
   return op.getMatchingIndexingMap(op.getDpsInitOperand(0)).isIdentity();
 }
