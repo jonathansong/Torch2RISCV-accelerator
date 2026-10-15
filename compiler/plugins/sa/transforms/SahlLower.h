@@ -158,6 +158,7 @@ private:
   Value advanceOf(Operation *op);
   void advanced(Operation *op, Value adv);
   SmallVector<Value> loopParams;
+  SmallVector<Value> lastLoopParams;             // the last sahl.loop's (sa.advance_final after it)
   SmallVector<Value> loopPool;                   // the loops' PARAMs, shared by loops one after another
 
   // ------------------------------------------------------------ DDR

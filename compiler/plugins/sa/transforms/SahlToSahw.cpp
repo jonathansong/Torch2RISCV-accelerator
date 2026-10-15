@@ -711,6 +711,13 @@ bool Lowerer::strip(sahl::StripOp st) {
 }
 
 Value Lowerer::advanceOf(Operation *op) {
+  if (auto f = op->getAttrOfType<IntegerAttr>("sa.advance_final")) {
+    // after a sahl.loop: its PARAM as the loop left it (LOOP_END adds the
+    // strides on every pass, the last one too: count x stride)
+    if (!loopParams.empty() || size_t(f.getInt()) >= lastLoopParams.size())
+      return fail("sa.advance_final not right after a sahl.loop"), Value();
+    return lastLoopParams[f.getInt()];
+  }
   auto a = op->getAttrOfType<IntegerAttr>("sa.advance");
   if (!a) return Value();
   if (size_t(a.getInt()) >= loopParams.size()) return fail("sa.advance outside a sahl.loop"), Value();
@@ -756,6 +763,7 @@ bool Lowerer::loop(sahl::LoopOp lp) {
   for (Operation *o = before ? before->getNextNode() : &blk->front(); o && o != l.getOperation(); o = o->getNextNode())
     moved.push_back(o);
   for (Operation *o : moved) o->moveBefore(lb, lb->end());
+  lastLoopParams = loopParams;
   loopParams.clear();
   return true;
 }

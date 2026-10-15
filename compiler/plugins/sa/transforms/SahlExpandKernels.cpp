@@ -62,13 +62,15 @@
 // count comes from T (ceil(T / Tb), T a multiple of D: ((T (M - 1)) >> log2(M Tb))
 // + 1 within the setup entry's 15-bit shift, else T >> log2 Tb, + 1: a T that is a
 // multiple of Tb then computes one block of scores past T, not stored): per block
-// the rows loaded and transposed, one EX per row of x (the strips of all rows
-// made before the loop), the DMA moving on with the loop; then per row the
-// epilogue over T and the store. An EX writes its D output rows one after the
-// other (Tb / D words each): row g's EX goes to slot g of a scratch of
-// G - 1 + D slots, its copies into slots g + 1, ... (each rewritten by its own
-// EX later in the block), and a VE copy moves slot g into row g's buffer at the
-// block's place (its destination moving on with the loop).
+// the rows loaded and transposed, one EX for all G rows of x (step b: the rows
+// of one A tile, made before the loop; G = 1: the strip), the DMA moving on
+// with the loop; then per row the epilogue over T and the store. An EX writes
+// its D output rows one after the other (Tb / D words each) into a scratch of D
+// slots, and a VE copy moves slot g into row g's buffer at the block's place
+// (its destination moving on with the loop). Step c: the loop software-
+// pipelined (iteration i: block i's LD, block i - 1's EX and copies, block i's
+// transpose; the last block's EX and copies after the loop, iteration 0's
+// copies into a guard block in front of each row's buffer).
 // Only integer accumulations are split, so the scores are those of the
 // untiled form, bit for bit. A dynamic K (p . V) with several chunks of
 // output tiles walks the rows of x again per chunk (the cursor repositioned).
@@ -943,8 +945,13 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
         return a;
       };
       Value scratch = accBuf(((oneEx ? 0 : G - 1) + d) * tb);
-      SmallVector<Value> rowsAcc;
-      for (int64_t g = 0; g < G; ++g) rowsAcc.push_back(accBuf(rowElems));
+      // (each row's buffer one block longer in front: §8.22 step c, block i - 1's
+      // copies in iteration i, iteration 0's into that guard block)
+      SmallVector<Value> rowsAll, rowsAcc;
+      for (int64_t g = 0; g < G; ++g) {
+        rowsAll.push_back(accBuf(tb + rowElems));
+        rowsAcc.push_back(e.sub(rowsAll.back(), {tb}, {rowElems}));
+      }
       // the block count: T is a multiple of D (the runtime pads it), so
       // ceil(T / Tb) = ((T * (M - 1)) >> log2(M Tb)) + 1 for a power of two
       // M >= max_dynamic / D (the setup entry's shift: at most 15 bits); else
@@ -962,12 +969,30 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       Value shv = arith::ShRUIOp::create(e.b, e.loc, tv, arith::ConstantIndexOp::create(e.b, e.loc, sh));
       auto cnt = arith::AddIOp::create(e.b, e.loc, shv, arith::ConstantIndexOp::create(e.b, e.loc, 1));
       cnt->setAttr("sa.index", e.b.getUnitAttr());
+      // §8.22 step c: the loop software-pipelined, iteration i = block i's LD,
+      // block i - 1's EX(s) and copies, block i's transpose: with the commands
+      // dispatched in order, the LD of block i runs beside the EX of block i - 1
+      // (no block past T is read: the last block's EX and copies follow the
+      // loop, the copies' destination at the loop PARAM's final value; iteration
+      // 0's EX reads whatever SPAD_B holds, its copies go to the guard block)
+      Value tiles = placedDyn({nb, K, d}, ValueRange{}, "spad_b", 0);
+      auto exAndCopies = [&](StringRef adv) {
+        Value tl = placedDyn({nb, K, d}, ValueRange{}, "spad_b", 0);
+        if (oneEx)
+          sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tl, e.sub(scratch, {0}, {tb}), false);
+        else
+          for (int64_t g = 0; g < G; ++g)
+            sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, g * K), tl, e.sub(scratch, {g * tb}, {tb}), false);
+        for (int64_t g = 0; g < G; ++g) {
+          auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch, {g * tb}, {tb}), e.sub(rowsAll[g], {0}, {tb}));
+          c->setAttr(adv, e.b.getI64IntegerAttr(1));
+        }
+      };
       auto lp = sahl::LoopOp::create(e.b, e.loc, blocks, ArrayRef<int64_t>{tb * rowPitch, nb}, cnt);
       {
         OpBuilder::InsertionGuard guard(e.b);
         e.b.setInsertionPointToEnd(&lp.getBody().emplaceBlock());
         Value raw = placedA({tb, K}, sb);
-        Value tiles = placedDyn({nb, K, d}, ValueRange{}, "spad_b", 0);
         llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
         if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
         at[p.kLoop] = {0, K};
@@ -975,17 +1000,10 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
         auto l = sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}), raw);
         l->setAttr("sa.rows", e.b.getUnitAttr());
         l->setAttr("sa.advance", e.b.getI64IntegerAttr(0));
+        exAndCopies("sa.advance");
         sahl::TransposeOp::create(e.b, e.loc, raw, tiles);
-        if (oneEx)
-          sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tiles, e.sub(scratch, {0}, {tb}), false);
-        else
-          for (int64_t g = 0; g < G; ++g)
-            sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, g * K), tiles, e.sub(scratch, {g * tb}, {tb}), false);
-        for (int64_t g = 0; g < G; ++g) {
-          auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch, {g * tb}, {tb}), e.sub(rowsAcc[g], {0}, {tb}));
-          c->setAttr("sa.advance", e.b.getI64IntegerAttr(1));
-        }
       }
+      exAndCopies("sa.advance_final");
       for (int64_t g = 0; g < G; ++g) {
         auto scope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
         OpBuilder::InsertionGuard guard(e.b);

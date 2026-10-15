@@ -145,7 +145,10 @@ def Sahl_LoopOp : Sahl_Op<"loop", [SingleBlock, NoTerminator]> {
     Each DMA of the body whose operation carries `sa.advance = j` moves on by
     `strides[j]` bytes per iteration (decode's linear layer: two chunks of
     weights, two chunks of per-chunk inputs and results); an mma with
-    `sa.advance = j` moves its accumulator on by `strides[j]` ACC words.
+    `sa.advance = j` moves its accumulator on by `strides[j]` ACC words, a
+    local copy its destination. An operation right after the loop with
+    `sa.advance_final = j` is offset by the final value, count x strides[j]
+    (the pipelined T loop's last block, §8.22 step c).
     `dyn_count` (an index from a push constant): the count is that value at run
     time (LOOP_END's count from a PARAM; at least 1), `count` its bound.
   }];
