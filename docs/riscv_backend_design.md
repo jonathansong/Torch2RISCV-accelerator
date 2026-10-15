@@ -84,7 +84,7 @@ GEMV is LD mode 2 with three fields only the descriptor path fills (`xword`, `cs
 
 The emitter needs the same register setup the serializer has (`SahwSerialize.cpp`) and the VE / EX field packing (`DescList.h`); writing it beside the serializer keeps the two encodings consistent.
 
-## 5. Plan (not started)
+## 5. Plan (R1–R5; R2 and R3 first forms done, §6)
 
 | Step | Content | Needs | Estimate |
 |---|---|---|---|
@@ -121,7 +121,30 @@ Six decode dispatches of SmolLM2-135M (2 layers, `build/hfgen/smollm2_l2_e2e_qf`
 
 So for an ASIC: a small in-order core issuing commands from a tightly coupled memory matches a descriptor DMA's rate on these kernels; from uncached DRAM it does not. The remaining lever is the configuration traffic per command (a one-instruction command format or a few command templates in registers).
 
-## 7. Open questions for an ASIC NPU
+## 7. Future plans: a whole Qwen3 driven by the RISC-V core
+
+Today a Qwen3-0.6B decode step is about 1074 dispatches, all on the accelerator, but the ARM schedules them: the IREE VM records a command buffer per step (the push constants and buffer sizes depend on T, so it is re-recorded: 6.5 µs per dispatch on the host, §13.1 of the generality plan), the sa HAL driver (`compiler/runtime/sa/sa_context.c`, `sa_command_buffer.c`) turns each dispatch into a list (SETREG of the BASE / PARAM values from the binding addresses and push constants, CALL of the export's template, END, `sadesc.dispatch_list` builds the same), `rt_fw` runs the lists, and the ARM samples the next token (`sa_llm_run.c`) and detokenizes. Two plans move that scheduling onto the PicoRV32, so that the ARM only loads the model, tokenizes and reads tokens back: plan B keeps the descriptor lists, plan A issues every command from RISC-V code. Neither is started.
+
+### 7.1 Plan B: the core schedules the descriptor lists (existing bitstream)
+
+The core becomes the per-step scheduler; the commands stay in the compiled lists (the fetch unit's rate, GEMV through descriptors). The shape of an ASIC with a small control core and a command DMA.
+
+- **Step schedule (compile and initialization time).** The decode step's dispatch sequence is fixed: only T changes, and every buffer is allocated once (the KV cache, the activations, the parameters at fixed addresses in the pool). A tool records one step through the sa driver (the dispatches in order, each with its export's template address and its setup entries: BASE = binding address + f(push constant), PARAM = f(push constant), `Lin` = `((pc · mul) >> shift) + add`, and how each push constant depends on the step: position, T = position + 1 rounded up to 16, constants) and writes a table into DDR: per dispatch the template address, the setup entries with their resolved binding addresses, and the push constant indices; plus the step's inputs (token, position) and the logits buffer.
+- **Firmware (`firmware/rvsched`, replacing `rt_fw` for the run).** Per step: write the token and position into the input buffers; for each table entry compute the register values (a multiply, a shift and an add per entry), write them with `mat_cfg` (BASE0–15, PARAM0–7) and `mat_submit` the template (or build a tiny list SETREG + CALL + END in a ring, as the driver does), fencing only where the driver's command buffer has a barrier; then sample. A few hundred bytes of code; the table is data read from DDR.
+- **Sampling on the device.** Greedy argmax over the vocabulary (151936 for Qwen3): a scalar scan on the PicoRV32 is about 1.5M cycles (15 ms, 10% of a step); instead a VE max reduction over the logits (one dispatch compiled for it, or appended by the tool) and a scalar search for the index of the maximum in one block. Top-k / sampling with a temperature later (scalar code, model C's llvm-cpu, §3).
+- **Prefill**: the same with the prefill function's table (chunks of 16 positions), then decode.
+- **Acceptance**: on the board, the token sequence of a prompt identical to the ARM-driven run (`board_llm.py`'s 17-token check), and the logits of the first steps bit-identical (dumped on request); the per-step time against the ARM path (expected: the host part, about 7 ms per Qwen3 step, replaced by about 1–2 µs of core time per dispatch, 1–2 ms per step; the device part unchanged).
+- **Effort**: about 3–5 days (the schedule tool from the driver, the firmware, sampling, the board script). **Risks**: the IREE VM's work that is not a dispatch (buffer copies, fills, transfers between allocations) must appear in the table as commands or be removed; a T-dependent buffer size must not change an address (allocations at the maximum, as today).
+
+### 7.2 Plan A: the core issues every command (new bitstream, research)
+
+The core runs the whole step as RISC-V code issuing PCPI commands (§3 model A), on top of plan B's scheduler.
+
+- **Prerequisites**: the structural `sahw` → C emitter (R2 in full: loops, registers and dynamic fields kept, so the code does not grow with T); GEMV over PCPI in a bitstream (§4.1, built by the user); code storage: the step's executables are an estimated 100 KB or more of code, beyond the 7.5 KB BRAM, so either fetching from DDR (§6: 1.8–3.7× slower on the issue-bound dispatches at 60 cycles a fetch) or a tightly coupled memory in URAM / an I-cache (a block design change).
+- **Expected**: on this board slower than plan B (the issue-bound part of a decode step, about 20% of it, slowed by the fetch latency and the configuration traffic: an estimated 30–60% per step from DDR, close to plan B with a TCM). Its value is the measurements for an ASIC: code size per model, issue rate per command kind over a whole model, the share of configuration writes, and the effect of a one-instruction command format.
+- **Effort**: weeks (the emitter, the bitstream, the code placement), after plan B.
+
+## 8. Open questions for an ASIC NPU
 
 - **Command format**: one-instruction issue (a descriptor written from registers, or a command FIFO the core stores to) instead of `mat_cfg` sequences; which fields must be dynamic.
 - **Instruction memory**: the hot loops' size (R2 gives it per dispatch) against a TCM or I-cache; PicoRV32's BRAM is 8 KB with `rt_fw` resident.
