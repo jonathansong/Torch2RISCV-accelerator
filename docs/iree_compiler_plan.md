@@ -1630,6 +1630,20 @@ Checks: golden corpus 7658 of 7664 dispatches byte-identical, the 6 changed are 
 - lit: `sahl_expand_tiled_t.mlir` (Gemma's decode q · Kᵀ at max_dynamic 512: the A tile from the G rows, the rotated loop body, the last block after the loop with `sa.advance_final`, and the lowered loop), `sahl_advance_final.mlir` (the attribute's error without a loop before it); `sahl-expand-kernels` takes `max-dynamic` and `attn-block` options for them.
 - Gemma 2 layers end to end on the sim with steps b + c (`build/hfgen/gemma_l2_e2e_bc`, `--prefill 16 --prefill-all --max-len 512`): 9/9 decode steps against torch W8A8 (min corr 0.9991, as before), teacher forcing 37/40 (torch 37/40), prefill vs decode only 5/5 rows bit-exact, prefill_all 40/40.
 
+**Where decode attention's time goes after steps a–c (analysis 2026-10-15, cycle model).** Per layer at T = 2048 (Gemma 512), the four attention dispatches:
+
+| Model | q · Kᵀ | masked max + exp | sum | p · V | total |
+|---|---|---|---|---|---|
+| Qwen3 (G 2, hd 128) | 275.6k | 100.1k | 23.9k | 74.3k | 474k |
+| Llama-3.2-1B (G 4, hd 64) | 213.7k | 199.2k | 47.7k | 81.9k | 543k |
+| SmolLM2 (G 3, hd 64) | 77.7k | 57.7k | 13.7k | 23.5k | 173k |
+| Gemma-3 at 512 (G 4, hd 256) | 17.8k | 7.3k | 2.6k | 10.7k | 38k |
+
+- **q · Kᵀ is EX-bound by structure.** An EX computes D × D products per step, of which only G output rows are used (the query rows of one KV head: G / D = 12.5–25%); swapping the operands (the K rows as A, q as B) uses G of D columns instead, the same steps; the GEMV unit does not fit (step e). LD (140k at Qwen3 T = 2048) now runs beside EX (172k).
+- **The probabilities are bound by the SFU** (VE busy is 90% of the two dispatches): by VE kind (`perf_model` costs: fp function 31.3 cycles per group of D, fp reduction 9.2, fp elementwise 2.5), exp ≈ 64%, the max ≈ 16%, the sum ≈ 16%, the scaling to int8 ≈ 4% (Llama: 128k / 40k / 40k / 11k). The integer VE has no reduction (the L2 fields need FP), so the sum of the int8 p is an fp reduction too.
+- **Compiler-only options (small).** (1) The sum on the GEMV unit: a 16-lane group of ones in front of each KV head's packed V groups makes p · V's GEMV produce Σp in one more strip (exact: Σp ≤ 2048 · 127 < 2²⁴), removing the sum dispatch; cost one strip per row (Llama 4 → 5 strips, +25% of p · V's LD) and the V cache +1 / (hd / 16); net about −28k cycles per layer for Llama at 2048 (−5% of attention), −15k for Qwen3 (−3%). (2) The max in the q · Kᵀ loop, where VE is idle part of the time (88k of 276k), would need the max and the scores in one dispatch (IREE's dispatch formation splits them): not pursued.
+- **Hardware option (larger).** exp throughput: the calibrated cost of an fp function VE is 31.3 cycles per group of 16 (about 2 cycles per element on the `p6` SFU); twice that throughput would take about 32% off the probabilities (Llama −64k cycles per layer at 2048, −12% of attention), at a LUT cost on an overlay already at 87% (not evaluated).
+
 ## 9. Verification system
 
 | Level | Content | Tools |
