@@ -5,8 +5,11 @@
 # prompt), plus the teacher-forcing windows of the context length with their fp32
 # reference (board_quality.py prep) for board_longctx.py (a prompt of the window's
 # length: prefill vs decode only on the device, PPL by position) and board_teacher.py.
-#   compiler/scripts/deploy_longctx.sh qwen3|gemma     -> build/deploy_hfgen_<model>_lc<max len>
-#   LC_MAX_LEN=<n>: another length (default qwen3 2048, gemma 512: its sliding window)
+#   compiler/scripts/deploy_longctx.sh qwen3|gemma|llama     -> build/deploy_hfgen_<model>_lc<max len>
+#   LC_MAX_LEN=<n>: another length (default qwen3 / llama 2048, gemma 512: its sliding window;
+#   llama at 2048 fills the 1280 MiB pool to 5 MiB, mem_preflight.py: at most 2227)
+#   LC_SUFFIX=<s>: appended to the directories' names (e.g. _pcpi: a new overlay's bundles
+#   beside the earlier ones)
 #   LC_LAYERS=<n>: a truncated model (a dry run of the whole flow: <tag>_l<n>, ~40 min)
 # Runs for hours (the export, the compile, the sim's 40-token runs: Qwen3 ~2.5 h);
 # under systemd-run -p MemoryMax=10G. A bundle compiled for more than 512
@@ -19,9 +22,10 @@ source "$(dirname "$0")/board_env.sh"
 case "${1:-}" in
   qwen3) MODEL=Qwen3-0.6B-W8A8 REF=Qwen3-0.6B LEN=${LC_MAX_LEN:-2048} EXTRA= ;;
   gemma) MODEL=gemma-3-270m REF=gemma-3-270m LEN=${LC_MAX_LEN:-512} EXTRA=--prefill-all ;;
-  *) echo "usage: $0 qwen3|gemma" >&2; exit 2 ;;
+  llama) MODEL=Llama-3.2-1B-Instruct-W8A8 REF=Llama-3.2-1B-Instruct LEN=${LC_MAX_LEN:-2048} EXTRA= ;;   # (no prefill_all: it does not fit; board_teacher.py --decode)
+  *) echo "usage: $0 qwen3|gemma|llama" >&2; exit 2 ;;
 esac
-TAG=$1_lc$LEN${LC_LAYERS:+_l$LC_LAYERS}
+TAG=$1_lc$LEN${LC_LAYERS:+_l$LC_LAYERS}${LC_SUFFIX:-}
 LAYERS=${LC_LAYERS:+--layers $LC_LAYERS}
 O=$SA_REPO/build/hfgen/$TAG
 HF=("$SA_PY" -u "$SA_COMPILER/tests/test_hf_generic.py" --model "$SA_REPO/build/llm_cache/$MODEL" --out "$O")

@@ -14,7 +14,7 @@ SIM_CPU_DDR_LAT ?= 0
 CC      := clang
 OBJCOPY := llvm-objcopy
 CFLAGS  := --target=riscv32-unknown-elf -march=rv32imc -mabi=ilp32 -O2 -ffreestanding -fno-builtin -nostdlib \
-           -Wall -I$(FW_ROOT)/include -I$(RVB)
+           -Wall -I$(FW_ROOT)/include -I$(RVB) $(if $(filter ddr,$(RVB_CODE)),-DRVB_CODE_DDR)
 VIVADO_SETTINGS ?= /home/jon/Projects/Vivado/Vivado/2024.1/settings64.sh
 PYTHON ?= python3
 SA  := $(ROOT)/rtl/sysarray
@@ -48,8 +48,21 @@ endif
 	$(PYTHON) $(SA)/sim/gen_vectors.py --out $(SIM) >/dev/null
 	cd $(SIM) && bash -c 'source $(VIVADO_SETTINGS) >/dev/null && \
 	  xvlog -i . -i $(SA) -d RVB_TEST $(if $(filter ddr,$(RVB_CODE)),-d RVB_DDR_CODE) -d SIM_D=$(SIM_D) -d SIM_DMA_W=$(SIM_DMA_W) -d SIM_GEMV=$(SIM_GEMV) \
-	    -d SIM_DDR_BYTES=$$(( $(DDR_BYTES) + 65536 )) -d SIM_CPU_DDR_LAT=$(SIM_CPU_DDR_LAT) $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { grep ERROR xvlog.out; exit 1; }; \
+	    -d SIM_DDR_BYTES=$$(( $(DDR_BYTES) + 65536 )) -d SIM_CPU_DDR_LAT=$(SIM_CPU_DDR_LAT) -d SIM_RVB_CODE=$$(( $(CODE_ADDR) )) $(RTL) $(FW_ROOT)/sim/tb_system.v >xvlog.out 2>&1 || { grep ERROR xvlog.out; exit 1; }; \
 	  xelab -debug off tb_system -s tb >xelab.out 2>&1 || { cat xelab.out; exit 1; }; \
 	  xsim tb -R' | grep -E "^(TB|ERROR|FATAL)"
 
-.PHONY: sim
+# the board's images (board_rvb.py): fw_bram.bin (rvb_gen in the BRAM image), fw_ddr.bin +
+# code.bin (rvb_gen loaded at the window's end), into OUT
+OUT ?= $(RVB)/board
+bundle:
+	mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fuse-ld=lld -T $(FW_ROOT)/common/link.ld -Wl,--gc-sections $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c -o $(OUT)/fw_bram.elf
+	$(OBJCOPY) -O binary $(OUT)/fw_bram.elf $(OUT)/fw_bram.bin
+	$(CC) $(CFLAGS) -DRVB_CODE_DDR -fuse-ld=lld -T link_ddr.ld -Wl,--defsym=RVB_CODE_ADDR=$(CODE_ADDR) -Wl,--gc-sections \
+	  $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c -o $(OUT)/fw_ddr.elf
+	$(OBJCOPY) -O binary --remove-section=.rvb_gen $(OUT)/fw_ddr.elf $(OUT)/fw_ddr.bin
+	$(OBJCOPY) -O binary --only-section=.rvb_gen $(OUT)/fw_ddr.elf $(OUT)/code.bin
+	@ls -l $(OUT)/fw_bram.bin $(OUT)/fw_ddr.bin $(OUT)/code.bin | awk '{print $$5, $$9}'
+
+.PHONY: sim bundle

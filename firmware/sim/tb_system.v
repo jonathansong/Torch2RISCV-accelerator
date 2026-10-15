@@ -436,7 +436,7 @@ module tb_system;
     // bindings' ranges) run by firmware/rvb twice: its descriptor list, then
     // the same commands over PCPI. After each phase the bindings are compared
     // with the functional simulator's; between them they are restored.
-    localparam integer RV = MBOX + 32'hE0 / 4;      // RV_PHASE, RV_GO, RV_CYC_DESC, RV_CYC_PCPI, RV_ST_DESC, RV_ST_PCPI, RV_MAGIC
+    localparam integer RV = MBOX + 32'hD8 / 4;      // RV_PHASE, RV_GO, RV_CYC_DESC, RV_CYC_PCPI, RV_ST_DESC, RV_ST_PCPI, RV_MAGIC, RV_BASE, RV_CODE
     reg [31:0] rimg [0:DDR_BYTES/4-1];
     reg [31:0] rexp [0:DDR_BYTES/4-1];
     integer cmp_off [0:63], cmp_len [0:63];
@@ -480,6 +480,10 @@ module tb_system;
         $fclose(rfd);
         for (rr = 0; rr < BRAM_WORDS; rr = rr + 1) bram[rr] = 0;
         $readmemh("fw.hex", bram);
+        bram[RV + 7] = DDR_BASE;                             // RV_BASE: the window
+`ifdef SIM_RVB_CODE
+        bram[RV + 8] = `SIM_RVB_CODE;                        // RV_CODE: rvb_gen in DDR
+`endif
         repeat (5) @(posedge clk);
         resetn <= 1;
         rvb_wait(1);

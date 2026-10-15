@@ -9,10 +9,15 @@ list: SETREG of the registers, CALL, END), run on the functional simulator
   rvb_ddr.hex     the DDR image before the run ($readmemh, @word addresses)
   rvb_expect.hex  the DDR image after the run (the bindings' pages)
   rvb_cmp.txt     the byte ranges to compare: one "offset length" a line
-  rvb_args.h      the list address for the descriptor path (mat_submit)
+  rvb_args.h      the list's offset in the window (the descriptor path: mat_submit)
   rvb_gen.c       the same commands issued over PCPI (model A): one
                   sysarray_intrinsics.h call per command, the configuration
-                  keys written only when their value changes
+                  keys written only when their value changes; DDR addresses
+                  relative to the window's base W (an argument: the board's
+                  buffer is wherever it is allocated)
+  rvb_list.json   the list's contents for the board (rebuilt there at the
+                  buffer's address: the registers, BASE values relative to W)
+  rvb_ddr.bin / rvb_expect.bin   the images as raw bytes (the board)
 
 This first form is a straight-line program from the trace (the dynamic
 fields, loops and register setup resolved for the given T): bit-identical
@@ -22,6 +27,7 @@ command; the structural emitter (loops, registers kept) is step R2.
     compiler/tests/rv_dispatch.py <dispatch source .mlir> --t 16 --out build/rvb/<name>
 """
 import argparse
+import json
 import os
 import sys
 
@@ -79,13 +85,23 @@ def layout(src, blob, d, t, seed=1):
     lst = sadesc.dispatch_list(DDR_BASE, phys, consts, setup, ext)
     lst_addr = DDR_BASE + size - 0x10000
     sim.ddr_write(lst_addr, lst.array().tobytes())
-    return sim, phys, bufs, want, regions, lst_addr, size, name
+    regs = sadesc.setup_values(setup, phys, consts)
+    if ext.get("prefix", 0):
+        regs.append((15, dict(regs)[ext["prefix_reg"]]))
+    lst_json = {"list_off": lst_addr - DDR_BASE, "end": 0x5A,
+                # (a BASE in the window relative to it, flagged; anything else as it is)
+                "regs": [[int(i), int(v) - DDR_BASE, True] if int(i) < 16 and DDR_BASE <= int(v) < DDR_BASE + size
+                         else [int(i), int(v), False] for i, v in regs],
+                "calls": ([0] if ext.get("prefix", 0) else []) + ([64 * ext.get("prefix", 0)] if ext.get("head", 0) else [])
+                         + [64 * (ext.get("prefix", 0) + ext.get("head", 0))]}
+    return sim, phys, bufs, want, regions, lst_addr, size, name, lst_json
 
 
 class Emitter:
     """C statements for the traced commands, the PCPI configuration tracked"""
 
-    def __init__(self):
+    def __init__(self, base):
+        self.base = base
         self.lines, self.cfg, self.vcfg, self.gcfg = [], {}, {}, {}
         self.counts = {"LD": 0, "GEMV": 0, "ST": 0, "EX": 0, "VE": 0, "FENCE": 0}
         self.insns = 0
@@ -95,6 +111,9 @@ class Emitter:
             table[key] = v
             self.lines.append(f"    {fn}({name}, 0x{v:x}u);")
             self.insns += 1
+
+    def a(self, ddr):
+        return f"W + 0x{ddr - self.base:x}u"
 
     def cmd(self, r):
         hdr, ddr = int(r[0]), int(r[1])
@@ -112,19 +131,19 @@ class Emitter:
             laddr = f(w[2], 0, 32)
             assert laddr >> 28 == 3, "GEMV result not in ACC"
             rs2 = f(w[3], 58, 1) << 28 | (f(w[2], 32, 16) - 1) << 16 | (laddr & 0xFFFF)
-            self.lines.append(f"    gemv_run(0x{ddr:x}u, 0x{rs2 & 0xFFFF:x}u, {f(w[2], 32, 16)}u, {f(w[3], 58, 1)}u);")
+            self.lines.append(f"    gemv_run({self.a(ddr)}, 0x{rs2 & 0xFFFF:x}u, {f(w[2], 32, 16)}u, {f(w[3], 58, 1)}u);")
         elif op == OP_LD:
             self.counts["LD"] += 1
             for k, n, v in ((0, "SA_CFG_LD_ROWS", f(w[2], 32, 16)), (1, "SA_CFG_LD_ROW_BYTES", f(w[2], 48, 16)),
                             (2, "SA_CFG_LD_PITCH", f(w[3], 0, 32)), (3, "SA_CFG_LD_MODE", f(w[3], 32, 2))):
                 self._set(self.cfg, "mat_cfg", k, n, v)
-            self.lines.append(f"    mat_load(0x{ddr:x}u, 0x{f(w[2], 0, 32):x}u);")
+            self.lines.append(f"    mat_load({self.a(ddr)}, 0x{f(w[2], 0, 32):x}u);")
         elif op == OP_ST:
             self.counts["ST"] += 1
             for k, n, v in ((4, "SA_CFG_ST_ROWS", f(w[2], 32, 16)), (5, "SA_CFG_ST_ROW_BYTES", f(w[2], 48, 16)),
                             (6, "SA_CFG_ST_PITCH", f(w[3], 0, 32))):
                 self._set(self.cfg, "mat_cfg", k, n, v)
-            self.lines.append(f"    mat_store(0x{ddr:x}u, 0x{f(w[2], 0, 32):x}u);")
+            self.lines.append(f"    mat_store({self.a(ddr)}, 0x{f(w[2], 0, 32):x}u);")
         elif op == OP_EX:
             self.counts["EX"] += 1
             for k, n, v in ((7, "SA_CFG_EX_REPEAT", f(w[2], 0, 12)), (8, "SA_CFG_EX_B_STEP", f(w[2], 16, 16)),
@@ -175,7 +194,7 @@ def main():
     if blob is None:
         raise SystemExit(err)
     d = DC.target_config(src).get("d", 16)
-    sim, phys, bufs, want, regions, lst_addr, size, name = layout(src, blob, d, args.t)
+    sim, phys, bufs, want, regions, lst_addr, size, name, lst_json = layout(src, blob, d, args.t)
     before = sim.ddr_read(DDR_BASE, size).tobytes()
     sim.trace = []
     sim.run_list(lst_addr)
@@ -189,20 +208,24 @@ def main():
                 raise SystemExit(f"{name}: the functional simulator differs from the oracle (binding {b})")
     hexfile(os.path.join(args.out, "rvb_ddr.hex"), DDR_BASE, before)
     hexfile(os.path.join(args.out, "rvb_expect.hex"), DDR_BASE, after)
+    open(os.path.join(args.out, "rvb_ddr.bin"), "wb").write(before)
+    open(os.path.join(args.out, "rvb_expect.bin"), "wb").write(after)
+    lst_json.update(name=name, t=args.t, window=size)
+    json.dump(lst_json, open(os.path.join(args.out, "rvb_list.json"), "w"), indent=1)
     with open(os.path.join(args.out, "rvb_cmp.txt"), "w") as fh:
         for b in sorted(bufs):
             fh.write(f"{phys[b] - DDR_BASE} {-(-len(bufs[b]) // 4096) * 4096}\n")
-    em = Emitter()
+    em = Emitter(DDR_BASE)
     for r in trace:
         em.cmd(r)
     with open(os.path.join(args.out, "rvb_args.h"), "w") as fh:
         fh.write(f"/* {name}, T = {args.t} (compiler/tests/rv_dispatch.py) */\n")
-        fh.write(f"#define RVB_LIST 0x{lst_addr:x}u\n#define RVB_DDR_BYTES {size}\n")
+        fh.write(f"#define RVB_LIST_OFF 0x{lst_addr - DDR_BASE:x}u\n#define RVB_DDR_BYTES {size}\n")
         fh.write(f"#define RVB_COMMANDS {sum(v for k, v in em.counts.items() if k != 'FENCE')}\n")
     with open(os.path.join(args.out, "rvb_gen.c"), "w") as fh:
         fh.write(f'/* {name}, T = {args.t}: the traced commands over PCPI (rv_dispatch.py) */\n'
                  f'#include "sysarray_intrinsics.h"\n\n'
-                 f'__attribute__((section(".rvb_gen"), noinline)) void rvb_gen(void)\n{{\n')
+                 f'__attribute__((section(".rvb_gen"), noinline)) void rvb_gen(uint32_t W)\n{{\n')
         fh.write("\n".join(em.lines) + "\n    mat_fence(0);\n}\n")
     print(f"{name}: {len(trace)} commands traced {em.counts}, {em.insns} PCPI instructions, "
           f"DDR window {size // 1024} KB, list at {lst_addr:#x} -> {args.out}")

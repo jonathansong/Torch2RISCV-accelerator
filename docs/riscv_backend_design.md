@@ -119,6 +119,8 @@ Six decode dispatches of SmolLM2-135M (2 layers, `build/hfgen/smollm2_l2_e2e_qf`
 - **Not modeled**: the board's DDR and HP0 latencies (the testbench's DMA model is idealized; the GEMV times are not the board's) and contention between the core's fetches and the unit's DMA. These are R1 on the board.
 - Testbench changes kept the other system tests passing (matmul, matmul_insn, gemm, vector, desc_run, rt; desc_run at D = 16 with GEMV).
 
+**On the board (staged, not yet run).** The same cases relocated: `rv_dispatch.py` writes the generated code relative to the window's base (`rvb_gen(W)`, W from the mailbox) and the list's contents (`rvb_list.json`: SETREG values, BASE ones relative to the window), `board_rvb.py` allocates the window wherever pynq places it, rebuilds the list there with the driver's `DescList`, loads `fw_bram.bin` or `fw_ddr.bin` + the position-independent `code.bin` (no PC-relative references), and compares as the testbench does (`compiler/scripts/deploy_rvb.sh` → `build/deploy_rvb_<config>`, `python3 board_run.py rvb`). The relocated form passes the testbench in both code placements; the rebuilt lists are byte-identical to the simulated ones at the simulated base. `compiler/scripts/build_board_bundles.sh` stages it with the long-context bundles of the `_pcpi` overlay.
+
 So for an ASIC: a small in-order core issuing commands from a tightly coupled memory matches a descriptor DMA's rate on these kernels; from uncached DRAM it does not. The remaining lever is the configuration traffic per command (a one-instruction command format or a few command templates in registers).
 
 ## 7. Future plans: a whole Qwen3 driven by the RISC-V core

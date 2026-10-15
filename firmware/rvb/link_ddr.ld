@@ -13,6 +13,6 @@ SECTIONS
     .rodata : { *(.rodata .rodata.* .srodata .srodata.*) } > bram
     .data   : { *(.data .data.* .sdata .sdata.*) } > bram
     .bss (NOLOAD) : { __bss_start = .; *(.bss .bss.* .sbss .sbss.* COMMON) __bss_end = .; } > bram
-    .rvb_gen : { *(.rvb_gen) } > ddr
+    .rvb_gen : { KEEP(*(.rvb_gen)) } > ddr          /* (called through a pointer: kept from --gc-sections) */
     __stack_top = ORIGIN(bram) + LENGTH(bram);
 }

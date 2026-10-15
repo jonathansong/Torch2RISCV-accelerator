@@ -14,10 +14,12 @@
 #include "sysarray_intrinsics.h"
 #include "rvb_args.h"
 
-#define RV_MBOX   ((volatile uint32_t *)0xC0001FE0u)  /* mailbox 0xE0..0xFC (free after MBOX_FW_CAPS) */
-enum { RV_PHASE, RV_GO, RV_CYC_DESC, RV_CYC_PCPI, RV_ST_DESC, RV_ST_PCPI, RV_MAGIC };
+#define RV_MBOX   ((volatile uint32_t *)0xC0001FD8u)  /* mailbox 0xD8..0xF8 (free after MBOX_FW_CAPS) */
+/* in: RV_BASE the dispatch's DDR window (its physical address), RV_CODE
+ * rvb_gen's address when it is in DDR (RVB_CODE_DDR), RV_GO; out: the rest */
+enum { RV_PHASE, RV_GO, RV_CYC_DESC, RV_CYC_PCPI, RV_ST_DESC, RV_ST_PCPI, RV_MAGIC, RV_BASE, RV_CODE };
 
-void rvb_gen(void);
+void rvb_gen(uint32_t W);
 
 static inline uint32_t rdcycle(void)
 {
@@ -28,10 +30,10 @@ static inline uint32_t rdcycle(void)
 
 int main(void)
 {
-    uint32_t t0, t1;
+    uint32_t t0, t1, W = RV_MBOX[RV_BASE];
     RV_MBOX[RV_MAGIC] = 0x52564230u;               /* "RVB0" */
     t0 = rdcycle();
-    mat_submit(RVB_LIST, 0);
+    mat_submit(W + RVB_LIST_OFF, 0);
     RV_MBOX[RV_ST_DESC] = mat_fence(0);
     t1 = rdcycle();
     RV_MBOX[RV_CYC_DESC] = t1 - t0;
@@ -39,7 +41,11 @@ int main(void)
     while (RV_MBOX[RV_GO] != 2)
         ;
     t0 = rdcycle();
-    rvb_gen();                                      /* (ends with mat_fence(0)) */
+#ifdef RVB_CODE_DDR
+    ((void (*)(uint32_t))RV_MBOX[RV_CODE])(W);      /* (position independent: immediates and PCPI only) */
+#else
+    rvb_gen(W);                                     /* (ends with mat_fence(0)) */
+#endif
     RV_MBOX[RV_ST_PCPI] = mat_fence(0);
     t1 = rdcycle();
     RV_MBOX[RV_CYC_PCPI] = t1 - t0;
