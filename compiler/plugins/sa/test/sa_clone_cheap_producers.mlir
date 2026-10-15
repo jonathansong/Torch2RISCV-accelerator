@@ -2,7 +2,7 @@
 // from indices and scalars only (the attention mask: index <= pos) is
 // recomputed inside each consumer, so the prefix structure stays visible to
 // the sa backend (the VE's VALID count).
-// RUN: iree-opt --iree-sa-clone-cheap-producers="force=true" %s | FileCheck %s
+// RUN: iree-opt --split-input-file --iree-sa-clone-cheap-producers="force=true" %s | FileCheck %s
 // CHECK-LABEL: func.func @mask
 // CHECK-COUNT-2: arith.cmpi sle
 func.func @mask(%pos: tensor<i64>, %a: tensor<16xf32>, %b: tensor<16xf32>) -> (tensor<16xf32>, tensor<16xf32>) {
@@ -27,4 +27,37 @@ func.func @mask(%pos: tensor<i64>, %a: tensor<16xf32>, %b: tensor<16xf32>) -> (t
     linalg.yield %s : f32
   } -> tensor<16xf32>
   return %x, %y : tensor<16xf32>, tensor<16xf32>
+}
+
+// -----
+
+// Decode's activation scale s = absmax / 127 as a [1, 1, 1] tensor (before
+// IREE folds unit dimensions; generality plan §13.4): fused into both its
+// consumers (the quantization's 1 / s and a dequantization's * s), no
+// generic of its own left.
+// CHECK-LABEL: func.func @unit_scale
+// CHECK-COUNT-2: arith.mulf %{{.+}}, %{{.+}} : f32
+// CHECK-NOT: linalg.generic {{.*}} ins(%{{.+}} : tensor<1x1x1xf32>) outs
+func.func @unit_scale(%amax: tensor<1x1x1xf32>, %x: tensor<1x1x8xf32>, %acc: tensor<1x1x8xf32>) -> (tensor<1x1x8xf32>, tensor<1x1x8xf32>) {
+  %c = arith.constant 0.00787401571 : f32
+  %one = arith.constant 1.0 : f32
+  %e1 = tensor.empty() : tensor<1x1x1xf32>
+  %s = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1, d2)>], iterator_types = ["parallel", "parallel", "parallel"]} ins(%amax : tensor<1x1x1xf32>) outs(%e1 : tensor<1x1x1xf32>) {
+  ^bb0(%a: f32, %o: f32):
+    %m = arith.mulf %a, %c : f32
+    linalg.yield %m : f32
+  } -> tensor<1x1x1xf32>
+  %e8 = tensor.empty() : tensor<1x1x8xf32>
+  %q = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1, 0)>, affine_map<(d0, d1, d2) -> (d0, d1, d2)>], iterator_types = ["parallel", "parallel", "parallel"]} ins(%x, %s : tensor<1x1x8xf32>, tensor<1x1x1xf32>) outs(%e8 : tensor<1x1x8xf32>) {
+  ^bb0(%v: f32, %sv: f32, %o: f32):
+    %r = arith.divf %one, %sv : f32
+    %y = arith.mulf %v, %r : f32
+    linalg.yield %y : f32
+  } -> tensor<1x1x8xf32>
+  %d = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1, 0)>, affine_map<(d0, d1, d2) -> (d0, d1, d2)>], iterator_types = ["parallel", "parallel", "parallel"]} ins(%acc, %s : tensor<1x1x8xf32>, tensor<1x1x1xf32>) outs(%e8 : tensor<1x1x8xf32>) {
+  ^bb0(%v: f32, %sv: f32, %o: f32):
+    %y = arith.mulf %v, %sv : f32
+    linalg.yield %y : f32
+  } -> tensor<1x1x8xf32>
+  return %q, %d : tensor<1x1x8xf32>, tensor<1x1x8xf32>
 }
