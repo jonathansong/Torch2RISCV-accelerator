@@ -60,7 +60,7 @@ The pre-research should measure A against B on the same dispatches (§5) and dem
 | `sahw.base`, `sahw.param` (setup entries: binding + f(push constant)) | patched by the runtime into BASE / PARAM | computed at function entry from the arguments (the `Lin` form: `((pc * mul) >> shift) + add`) |
 | `sahw.private` | a PARAM owned by the template | a local variable |
 | `sahw.ld` / `st` (LINEAR, INTERLEAVE) | LD / ST descriptor | `mat_cfg_load` / `mat_cfg_store` + `mat_load` / `mat_store`; dynamic fields as register operands |
-| `sahw.ld` mode GEMV | LD descriptor (CAPS bit 25) | **not available**: model B (a one-command list) or a new PCPI encoding (hardware change) |
+| `sahw.ld` mode GEMV | LD descriptor (CAPS bit 25) | **not available today**: model B (a one-command list), or the proposed `gemv_run` (§4.1, hardware change) |
 | `sahw.ex` | EX | `mat_cfg_exec` (repeat, B / C steps, C row) + `mat_exec` |
 | `sahw.ve`, `sahw.transpose` | VE | `vec_cfg` keys 0–15 (only the changed ones: the emitter tracks the configuration state) + `vec_run` |
 | `sahw.loop` (`LOOP_END`, dynamic count) | fetch-unit loop, strides added to two PARAMs | a `for` loop; strides added to the variables |
@@ -68,6 +68,19 @@ The pre-research should measure A against B on the same dispatches (§5) and dem
 | `sahw.ldparam` | LDPARAM (mem32 × mul + add) | a 32-bit load from DDR (uncached, coherent with the ARM's writes after its flush) |
 | `sahw.fence` (mask) | FENCE | `mat_fence(mask)` |
 | fence-before flags, list END | | `mat_fence(0)` before return |
+
+### 4.1 Proposed: GEMV over PCPI (`gemv_cfg` / `gemv_run`, funct7 = 3)
+
+GEMV is LD mode 2 with three fields only the descriptor path fills (`xword`, `cstep`, `acc`: descriptor w3[58:34], `pkt_ldg` in `sa_defs.vh`); the PCPI decoder builds LDs with `pkt_ld`, so a GEMV over PCPI would go out with cstep = 0 (a shape error). The proposal gives it its own group, in the style of `mat_exec`: what changes per chunk in the two source registers, what stays per layer in sticky configuration.
+
+| funct7 / funct3 | Mnemonic | Operands | Semantics |
+|---|---|---|---|
+| 3 / 0 | `gemv_cfg` | rs1 = key, rs2 = value | key 0 `KBYTES`: bytes per strip = K × 16 (a multiple of 256, ≤ 65535; reset 256); key 1 `PITCH`: DDR bytes between strips (reset 256); key 2 `XWORD`: SPAD_A word of x (reset 0); key 3 `CSTEP`: ACC words between strips' results (1 … 255, reset 1). Waits while a list runs (as `mat_cfg`) |
+| 3 / 1 | `gemv_run` | rs1 = DDR address of strip 0 (16-byte aligned); rs2 = `acc << 28 \| (strips − 1) << 16 \| C` | One LD in mode GEMV: for s < strips (1 … 8), ACC word C + s · CSTEP (+)= x · W_s, x = KBYTES / 16 int8 from SPAD_A word XWORD, W_s at rs1 + s · PITCH. Same command as the descriptor's (`pkt_ldg`), so the same engine (LD), scoreboard, ports and errors; returns once queued |
+
+- A decode GEMV chunk is then one `gemv_run` (K split: the second block's `acc` = 1 in the same register), against a `mat_cfg` per changed field plus `mat_load` with LD mode keys extended.
+- Hardware: `sa_pcpi.v` decodes funct7 = 3 funct3 0–1 (four configuration registers, `pkt_ldg`); a CAPS bit (26, "GEMV over PCPI"); `sysarray_intrinsics.h` wrappers `gemv_cfg` / `gemv_run`; `tb_sa_unit` cases issuing the same GEMVs over PCPI and as descriptors (results, scoreboard order against a following VE, errors: cstep 0 is no longer reachable, bad alignment, strips 0 impossible by encoding). Logic: four registers and the decode, tens of LUTs; a new bitstream for the board.
+- The encodings funct7 = 3 funct3 ≥ 2 and funct7 ≥ 4 stay unclaimed (trap).
 
 The emitter needs the same register setup the serializer has (`SahwSerialize.cpp`) and the VE / EX field packing (`DescList.h`); writing it beside the serializer keeps the two encodings consistent.
 

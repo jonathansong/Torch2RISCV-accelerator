@@ -24,6 +24,7 @@ the matmul unit directly, bypassing its AXI4-Lite CSRs.
 > | 0 | legacy 8×8×8 jobs | `mat_trigger` 0, `mat_status` 1, `mat_reset` 2, `mat_wait` 3, `mat_cycles` 4 | this page |
 > | 1 | matrix / DMA / host | `mat_cfg` 0, `mat_load` 1, `mat_store` 2, `mat_exec` 3, `mat_fence` 4, `mat_perf` 5, `mat_submit` 6, **`mat_notify` 7** (L1) | `double_buffer_design.md` §8.1–8.3, §8.6; `llm_inference_plan.md` §5 |
 > | 2 | vector | `vec_cfg` 0, `vec_run` 1 | `double_buffer_design.md` §8.4; `llm_inference_plan.md` §6.6 |
+> | 3 | GEMV (**proposed**, not implemented) | `gemv_cfg` 0, `gemv_run` 1 | `riscv_backend_design.md` §4.1 |
 >
 > These are the extensions since M5:
 >
