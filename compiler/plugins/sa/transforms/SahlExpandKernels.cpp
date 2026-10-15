@@ -694,7 +694,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
     // Qwen3 and Gemma, against 32..512: short T pays for a whole block)
     const int64_t blk = attnBlock > 0 ? attnBlock : 128;
     nb = std::min(nb, std::max<int64_t>(int64_t(llvm::bit_floor(uint64_t(std::max<int64_t>(blk / d, 1)))), 1));
-    if (nb < 1 || G * K > sb) return notExpanded(k, __LINE__);   // (the strips of all rows of x in bank 0)
+    if (nb < 1 || (G > 1 ? G > d || 2 * K > sb : K > sb)) return notExpanded(k, __LINE__);   // (x: one A tile at word 0; step b)
   }
   int64_t rowPitch = 0;                            // (the tiled form: bytes between the matrix's rows of T)
   if (nb) {
@@ -907,9 +907,33 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       auto bscope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
       OpBuilder::InsertionGuard bguard(e.b);
       e.b.setInsertionPointToEnd(&bscope.getBody().emplaceBlock());
-      for (int64_t g = 0; g < G; ++g) {
-        loadX(b, g);
-        sahl::StripOp::create(e.b, e.loc, e.sub(xl, {0}, {K}), placedA({d, K}, g * K));
+      // §8.22 step b: G > 1 rows of x as the rows of one A tile (one EX a block
+      // for all of them, its output rows 0 .. G - 1): the G rows loaded as rows
+      // (bank 1, int32 x through ACC; the tile's other rows whatever is there,
+      // their outputs unused),
+      // transposed into the [K, D] tile form (after them), then each D x D block
+      // transposed into the A form at word 0
+      const bool oneEx = G > 1;
+      if (oneEx) {
+        llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
+        if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
+        at[p.gLoop] = {0, G};
+        Value xv = e.view(p.x.view, xMap, at, {p.bLoop});
+        if (xI32) {                                 // (int32 x: the rows into ACC, one VE copy to int8)
+          Value xa = e.alloc({G, K}, p.x.et, "acc", "packed");
+          sahl::LoadOp::create(e.b, e.loc, xv, xa);
+          sahl::StripOp::create(e.b, e.loc, xa, placedA({G, K}, sb))->setAttr("sa.packed", e.b.getUnitAttr());
+        } else {
+          sahl::LoadOp::create(e.b, e.loc, xv, placedA({G, K}, sb))->setAttr("sa.rows", e.b.getUnitAttr());
+        }
+        Value cols = placedA({K, d}, sb + K);
+        sahl::TransposeOp::create(e.b, e.loc, placedA({d, K}, sb), cols);
+        sahl::TransposeOp::create(e.b, e.loc, cols, placedA({d, K}, 0));
+      } else {
+        for (int64_t g = 0; g < G; ++g) {
+          loadX(b, g);
+          sahl::StripOp::create(e.b, e.loc, e.sub(xl, {0}, {K}), placedA({d, K}, g * K));
+        }
       }
       const int64_t tb = nb * d, blocks = N / tb + 1, rowElems = blocks * tb;
       auto accBuf = [&](int64_t n) {
@@ -918,7 +942,7 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
         sahl::ReserveOp::create(e.b, e.loc, a, false);
         return a;
       };
-      Value scratch = accBuf((G - 1 + d) * tb);
+      Value scratch = accBuf(((oneEx ? 0 : G - 1) + d) * tb);
       SmallVector<Value> rowsAcc;
       for (int64_t g = 0; g < G; ++g) rowsAcc.push_back(accBuf(rowElems));
       // the block count: T is a multiple of D (the runtime pads it), so
@@ -952,8 +976,11 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
         l->setAttr("sa.rows", e.b.getUnitAttr());
         l->setAttr("sa.advance", e.b.getI64IntegerAttr(0));
         sahl::TransposeOp::create(e.b, e.loc, raw, tiles);
-        for (int64_t g = 0; g < G; ++g)
-          sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, g * K), tiles, e.sub(scratch, {g * tb}, {tb}), false);
+        if (oneEx)
+          sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tiles, e.sub(scratch, {0}, {tb}), false);
+        else
+          for (int64_t g = 0; g < G; ++g)
+            sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, g * K), tiles, e.sub(scratch, {g * tb}, {tb}), false);
         for (int64_t g = 0; g < G; ++g) {
           auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch, {g * tb}, {tb}), e.sub(rowsAcc[g], {0}, {tb}));
           c->setAttr("sa.advance", e.b.getI64IntegerAttr(1));
