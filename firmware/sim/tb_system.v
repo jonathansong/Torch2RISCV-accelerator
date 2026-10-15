@@ -29,6 +29,12 @@
 `ifndef SIM_GEMV
 `define SIM_GEMV 0       // GEMV unit: make sim SIM_D=16 SIM_DMA_W=128 SIM_GEMV=1 (K2b)
 `endif
+`ifndef SIM_DDR_BYTES
+`define SIM_DDR_BYTES 327680   // DDR model size (RVB_TEST: the dispatch's window + its code)
+`endif
+`ifndef SIM_CPU_DDR_LAT
+`define SIM_CPU_DDR_LAT 0      // extra cycles of a PicoRV32 read from DDR (HP0; RVB_TEST code in DDR)
+`endif
 module tb_system;
     `include "n_cases.vh"
 
@@ -36,7 +42,7 @@ module tb_system;
     localparam        BRAM_WORDS = 2048;
     localparam [31:0] CSR_BASE   = 32'h8000_0000;
     localparam [31:0] DDR_BASE   = 32'h1800_0000;
-    localparam        DDR_BYTES  = 327680;
+    localparam        DDR_BYTES  = `SIM_DDR_BYTES;
     localparam [31:0] A_BASE     = DDR_BASE;             // NC * 64 B
     localparam [31:0] B_BASE     = DDR_BASE + 32'h1000;  // NC * 64 B
     localparam [31:0] C_BASE     = DDR_BASE + 32'h2000;  // NC * 256 B
@@ -99,6 +105,9 @@ module tb_system;
     wire [1:0]  mm_bresp, mm_rresp;
     reg         br_awready = 0, br_wready = 0, br_bvalid = 0, br_arready = 0, br_rvalid = 0;
     reg  [31:0] br_rdata;
+    reg         rd_pending = 0;                          // a delayed CPU read from DDR
+    reg  [15:0] rd_wait = 0;
+    reg  [31:0] rd_val;
 
     assign c_awready = aw_csr ? mm_awready : br_awready;
     assign c_wready  = aw_csr ? mm_wready  : br_wready;
@@ -141,17 +150,34 @@ module tb_system;
             br_bvalid <= 1; aw_seen <= 0; w_seen <= 0;
         end
 
-        if (c_arvalid && !ar_csr && !br_arready && !br_rvalid) begin
+        if (c_arvalid && !ar_csr && !br_arready && !br_rvalid && !rd_pending) begin
             br_arready <= 1;
-            if (in_cpu_ddr(c_araddr))
-                br_rdata <= {ddr[c_araddr - DDR_BASE + 3], ddr[c_araddr - DDR_BASE + 2],
-                             ddr[c_araddr - DDR_BASE + 1], ddr[c_araddr - DDR_BASE]};
-            else if (!in_bram(c_araddr)) begin
+            if (in_cpu_ddr(c_araddr)) begin
+                rd_val = {ddr[c_araddr - DDR_BASE + 3], ddr[c_araddr - DDR_BASE + 2],
+                          ddr[c_araddr - DDR_BASE + 1], ddr[c_araddr - DDR_BASE]};
+                if (`SIM_CPU_DDR_LAT == 0) begin
+                    br_rdata <= rd_val;
+                    br_rvalid <= 1;
+                end else begin                               // (the HP0 round trip)
+                    rd_pending <= 1;
+                    rd_wait <= `SIM_CPU_DDR_LAT;
+                end
+            end else if (!in_bram(c_araddr)) begin
                 $display("TB ERROR: CPU load from unmapped %08x", c_araddr); errors = errors + 1;
                 br_rdata <= 32'hXXXXXXXX;
-            end else
+                br_rvalid <= 1;
+            end else begin
                 br_rdata <= bram[(c_araddr - BRAM_BASE) >> 2];
-            br_rvalid <= 1;
+                br_rvalid <= 1;
+            end
+        end
+        if (rd_pending) begin
+            if (rd_wait == 1) begin
+                br_rdata <= rd_val;
+                br_rvalid <= 1;
+                rd_pending <= 0;
+            end
+            rd_wait <= rd_wait - 1;
         end
     end
 
@@ -400,6 +426,76 @@ module tb_system;
         end
         $display("TB %s: bandwidth test, %0d errors (simulated DDR model, not board numbers)",
                  errors ? "FAIL" : "PASS", errors);
+        $finish;
+    end
+`elsif RVB_TEST
+    // -------------------------------------------------------- RVB_TEST
+    // RISC-V backend test (docs/riscv_backend_design.md §5): one compiled
+    // dispatch (compiler/tests/rv_dispatch.py: rvb_ddr.hex the DDR image,
+    // rvb_expect.hex after the functional simulator's run, rvb_cmp.txt the
+    // bindings' ranges) run by firmware/rvb twice: its descriptor list, then
+    // the same commands over PCPI. After each phase the bindings are compared
+    // with the functional simulator's; between them they are restored.
+    localparam integer RV = MBOX + 32'hE0 / 4;      // RV_PHASE, RV_GO, RV_CYC_DESC, RV_CYC_PCPI, RV_ST_DESC, RV_ST_PCPI, RV_MAGIC
+    reg [31:0] rimg [0:DDR_BYTES/4-1];
+    reg [31:0] rexp [0:DDR_BYTES/4-1];
+    integer cmp_off [0:63], cmp_len [0:63];
+    integer ncmp, rfd, rr, rbad, rcyc, rk, rj;
+    task rvb_compare(input integer phase);
+        begin
+            rbad = 0;
+            for (rk = 0; rk < ncmp; rk = rk + 1)
+                for (rj = cmp_off[rk]; rj < cmp_off[rk] + cmp_len[rk]; rj = rj + 1)
+                    if (ddr[rj] !== rexp[rj / 4][8 * (rj % 4) +: 8]) begin
+                        rbad = rbad + 1;
+                        if (rbad <= 3) $display("TB ERROR: phase %0d: DDR byte +%0h = %02x, expected %02x",
+                                                phase, rj, ddr[rj], rexp[rj / 4][8 * (rj % 4) +: 8]);
+                    end
+            if (rbad) $display("TB ERROR: phase %0d: %0d bytes differ from the functional simulator", phase, rbad);
+            errors = errors + rbad;
+        end
+    endtask
+    task rvb_wait(input integer phase);
+        begin
+            rcyc = 0;
+            while (bram[RV] !== phase && !trap && rcyc < 20000000) begin @(posedge clk); rcyc = rcyc + 1; end
+            if (bram[RV] !== phase) begin
+                $display("TB ERROR: phase %0d not reached (phase word %08x, trap %0d)", phase, bram[RV], trap);
+                errors = errors + 1;
+            end
+        end
+    endtask
+    initial begin
+        for (rr = 0; rr < DDR_BYTES / 4; rr = rr + 1) begin rimg[rr] = 0; rexp[rr] = 0; end
+        $readmemh("rvb_ddr.hex", rimg);
+        $readmemh("rvb_expect.hex", rexp);
+`ifdef RVB_DDR_CODE
+        $readmemh("rvb_code.hex", rimg);
+`endif
+        for (rr = 0; rr < DDR_BYTES; rr = rr + 1) ddr[rr] = rimg[rr / 4][8 * (rr % 4) +: 8];
+        ncmp = 0;
+        rfd = $fopen("rvb_cmp.txt", "r");
+        while (!$feof(rfd) && ncmp < 64)
+            if ($fscanf(rfd, "%d %d\n", cmp_off[ncmp], cmp_len[ncmp]) == 2) ncmp = ncmp + 1;
+        $fclose(rfd);
+        for (rr = 0; rr < BRAM_WORDS; rr = rr + 1) bram[rr] = 0;
+        $readmemh("fw.hex", bram);
+        repeat (5) @(posedge clk);
+        resetn <= 1;
+        rvb_wait(1);
+        rvb_compare(1);
+        for (rk = 0; rk < ncmp; rk = rk + 1)                 // the bindings as before the run
+            for (rj = cmp_off[rk]; rj < cmp_off[rk] + cmp_len[rk]; rj = rj + 1)
+                ddr[rj] = rimg[rj / 4][8 * (rj % 4) +: 8];
+        bram[RV + 1] = 2;
+        rvb_wait(2);
+        rvb_compare(2);
+        $display("TB   descriptor list: %0d cycles (status %08x); PCPI: %0d cycles (status %08x), x%0d.%02d",
+                 bram[RV + 2], bram[RV + 4], bram[RV + 3], bram[RV + 5],
+                 bram[RV + 3] / bram[RV + 2], (100 * bram[RV + 3] / bram[RV + 2]) % 100);
+        if (bram[RV + 4] !== 0 && bram[RV + 4][1]) begin $display("TB ERROR: descriptor run status %08x", bram[RV + 4]); errors = errors + 1; end
+        if (bram[RV + 5] !== 0 && bram[RV + 5][1]) begin $display("TB ERROR: PCPI run status %08x", bram[RV + 5]); errors = errors + 1; end
+        $display("TB %s: RVB_TEST, %0d errors (CPU DDR read latency %0d)", errors ? "FAIL" : "PASS", errors, `SIM_CPU_DDR_LAT);
         $finish;
     end
 `elsif DESC_TEST

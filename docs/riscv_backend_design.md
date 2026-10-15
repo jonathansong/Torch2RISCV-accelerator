@@ -89,14 +89,39 @@ The emitter needs the same register setup the serializer has (`SahwSerialize.cpp
 | Step | Content | Needs | Estimate |
 |---|---|---|---|
 | R1 | **Measure the issue cost**: a firmware loop issuing the commands of one recorded dispatch (from a funcsim trace) over PCPI from BRAM and from DDR, against the same list through `mat_submit`; on the board with the performance counters (scheduler starvation, all-idle) | the trace, firmware, the board | 1 day |
-| R2 | **`sahw` → C emitter** (model A) with `sysarray_intrinsics.h`, compiled by the system clang to rv32imc: no LLVM rebuild. Functional check on the host: the same C compiled for x86 with the intrinsics redirected to the functional simulator (a C shim over `sa_funcsim`), compared with the descriptor path's results | compiler plugin, a host shim | 2–3 days |
-| R3 | **RTL co-simulation** of one small dispatch (a norm or the scalar index store) on `tb_system` (PicoRV32 + sa_unit), bit-identical to the descriptor path; then the board through a ring "call" entry in `rt_fw` | RTL sim, firmware | 2 days |
+| R2 | (first form done 2026-10-15, §6: straight-line from the trace) **`sahw` → C emitter** (model A) with `sysarray_intrinsics.h`, compiled by the system clang to rv32imc: no LLVM rebuild. Functional check on the host: the same C compiled for x86 with the intrinsics redirected to the functional simulator (a C shim over `sa_funcsim`), compared with the descriptor path's results | compiler plugin, a host shim | 2–3 days |
+| R3 | (RTL part done 2026-10-15, §6: six dispatches bit-identical) **RTL co-simulation** of one small dispatch (a norm or the scalar index store) on `tb_system` (PicoRV32 + sa_unit), bit-identical to the descriptor path; then the board through a ring "call" entry in `rt_fw` | RTL sim, firmware | 2 days |
 | R4 | **Model B**: a control program that computes the T loop's counts and offsets and submits the list (the dynamic fields no longer needed), as a prototype of a scalar core + command DMA | firmware, runtime | 2 days |
 | R5 | **Model C**: iree-compile rebuilt with llvm-cpu and the RISC-V target (about 2 hours; the user runs it), one sampling kernel (argmax over the logits) compiled for riscv32 and run on the core | compiler rebuild | 1–2 days |
 
 Acceptance of the C7 stage (§10 of the compiler plan): one dispatch executed by PicoRV32 code issuing PCPI instructions, bit-identical to the descriptor path (R3), and one riscv32 dispatch compiled with IREE llvm-cpu (R5). For the ASIC pre-research the output is the measured issue cost per command kind (R1), the A / B comparison on the decode step's tightest dispatches, and the code size of the hot paths (whether a tightly coupled memory of a few KB is enough).
 
-## 6. Open questions for an ASIC NPU
+## 6. First results: real dispatches over PCPI in RTL simulation (2026-10-15)
+
+**Setup.** `compiler/tests/rv_dispatch.py` takes one compiled dispatch, lays it out in the system testbench's DDR window as `dispatch_check.py` does for the functional simulator (template, bindings with generated inputs, the driver's list), runs it on the functional simulator (checked against the oracle, commands traced) and writes the DDR image, the expected image and `rvb_gen.c`: the traced commands as `sysarray_intrinsics.h` calls, configuration keys written only when their value changes (a straight-line program for the given T: the first form of R2; the structural emitter keeping loops and registers is still to do). `firmware/rvb` runs the dispatch twice on the RTL (`firmware/sim/tb_system.v`, mode `RVB_TEST`: PicoRV32 + sa_unit at D = 16 with the GEMV unit, one clock for both as on the KV260's `pl_clk0`): its descriptor list (`mat_submit`), then `rvb_gen()` over PCPI, each timed with `rdcycle`; the testbench compares the bindings with the functional simulator's after each run and restores them in between. The generated code sits in the program BRAM or, `RVB_CODE=ddr`, in DDR, fetched uncached with an extra read latency (`SIM_CPU_DDR_LAT`, cycles; the board's HP0 latency is not measured yet).
+
+Six decode dispatches of SmolLM2-135M (2 layers, `build/hfgen/smollm2_l2_e2e_qf`, T = 64; `build/rvb/results_*.txt`), PCPI time as a multiple of the descriptor list's:
+
+| Dispatch | Commands | Code | Descriptor list | PCPI, code in BRAM | DDR, +20 cycles | DDR, +60 cycles |
+|---|---:|---:|---:|---:|---:|---:|
+| RMSNorm reduction | 3 | 196 B | 1465 | 0.87 | 1.14 | 2.26 |
+| quantization | 6 | 308 B | 1405 | 0.87 | 1.55 | 3.70 |
+| q projection (GEMV) | 9 | 212 B | 87162 | 0.99 | 0.99 | 1.00 |
+| q · Kᵀ | 54 | 1724 B | 12233 | 0.98 | 1.11 | 2.31 |
+| p · V (GEMV + VE) | 57 | 1360 B | 12723 | 0.98 | 1.12 | 1.80 |
+| up projection (GEMV + epilogue) | 67 | 1664 B | 241980 | 0.99 | 1.00 | 1.01 |
+
+- **Bit-identical** in all 18 runs (descriptor list, PCPI from BRAM, PCPI from DDR at both latencies) to the functional simulator, including the GEMV chunks issued with `gemv_run` (§4.1).
+- **Code in BRAM keeps up**: 0.87–0.99 of the descriptor list's time; on the smallest dispatches PCPI is even faster, the list paying its SETREG / CALL / descriptor fetches.
+- **Code in DDR does not**: the issue-bound dispatches (attention, norms, quantization) lose 11–55% at 20 cycles per fetch and 1.8–3.7× at 60; the GEMV-bound ones are unaffected (the weight stream hides the issue).
+- **Issue cost**: the generated code needs about 5 PCPI instructions per command for attention (q · Kᵀ: 289 for 54 commands), most of them configuration writes (a VE has up to 16 `vec_cfg` keys); a GEMV chunk is one `gemv_run`.
+- **Code size**: 0.2–1.7 KB per dispatch as straight-line code at T = 64; the decode step's 30 executables of a 2-layer SmolLM2 would not fit the 7.5 KB BRAM next to the firmware, and straight-line attention grows with T: the structural emitter (loops) and a TCM / I-cache (§1) are needed beyond single dispatches.
+- **Not modeled**: the board's DDR and HP0 latencies (the testbench's DMA model is idealized; the GEMV times are not the board's) and contention between the core's fetches and the unit's DMA. These are R1 on the board.
+- Testbench changes kept the other system tests passing (matmul, matmul_insn, gemm, vector, desc_run, rt; desc_run at D = 16 with GEMV).
+
+So for an ASIC: a small in-order core issuing commands from a tightly coupled memory matches a descriptor DMA's rate on these kernels; from uncached DRAM it does not. The remaining lever is the configuration traffic per command (a one-instruction command format or a few command templates in registers).
+
+## 7. Open questions for an ASIC NPU
 
 - **Command format**: one-instruction issue (a descriptor written from registers, or a command FIFO the core stores to) instead of `mat_cfg` sequences; which fields must be dynamic.
 - **Instruction memory**: the hot loops' size (R2 gives it per dispatch) against a TCM or I-cache; PicoRV32's BRAM is 8 KB with `rt_fw` resident.
