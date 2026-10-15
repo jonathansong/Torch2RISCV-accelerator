@@ -297,9 +297,11 @@ KernelSchedule linearSchedule(const LinearPlan &p, const ::sa::Layout &lay, int6
   uint32_t extra = p.chunked.size() > 1 ? uint32_t(p.chunked.size()) - 1 : 0;
   uint32_t scratchRows = std::max<uint32_t>(steps > 2 ? 2 : 1, 1 + extra);
   ks.chunkTiles = lay.chunkTiles(uint32_t(k), uint32_t(nt), scratchRows);
-  if (gemvPorts && k > int64_t(lay.sbank)) {
-    // the GEMV unit streams the weights (no SPAD_B tile): a K beyond one bank
-    // (in K blocks, expandLinear) takes the chunk the ACC scratch holds
+  if (gemvPorts) {
+    // the GEMV unit streams the weights (no SPAD_B tile): the chunk the ACC
+    // scratch holds, whatever K (a K beyond one bank in K blocks, expandLinear;
+    // below it the SPAD_B bound gave e.g. 2 tiles at K = 2048: a chunk's fixed
+    // part, the epilogue inputs' LDs, paid 32 times, generality plan §13.4)
     int64_t cap = int64_t(lay.scr) / (d + 1 + scratchRows), nc = std::min<int64_t>(cap, nt);
     while (nc > 1 && nt % nc) --nc;
     ks.chunkTiles = nc > 0 ? nc : 0;

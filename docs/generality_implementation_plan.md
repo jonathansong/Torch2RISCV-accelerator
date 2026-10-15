@@ -780,6 +780,17 @@ From the main table's board profiles (`build/deploy_hfgen_*_qs/prof3.csv`: `SA_P
 
 What fusion could recover (estimates): each dispatch removed saves about 8 µs device + 6.5 µs host. Removing the scalar index dispatches and merging abs-max with its quantization (about 400 dispatches for Qwen3 and SmolLM2) would save about 5–6 ms per step: Qwen3 about 4%, SmolLM2 about 12%, Gemma about 6% (300 dispatches), Llama about 1.3%. Independently, keeping T out of the host program (§13.1 option b) halves the host part (Qwen3 −3.5 ms, SmolLM2 −3.4 ms), and overlapping the o_proj / down epilogues with the weight stream would recover most of GEMV's excess (Qwen3 about 4.5 ms). C4's remaining items (SiLU / quantization fusions against the Z1 hand-written path, `iree_compiler_plan.md` §7.1) are closed and continue here.
 
+**GEMV chunks from the ACC scratch for every K (2026-10-15).** `linearSchedule` sized a decode GEMV chunk by the SPAD_B bank (as the EX path, whose weight tiles live there) whenever K fits one bank: o_proj (K = 2048) ran 32 chunks of 2 tiles, each paying its own GEMV command and one LD per epilogue input (the per-column scale, the residual: 73 cycles each on the LD engine between the weight streams) and an in-order dispatch gap. With the GEMV unit the weights never touch SPAD_B, so the chunk now comes from the ACC scratch for every K, as it already did above one bank (`scr / (D + 1 + rows)`: up to 26 tiles, the largest divisor of the tile count; o_proj 16 tiles in 4 chunks of two 8-strip GEMV commands). The EX path is unchanged. Cycle model per dispatch (`perf_model`, all GEMV dispatches of five builds re-compiled, all OK against the oracle):
+
+| | per layer before → after | lm_head | per step (model) | board's GEMV excess (above) |
+|---|---|---|---|---|
+| Qwen3 | 315.2k → 279.3k | 2842k → 2671k | −11.8 ms | 8.1 ms |
+| SmolLM2 | 80.5k → 73.4k | 539k → 501k | −2.5 ms | 5.2 ms |
+| Llama-1B | 1137.5k → 1037.2k | 4740k → 4256k | −20.9 ms | 13.0 ms |
+| Gemma | 122.5k → 110.0k | 3330k → 2956k | −6.0 ms | 6.2 ms |
+
+The model's GEMV dispatches before the change are about 5% above the board's (Qwen3 116.7 against 111.3 ms), so on the board expect the smaller of the model's change and the measured excess: about 2.5–13 ms per step (Qwen3 up to 5.6%, Llama up to 5.3%, Gemma about 9%, SmolLM2 about 5.5%). After the change the model puts Qwen3's GEMV dispatches at 104.9 ms against the 103.3 ms floor. Golden corpus: the 42 decode GEMV dispatches of the six GEMV cases changed (re-recorded), the EX cases identical. SmolLM2 2 layers end to end on the sim (`build/hfgen/smollm2_l2_e2e_gc`): 9/9 decode steps against torch W8A8 (min corr 0.99994), prefill vs decode only 5/5 rows bit-exact, prefill_all 40/40. Not yet on the board.
+
 ## 14. Schedule and stop conditions
 
 | Dates | Goal | Stop condition / fallback action |
