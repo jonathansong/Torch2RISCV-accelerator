@@ -53,11 +53,11 @@ class PositionedCache(StaticCache):
 # "kv": the KV cache in fp32; "q": the attention's query not quantized; "probs":
 # the attention probabilities not quantized to int8.
 SA_FP32 = set()
-# Feasibility (iree_compiler_plan.md §8.22, p . V on the GEMV unit): the V cache
-# packed, [L, kv_heads * hd / 16, max_len, 16] (per head, 16-channel groups,
-# each a [T, 16] block: the GEMV unit's weight layout) instead of [L * max_len,
-# kv_dim]; the same int8 values, so the same logits.
-V_PACKED = os.environ.get("SA_V_PACKED", "") == "1"
+# The V cache packed (iree_compiler_plan.md §8.22, p . V on the GEMV unit):
+# [L, kv_heads * hd / 16, max_len + 16, 16] (per head, 16-channel groups, each a
+# [T, 16] block: the GEMV unit's weight layout) instead of [L * max_len, kv_dim];
+# the same int8 values, so the same logits. SA_V_PACKED=0: the row-major cache.
+V_PACKED = os.environ.get("SA_V_PACKED", "1") != "0"
 VP_LANES = 16
 
 
@@ -193,7 +193,7 @@ class SaCache(StaticCache):
                 vr = value_states[0].transpose(0, 1).reshape(value_states.shape[2], -1)
                 if "kv" in SA_FP32:                   # (attribution: an fp32 cache beside the int8 one)
                     kf = owner.__dict__.setdefault("_kf", torch.zeros(owner.kc.shape, dtype=torch.float32))
-                    vf = owner.__dict__.setdefault("_vf", torch.zeros(owner.vc.shape, dtype=torch.float32))
+                    vf = owner.__dict__.setdefault("_vf", torch.zeros(owner.kc.shape, dtype=torch.float32))  # (row-major)
                     for m in range(kr.shape[0]):
                         row = cache.positions[m:m + 1] + i * T
                         kf.index_copy_(0, row, kr[m:m + 1].float())
@@ -348,6 +348,8 @@ def _sa_attention_fp32(module, query, key, value, scaling):
     T = key.shape[0]
     Hk = key.shape[1] // hd
     G = H // Hk
+    if value.dim() == 3:                         # (the packed int8 V cache: back to [T, kv_dim])
+        value = value.permute(1, 0, 2).reshape(T, -1)
     kv32 = key.is_floating_point()               # ("kv": the fp32 cache)
     a_k = cache.a_k[l]
     if scaling is not None and abs(scaling * np.sqrt(cache.hd) - 1.0) > 1e-9:
@@ -414,6 +416,7 @@ class SaDecoder(HFDecoder):
         if V_PACKED:
             # (16 positions more than attended: a slice [:, :T] is never the whole
             # block, so the export does not guard T != max_len on its layout)
+            assert kv_dim % VP_LANES == 0, f"packed V cache: kv_dim {kv_dim} not a multiple of {VP_LANES}"
             self.register_buffer("vc", torch.ones(L, kv_dim // VP_LANES, max_len + VP_LANES, VP_LANES, dtype=torch.int8))
         else:
             self.register_buffer("vc", torch.ones(L * max_len, kv_dim, dtype=torch.int8))

@@ -48,17 +48,23 @@ def tensors(model_dir):
     return out
 
 
+# hf_generic's packed V cache holds 16 positions more than max_len (its slices
+# never the whole buffer: iree_compiler_plan.md §8.22)
+V_PAD = 16
+
+
 def packed_kv_len(path, per_t):
     """the KV cache length a packed file was built with (its kc / vc initial values;
-    hf_generic.SaDecoder's buffers), 0 when unknown"""
+    hf_generic.SaDecoder's buffers), 0 when unknown: from kc alone (vc may be the
+    packed V cache, V_PAD positions longer)"""
     try:
         import iree.runtime as rt
     except ImportError:
         return 0
     idx = rt.ParameterIndex()
     idx.load(path)
-    n = sum(e.length for k, e in idx.items() if k.endswith(".kc") or k.endswith(".vc"))
-    return n // per_t
+    n = sum(e.length for k, e in idx.items() if k.endswith(".kc"))
+    return 2 * n // per_t
 
 
 def main():
@@ -94,7 +100,7 @@ def main():
             other += 4 * n                                            # norms, biases: fp32
     L = cfg["num_hidden_layers"]
     hd = cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"]
-    kv = 2 * L * args.t * cfg["num_key_value_heads"] * hd
+    kv = 2 * L * args.t * cfg["num_key_value_heads"] * hd + L * V_PAD * cfg["num_key_value_heads"] * hd
     rows = [("int8 linear weights", lin_q), ("their scales (fp32 per row)", lin_s),
             (f"embedding int8{' (shared with the tied classifier)' if tied else ''}", emb), ("its scales", emb_s),
             ("other fp32 (norms, biases)", other)]
@@ -106,14 +112,14 @@ def main():
         t_build = packed_kv_len(args.packed, per_t)
         if t_build:                                                  # (the file holds kc / vc at the build's max_len)
             size += (args.t - t_build) * per_t
-            kv_in = args.t * per_t
+            kv_in = args.t * per_t + L * V_PAD * cfg["num_key_value_heads"] * hd
         rows += [(f"constants, padding, KV init ({os.path.basename(args.packed)}"
                   f"{f', built at T = {t_build}' if t_build else ''})", size - packed)]
         packed = size
     else:
         rows += [("constants, padding (2.5%)", 0.025 * packed)]
         packed *= 1.025
-    rows += [(f"int8 KV cache (T = {args.t})", kv), ("margin (work buffers)", args.margin_mib * 2**20)]
+    rows += [(f"int8 KV cache (T = {args.t}, V + {V_PAD} positions)", kv), ("margin (work buffers)", args.margin_mib * 2**20)]
     total = sum(b for _, b in rows)
     print(f"{args.model}: {L} layers, kv_heads {cfg['num_key_value_heads']} x head_dim {hd}, vocab {cfg['vocab_size']}, "
           f"tied {tied}")

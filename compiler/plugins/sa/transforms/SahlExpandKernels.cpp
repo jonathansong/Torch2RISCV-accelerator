@@ -525,9 +525,9 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   const bool dyn = Kr.dyn || Nr.dyn;
   if (xRows != bool(Kr.dyn)) return notExpanded(k, __LINE__);          // (x of a dynamic K: its rows a dynamic stride apart)
   // p . V over the packed V cache (a dynamic K, the matrix [n, T, D] blocks): on
-  // the GEMV unit, one command per row of x (plan §8.22, feasibility)
+  // the GEMV unit, per row of x one command per 8 groups (plan §8.22)
   const bool gemvDyn = gemvPorts && Kr.dyn && !Nr.dyn && p.layout == MatLayout::Packed && p.laneLoop >= 0 &&
-                       N / d <= 8 && p.x.et.isInteger(8) && K * d <= 65535;
+                       p.x.et.isInteger(8) && K * d <= 65535;
   if (dyn && !gemvDyn && (p.laneLoop >= 0 || p.layout == MatLayout::Packed)) return notExpanded(k, __LINE__);
   if (Kr.dyn && p.layout == MatLayout::RowsK) return notExpanded(k, __LINE__);
   if (Nr.dyn && p.layout != MatLayout::RowsK) return notExpanded(k, __LINE__);
@@ -875,13 +875,9 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
   };
   for (int64_t b = 0; b < H; ++b) {
     if (gemvDyn) {
-      // per row of x (its T int8 at the cursor into SPAD_A): one GEMV over the
-      // n blocks of the batch's [n, T, D] (rows bytes T * D a dynamic field)
-      llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
-      if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
-      at[p.kLoop] = {0, K};
-      at[p.nLoop] = {0, nt};
-      at[p.laneLoop] = {0, d};
+      // per row of x (its T int8 at the cursor into SPAD_A): GEMVs over the n
+      // blocks of the batch's [n, T, D], at most 8 a command (Gemma's 16: two;
+      // rows bytes T * D a dynamic field)
       llvm::DenseMap<int, Value> dv;
       dv[p.kLoop] = Kv;
       for (int64_t g = 0; g < G; ++g) {
@@ -890,7 +886,16 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
         OpBuilder::InsertionGuard guard(e.b);
         e.b.setInsertionPointToEnd(&scope.getBody().emplaceBlock());
         Value acc = e.alloc({nOut}, accT, "acc", "packed");
-        sahl::GemvOp::create(e.b, e.loc, xl, e.view(p.m.view, mMap, at, {p.bLoop}, dv), acc, false);
+        for (int64_t c0 = 0; c0 < nt; c0 += 8) {
+          const int64_t ncg = std::min<int64_t>(8, nt - c0);
+          llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
+          if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
+          at[p.kLoop] = {0, K};
+          at[p.nLoop] = {c0, ncg};
+          at[p.laneLoop] = {0, d};
+          sahl::GemvOp::create(e.b, e.loc, xl, e.view(p.m.view, mMap, at, {p.bLoop}, dv),
+                               nt > 8 ? e.sub(acc, {c0 * d}, {ncg * d}) : acc, false);
+        }
         if (!finish(acc, b, g, 0)) return false;
       }
       continue;
