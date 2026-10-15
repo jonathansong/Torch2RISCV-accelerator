@@ -202,16 +202,20 @@ class SaCache(StaticCache):
                     return kf[i * T:i * T + n], vf[i * T:i * T + n]
                 kq, vq = _to_i8(kr * cache.inv_sk[i]), _to_i8(vr * cache.inv_sv[i])
                 for m in range(kr.shape[0]):          # row by row: a scalar position each (a decode step's write)
-                    row = cache.positions[m:m + 1] + i * T
-                    owner.kc.index_copy_(0, row, kq[m:m + 1])
-                    if V_PACKED:                      # (the row's 16-channel groups, each at its block's row)
-                        # (a slice at the position as an integer: a strided store at a
-                        # dynamic offset; a tensor index becomes an element scatter)
+                    if V_PACKED:
+                        # (a slice at the position as an integer: a store at a dynamic
+                        # offset read in the store's dispatch; a tensor index became an
+                        # i64 dispatch per row (position + layer offset, generality
+                        # plan §13.4) and, for V, an element scatter)
                         pv = cache.positions[m].item()
                         torch._check(pv >= 0)
                         torch._check(pv < T)
+                        owner.kc[i * T + pv:i * T + pv + 1] = kq[m:m + 1]
+                        # (the row's 16-channel groups, each at its block's row)
                         owner.vc[i, :, pv:pv + 1] = vq[m:m + 1].reshape(-1, 1, VP_LANES)
                     else:
+                        row = cache.positions[m:m + 1] + i * T
+                        owner.kc.index_copy_(0, row, kq[m:m + 1])
                         owner.vc.index_copy_(0, row, vq[m:m + 1])
                 n = T if cache.T is None else cache.T    # (the first n rows: the positions attended)
                 if V_PACKED:

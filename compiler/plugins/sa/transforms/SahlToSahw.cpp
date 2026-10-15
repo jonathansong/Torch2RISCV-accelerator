@@ -960,6 +960,12 @@ LocalBuf Lowerer::packBcast(const LocalBuf &b) {
   return p;
 }
 
+// the constant added to a scatter's index (sa.index_add: replaceDynStores' layer offset)
+static int64_t indexAdd(sahl::ScatterOp sc) {
+  auto a = sc->getAttrOfType<IntegerAttr>("sa.index_add");
+  return a ? a.getInt() : 0;
+}
+
 bool Lowerer::scatter(sahl::ScatterOp sc) {
   Value upd = sc.getUpdates(), idx = sc.getIndices(), orig = sc.getDest();
   if (auto dim = sc->getAttrOfType<IntegerAttr>("sa.dim")) {
@@ -981,7 +987,7 @@ bool Lowerer::scatter(sahl::ScatterOp sc) {
     if (!u || !ir || !orr) return false;
     if (orr->off % 8) return fail("scatter target not 8-byte aligned");
     Value p = privateParam();
-    sahw::LdParamOp::create(bb, loc, ir->base, p, ir->off, rb, 0, ValueRange{});
+    sahw::LdParamOp::create(bb, loc, ir->base, p, ir->off, rb, indexAdd(sc) * rb, ValueRange{});
     auto s = sahw::StOp::create(bb, loc, orr->base, orr->off, int64_t(u->la), rows, rb, pitch, ValueRange{p});
     s.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
     s.setDynAdd(ArrayRef<bool>{true});
@@ -997,7 +1003,7 @@ bool Lowerer::scatter(sahl::ScatterOp sc) {
   if (!u || !ir || !orr) return false;
   if (orr->off % 8) return fail("scatter target not 8-byte aligned");
   Value p = privateParam();
-  sahw::LdParamOp::create(bb, loc, ir->base, p, ir->off, rowBytes, 0, ValueRange{});
+  sahw::LdParamOp::create(bb, loc, ir->base, p, ir->off, rowBytes, indexAdd(sc) * int64_t(rowBytes), ValueRange{});
   auto st = sahw::StOp::create(bb, loc, orr->base, orr->off, int64_t(u->la), 1, int64_t(rowBytes), int64_t(rowBytes),
                                ValueRange{p});
   st.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});

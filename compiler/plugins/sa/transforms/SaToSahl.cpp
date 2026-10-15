@@ -256,12 +256,16 @@ void replaceScatters(func::FuncOp f) {
 }
 
 // A store into a DDR view at one dynamic offset that is a function of an i64
-// read from DDR (the packed V cache's row written at the position: a slice
-// [.., pos, ..] of the cache, plan §8.22) -> sahl.scatter along that dimension
-// (`sa.dim`). The function is torch's normalization of a slice start (a negative
-// index wrapped, then clamped to the size): only selects, compares, adds and
-// casts of the loaded value and constants; the position is taken as is (it is
-// in range: hf_generic checks it at export).
+// read from DDR -> sahl.scatter: along dimension 1 (`sa.dim`; the packed V
+// cache's row written at the position: a slice [.., pos, ..] of the cache, plan
+// §8.22), or one whole row along dimension 0 (the K cache's row at layer
+// offset + position, generality plan §13.4). The function is torch's
+// normalization of a slice start (a negative index wrapped, then clamped to
+// the size) around the position plus constants: only selects, compares, adds
+// and casts of the loaded value and constants. It is evaluated at two
+// positions in range (hf_generic checks the position at export, so the wrap
+// and the clamps are the identity): position + c with a constant c
+// (`sa.index_add`, elements along the dimension), else not replaced.
 void replaceDynStores(func::FuncOp f) {
   SmallVector<sahl::StoreOp> sts;
   f.walk([&](sahl::StoreOp s) { sts.push_back(s); });
@@ -279,9 +283,16 @@ void replaceDynStores(func::FuncOp f) {
         ok &= getConstantIntValue(o) == 0;
       }
     }
-    if (!ok || dim != 1 || getConstantIntValue(sv.getMixedSizes()[dim]) != 1) continue;
+    if (!ok || dim > 1 || dim < 0 || getConstantIntValue(sv.getMixedSizes()[dim]) != 1) continue;
     for (auto s : sv.getMixedStrides()) ok &= getConstantIntValue(s) == 1;
     if (!ok) continue;
+    if (dim == 0) {                               // (whole rows of a contiguous [N, ...] view)
+      auto dT = dyn_cast<MemRefType>(sv.getSource().getType());
+      if (!dT || !dT.hasStaticShape() || !dT.getLayout().isIdentity()) continue;
+      for (auto [i, z] : llvm::enumerate(sv.getMixedSizes()))
+        if (i > 0) ok &= getConstantIntValue(z) == dT.getDimSize(i);
+      if (!ok) continue;
+    }
     // the offset's backward slice: one memref.load of an i64 in DDR, the rest arith on it and constants
     memref::LoadOp ld;
     SmallVector<Operation *> chain, work{off.getDefiningOp()};
@@ -304,9 +315,49 @@ void replaceDynStores(func::FuncOp f) {
       for (Value v : op->getOperands()) work.push_back(v.getDefiningOp());
     }
     if (!ok || !ld) continue;
+    // the offset at positions 3 and 5: position + c for one constant c
+    auto at = [&](int64_t pos) -> std::optional<int64_t> {
+      llvm::DenseMap<Value, int64_t> val;
+      std::function<std::optional<int64_t>(Value)> ev = [&](Value v) -> std::optional<int64_t> {
+        if (auto it = val.find(v); it != val.end()) return it->second;
+        Operation *op = v.getDefiningOp();
+        std::optional<int64_t> r;
+        if (op == ld.getOperation()) r = pos;
+        else if (auto c = getConstantIntValue(v)) r = *c;
+        else if (auto a = dyn_cast<arith::AddIOp>(op)) {
+          auto x = ev(a.getLhs()), y = ev(a.getRhs());
+          if (x && y) r = *x + *y;
+        } else if (auto sl = dyn_cast<arith::SelectOp>(op)) {
+          auto c = ev(sl.getCondition());
+          if (c) r = ev(*c ? sl.getTrueValue() : sl.getFalseValue());
+        } else if (auto cm = dyn_cast<arith::CmpIOp>(op)) {
+          auto x = ev(cm.getLhs()), y = ev(cm.getRhs());
+          if (x && y) {
+            using P = arith::CmpIPredicate;
+            switch (cm.getPredicate()) {
+              case P::eq: r = *x == *y; break;
+              case P::ne: r = *x != *y; break;
+              case P::slt: case P::ult: r = *x < *y; break;
+              case P::sle: case P::ule: r = *x <= *y; break;
+              case P::sgt: case P::ugt: r = *x > *y; break;
+              case P::sge: case P::uge: r = *x >= *y; break;
+            }
+          }
+        } else if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(op)) {
+          r = ev(op->getOperand(0));
+        }
+        if (r) val[v] = *r;
+        return r;
+      };
+      return ev(off);
+    };
+    auto v3 = at(3), v5 = at(5);
+    if (!v3 || !v5 || *v3 - 3 != *v5 - 5) continue;
+    const int64_t add = *v3 - 3;
     OpBuilder b(st);
     auto sc = sahl::ScatterOp::create(b, st.getLoc(), st.getSrc(), ld.getMemRef(), sv.getSource());
-    sc->setAttr("sa.dim", b.getI64IntegerAttr(dim));
+    if (dim == 1) sc->setAttr("sa.dim", b.getI64IntegerAttr(dim));
+    if (add) sc->setAttr("sa.index_add", b.getI64IntegerAttr(add));
     st.erase();
     if (sv->use_empty()) sv.erase();
     // the offset's computation, now unused (users first)
