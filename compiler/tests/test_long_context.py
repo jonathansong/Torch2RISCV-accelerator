@@ -59,6 +59,11 @@ def main():
     for l in host[:5]:
         print("  " + l)
     fails = len(host) > 0
+    # no host copies of the KV caches per step (host_copies.py: the driver copies them on the CPU)
+    hc = subprocess.run([PY, os.path.join(HERE, "host_copies.py"), out], capture_output=True, text=True, env=env)
+    for l in hc.stdout.strip().splitlines():
+        print("  " + l)
+    fails |= hc.returncode != 0
     for t in args.t.split(","):
         c = subprocess.run([PY, os.path.join(HERE, "dispatch_check.py"), os.path.join(out, "sa_sources"), bins, "--t", t],
                            capture_output=True, text=True)

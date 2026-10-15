@@ -41,6 +41,8 @@ if [ ! -s "$O/sa.vmfb" ]; then
   echo "compiled in $((SECONDS - T0)) s: $(grep -c ': ok$' "$O/compile.log" || true) executables for the accelerator," \
     "$(grep -c ': on the host' "$O/compile.log" || true) for the host"
 fi
+# no per-step host copies of the KV caches (host_copies.py; §8.22: the packed V cache's strided write cost 640 ms a step)
+"$SA_PY" "$SA_COMPILER/tests/host_copies.py" "$O"
 "${HF[@]}" --skip-export --quant --rope --attn --prefill "$SA_D" $EXTRA --max-len "$LEN" --mb "${LC_MB:-${MB:-1100}}" \
   --kv-channel k --kv-calib "$SA_REPO/build/llm_cache/wikitext-2-raw-v1-train.txt:1024" --board-bundle "${O}_bundle" $LAYERS
 HFGEN_TAG=$TAG HFGEN_BUNDLE=${O}_bundle "$SA_COMPILER/scripts/deploy_hfgen.sh"

@@ -212,14 +212,16 @@ class SaCache(StaticCache):
                         torch._check(pv < T)
                         owner.kc[i * T + pv:i * T + pv + 1] = kq[m:m + 1]
                         # (the row's 16-channel groups, each at its block's row)
-                        owner.vc[i, :, pv:pv + 1] = vq[m:m + 1].reshape(-1, 1, VP_LANES)
+                        ng = vq.shape[1] // VP_LANES
+                        rows = torch.arange(ng) * (T + VP_LANES) + cache.positions[m:m + 1]
+                        getattr(owner, f"vc{i}").view(-1, VP_LANES).index_copy_(0, rows, vq[m:m + 1].reshape(ng, VP_LANES))
                     else:
                         row = cache.positions[m:m + 1] + i * T
                         owner.kc.index_copy_(0, row, kq[m:m + 1])
                         owner.vc.index_copy_(0, row, vq[m:m + 1])
                 n = T if cache.T is None else cache.T    # (the first n rows: the positions attended)
                 if V_PACKED:
-                    return owner.kc[i * T:i * T + n], owner.vc[i, :, :n]
+                    return owner.kc[i * T:i * T + n], getattr(owner, f"vc{i}")[:, :n]
                 return owner.kc[i * T:i * T + n], owner.vc[i * T:i * T + n]
             return update
         for i, layer in enumerate(self.layers):
@@ -421,7 +423,8 @@ class SaDecoder(HFDecoder):
             # (16 positions more than attended: a slice [:, :T] is never the whole
             # block, so the export does not guard T != max_len on its layout)
             assert kv_dim % VP_LANES == 0, f"packed V cache: kv_dim {kv_dim} not a multiple of {VP_LANES}"
-            self.register_buffer("vc", torch.ones(L, kv_dim // VP_LANES, max_len + VP_LANES, VP_LANES, dtype=torch.int8))
+            for l in range(L):
+                self.register_buffer(f"vc{l}", torch.ones(kv_dim // VP_LANES, max_len + VP_LANES, VP_LANES, dtype=torch.int8))
         else:
             self.register_buffer("vc", torch.ones(L * max_len, kv_dim, dtype=torch.int8))
         for mod in model.modules():

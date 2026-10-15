@@ -61,7 +61,9 @@ def Sahl_ScatterOp : Sahl_Op<"scatter"> {
   let description = [{
     dest[index, ...] = updates[0, ...], index = the i64 in `indices` (DDR).
     sa-to-sahl makes it from an iree_linalg_ext.scatter that overwrites one
-    row along dimension 0.
+    row along dimension 0; with `sa.row_stride` = s, R rows: row r of the
+    updates at index + r * s (the packed V cache's token row); `sa.dim` and
+    `sa.index_add` as replaceDynStores sets them.
   }];
   let arguments = (ins Arg<AnyMemRef, "the row", [MemRead]>:$updates,
                        Arg<AnyMemRef, "the index", [MemRead]>:$indices,

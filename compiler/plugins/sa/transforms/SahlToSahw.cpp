@@ -968,6 +968,28 @@ static int64_t indexAdd(sahl::ScatterOp sc) {
 
 bool Lowerer::scatter(sahl::ScatterOp sc) {
   Value upd = sc.getUpdates(), idx = sc.getIndices(), orig = sc.getDest();
+  if (auto rstride = sc->getAttrOfType<IntegerAttr>("sa.row_stride")) {
+    // R rows of a contiguous [N, C] table at index + r * stride (the packed V
+    // cache's token row): one ST of R rows, a pitch of stride rows
+    auto dT = cast<MemRefType>(orig.getType());
+    auto uT = cast<MemRefType>(upd.getType());
+    uint32_t es = esize(dT.getElementType());
+    int64_t rows = uT.getDimSize(0), rb = dT.getDimSize(1) * es, pitch = rstride.getInt() * rb;
+    if (dT.getRank() != 2 || (!dT.getLayout().isIdentity() && !isa<StridedLayoutAttr>(dT.getLayout())) || rb % 8 ||
+        pitch % 8 || rb > 0xFFFF || rows > 0xFFFF)
+      return fail("scatter of strided rows: layout");
+    auto u = materialize(upd);
+    auto ir = ddrOf(idx);
+    auto orr = ddrOf(orig);
+    if (!u || !ir || !orr) return false;
+    if (orr->off % 8) return fail("scatter target not 8-byte aligned");
+    Value p = privateParam();
+    sahw::LdParamOp::create(bb, loc, ir->base, p, ir->off, rb, indexAdd(sc) * rb, ValueRange{});
+    auto s = sahw::StOp::create(bb, loc, orr->base, orr->off, int64_t(u->la), rows, rb, pitch, ValueRange{p});
+    s.setDynFields(ArrayRef<int32_t>{::sa::DYN_DMA_DDR});
+    s.setDynAdd(ArrayRef<bool>{true});
+    return err.empty();
+  }
   if (auto dim = sc->getAttrOfType<IntegerAttr>("sa.dim")) {
     // along dimension 1 of [R, N, C] (the packed V cache: R blocks of N rows of
     // C bytes): R rows of C bytes, a pitch of N * C apart, at index * C

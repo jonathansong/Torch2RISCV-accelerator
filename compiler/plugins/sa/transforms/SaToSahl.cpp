@@ -237,10 +237,88 @@ void unrollOuterRows(func::FuncOp f) {
 
 // An iree_linalg_ext.scatter that overwrites one row along dimension 0 (the
 // KV cache update) -> sahl.scatter; others stay (the lowering rejects them).
+// The rows of a scatter whose indices a generic in the dispatch computes as
+// row r = r * stride + an i64 read from DDR (+ a constant): the packed V
+// cache's token row, one 16-byte row per 16-channel group, (max_len + 16) rows
+// apart (hf_generic: index_copy on the layer's [groups * (max_len + 16), 16]
+// view; a strided slice write made IREE copy the cache out and back every
+// step, iree_compiler_plan.md §8.22). The body is evaluated at rows 0 / 1 and
+// two loaded values: {DDR scalar, stride, add}, or nothing.
+static std::optional<std::tuple<Value, int64_t, int64_t>> stridedRows(Value idx, linalg::GenericOp &g) {
+  auto alloc = idx.getDefiningOp<memref::AllocOp>();
+  if (!alloc) return std::nullopt;
+  g = {};
+  for (Operation *u : alloc->getUsers()) {
+    auto gg = dyn_cast<linalg::GenericOp>(u);
+    if (gg && gg.getNumDpsInits() == 1 && gg.getDpsInitOperand(0)->get() == idx) g = gg;
+  }
+  if (!g || g.getNumDpsInputs() != 1 || g.getNumLoops() != 1) return std::nullopt;
+  Value src = g.getDpsInputOperand(0)->get();
+  auto st = dyn_cast<MemRefType>(src.getType());
+  if (!st || st.getRank() != 0 || !st.getElementType().isInteger(64) || !ddrRoot(src)) return std::nullopt;
+  Block &b = g.getRegion().front();
+  auto eval = [&](int64_t row, int64_t in) -> std::optional<int64_t> {
+    llvm::DenseMap<Value, int64_t> v;
+    v[b.getArgument(0)] = in;
+    for (Operation &op : b) {
+      if (auto y = dyn_cast<linalg::YieldOp>(op)) {
+        auto it = v.find(y.getOperand(0));
+        return it == v.end() ? std::nullopt : std::optional<int64_t>(it->second);
+      }
+      auto get = [&](Value x) -> std::optional<int64_t> {
+        if (auto it = v.find(x); it != v.end()) return it->second;
+        if (auto c = getConstantIntValue(x)) return *c;
+        return std::nullopt;
+      };
+      if (isa<linalg::IndexOp>(op)) v[op.getResult(0)] = row;
+      else if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp, arith::ExtUIOp>(op)) {
+        auto x = get(op.getOperand(0));
+        if (!x) return std::nullopt;
+        v[op.getResult(0)] = *x;
+      } else if (isa<arith::AddIOp, arith::MulIOp>(op)) {
+        auto x = get(op.getOperand(0)), y = get(op.getOperand(1));
+        if (!x || !y) return std::nullopt;
+        v[op.getResult(0)] = isa<arith::AddIOp>(op) ? *x + *y : *x * *y;
+      } else if (!isa<arith::ConstantOp>(op)) {
+        return std::nullopt;
+      }
+    }
+    return std::nullopt;
+  };
+  auto a0 = eval(0, 5), a1 = eval(1, 5), b0 = eval(0, 9), b1 = eval(1, 9);
+  if (!a0 || !a1 || !b0 || !b1) return std::nullopt;
+  const int64_t stride = *a1 - *a0, add = *a0 - 5;
+  if (*b0 - *a0 != 4 || *b1 - *b0 != stride || stride <= 0) return std::nullopt;   // (row * stride + in + add)
+  return std::make_tuple(src, stride, add);
+}
+
 void replaceScatters(func::FuncOp f) {
   SmallVector<IREE::LinalgExt::ScatterOp> scs;
   f.walk([&](IREE::LinalgExt::ScatterOp sc) { scs.push_back(sc); });
   for (auto sc : scs) {
+    {                                             // R rows at strided indices (the packed V cache)
+      auto uT = dyn_cast<MemRefType>(sc.getUpdates().getType());
+      auto oT = dyn_cast<MemRefType>(sc.getOriginal().getType());
+      linalg::GenericOp g;
+      Block &b = sc.getRegion().front();
+      auto y = dyn_cast<IREE::LinalgExt::YieldOp>(b.getTerminator());
+      if (uT && oT && sc.getDimensionMap() == ArrayRef<int64_t>{0} && uT.hasStaticShape() && oT.hasStaticShape() &&
+          uT.getRank() == 2 && oT.getRank() == 2 && uT.getDimSize(1) == oT.getDimSize(1) &&
+          uT.getElementType() == oT.getElementType() && y && y.getOperand(0) == b.getArgument(0)) {
+        if (auto rs = stridedRows(sc.getIndices(), g)) {
+          auto [src, stride, add] = *rs;
+          OpBuilder bld(sc);
+          auto ns = sahl::ScatterOp::create(bld, sc.getLoc(), sc.getUpdates(), src, sc.getOriginal());
+          ns->setAttr("sa.row_stride", bld.getI64IntegerAttr(stride));
+          if (add) ns->setAttr("sa.index_add", bld.getI64IntegerAttr(add));
+          Value idx = sc.getIndices();
+          sc.erase();
+          g.erase();
+          if (auto al = idx.getDefiningOp<memref::AllocOp>(); al && al->use_empty()) al.erase();
+          continue;
+        }
+      }
+    }
     auto uT = dyn_cast<MemRefType>(sc.getUpdates().getType());
     auto oT = dyn_cast<MemRefType>(sc.getOriginal().getType());
     if (!uT || !oT || sc.getDimensionMap() != ArrayRef<int64_t>{0} || uT.getDimSize(0) != 1 || !uT.hasStaticShape() ||
