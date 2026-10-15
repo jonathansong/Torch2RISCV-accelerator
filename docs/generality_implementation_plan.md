@@ -758,6 +758,28 @@ Do not mix hardware resources and pure compiler features in the same table.
 
 The generic frontend's Qwen3 decode (6.88 tok/s, 6.96 after qsum) is now faster than the hand-written path on the same overlay (6.28).
 
+### 13.4 The decode step's fixed part (2026-10-15)
+
+From the main table's board profiles (`build/deploy_hfgen_*_qs/prof3.csv`: `SA_PROFILE_PERF`, one list per dispatch, the unit's counters per export; decode at positions 32–48) with `compiler/tests/kv260_fixed.py`: per dispatch kind the device cycles against the LD floor (the bytes read at the four-port GEMV peak, 57.95 B/cycle), split by the counters (all engines idle = descriptor fetch and fences, VE, EX, LD). These bundles predate the packed V cache (attention below is the earlier row-major p · V).
+
+| ms per step | Qwen3 | SmolLM2 | Llama-1B | Gemma |
+|---|---:|---:|---:|---:|
+| Wall (batched) | 143.6 | 45.2 | 247.3 | 66.9 |
+| LD floor (weights + KV at 57.95 B/cycle) | 104.7 (73%) | 23.8 (53%) | 214.6 (87%) | 47.0 (70%) |
+| GEMV above the floor | 8.1 | 5.2 | 13.0 | 6.2 |
+| attention (q · Kᵀ, p · V) | 11.7 | 4.1 | 7.3 | 2.9 |
+| small dispatches (elementwise, reduction, scatter) | 14.1 (821) | 7.2 (759) | 9.8 (409) | 6.0 (545) |
+| 　of which VE work / all-idle | 7.4 / 3.0 | 3.2 / 2.8 | 5.7 / 1.5 | 2.9 / 2.0 |
+| host, rest of the runtime (6.5 µs per dispatch) | 7.0 | 6.7 | 3.7 | 5.8 |
+| dispatches per step | 1074 | 1030 | 554 | 708 |
+
+- **Per dispatch** the device spends about 350 cycles with every engine idle (the list's descriptor fetch and the fence) plus the LD / ST latencies of its inputs and outputs, and the host 6.5 µs (re-recording the command buffer, §13.1): a small dispatch costs about 8 µs device + 6.5 µs host beyond its own work.
+- **GEMV above the floor** is mostly two dispatch kinds per layer whose epilogue is fused (o_proj and down: dequantization and the residual add, its VE and the residual's LD on the LD engine not fully hidden behind the weight stream; cycle model 5.2k / 10.7k cycles per call for Qwen3, the other projections at the floor) and lm_head's tail (Qwen3 157k cycles).
+- **Scalar index dispatches**: 141 per step for Qwen3 (151 SmolLM2, 90 Gemma) are one i64 addition each (`elementwise`, about 420 cycles + 6.5 µs host): torch's normalization of a dynamic index (`i < 0 ? i + size : i`) around the KV cache's per-layer slices, each its own dispatch. About 1.5 ms per step (Qwen3 1%, SmolLM2 3.5%).
+- **Quantization chain**: before each linear layer abs-max (`reduction_N_f32`, Qwen3 170 per step) and quantization (`elementwise_N_f32xf32xi8`, 113) are separate dispatches with a DDR round trip each.
+
+What fusion could recover (estimates): each dispatch removed saves about 8 µs device + 6.5 µs host. Removing the scalar index dispatches and merging abs-max with its quantization (about 400 dispatches for Qwen3 and SmolLM2) would save about 5–6 ms per step: Qwen3 about 4%, SmolLM2 about 12%, Gemma about 6% (300 dispatches), Llama about 1.3%. Independently, keeping T out of the host program (§13.1 option b) halves the host part (Qwen3 −3.5 ms, SmolLM2 −3.4 ms), and overlapping the o_proj / down epilogues with the weight stream would recover most of GEMV's excess (Qwen3 about 4.5 ms). C4's remaining items (SiLU / quantization fusions against the Z1 hand-written path, `iree_compiler_plan.md` §7.1) are closed and continue here.
+
 ## 14. Schedule and stop conditions
 
 | Dates | Goal | Stop condition / fallback action |
