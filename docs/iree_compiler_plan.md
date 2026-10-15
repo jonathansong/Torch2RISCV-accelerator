@@ -1644,6 +1644,18 @@ Checks: golden corpus 7658 of 7664 dispatches byte-identical, the 6 changed are 
 - **Compiler-only options (small).** (1) The sum on the GEMV unit: a 16-lane group of ones in front of each KV head's packed V groups makes p · V's GEMV produce Σp in one more strip (exact: Σp ≤ 2048 · 127 < 2²⁴), removing the sum dispatch; cost one strip per row (Llama 4 → 5 strips, +25% of p · V's LD) and the V cache +1 / (hd / 16); net about −28k cycles per layer for Llama at 2048 (−5% of attention), −15k for Qwen3 (−3%). (2) The max in the q · Kᵀ loop, where VE is idle part of the time (88k of 276k), would need the max and the scores in one dispatch (IREE's dispatch formation splits them): not pursued.
 - **Hardware option (larger).** exp throughput: the calibrated cost of an fp function VE is 31.3 cycles per group of 16 (about 2 cycles per element on the `p6` SFU); twice that throughput would take about 32% off the probabilities (Llama −64k cycles per layer at 2048, −12% of attention), at a LUT cost on an overlay already at 87% (not evaluated).
 
+**Projected whole-model decode after steps a–c and p · V on the GEMV unit (2026-10-15; to be checked on the board).** Qwen3-0.6B compiled for 2048 (`deploy_hfgen_qwen3_lc2048`): the board's decode wall time per step (the `--sweep` above, before these changes) minus the cycle model's change of the four attention dispatches × 28 layers (before: the table "compiled for 2048" above, T = 64 interpolated; after: `attn_cycles.py … --attn-block 128`, T = 64 / 256 added, all OK against the oracle). The model read about 11% low against the board for attention's growth with T (the 2-layer dry run), so both the plain difference (k = 1) and k = 1.11:
+
+| T | board ms (tok/s) before | attention ms / token, model: before → after | projected k = 1 | projected k = 1.11 |
+|---|---|---|---|---|
+| 64 | 197.0 (5.08) | 51.3 → 15.4 | 161 (6.21) | 157 (6.37) |
+| 256 | 218.2 (4.58) | 74.9 → 24.8 | 168 (5.95) | 163 (6.15) |
+| 512 | 298.9 (3.35) | 140.5 → 40.2 | 199 (5.04) | 188 (5.33) |
+| 1024 | 408.0 (2.45) | 237.5 → 71.0 | 242 (4.14) | 223 (4.48) |
+| 2048 | 626.1 (1.60) | 431.6 → 132.7 | 327 (3.06) | 294 (3.40) |
+
+With k = 1.11 the part outside attention at T = 2048 comes to 626.1 − 1.11 · 431.6 = 147 ms, the bundle compiled for 256 measured 145 ms per step at short T: consistent. So at 2048 decode should about double (1.60 → 3.1–3.4 tok/s), and the cost of compiling for 2048 at short contexts drops from +36% (197 against 145 ms at T = 64) to about +10%. Prefill (row attention) is not covered by these changes beyond p · V.
+
 ## 9. Verification system
 
 | Level | Content | Tools |
