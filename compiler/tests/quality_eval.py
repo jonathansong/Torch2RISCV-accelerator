@@ -125,7 +125,10 @@ def main():
     ap.add_argument("--ref-cache", help="the fp32 reference's logits (.npy): loaded if present, else saved, so that "
                     "each variant can run in a process of its own (Llama-1B: fp32 and an sa form do not fit in 10 GB together)")
     ap.add_argument("--kv-calib", help="FILE[:TOKENS] text for the sa variants' KV scales (default: export_hf.CALIB)")
+    ap.add_argument("--ranges", help="also per range of positions within the window, e.g. 0,256,512,1024,2048 "
+                    "(the long-context loss by position, iree_compiler_plan.md §8.22)")
     args = ap.parse_args()
+    edges = [int(x) for x in args.ranges.split(",")] if args.ranges else []
     torch.set_grad_enabled(False)
     names = (args.variants or "fp32,w8a8,sa" + (",ct-w8a8,ct-sa" if args.ct else "")).split(",")
     if names[0] != "fp32":
@@ -146,32 +149,59 @@ def main():
         t0 = time.time()
         f, ctx = build(name, args)
         nll, agree, corr, kl, n = 0.0, 0, 0.0, 0.0, 0
+        pos = {"nll": np.zeros(args.window), "agree": np.zeros(args.window), "kl": np.zeros(args.window)}
         refs = [] if ref is None else ref
         with ctx():
             for w, win in enumerate(wins):
                 lg = f(win)
-                lp = torch.log_softmax(lg, -1)
-                tgt = torch.tensor(win[1:])
-                nll += float(-lp[:-1].gather(1, tgt[:, None]).sum())
-                if ref is None:
+                tgt = torch.tensor(win[1:] + [0])
+                r = None if ref is None else ref[w]
+                for c in range(0, len(win), 256):        # (row blocks: a 2048-token window's [L, V] fp32 is 1.2 GB)
+                    lp = torch.log_softmax(lg[c:c + 256], -1)
+                    nll_i = -lp.gather(1, tgt[c:c + 256, None])[:, 0]
+                    if c + 256 >= len(win):
+                        nll_i = nll_i[:-1]                # (the last position has no target)
+                    nll += float(nll_i.sum())
+                    pos["nll"][c:c + len(nll_i)] += nll_i.numpy()
+                    if r is None:
+                        continue
+                    rc = r[c:c + 256]
+                    rlp = torch.log_softmax(rc, -1)
+                    agree_i = (lg[c:c + 256].argmax(-1) == rc.argmax(-1))
+                    kl_i = (rlp.exp() * (rlp - lp)).sum(-1)
+                    agree += int(agree_i.sum())
+                    kl += float(kl_i.sum())
+                    pos["agree"][c:c + len(agree_i)] += agree_i.numpy()
+                    pos["kl"][c:c + len(kl_i)] += kl_i.numpy()
+                    del lp, rlp
+                if r is None:
                     refs.append(lg)
                     continue
-                r = ref[w]
-                rlp = torch.log_softmax(r, -1)
-                agree += int((lg.argmax(-1) == r.argmax(-1)).sum())
-                kl += float((rlp.exp() * (rlp - lp)).sum())
                 corr += sum(float(np.corrcoef(lg[i].numpy(), r[i].numpy())[0, 1]) for i in range(len(win)))
                 n += len(win)
         if ref is None:
             ref = refs
             if args.ref_cache:
-                np.save(args.ref_cache, torch.stack(ref).numpy())
+                np.save(args.ref_cache, np.stack([x.numpy() for x in ref]))
         f = ctx = None                   # (the model freed before the next one loads: one at a time in memory)
         gc.collect()
         P = len(wins) * (args.window - 1)
         res[name] = {"ppl": math.exp(nll / P), "seconds": round(time.time() - t0, 1)}
         if n:
             res[name].update(top1=agree / n, corr=corr / n, kl=kl / n)
+        if edges:                        # (positions [a, b) of every window; the PPL over the targets of [a, b))
+            res[name]["ranges"] = {}
+            for a, b in zip(edges, edges[1:]):
+                b = min(b, args.window)
+                if a >= b:
+                    continue
+                r = {"ppl": math.exp(pos["nll"][a:min(b, args.window - 1)].sum() / (len(wins) * (min(b, args.window - 1) - a)))}
+                if n:
+                    r.update(top1=pos["agree"][a:b].sum() / (len(wins) * (b - a)),
+                             kl=pos["kl"][a:b].sum() / (len(wins) * (b - a)))
+                res[name]["ranges"][f"{a}-{b}"] = r
+                print(f"    [{a}, {b}) PPL {r['ppl']:8.3f}" +
+                      (f"  top-1 {100 * r['top1']:.1f}%  KL {r['kl']:.4f}" if n else ""), flush=True)
         print(f"{name:8s} PPL {res[name]['ppl']:8.3f}" +
               (f"  top-1 vs fp32 {agree}/{n} ({100 * agree / n:.1f}%)  corr {corr / n:.4f}  KL {kl / n:.4f}" if n else "") +
               f"  ({res[name]['seconds']} s)", flush=True)

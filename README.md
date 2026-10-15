@@ -212,7 +212,9 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   end-to-end compiler (level L6-IREE): a quantized PyTorch llama exported with
   iree-turbine, an IREE target-backend plugin that emits descriptor-list
   templates, and a C HAL driver on the ARM that submits them through the
-  command ring, in stages C0-C7. Done: a full MLIR code generator (the `sahl`
+  command ring, in stages C0-C7 (C4 closed 2026-10-15, its fusions continued on
+  the KV260; C7, a RISC-V backend, is pre-research for an ASIC NPU:
+  [design](docs/riscv_backend_design.md)). Done: a full MLIR code generator (the `sahl`
   / `sahw` dialects, templates as micro-kernels); stories15M (17.7 tok/s) and
   HuggingFace SmolLM2-135M (2.22 tok/s) run on the board bit-exact with the
   references, and generate text interactively there (on the KV260 also the
@@ -267,7 +269,7 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 | 5 | MLIR dialect + instruction-level lowering | ✅ superseded | done as the IREE compiler (`sahl` / `sahw` dialects → descriptor lists, [`compiler/`](compiler/README.md)) instead of `.insn` firmware |
 | 6 | Loose- vs tight-coupling benchmark | 🟡 partial | Phase 3 vs 4 board numbers exist; write-up pending |
 | 7 | Vector unit | ✅ done in M3 | fused int8 epilogue + standalone vector ops |
-| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T (C6.5 / C6.5b, sim: Gemma 512, Qwen3 2048, a 1104-token prompt end to end; on the board 2026-10-14: whole Qwen3 at 2048 / Gemma at 512, prefill vs decode only bit-exact over a 2032-token prompt, Qwen3 decode 1.60 tok/s at T = 2048; [plan §8.22](docs/iree_compiler_plan.md)) |
+| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T (C6.5 / C6.5b, sim: Gemma 512, Qwen3 2048, a 1104-token prompt end to end; on the board 2026-10-14: whole Qwen3 at 2048 / Gemma at 512, prefill vs decode only bit-exact over a 2032-token prompt, Qwen3 decode 1.60 tok/s at T = 2048; since 2026-10-15 on the sim: p · V on the GEMV unit with a packed V cache, the tiled q · Kᵀ's blocks of 128, query rows in one EX and a software-pipelined T loop: attention at T = 2048 431.6 → 132.7 ms per token by the cycle model, decode projected 3.1–3.4 tok/s, not yet on the board; [plan §8.22](docs/iree_compiler_plan.md)) |
 | 9 | Documentation and write-up | 🟡 in progress | `docs/` (design doc, learning path) |
 
 The accelerator rebuild replaced the Phase 2–4 unit with a double-buffered
