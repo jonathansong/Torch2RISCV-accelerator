@@ -8,6 +8,7 @@
 #   compiler/scripts/deploy_longctx.sh qwen3|gemma|llama     -> build/deploy_hfgen_<model>_lc<max len>
 #   LC_MAX_LEN=<n>: another length (default qwen3 / llama 2048, gemma 512: its sliding window;
 #   llama at 2048 fills the 1280 MiB pool to 5 MiB, mem_preflight.py: at most 2227)
+#   LC_MB=<MB>: the sim's device window (default 1100, llama 1400)
 #   LC_SUFFIX=<s>: appended to the directories' names (e.g. _pcpi: a new overlay's bundles
 #   beside the earlier ones)
 #   LC_LAYERS=<n>: a truncated model (a dry run of the whole flow: <tag>_l<n>, ~40 min)
@@ -22,7 +23,7 @@ source "$(dirname "$0")/board_env.sh"
 case "${1:-}" in
   qwen3) MODEL=Qwen3-0.6B-W8A8 REF=Qwen3-0.6B LEN=${LC_MAX_LEN:-2048} EXTRA= ;;
   gemma) MODEL=gemma-3-270m REF=gemma-3-270m LEN=${LC_MAX_LEN:-512} EXTRA=--prefill-all ;;
-  llama) MODEL=Llama-3.2-1B-Instruct-W8A8 REF=Llama-3.2-1B-Instruct LEN=${LC_MAX_LEN:-2048} EXTRA= ;;   # (no prefill_all: it does not fit; board_teacher.py --decode)
+  llama) MODEL=Llama-3.2-1B-Instruct-W8A8 REF=Llama-3.2-1B-Instruct LEN=${LC_MAX_LEN:-2048} EXTRA= MB=1400 ;;   # (no prefill_all: it does not fit; board_teacher.py --decode; the sim's window: 1275 MB at 2048)
   *) echo "usage: $0 qwen3|gemma|llama" >&2; exit 2 ;;
 esac
 TAG=$1_lc$LEN${LC_LAYERS:+_l$LC_LAYERS}${LC_SUFFIX:-}
@@ -40,7 +41,7 @@ if [ ! -s "$O/sa.vmfb" ]; then
   echo "compiled in $((SECONDS - T0)) s: $(grep -c ': ok$' "$O/compile.log" || true) executables for the accelerator," \
     "$(grep -c ': on the host' "$O/compile.log" || true) for the host"
 fi
-"${HF[@]}" --skip-export --quant --rope --attn --prefill "$SA_D" $EXTRA --max-len "$LEN" \
+"${HF[@]}" --skip-export --quant --rope --attn --prefill "$SA_D" $EXTRA --max-len "$LEN" --mb "${LC_MB:-${MB:-1100}}" \
   --kv-channel k --kv-calib "$SA_REPO/build/llm_cache/wikitext-2-raw-v1-train.txt:1024" --board-bundle "${O}_bundle" $LAYERS
 HFGEN_TAG=$TAG HFGEN_BUNDLE=${O}_bundle "$SA_COMPILER/scripts/deploy_hfgen.sh"
 D=$SA_REPO/build/deploy_hfgen_$TAG
