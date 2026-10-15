@@ -24,7 +24,7 @@ the matmul unit directly, bypassing its AXI4-Lite CSRs.
 > | 0 | legacy 8×8×8 jobs | `mat_trigger` 0, `mat_status` 1, `mat_reset` 2, `mat_wait` 3, `mat_cycles` 4 | this page |
 > | 1 | matrix / DMA / host | `mat_cfg` 0, `mat_load` 1, `mat_store` 2, `mat_exec` 3, `mat_fence` 4, `mat_perf` 5, `mat_submit` 6, **`mat_notify` 7** (L1) | `double_buffer_design.md` §8.1–8.3, §8.6; `llm_inference_plan.md` §5 |
 > | 2 | vector | `vec_cfg` 0, `vec_run` 1 | `double_buffer_design.md` §8.4; `llm_inference_plan.md` §6.6 |
-> | 3 | GEMV (**proposed**, not implemented) | `gemv_cfg` 0, `gemv_run` 1 | `riscv_backend_design.md` §4.1 |
+> | 3 | GEMV over PCPI (CAPS bit 26; RTL / simulation, not yet in a bitstream) | `gemv_cfg` 0, `gemv_run` 1 | `riscv_backend_design.md` §4.1 |
 >
 > These are the extensions since M5:
 >
@@ -71,7 +71,7 @@ the matmul unit directly, bypassing its AXI4-Lite CSRs.
 | 4 | `mat_cycles` | rd | Accelerator cycles of the last job (CYCLES) | no |
 
 - `funct7` must be 0 and `funct3` ≤ 4 for this group. Encodings no group
-  claims (today: funct7 = 2 with funct3 ≥ 2, and funct7 ≥ 3) are not
+  claims (today: funct7 = 2 with funct3 ≥ 2, funct7 = 3 with funct3 ≥ 2 or without the GEMV unit, and funct7 ≥ 4) are not
   answered, so the core's PCPI timeout turns them into an illegal-instruction
   trap.
 - `mat_perf`, `mat_submit` and `mat_notify` exist only on overlays that set

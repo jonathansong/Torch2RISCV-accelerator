@@ -13,17 +13,24 @@
 //              mat_cfg keys 11..34 write the fetch unit's BASE0..15 /
 //              PARAM0..7 (waiting while a list runs).
 //   funct7 = 2: vec_cfg (0), vec_run (1) -> command queue (M3 vector engine)
+//   funct7 = 3 (GEMV != 0 only): gemv_cfg (0), gemv_run (1) -> an LD in mode
+//              GEMV, the descriptor's command (pkt_ldg): rs1 = strip 0's DDR
+//              address, rs2 = {acc [28], strips - 1 [18:16], ACC word [15:0]},
+//              K bytes / pitch / x word / C step from gemv_cfg
+//              (docs/riscv_backend_design.md §4.1)
 // Load/store/exec capture the current configuration into the packet, so
 // software may reconfigure right after issuing. With a sticky error set,
 // new commands are dropped (the core never blocks on a halted queue).
-// Unclaimed encodings are not answered: the core raises its illegal-
+// Unclaimed encodings (funct7 = 2 / 3 with funct3 >= 2, funct7 = 3 without
+// GEMV, funct7 >= 4) are not answered: the core raises its illegal-
 // instruction trap after the PCPI timeout.
 `timescale 1ns / 1ps
 `include "sa_macros.vh"
 
 module sa_pcpi #(
     parameter integer D    = 8,            // VL: vec_cfg LEN is in elements
-    parameter integer NCNT = 32            // performance counters (0: none), returned by mat_perf control
+    parameter integer NCNT = 32,           // performance counters (0: none), returned by mat_perf control
+    parameter integer GEMV = 0             // funct7 = 3: GEMV over PCPI (the unit has sa_gemv)
 ) (
     input  wire                  clk,
     input  wire                  resetn,
@@ -83,7 +90,8 @@ module sa_pcpi #(
     wire       ours   = opcode == 7'b0001011 &&
                         ((funct7 == 7'd0 && funct3 <= 3'd4) ||
                          funct7 == 7'd1 ||
-                         (funct7 == 7'd2 && funct3 <= 3'd1));
+                         (funct7 == 7'd2 && funct3 <= 3'd1) ||
+                         (GEMV != 0 && funct7 == 7'd3 && funct3 <= 3'd1));
 
     assign pcpi_wait = pcpi_valid && ours;
 
@@ -104,6 +112,10 @@ module sa_pcpi #(
     reg [10:0] v_flags;                // L2 fp32 VE fields (vec_cfg keys 10..15)
     reg [31:0] v_imm, v_a, v_b, v_row, v_p1s;
     wire       v_fp_cmd = v_flags[0] && v_op[2:0] != VOP_TRANSPOSE;
+    // GEMV configuration (gemv_cfg)
+    reg [15:0] g_kbytes, g_xword;
+    reg [31:0] g_pitch;
+    reg [7:0]  g_cstep;
     wire [11:0] ex_rep_m1 = ex_rep == 0 ? 12'd0 : ex_rep - 12'd1;
 
     localparam [1:0] S_IDLE = 0, S_EXEC = 1, S_DONE = 2;
@@ -139,6 +151,7 @@ module sa_pcpi #(
             v_op <= 0; v_groups <= 1; v_dst <= 0; v_types <= {2'd2, 2'd2}; v_mod <= 0;
             v_scale <= 1; v_shift <= 0; v_zp <= 0; v_lo <= 32'h80000000; v_hi <= 32'h7FFFFFFF;
             v_flags <= 0; v_imm <= 0; v_a <= 32'h3F80_0000; v_b <= 0; v_row <= 0; v_p1s <= 0;
+            g_kbytes <= 256; g_pitch <= 256; g_xword <= 0; g_cstep <= 1;
         end else begin
             case (state)
                 S_IDLE:
@@ -150,11 +163,15 @@ module sa_pcpi #(
                         state <= S_EXEC;
                         // build the packet now, from the configuration current at issue
                         q_pkt <= 0;
-                        if (funct7[0] && funct3 == 3'd1)
+                        if (funct7 == 7'd1 && funct3 == 3'd1)
                             q_pkt <= pkt_ld(pcpi_rs1, pcpi_rs2, ld_rows, ld_rb, ld_pitch, ld_mode);
-                        if (funct7[0] && funct3 == 3'd2)
+                        if (funct7 == 7'd1 && funct3 == 3'd2)
                             q_pkt <= pkt_st(pcpi_rs1, pcpi_rs2, st_rows, st_rb, st_pitch);
-                        if (funct7[0] && funct3 == 3'd3)       // {acc, Kt, C} {B, A} + EX config
+                        if (funct7 == 7'd3 && funct3 == 3'd1)  // gemv_run: strips at rs1, {acc, strips - 1, C}
+                            q_pkt <= pkt_ldg(pcpi_rs1, {MEM_ACC, 12'd0, pcpi_rs2[15:0]},
+                                             {13'd0, pcpi_rs2[18:16]} + 16'd1, g_kbytes, g_pitch, MODE_GEMV,
+                                             g_xword, g_cstep, pcpi_rs2[28]);
+                        if (funct7 == 7'd1 && funct3 == 3'd3)  // {acc, Kt, C} {B, A} + EX config
                             q_pkt <= pkt_ex(pcpi_rs1[15:0], pcpi_rs1[31:16], pcpi_rs2[15:0], pcpi_rs2[27:16],
                                             pcpi_rs2[28], ex_rep_m1, ex_bstep, ex_cstep, ex_crow);
                         if (funct7 == 7'd2 && funct3 == 3'd1)  // vec_run: src1, src2 + VE config
@@ -193,6 +210,24 @@ module sa_pcpi #(
                             endcase
                             respond(0, 0);
                         end else if (q_valid && q_ready) begin   // vec_run
+                            q_valid <= 0;
+                            respond(0, 0);
+                        end else if (sched_err) begin
+                            q_valid <= 0;
+                            respond(0, 0);
+                        end else if (!fetch_busy)            // after a running list
+                            q_valid <= 1;
+                    end else if (grp == 2'd3) begin       // GEMV (GEMV != 0)
+                        if (op == 3'd0) begin                // gemv_cfg
+                            case (rs1[7:0])
+                                GCFG_KBYTES: g_kbytes <= rs2[15:0];
+                                GCFG_PITCH:  g_pitch  <= rs2;
+                                GCFG_XWORD:  g_xword  <= rs2[15:0];
+                                GCFG_CSTEP:  g_cstep  <= rs2[7:0];
+                                default: ;
+                            endcase
+                            respond(0, 0);
+                        end else if (q_valid && q_ready) begin   // gemv_run
                             q_valid <= 0;
                             respond(0, 0);
                         end else if (sched_err) begin

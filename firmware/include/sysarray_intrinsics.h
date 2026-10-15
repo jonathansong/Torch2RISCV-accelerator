@@ -92,7 +92,8 @@ static inline uint32_t mat_cycles(void)
 #define SA_CAPS_CMDX    (1u << 24)    /* L1: BASE0-15, PARAM0-7, dynamic fields,
                                        *     SETREG, LOOP_END, CALL / RET, LDPARAM   */
 #define SA_CAPS_FPVE    (1u << 23)    /* L2: fp32 vector engine, SFU, TRANSPOSE       */
-#define SA_CAPS_GEMV    (1u << 25)    /* K2b: LD mode GEMV (descriptors only)         */
+#define SA_CAPS_GEMV    (1u << 25)    /* K2b: LD mode GEMV (descriptors)              */
+#define SA_CAPS_GEMV_PCPI (1u << 26)  /* C7: GEMV over PCPI (gemv_cfg / gemv_run)     */
 static uint32_t sa_caps_runtime = 0u;
 #ifndef SA_D
 static uint32_t sa_d_runtime = 8u;
@@ -123,6 +124,7 @@ static inline int sa_has_cmdx(void) { return (sa_caps_runtime & SA_CAPS_CMDX) !=
 static inline int sa_has_fpve(void) { return (sa_caps_runtime & SA_CAPS_FPVE) != 0; }
 /* K2b: the GEMV unit (docs/k2b_gemv_design.md) */
 static inline int sa_has_gemv(void) { return (sa_caps_runtime & SA_CAPS_GEMV) != 0; }
+static inline int sa_has_gemv_pcpi(void) { return (sa_caps_runtime & SA_CAPS_GEMV_PCPI) != 0; }
 #define SA_SPAD_WORDS   (131072u / SA_D)            /* per SPAD, D-byte words      */
 #define SA_ACC_WORDS    (262144u / (4u * SA_D))     /* D x int32 words             */
 #define SA_SPAD_BANK    (SA_SPAD_WORDS / 2u)        /* first word of bank 1        */
@@ -214,6 +216,38 @@ static inline void mat_cfg_store(uint32_t rows, uint32_t row_bytes, uint32_t pit
     mat_cfg(SA_CFG_ST_ROWS, rows);
     mat_cfg(SA_CFG_ST_ROW_BYTES, row_bytes);
     mat_cfg(SA_CFG_ST_PITCH, pitch);
+}
+
+/* ------------------------------------------------------------------------
+ * funct7 = 3: GEMV over PCPI (CAPS bit 26; docs/riscv_backend_design.md §4.1)
+ * gemv_run(w, c, strips, acc): for s < strips (1 .. 8), ACC word
+ * c + s * CSTEP (+)= x . W_s, x = KBYTES / 16 int8 at SPAD_A word XWORD,
+ * W_s = KBYTES bytes at w + s * PITCH (w 16-byte aligned); the descriptor's
+ * LD in mode GEMV (same engine, scoreboard, errors). The configuration is
+ * sticky: set it once per layer with gemv_cfg_all.
+ * ---------------------------------------------------------------------- */
+#define SA_GCFG_KBYTES       0u      /* bytes per strip = K x 16, multiple of 256 (reset 256) */
+#define SA_GCFG_PITCH        1u      /* DDR bytes between strips (reset 256)       */
+#define SA_GCFG_XWORD        2u      /* SPAD_A word of x (reset 0)                 */
+#define SA_GCFG_CSTEP        3u      /* ACC words between strips' results (reset 1) */
+
+static inline void gemv_cfg(uint32_t key, uint32_t value)
+{
+    __asm__ volatile (".insn r 0x0B, 0, 3, x0, %0, %1" :: "r"(key), "r"(value));
+}
+
+static inline void gemv_cfg_all(uint32_t k, uint32_t pitch, uint32_t xword, uint32_t cstep)
+{
+    gemv_cfg(SA_GCFG_KBYTES, k * 16u);
+    gemv_cfg(SA_GCFG_PITCH, pitch);
+    gemv_cfg(SA_GCFG_XWORD, xword);
+    gemv_cfg(SA_GCFG_CSTEP, cstep);
+}
+
+static inline void gemv_run(uint32_t w, uint32_t c, uint32_t strips, uint32_t acc)
+{
+    uint32_t rs2 = (acc ? (1u << 28) : 0u) | (((strips - 1u) & 7u) << 16) | (c & 0xFFFFu);
+    __asm__ volatile (".insn r 0x0B, 1, 3, x0, %0, %1" :: "r"(w), "r"(rs2) : "memory");
 }
 
 /* ------------------------------------------------------------------------

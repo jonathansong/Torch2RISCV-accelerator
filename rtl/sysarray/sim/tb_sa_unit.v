@@ -1448,6 +1448,21 @@ module tb_sa_unit;
         end
     endtask
 
+    // GEMV over PCPI (funct7 = 3, docs/riscv_backend_design.md §4.1): gemv_cfg keys, gemv_run
+    localparam [7:0] G_KBYTES = 0, G_PITCH = 1, G_XWORD = 2, G_CSTEP = 3;
+    task g_op(input [2:0] f3, input [31:0] rs1, input [31:0] rs2);
+        begin
+            pcpi_exec(custom0(f3, 7'd3), rs1, rs2);
+            if (pc_cycles < 0) fail("GEMV PCPI instruction timed out (would trap)");
+        end
+    endtask
+    task gemv_cfg(input integer k, input [31:0] pitch, input integer xw, input integer cs);
+        begin g_op(3'd0, G_KBYTES, k * 16); g_op(3'd0, G_PITCH, pitch); g_op(3'd0, G_XWORD, xw); g_op(3'd0, G_CSTEP, cs); end
+    endtask
+    task gemv_run(input [31:0] ddr, input integer c, input integer strips, input acc);
+        g_op(3'd1, ddr, {3'd0, acc, 9'd0, strips[2:0] - 3'd1, c[15:0]});
+    endtask
+
     task gemv_tests;
         integer i, r0, r1, r2;
         begin
@@ -1502,9 +1517,55 @@ module tb_sa_unit;
                 submit(DL, 0); desc_expect_err(4'd1, 4'd0, "GEMV err: LD mode 3");
                 dl_begin(DL); d_gemv(GW + 8, 40, 1, 64, 1024, 500, 1, 0); d_end(0);
                 submit(DL, 0); desc_expect_err(4'd1, 4'd0, "GEMV err: DDR not 16-byte aligned");
+                // ---- the same GEMVs over PCPI (gemv_cfg / gemv_run): x by a PCPI LD,
+                //      3 strips C step 2, then accumulate with x resident
+                cfg_ld(1, 64, 64, 0);
+                ld(GX, M_A, 500);
+                gemv_cfg(64, 1040, 500, 2);
+                r0 = gx_reads;
+                gemv_run(GW, 40, 3, 0);
+                fence(0);
+                r1 = gx_reads;
+                gemv_ref(GW, 0, 3, 64, 1040, 0);
+                gemv_check(40, 3, 2, "PCPI GEMV: 3 strips, C step 2");
+                gemv_run(GW + 16, 40, 3, 1);
+                fence(0);
+                r2 = gx_reads;
+                gemv_ref(GW + 16, 0, 3, 64, 1040, 1);
+                gemv_check(40, 3, 2, "PCPI GEMV: accumulate, x resident");
+                gemv_checks = gemv_checks + 1;
+                if (r1 - r0 != 4 || r2 != r1) fail("PCPI GEMV: x words read (4, then resident)");
+                // 8 strips, K = 256 across the SPAD_A banks; the configuration is sticky
+                cfg_ld(1, 256, 256, 0);
+                ld(GX + 64, M_A, SW/2 - 8);
+                gemv_cfg(256, 4096 + 16, SW/2 - 8, 1);
+                gemv_run(GW, CW/2 - 4, 8, 0);
+                fence(0);
+                gemv_ref(GW, 64, 8, 256, 4096 + 16, 0);
+                gemv_check(CW/2 - 4, 8, 1, "PCPI GEMV: 8 strips, K = 256, across banks");
+                gemv_run(GW, CW/2 - 4, 8, 1);                     // (no gemv_cfg: kept)
+                fence(0);
+                gemv_ref(GW, 64, 8, 256, 4096 + 16, 1);
+                gemv_check(CW/2 - 4, 8, 1, "PCPI GEMV: configuration kept between runs");
+                // errors as the descriptor's: unaligned DDR; K bytes not a multiple of 256
+                gemv_cfg(64, 1040, 500, 2);
+                gemv_run(GW + 8, 40, 1, 0);
+                desc_expect_err(4'd1, 4'd0, "PCPI GEMV err: DDR not 16-byte aligned");
+                g_op(3'd0, G_KBYTES, 1000);
+                gemv_run(GW, 40, 1, 0);
+                desc_expect_err(4'd1, 4'd0, "PCPI GEMV err: K bytes not a multiple of 256");
+                // funct7 = 3 funct3 = 2 stays unclaimed (the core traps)
+                pcpi_exec(custom0(3'd2, 7'd3), 0, 0);
+                gemv_checks = gemv_checks + 1;
+                if (pc_cycles >= 0) fail("PCPI GEMV: funct3 = 2 answered");
+                cfg_ld(1, 8, 8, 0);
             end else begin
                 dl_begin(DL); d_gemv(GW, 40, 3, 64, 1040, 500, 2, 0); d_end(0);
                 submit(DL, 0); desc_expect_err(4'd1, 4'd0, "GEMV err: no GEMV unit");
+                // without the unit gemv_run is unclaimed (the core traps)
+                pcpi_exec(custom0(3'd1, 7'd3), GW, 32'h0002_0028);
+                gemv_checks = gemv_checks + 1;
+                if (pc_cycles >= 0) fail("PCPI GEMV answered without a GEMV unit");
             end
         end
     endtask
@@ -1827,8 +1888,12 @@ module tb_sa_unit;
         // --- unknown encodings are not claimed (core must trap)
         pcpi_exec(custom0(3'd5, 7'd0), 0, 0);
         if (pc_cycles >= 0) fail("funct3=5 was answered");
-        pcpi_exec(custom0(3'd0, 7'd3), 0, 0);
-        if (pc_cycles >= 0) fail("funct7=3 was answered");
+        pcpi_exec(custom0(3'd0, 7'd4), 0, 0);
+        if (pc_cycles >= 0) fail("funct7=4 was answered");
+        if (!GEMV) begin                          // (funct7 = 3: GEMV over PCPI when the unit has it)
+            pcpi_exec(custom0(3'd0, 7'd3), 0, 0);
+            if (pc_cycles >= 0) fail("funct7=3 was answered without a GEMV unit");
+        end
         pcpi_exec(custom0(3'd2, 7'd2), 0, 0);
         if (pc_cycles >= 0) fail("funct7=2 funct3=2 was answered");
         pcpi_exec(32'h02B50533, 0, 0);            // mul a0,a0,a1 (not custom-0)
@@ -1912,9 +1977,9 @@ module tb_sa_unit;
         if (xst[11:8] !== 4'd2) fail("bad memory id: wrong ext status");
         mat_op(F_RESET, 0, 0);
         // (funct7 = 1 uses all funct3 values: 5 mat_perf, 6 mat_submit, 7 mat_notify)
-        expect_csr(8'h24, 32'h01E0_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + (GEMV ? 32'h0200_0000 : 32'd0) +
+        expect_csr(8'h24, 32'h01E0_0000 + (PERF != 0 ? 32'h0010_0000 : 32'd0) + (GEMV ? 32'h0600_0000 : 32'd0) +
                    NP * 32'h0001_0000 + D * 256 + D,
-                   "CAPS");     // [25] GEMV, [24] command ext., [23] fp32 VE, [22] notify, [21] desc, [20] perf, 1 port, VL = D, D
+                   "CAPS");     // [26] GEMV over PCPI, [25] GEMV, [24] command ext., [23] fp32 VE, [22] notify, [21] desc, [20] perf, 1 port, VL = D, D
         csr_read(8'h28, ext_rd);
         if (ext_rd[0] !== 1'b1 || ext_rd[1] !== 1'b0) fail("EXT_STATUS not idle/ok at the end");
 

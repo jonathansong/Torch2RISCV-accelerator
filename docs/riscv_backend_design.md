@@ -69,17 +69,17 @@ The pre-research should measure A against B on the same dispatches (§5) and dem
 | `sahw.fence` (mask) | FENCE | `mat_fence(mask)` |
 | fence-before flags, list END | | `mat_fence(0)` before return |
 
-### 4.1 Proposed: GEMV over PCPI (`gemv_cfg` / `gemv_run`, funct7 = 3)
+### 4.1 GEMV over PCPI (`gemv_cfg` / `gemv_run`, funct7 = 3; RTL and simulation 2026-10-15, not on the board)
 
 GEMV is LD mode 2 with three fields only the descriptor path fills (`xword`, `cstep`, `acc`: descriptor w3[58:34], `pkt_ldg` in `sa_defs.vh`); the PCPI decoder builds LDs with `pkt_ld`, so a GEMV over PCPI would go out with cstep = 0 (a shape error). The proposal gives it its own group, in the style of `mat_exec`: what changes per chunk in the two source registers, what stays per layer in sticky configuration.
 
 | funct7 / funct3 | Mnemonic | Operands | Semantics |
 |---|---|---|---|
-| 3 / 0 | `gemv_cfg` | rs1 = key, rs2 = value | key 0 `KBYTES`: bytes per strip = K × 16 (a multiple of 256, ≤ 65535; reset 256); key 1 `PITCH`: DDR bytes between strips (reset 256); key 2 `XWORD`: SPAD_A word of x (reset 0); key 3 `CSTEP`: ACC words between strips' results (1 … 255, reset 1). Waits while a list runs (as `mat_cfg`) |
+| 3 / 0 | `gemv_cfg` | rs1 = key, rs2 = value | key 0 `KBYTES`: bytes per strip = K × 16 (a multiple of 256, ≤ 65535; reset 256); key 1 `PITCH`: DDR bytes between strips (reset 256); key 2 `XWORD`: SPAD_A word of x (reset 0); key 3 `CSTEP`: ACC words between strips' results (1 … 255, reset 1). Registers of the PCPI front end (as `mat_cfg`'s LD keys): no wait |
 | 3 / 1 | `gemv_run` | rs1 = DDR address of strip 0 (16-byte aligned); rs2 = `acc << 28 \| (strips − 1) << 16 \| C` | One LD in mode GEMV: for s < strips (1 … 8), ACC word C + s · CSTEP (+)= x · W_s, x = KBYTES / 16 int8 from SPAD_A word XWORD, W_s at rs1 + s · PITCH. Same command as the descriptor's (`pkt_ldg`), so the same engine (LD), scoreboard, ports and errors; returns once queued |
 
 - A decode GEMV chunk is then one `gemv_run` (K split: the second block's `acc` = 1 in the same register), against a `mat_cfg` per changed field plus `mat_load` with LD mode keys extended.
-- Hardware: `sa_pcpi.v` decodes funct7 = 3 funct3 0–1 (four configuration registers, `pkt_ldg`); a CAPS bit (26, "GEMV over PCPI"); `sysarray_intrinsics.h` wrappers `gemv_cfg` / `gemv_run`; `tb_sa_unit` cases issuing the same GEMVs over PCPI and as descriptors (results, scoreboard order against a following VE, errors: cstep 0 is no longer reachable, bad alignment, strips 0 impossible by encoding). Logic: four registers and the decode, tens of LUTs; a new bitstream for the board.
+- **Implemented** (RTL, simulation): `sa_pcpi.v` decodes funct7 = 3 funct3 0–1 when built with `GEMV` (four configuration registers, the descriptor's `pkt_ldg`; the funct7 = 1 checks now compare the whole funct7, which bit 0 alone no longer identifies); CAPS bit 26 (`sa_legacy.v`, set with bit 25); `sysarray_intrinsics.h`: `SA_CAPS_GEMV_PCPI`, `gemv_cfg`, `gemv_cfg_all`, `gemv_run` (rv32imc output checked: funct7 = 3, funct3 0 / 1). `tb_sa_unit` (`GEN="D=16 DMA_W=128 GEMV=1"`): the descriptor cases repeated over PCPI against the same reference (3 strips C step 2, accumulate with x resident and the x words read 4 then 0, 8 strips K = 256 across the SPAD_A banks, the configuration kept between runs), errors (DDR not 16-byte aligned, K bytes not a multiple of 256: the descriptor's error codes), funct7 = 3 funct3 = 2 unclaimed; without `GEMV` funct7 = 3 is unclaimed (traps). Two GEMV chunks issue as `gemv_cfg_all` once and one `gemv_run` each (about 20 rv32 instructions for the pair, the configuration included). Logic: four registers and the decode; a new bitstream for the board (not built).
 - The encodings funct7 = 3 funct3 ≥ 2 and funct7 ≥ 4 stay unclaimed (trap).
 
 The emitter needs the same register setup the serializer has (`SahwSerialize.cpp`) and the VE / EX field packing (`DescList.h`); writing it beside the serializer keeps the two encodings consistent.

@@ -43,6 +43,12 @@ localparam [7:0] CFG_EX_C_ROW     = 8'd10;   //     ACC words between rows of a 
 localparam [7:0] CFG_BASE0        = 8'd11;   // descriptor relocation bases BASE0..BASE15 (keys 11..26; L1: 16)
 localparam [7:0] CFG_PARAM0       = 8'd27;   // L1: descriptor parameters PARAM0..PARAM7 (keys 27..34)
 
+// gemv_cfg keys (funct7 = 3, funct3 = 0; docs/riscv_backend_design.md §4.1): GEMV over PCPI
+localparam [7:0] GCFG_KBYTES      = 8'd0;    // bytes per strip = K x 16 (reset 256)
+localparam [7:0] GCFG_PITCH       = 8'd1;    // DDR bytes between strips (reset 256)
+localparam [7:0] GCFG_XWORD       = 8'd2;    // SPAD_A word of x (reset 0)
+localparam [7:0] GCFG_CSTEP       = 8'd3;    // ACC words between strips' results (reset 1)
+
 // vec_cfg keys (funct7 = 2, funct3 = 0), M3
 localparam [7:0] VCFG_OP       = 8'd0;   // [2:0] op, [4] RELU, [5] REQUANT
 localparam [7:0] VCFG_LEN      = 8'd1;   // elements (multiple of VL)

@@ -394,7 +394,7 @@ module sa_unit #(
     wire        leg_trigger, leg_accept, leg_busy, leg_reset, leg_reset_done;
     wire [31:0] leg_desc, leg_dst, leg_status, leg_cycles;
 
-    sa_pcpi #(.D(D), .NCNT(PERF != 0 ? PERF_NCNT : 0)) pcpi (
+    sa_pcpi #(.D(D), .NCNT(PERF != 0 ? PERF_NCNT : 0), .GEMV(GEMV)) pcpi (
         .clk(aclk), .resetn(resetn),
         .pcpi_valid(pcpi_valid), .pcpi_insn(pcpi_insn), .pcpi_rs1(pcpi_rs1), .pcpi_rs2(pcpi_rs2),
         .pcpi_wr(pcpi_wr), .pcpi_rd(pcpi_rd), .pcpi_wait(pcpi_wait), .pcpi_ready(pcpi_ready),
