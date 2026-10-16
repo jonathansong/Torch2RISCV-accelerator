@@ -428,9 +428,10 @@ static iree_status_t run(iree_allocator_t host) {
       sa_rvsched_info(s, &rvs_info);
       fprintf(stderr,
               "rvsched: %u buckets of %d positions recorded in %.3f s; %u lists per step (%u descriptors), %u calls "
-              "of RISC-V code, %u words patched per bucket, table %.1f KB at %#x\n",
+              "of RISC-V code, %u words patched per bucket, table %.1f KB at %#x%s%s\n",
               b1 - b0 + 1, FLAG_pad, t_rec, rvs_info.lists, rvs_info.descriptors, rvs_info.calls, rvs_info.words,
-              rvs_info.table_bytes / 1024.0, rvs_info.table_phys);
+              rvs_info.table_bytes / 1024.0, rvs_info.table_phys, rvs_info.r5_symbol ? "; block argmax by R5 kernel " : "",
+              rvs_info.r5_symbol ? rvs_info.r5_symbol : "");
       t0 = now();
       if (!getenv("SA_RVSCHED_RECORD_ONLY"))          // (tests: the table without the run)
         status = sa_rvsched_run(s, (uint32_t)start, n, (uint32_t)token, FLAG_stop_token, toks_out, toks_out + n,

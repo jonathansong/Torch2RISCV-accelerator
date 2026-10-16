@@ -44,6 +44,8 @@ typedef struct sa_rvsched_info_t {
   uint32_t words;               // list words patched between buckets
   uint32_t table_bytes;
   uint32_t table_phys;
+  uint32_t r5_bytes;            // R5 (SA_R5): the block argmax kernel's rv32 code, 0: the core's own scan
+  const char* r5_symbol;
 } sa_rvsched_info_t;
 
 iree_status_t sa_rvsched_create(sa_context_t* context, uint32_t pad, uint32_t bucket0, uint32_t nbuckets,

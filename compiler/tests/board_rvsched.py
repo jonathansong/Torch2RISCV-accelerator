@@ -22,7 +22,11 @@ calls each dispatch's generated RISC-V code (SA_RV=rv/, compiler/scripts/
 deploy_rvcode.sh) instead of submitting its descriptor list; the ARM's loop of
 run 2 stays on descriptor lists (the reference). Writes rvsched_rv_board.json.
 
-Writes rvsched_board.json.
+--r5 (R5, §5): the core picks the block of the largest maximum with a kernel
+IREE's llvm-cpu compiled for it (r5/, compiler/scripts/deploy_r5.sh; rt_fw
+version 6) instead of its own scan; the ARM's loop of run 2 is the reference.
+
+Writes rvsched_board.json (rvsched_rv_board.json, rvsched_rv_embedded_board.json, rvsched_r5_board.json).
 """
 import argparse
 import json
@@ -38,20 +42,23 @@ sys.path.insert(0, HERE)
 import board_launcher as BL  # noqa: E402
 
 
-def run(env, extra, tokens, gen, rvsched, logits_path, rv=False):
-    """rv: False, or the SA_RV value (an image directory, or "embedded")"""
+def run(env, extra, tokens, gen, rvsched, logits_path, rv=False, r5=False):
+    """rv: False, or the SA_RV value (an image directory, or "embedded"); r5: SA_R5's directory"""
     cmd = [os.path.join(HERE, "sa-llm-run"), "--device=sa", f"--module={HERE}/argmax.vmfb",
            f"--module={HERE}/sa.vmfb", f"--parameters=model={HERE}/sa_packed.irpa",
            "--tokens=" + ",".join(str(int(t)) for t in tokens), f"--generate={gen}",
            f"--logits_out={logits_path}"] + extra + (["--rvsched"] if rvsched else [])
     r = subprocess.run(cmd, capture_output=True, text=True,
-                       env=dict(env, SA_STATS="1", **({"SA_RV": rv} if rv else {})))
+                       env=dict(env, SA_STATS="1", **({"SA_RV": rv} if rv else {}), **({"SA_R5": r5} if r5 else {})))
     if r.returncode:
         raise SystemExit(f"sa-llm-run{' --rvsched' if rvsched else ''} failed ({r.returncode})\n"
                          f"{r.stdout[-2000:]}\n{r.stderr[-3000:]}")
     out = r.stdout
     toks = [int(t) for t in out.strip().splitlines()[0].split(":")[1].split()]
-    res = {"tokens": toks, "stdout": out, "stderr": [l for l in r.stderr.splitlines() if l.startswith(("sa:", "rvsched:"))]}
+    res = {"tokens": toks, "stdout": out,
+           "stderr": [l for l in r.stderr.splitlines() if l.startswith(("sa:", "rvsched:", "sa r5:"))]}
+    if r5 and not any(l.startswith("sa r5: the block argmax by") for l in res["stderr"]):
+        raise SystemExit(f"SA_R5 set but the R5 kernel was not loaded\n{r.stderr[-2000:]}")
     m = re.search(r"rvsched: (\d+) decode steps on the RISC-V core, ([\d.]+) ms per step .*core ([\d.]+) ms per step, "
                   r"its lists ([\d.]+) ms", out)
     if m:
@@ -72,7 +79,9 @@ def main():
     ap.add_argument("--rv", action="store_true", help="the core calls the generated RISC-V code (S3)")
     ap.add_argument("--embedded", action="store_true",
                     help="with --rv: the code iree-compile embedded in sa.vmfb (S4, SA_RV=embedded)")
+    ap.add_argument("--r5", action="store_true", help="the block argmax by the llvm-cpu kernel in r5/ (R5)")
     args = ap.parse_args()
+    r5 = os.path.join(HERE, "r5") if args.r5 else False
     prompt = np.load(os.path.join(HERE, "prompt.npy"))
     want_tokens = [int(t) for t in np.load(os.path.join(HERE, "expected_tokens.npy"))]
     want_logits = np.load(os.path.join(HERE, "expected_logits.npy"))
@@ -86,7 +95,10 @@ def main():
     try:
         # 1. the bundle's prompt, the generation on the core, against the sim's reference
         rv = ("embedded" if args.embedded else os.path.join(HERE, "rv")) if args.rv else False
-        a = run(env, extra, prompt, n_gen, True, lp, rv)
+        a = run(env, extra, prompt, n_gen, True, lp, rv, r5)
+        for l in a["stderr"]:
+            if l.startswith("sa r5:"):
+                print("   " + l)
         got = np.fromfile(lp, np.float32).reshape(-1, want_logits.shape[1])
         same = a["tokens"][:len(want_tokens)] == want_tokens
         last = got[-1].tobytes() == want_logits[-1].tobytes()
@@ -103,7 +115,7 @@ def main():
         g = min(args.gen, vlen - len(prompt))
         if g > 0:
             h = run(env, extra, prompt, g, False, os.path.join(HERE, "logits_arm.f32"))
-            c = run(env, extra, prompt, g, True, lp, rv)
+            c = run(env, extra, prompt, g, True, lp, rv, r5)
             same2 = h["tokens"] == c["tokens"]
             arm = np.fromfile(os.path.join(HERE, "logits_arm.f32"), np.float32).reshape(-1, want_logits.shape[1])
             last2 = np.fromfile(lp, np.float32).reshape(-1, want_logits.shape[1])[-1].tobytes() == arm[-1].tobytes()
@@ -118,8 +130,8 @@ def main():
             ok = ok and same2 and last2
     finally:
         BL.stop(mm, buf)
-    out_name = ("rvsched_rv_embedded_board.json" if args.embedded else "rvsched_rv_board.json") if args.rv \
-        else "rvsched_board.json"
+    out_name = "rvsched" + ("_rv" if args.rv else "") + ("_embedded" if args.rv and args.embedded else "") + \
+        ("_r5" if args.r5 else "") + "_board.json"
     with open(os.path.join(HERE, out_name), "w") as f:
         json.dump(out, f, indent=1)
     print("rvsched PASS" if ok else "rvsched FAILED")

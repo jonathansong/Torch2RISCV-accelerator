@@ -332,6 +332,7 @@ iree_status_t sa_transport_board_open(iree_allocator_t host_allocator, sa_transp
   t->heap_offset = SA_BOARD_HEAP_OFFSET;
   t->d = sa_board_attached.d;
   t->caps = mbox_rd(b, MBOX_FW_VERSION) >= 2 ? mbox_rd(b, MBOX_FW_CAPS) : 0;   // (older rt_fw: unknown)
+  t->fw_version = mbox_rd(b, MBOX_FW_VERSION);
   t->run = sa_board_run;
   if (mbox_rd(b, MBOX_FW_VERSION) >= 3) t->run_sched = sa_board_run_sched;   // (older rt_fw: no schedules)
   if (mbox_rd(b, MBOX_FW_VERSION) >= 4) t->run_call = sa_board_run_call;     // (older rt_fw: no RT_CALL)

@@ -148,6 +148,12 @@ static uint32_t sa_sim_rvs_submit(uint32_t list) {
 
 #if defined(__x86_64__)
 static uint32_t sa_sim_rvs_call(uint32_t code, uint32_t args) {
+  sa_rv_host_fn_t r5 = sa_rv_host_kernel_at(code);   // (R5: a core kernel's host build; no unit commands)
+  if (r5) {
+    const uint32_t* a = (const uint32_t*)(sa_sim_rvs_t->mem + (args - sa_sim_rvs_t->mem_phys));
+    r5(a, a + 16);
+    return 0;
+  }
   const char* sym = sa_rv_symbol_at(code);
   if (!sym) {
     if (iree_status_is_ok(sa_sim_rvs_error))
@@ -217,6 +223,7 @@ iree_status_t sa_transport_sim_open(iree_allocator_t host_allocator, sa_transpor
   t->mem_size = size;
   t->heap_offset = 0;
   t->d = d;
+  t->fw_version = 6;      // (the schedule emulation is firmware/include/rvsched.h as it is)
   // the functional simulator has it all; SA_SIM_CAPS=<CAPS> stands in for another unit (tests)
   t->caps = (1u << 21) | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);
   const char* caps = getenv("SA_SIM_CAPS");

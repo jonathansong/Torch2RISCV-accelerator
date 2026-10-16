@@ -4,8 +4,12 @@
 // docs/riscv_backend_design.md §0, S3). Bucket 0's items are copied into the
 // table once (a list's descriptors, a call's 64-word argument block); the
 // words that differ between buckets are patched by the core at a bucket change.
+// SA_R5=<dir> (R5, docs/riscv_backend_design.md §5): the core picks the block
+// of the largest maximum with a kernel IREE's llvm-cpu compiled for it
+// (compiler/tests/r5_kernel.py: r5.bin, r5.txt; the sim calls r5_host.so).
 #include "sa_rvsched.h"
 
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +45,10 @@ struct sa_rvsched_t {
   uint32_t off_items, off_words, off_buckets, off_values, off_out;
   uint32_t nwords;
   uint32_t last_pos;                 // position of the last step run
+  // R5: the block argmax kernel (code, then its argument block) in the device window
+  void* r5_raw;
+  uint32_t r5_bytes, r5_n, r5_phys, r5_args_phys;
+  char r5_symbol[160];
 };
 
 static void sa_rvs_clear(sa_rvsched_t* s) {
@@ -155,6 +163,58 @@ static iree_status_t sa_rvs_diff(sa_rvsched_t* s, sa_rvs_word_t* idx, uint32_t c
 
 static uint32_t sa_align64(uint32_t x) { return (x + 63u) & ~63u; }
 
+static sa_transport_t* sa_rvs_r5_t;     // (the host build's binding addresses)
+static void* sa_rvs_r5_ptr(uint32_t phys) { return sa_rvs_r5_t->mem + (phys - sa_rvs_r5_t->mem_phys); }
+
+// R5: loads SA_R5's kernel into the device window (after pass 1, with the
+// table: the second pass's recordings see the same allocations).
+static iree_status_t sa_rvs_r5_load(sa_rvsched_t* s, const char* dir) {
+  sa_context_t* c = s->c;
+  sa_transport_t* t = c->transport;
+  if (t->fw_version < 6) {
+    return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "sa r5: the %s transport's rt_fw is version %u, R5 needs 6",
+                            t->name, t->fw_version);
+  }
+  char path[1024];
+  unsigned n = 0, bytes = 0;
+  snprintf(path, sizeof(path), "%s/r5.txt", dir);
+  FILE* f = fopen(path, "r");
+  if (!f) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa r5: cannot open %s", path);
+  int got = fscanf(f, "%159s %u %u", s->r5_symbol, &n, &bytes);
+  fclose(f);
+  if (got != 3) return iree_make_status(IREE_STATUS_DATA_LOSS, "sa r5: %s is not '<symbol> <n> <bytes>'", path);
+  s->r5_n = n;
+  uint32_t args_off = sa_align64(bytes);
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(sa_context_data_allocator(c), args_off + 68u * 4u + 64u, &s->r5_raw));
+  uint8_t* code = (uint8_t*)(((uintptr_t)s->r5_raw + 63) & ~(uintptr_t)63);
+  snprintf(path, sizeof(path), "%s/r5.bin", dir);
+  f = fopen(path, "rb");
+  if (!f) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa r5: cannot open %s", path);
+  size_t rd = fread(code, 1, bytes, f);
+  fclose(f);
+  if (rd != bytes) return iree_make_status(IREE_STATUS_DATA_LOSS, "sa r5: %s is not %u bytes", path, bytes);
+  memset(code + args_off, 0, 68u * 4u);
+  uint32_t code_phys = 0;
+  IREE_RETURN_IF_ERROR(sa_context_phys(c, code, &code_phys));
+  if (strcmp(t->name, "sim") == 0) {     // the sim runs the host build
+    snprintf(path, sizeof(path), "%s/r5_host.so", dir);
+    void* so = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!so) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa r5: %s", dlerror());
+    void (*init)(void* (*)(uint32_t)) = (void (*)(void* (*)(uint32_t)))dlsym(so, "r5_host_init");
+    sa_rv_host_fn_t fn = (sa_rv_host_fn_t)dlsym(so, "r5_entry");
+    if (!init || !fn) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa r5: no r5_host_init / r5_entry in %s", path);
+    sa_rvs_r5_t = t;
+    init(sa_rvs_r5_ptr);
+    sa_rv_set_host_kernel(code_phys, fn);
+  }
+  s->r5_bytes = bytes;
+  s->r5_phys = code_phys;
+  s->r5_args_phys = code_phys + args_off;
+  fprintf(stderr, "sa r5: the block argmax by %s (IREE llvm-cpu, %u bytes of rv32) on the core\n", s->r5_symbol,
+          bytes);
+  return iree_ok_status();
+}
+
 iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
   sa_context_t* c = s->c;
   if (s->pass == 1) {
@@ -189,6 +249,10 @@ iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
     IREE_RETURN_IF_ERROR(iree_allocator_malloc(a, (iree_host_size_t)o + 64, &s->raw));
     s->table = (uint8_t*)(((uintptr_t)s->raw + 63) & ~(uintptr_t)63);
     IREE_RETURN_IF_ERROR(sa_context_phys(c, s->table, &s->table_phys));
+    const char* r5 = getenv("SA_R5");
+    if (r5 && *r5) {
+      IREE_RETURN_IF_ERROR(sa_rvs_r5_load(s, r5));
+    }
     sa_rvs_clear(s);
     s->pass = 2;
     return iree_ok_status();
@@ -263,6 +327,14 @@ iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
     for (uint32_t i = 0; i < n; ++i) v[i] = e->rec.items[idx[i].item].words[idx[i].word];
   }
   free(idx);
+  if (s->r5_bytes) {
+    if (s->r5_n != s->nblocks) {
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "sa r5: the kernel takes %u block maxima, the logits have %u", s->r5_n, s->nblocks);
+    }
+    hdr[RVS_T_ARGMAX] = s->r5_phys;
+    hdr[RVS_T_ARGMAX_ARGS] = s->r5_args_phys;
+  }
   __sync_synchronize();
   s->pass = 3;
   return iree_ok_status();
@@ -281,6 +353,8 @@ void sa_rvsched_info(const sa_rvsched_t* s, sa_rvsched_info_t* out) {
   out->words = s->nwords;
   out->table_bytes = s->table_bytes;
   out->table_phys = s->table_phys;
+  out->r5_bytes = s->r5_bytes;
+  out->r5_symbol = s->r5_bytes ? s->r5_symbol : NULL;
 }
 
 iree_status_t sa_rvsched_run(sa_rvsched_t* s, uint32_t pos, uint32_t steps, uint32_t token, int32_t stop,
@@ -315,6 +389,7 @@ iree_status_t sa_rvsched_run(sa_rvsched_t* s, uint32_t pos, uint32_t steps, uint
                               done, st,
                               st == RVS_E_RANGE   ? " (a position outside the table)"
                               : st == RVS_E_MAGIC ? " (no table)"
+                              : st == RVS_E_ARGMAX ? " (the R5 kernel wrote no block index)"
                                                   : " (an item failed)");
   }
   return status;
@@ -338,5 +413,7 @@ void sa_rvsched_destroy(sa_rvsched_t* s) {
   free(s->item_words);
   free(s->off_copy);
   if (s->raw) iree_allocator_free(sa_context_data_allocator(s->c), s->raw);
+  if (s->r5_raw) iree_allocator_free(sa_context_data_allocator(s->c), s->r5_raw);
+  if (s->r5_bytes) sa_rv_set_host_kernel(0, NULL);
   free(s);
 }

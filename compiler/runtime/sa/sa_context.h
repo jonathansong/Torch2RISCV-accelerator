@@ -40,6 +40,7 @@ struct sa_transport_t {
   uint32_t heap_offset;   // first byte the arena may use (after transport-private data)
   uint32_t d;             // array size of the device
   uint32_t caps;          // the unit's CAPS register (0: unknown, executables' required CAPS not checked)
+  uint32_t fw_version;    // the core firmware's RT_VERSION (firmware/include/mailbox.h; the sim: the current one)
   iree_string_view_t tag; // the dispatch being run (single-dispatch lists; else empty): sim traces
   // Runs the descriptor list at |list_phys| and waits for its completion.
   iree_status_t (*run)(sa_transport_t* t, uint32_t list_phys, sa_completion_t* out);
@@ -199,6 +200,10 @@ void sa_context_profile_reset(void);
 iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap,
                            uint32_t embedded_phys, uint32_t* out_phys);
 const char* sa_rv_symbol_at(uint32_t phys);
+// R5 (sa_rvsched.c, SA_R5): the host build of the core kernel at |phys| (the sim's schedule emulation calls it).
+typedef void (*sa_rv_host_fn_t)(const uint32_t* args, const uint32_t* constants);
+void sa_rv_set_host_kernel(uint32_t phys, sa_rv_host_fn_t fn);
+sa_rv_host_fn_t sa_rv_host_kernel_at(uint32_t phys);
 uint32_t sa_rv_scratch_phys(void);
 iree_status_t sa_rv_call(sa_context_t* c, iree_string_view_t name, const char* symbol, uint32_t code_phys,
                          uint32_t binding_count, const uint32_t* binding_phys, uint32_t constant_count,

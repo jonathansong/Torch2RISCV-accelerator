@@ -6,7 +6,8 @@
  * then, per step, writes the inputs (token, position, the valid mask),
  * patches the lists' words that differ between buckets when the bucket
  * changes, submits the lists (the model's step, then a block-max reduction of
- * the logits), picks the argmax from the block maxima and the winning block,
+ * the logits), picks the argmax from the block maxima (by itself, or with R5 by
+ * a kernel IREE's llvm-cpu compiled for the core) and the winning block,
  * and feeds the token back. The ARM is not involved until the run ends.
  *
  * Shared by rt_fw (firmware/rt/rt_fw.c: ring entry RT_RUN_SCHED) and the sim
@@ -50,12 +51,18 @@ enum {
   RVS_T_OUT,         /*      RVS_O_* words per step */
   RVS_T_DONE,        /* out: steps completed */
   RVS_T_STATUS,      /* out: 0, RVS_E_*, or the unit's status of a failing list */
+  RVS_T_ARGMAX,      /* R5 (rt_fw >= 6): 0, or a kernel compiled by IREE's llvm-cpu for the core
+                      * (compiler/tests/r5_kernel.py) picking the block of the largest maximum:
+                      * called as RVS_CALL(code, args) with binding 0 the block maxima, binding 1
+                      * the i32 result (the word after the 64-word argument block) */
+  RVS_T_ARGMAX_ARGS, /*   its argument block (64 words + the result word) */
   RVS_T_WORDS_ = 24
 };
 enum { RVS_B_TOKEN = 0, RVS_B_POS, RVS_B_VALID, RVS_B_LOGITS, RVS_B_BMAX, RVS_B_WORDS_ = 8 };
 enum { RVS_O_TOKEN = 0, RVS_O_CYCLES, RVS_O_DEVICE, RVS_O_LIST_ERR, RVS_O_WORDS_ = 4 };
 #define RVS_E_MAGIC 0xE0000001u
 #define RVS_E_RANGE 0xE0000002u          /* a position outside the table's buckets */
+#define RVS_E_ARGMAX 0xE0000003u         /* the R5 kernel failed or wrote no block index */
 #define RVS_F32_ONE 0x3F800000u
 
 #ifdef RVS_RD
@@ -78,6 +85,7 @@ static uint32_t rvs_run(uint32_t tab)
     uint32_t nblocks = RVS_T(RVS_T_NBLOCKS), block = RVS_T(RVS_T_BLOCK);
     uint32_t pos = RVS_T(RVS_T_POS), steps = RVS_T(RVS_T_STEPS), token = RVS_T(RVS_T_TOKEN);
     uint32_t stop = RVS_T(RVS_T_STOP), out = RVS_T(RVS_T_OUT);
+    uint32_t r5 = RVS_T(RVS_T_ARGMAX), r5a = RVS_T(RVS_T_ARGMAX_ARGS);
     uint32_t cur = 0xFFFFFFFFu, bk = 0, s;
     RVS_WR(tab + 4u * RVS_T_DONE, 0u);
     for (s = 0; s < steps; ++s, ++pos) {
@@ -120,12 +128,26 @@ static uint32_t rvs_run(uint32_t tab)
             break;
         }
         /* argmax: the first block with the largest maximum, the first position in it holding that value */
-        uint32_t bm = RVS_RD(bk + 4u * RVS_B_BMAX), best = 0, bkey = rvs_key(RVS_RD(bm));
-        for (uint32_t j = 1; j < nblocks; ++j) {
-            uint32_t k = rvs_key(RVS_RD(bm + 4u * j));
-            if (k > bkey) {
-                bkey = k;
-                best = j;
+        uint32_t bm = RVS_RD(bk + 4u * RVS_B_BMAX), best = 0;
+        if (r5) {                        /* the block by the R5 kernel */
+            RVS_WR(r5a, bm);
+            RVS_WR(r5a + 4u, r5a + 256u);
+            RVS_WR(r5a + 256u, 0xFFFFFFFFu);
+            uint32_t st = RVS_CALL(r5, r5a);
+            best = RVS_RD(r5a + 256u);
+            if (st || best >= nblocks) {
+                status = st ? st : RVS_E_ARGMAX;
+                RVS_WR(out + 4u * (RVS_O_WORDS_ * s + RVS_O_LIST_ERR), nitems);
+                break;
+            }
+        } else {
+            uint32_t bkey = rvs_key(RVS_RD(bm));
+            for (uint32_t j = 1; j < nblocks; ++j) {
+                uint32_t k = rvs_key(RVS_RD(bm + 4u * j));
+                if (k > bkey) {
+                    bkey = k;
+                    best = j;
+                }
             }
         }
         uint32_t m = RVS_RD(bm + 4u * best), lg = RVS_RD(bk + 4u * RVS_B_LOGITS) + 4u * block * best, idx = 0;

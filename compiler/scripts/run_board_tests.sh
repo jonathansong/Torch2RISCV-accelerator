@@ -7,10 +7,11 @@
 #   sudo bash ~/run_board_tests.sh               all: rvb gemma qwen3 llama
 #   sudo bash ~/run_board_tests.sh qwen3 llama   only those bundles
 #   sudo REDO=1 bash ~/run_board_tests.sh rvb
-#   rvbc: the RVB cases with generated code (deploy_rvb.sh RVB_GEN=compiled); qwen3's / gemma's rvcode:
+#   rvbc: the RVB cases with generated code (deploy_rvb.sh RVB_GEN=compiled); the models' rvcode:
 #   every dispatch as RISC-V code (deploy_rvcode.sh); their "rvsched --rv": the core's decode loop
-#   calling that code (S3); qwen3's "--embedded" variants: the code iree-compile embedded in sa.vmfb
-#   (S4, deploy_rvembed.sh)
+#   calling that code (S3); the "--embedded" variants: the code iree-compile embedded in sa.vmfb
+#   (S4, deploy_rvembed.sh); "rvsched --r5": the block argmax by a kernel IREE's llvm-cpu compiled
+#   for the core (R5, deploy_r5.sh)
 #   (rvsched: the decode loop on the RISC-V core, after compiler/scripts/deploy_rvsched.sh; without
 #   REDO only the tests not passed yet run)
 # Logs: ~/board_tests_pcpi/<bundle>.<mode>.log, markers .done / .failed, summary.txt.
@@ -35,9 +36,9 @@ declare -A DIR=(
 tests_of() {
   case $1 in
     rvb|rvbc|rvbe) echo "rvb" ;;
-    gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" "rvcode" "rvsched --rv" ;;
-    qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" ;;
-    llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" ;;
+    gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" ;;
+    qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" ;;
+    llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" ;;
   esac
 }
 

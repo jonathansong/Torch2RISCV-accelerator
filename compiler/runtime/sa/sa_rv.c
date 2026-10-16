@@ -138,6 +138,14 @@ const char* sa_rv_symbol_at(uint32_t phys) {
   return NULL;
 }
 
+static uint32_t sa_rv_host_phys;
+static sa_rv_host_fn_t sa_rv_host_fn;
+void sa_rv_set_host_kernel(uint32_t phys, sa_rv_host_fn_t fn) {
+  sa_rv_host_phys = phys;
+  sa_rv_host_fn = fn;
+}
+sa_rv_host_fn_t sa_rv_host_kernel_at(uint32_t phys) { return phys && phys == sa_rv_host_phys ? sa_rv_host_fn : NULL; }
+
 // The transport's scratch for a call: 128 bytes after the argument block (sa_transport_sim.c's one-command lists).
 uint32_t sa_rv_scratch_phys(void) { return sa_rv.scratch_phys; }
 
