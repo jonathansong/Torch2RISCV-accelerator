@@ -19,6 +19,11 @@
  * RT_RUN_SCHED (version 3): w1 is a decode schedule (rvsched.h,
  *   docs/riscv_backend_design.md §7.1): the core runs the decode loop itself,
  *   the lists one after another; status = the schedule's, cycles = the whole run.
+ * RT_CALL (version 4): w1 is generated RISC-V code (docs/riscv_backend_design.md
+ *   §9, plan A), called as f(args, args + 64) with w2 = args: the dispatch's
+ *   16 binding addresses, then its push constants; it issues the dispatch's
+ *   commands over PCPI. Then all engines idle; status = the extended status
+ *   of an error, cycles = call .. idle.
  */
 #include <stdint.h>
 #include "mailbox.h"
@@ -105,6 +110,17 @@ int main(void)
             uint32_t t0 = rdcycle();
             status = rvs_run(e[2]);
             cycles = rdcycle() - t0;
+        } else if (type == RT_CALL) {
+            uint32_t args = e[4];
+            uint32_t t0 = rdcycle();
+            ((void (*)(const uint32_t *, const uint32_t *))e[2])((const uint32_t *)args,
+                                                                 (const uint32_t *)(args + 64u));
+            uint32_t st = mat_fence(SA_ENG_ALL);
+            cycles = rdcycle() - t0;
+            if (st & SA_XST_ERROR) {
+                status = st;
+                mat_reset();
+            }
         } else if (type == RT_RESET) {
             mat_reset();
         } else if (type != RT_NOP && type != RT_EXIT) {

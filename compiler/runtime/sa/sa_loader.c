@@ -75,6 +75,9 @@ typedef struct sa_export_t {
   uint32_t est_cycles;
   uint32_t setup_count;     // 0: the default setup
   const sa_setup_t* setup;  // in the executable's host allocation
+  int rv_state;             // generated RISC-V code (sa_rv.c): 0 not looked up, 1 none, 2 rv_phys
+  uint32_t rv_phys;
+  char rv_symbol[160];
 } sa_export_t;
 
 typedef struct sa_executable_t {
@@ -231,6 +234,20 @@ iree_status_t sa_executable_append(iree_hal_executable_t* executable, uint32_t o
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa: '%.*s' takes %u bindings / %u constants",
                             (int)x->name.size, x->name.data, e->attrs[ordinal].binding_count,
                             e->attrs[ordinal].constant_count);
+  }
+  // plan A (SA_RV): the export's generated RISC-V code instead of its descriptor list
+  sa_export_t* xm = &e->exports[ordinal];
+  if (xm->rv_state == 0) {
+    IREE_RETURN_IF_ERROR(sa_rv_lookup(e->context, x->name, xm->rv_symbol, sizeof(xm->rv_symbol), &xm->rv_phys));
+    xm->rv_state = xm->rv_phys ? 2 : 1;
+  }
+  if (xm->rv_state == 2) {
+    uint32_t phys[16];
+    for (uint32_t i = 0; i < binding_count && i < 16; ++i) {
+      IREE_RETURN_IF_ERROR(sa_context_phys(e->context, binding_ptrs[i], &phys[i]));
+    }
+    return sa_rv_call(e->context, x->name, xm->rv_symbol, xm->rv_phys, binding_count, phys, constant_count,
+                      constants);
   }
   uint32_t regs[24], vals[24], n = 0;
   IREE_RETURN_IF_ERROR(

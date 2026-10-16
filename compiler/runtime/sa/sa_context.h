@@ -46,6 +46,12 @@ struct sa_transport_t {
   // Runs the decode schedule (firmware/include/rvsched.h) at |table_phys| on
   // the device's RISC-V core and waits; NULL: not supported (sa_rvsched.c).
   iree_status_t (*run_sched)(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status);
+  // Calls generated RISC-V code (sa_rv.c, docs/riscv_backend_design.md §9.4) at |code_phys|
+  // with the argument block at |args_phys| (16 binding addresses, then the push constants;
+  // 128 bytes after it are the transport's scratch) and waits; |symbol| names the function
+  // (the sim calls its host build); NULL: not supported.
+  iree_status_t (*run_call)(sa_transport_t* t, uint32_t code_phys, uint32_t args_phys, const char* symbol,
+                            sa_completion_t* out);
   void (*close)(sa_transport_t* t);
   void* impl;
 };
@@ -105,6 +111,7 @@ typedef struct sa_context_t {
   uint64_t host_dispatches;        // dispatches run on the host (the VMVX fallback)
   uint64_t host_ops;               // fills, updates and copies done by the host (sa_command_buffer.c)
   sa_record_t* record;             // recording (sa_rvsched.c), else NULL
+  uint64_t rv_calls;               // dispatches run as RISC-V code (sa_rv.c)
   // statistics: prefixes run inside an earlier dispatch / before their FENCE,
   // barriers, FENCEs emitted
   uint64_t batch_hosted, batch_hoisted, batch_barriers, batch_fences;
@@ -178,6 +185,14 @@ void sa_context_profile_report(void* f, double per_step, const char* label);
 // Totals since the last reset: dispatches, device cycles, host ns.
 void sa_context_profile_totals(uint64_t* dispatches, uint64_t* cycles, uint64_t* host_ns);
 void sa_context_profile_reset(void);
+
+// Generated RISC-V code (sa_rv.c; SA_RV=<dir>): the function of an export (0: none,
+// the descriptor list then) and its symbol; a dispatch through it (the pending
+// batch flushed first).
+iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap, uint32_t* out_phys);
+iree_status_t sa_rv_call(sa_context_t* c, iree_string_view_t name, const char* symbol, uint32_t code_phys,
+                         uint32_t binding_count, const uint32_t* binding_phys, uint32_t constant_count,
+                         const uint32_t* constants);
 
 // Registers the "sa" HAL driver (sa_driver_module.c).
 iree_status_t iree_hal_sa_driver_module_register(iree_hal_driver_registry_t* registry);

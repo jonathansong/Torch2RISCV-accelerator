@@ -90,6 +90,64 @@ static iree_status_t sa_sim_run_sched(sa_transport_t* t, uint32_t table_phys, do
   return st;
 }
 
+#if defined(__x86_64__)
+// Generated RISC-V code on the sim (plan A, sa_rv.c): the host build of the
+// same code (SA_RV's rvcode_host.so, firmware/rv/sa_rv_rt.c SA_RV_SIM), each
+// command handed back here and run as a one-command list in the transport's
+// scratch (128 bytes after the argument block).
+#include <dlfcn.h>
+static void* sa_sim_rv_so;
+static sa_transport_t* sa_sim_rv_tp;
+static uint32_t sa_sim_rv_list, sa_sim_rv_err;
+static iree_status_t sa_sim_rv_status;
+static void sa_sim_rv_cmd(const uint64_t* w) {
+  if (sa_sim_rv_err || !iree_status_is_ok(sa_sim_rv_status)) return;
+  sa_transport_t* t = sa_sim_rv_tp;
+  uint64_t* p = (uint64_t*)(t->mem + (sa_sim_rv_list - t->mem_phys));
+  memcpy(p, w, 64);
+  memset(p + 8, 0, 64);
+  p[8] = 0x12;                                    // END 0x5A
+  p[9] = 0x5A;
+  __sync_synchronize();
+  sa_completion_t done = {0};
+  iree_status_t st = sa_sim_run(t, sa_sim_rv_list, &done);
+  if (!iree_status_is_ok(st)) sa_sim_rv_status = st;
+  else if (done.status) sa_sim_rv_err = done.status;
+}
+static uint32_t sa_sim_rv_load32(uint32_t a) {
+  return *(volatile uint32_t*)(sa_sim_rv_tp->mem + (a - sa_sim_rv_tp->mem_phys));
+}
+static iree_status_t sa_sim_run_call(sa_transport_t* t, uint32_t code_phys, uint32_t args_phys, const char* symbol,
+                                     sa_completion_t* out) {
+  (void)code_phys;
+  if (!sa_sim_rv_so) {
+    const char* dir = getenv("SA_RV");
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/rvcode_host.so", dir ? dir : ".");
+    sa_sim_rv_so = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!sa_sim_rv_so) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa sim: %s", dlerror());
+    void (*init)(void (*)(const uint64_t*), uint32_t (*)(uint32_t)) =
+        (void (*)(void (*)(const uint64_t*), uint32_t (*)(uint32_t)))dlsym(sa_sim_rv_so, "sa_rv_sim_init");
+    if (!init) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa sim: no sa_rv_sim_init in %s", path);
+    init(sa_sim_rv_cmd, sa_sim_rv_load32);
+  }
+  void (*fn)(const uint32_t*, const uint32_t*) = (void (*)(const uint32_t*, const uint32_t*))dlsym(sa_sim_rv_so, symbol);
+  if (!fn) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa sim: no function %s in rvcode_host.so", symbol);
+  sa_sim_rv_tp = t;
+  sa_sim_rv_list = args_phys + 256;
+  sa_sim_rv_err = 0;
+  sa_sim_rv_status = iree_ok_status();
+  const uint32_t* args = (const uint32_t*)(t->mem + (args_phys - t->mem_phys));
+  fn(args, args + 16);
+  memset(out, 0, sizeof(*out));
+  out->status = sa_sim_rv_err;
+  out->end = 0x5A;
+  iree_status_t st = sa_sim_rv_status;
+  sa_sim_rv_status = iree_ok_status();
+  return st;
+}
+#endif
+
 static void sa_sim_close(sa_transport_t* t) {
   sa_sim_t* s = (sa_sim_t*)t->impl;
   if (write(s->fd, "QUIT\n", 5) != 5) { /* the server may be gone */ }
@@ -138,6 +196,9 @@ iree_status_t sa_transport_sim_open(iree_allocator_t host_allocator, sa_transpor
   if (caps) t->caps = (uint32_t)strtoul(caps, NULL, 0);
   t->run = sa_sim_run;
   t->run_sched = sa_sim_run_sched;
+#if defined(__x86_64__)
+  t->run_call = sa_sim_run_call;
+#endif
   t->close = sa_sim_close;
   t->impl = s;
   *out = t;

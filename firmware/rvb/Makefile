@@ -29,9 +29,23 @@ else
 LDFLAGS := -fuse-ld=lld -T $(FW_ROOT)/common/link.ld -Wl,--gc-sections
 endif
 
+# rv_dispatch.py --code compiled: rvb_gen.c calls the export's generated function (rvb_gen.ll,
+# docs/riscv_backend_design.md §9), linked with its runtime. In DDR both go to .rvb_gen
+# (link_ddr.ld, by object name): position independent (medany: PC-relative), no jump tables,
+# no linker relaxation (gp-relative accesses would tie the code to its link address).
+RVLL := $(wildcard $(RVB)/rvb_gen.ll)
+RVFLAGS := --target=riscv32-unknown-elf -march=rv32imc -mabi=ilp32 -O2 -ffreestanding -fno-builtin -nostdlib \
+           -mcmodel=medany -fno-jump-tables -mno-relax -fno-asynchronous-unwind-tables -fno-unwind-tables -Wno-override-module -I$(FW_ROOT)/include
+define rvobjs
+$(if $(RVLL),$(CC) $(RVFLAGS) -c $(RVLL) -o $(1)/rvb_gen_ll.o && \
+  $(CC) $(RVFLAGS) -c $(FW_ROOT)/rv/sa_rv_rt.c -o $(1)/sa_rv_rt.o,true)
+endef
+RVOBJS = $(if $(RVLL),$(1)/rvb_gen_ll.o $(1)/sa_rv_rt.o)
+
 sim:
 	mkdir -p $(SIM)
-	$(CC) $(CFLAGS) $(LDFLAGS) $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c -o $(SIM)/rvb_fw.elf
+	$(call rvobjs,$(SIM))
+	$(CC) $(CFLAGS) $(LDFLAGS) -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(call RVOBJS,$(SIM)) -o $(SIM)/rvb_fw.elf
 	$(OBJCOPY) -O binary $(if $(filter ddr,$(RVB_CODE)),--remove-section=.rvb_gen) $(SIM)/rvb_fw.elf $(SIM)/fw.bin
 	$(PYTHON) -c "import struct; d=open('$(SIM)/fw.bin','rb').read(); d+=b'\0'*(-len(d)%4); \
 	open('$(SIM)/fw.hex','w').write('\n'.join('%08x'%w for w in struct.unpack('<%dI'%(len(d)//4),d))+'\n'); \
@@ -57,10 +71,11 @@ endif
 OUT ?= $(RVB)/board
 bundle:
 	mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fuse-ld=lld -T $(FW_ROOT)/common/link.ld -Wl,--gc-sections $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c -o $(OUT)/fw_bram.elf
+	$(call rvobjs,$(OUT))
+	$(CC) $(CFLAGS) -fuse-ld=lld -T $(FW_ROOT)/common/link.ld -Wl,--gc-sections -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(call RVOBJS,$(OUT)) -o $(OUT)/fw_bram.elf
 	$(OBJCOPY) -O binary $(OUT)/fw_bram.elf $(OUT)/fw_bram.bin
 	$(CC) $(CFLAGS) -DRVB_CODE_DDR -fuse-ld=lld -T link_ddr.ld -Wl,--defsym=RVB_CODE_ADDR=$(CODE_ADDR) -Wl,--gc-sections \
-	  $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c -o $(OUT)/fw_ddr.elf
+	  -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(call RVOBJS,$(OUT)) -o $(OUT)/fw_ddr.elf
 	$(OBJCOPY) -O binary --remove-section=.rvb_gen $(OUT)/fw_ddr.elf $(OUT)/fw_ddr.bin
 	$(OBJCOPY) -O binary --only-section=.rvb_gen $(OUT)/fw_ddr.elf $(OUT)/code.bin
 	@ls -l $(OUT)/fw_bram.bin $(OUT)/fw_ddr.bin $(OUT)/code.bin | awk '{print $$5, $$9}'

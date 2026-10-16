@@ -141,8 +141,11 @@ static void sa_device_destroy(iree_hal_device_t* base_device) {
   // SA_STATS: the split between the accelerator and the host fallback
   sa_context_t* context = NULL;
   if (getenv("SA_STATS") && iree_status_is_ok(sa_context_get(&context))) {
-    fprintf(stderr, "sa: %llu descriptor lists on the accelerator, %llu dispatches on the host\n",
+    fprintf(stderr, "sa: %llu descriptor lists on the accelerator, %llu dispatches on the host",
             (unsigned long long)context->lists, (unsigned long long)context->host_dispatches);
+    if (context->rv_calls)   // plan A (SA_RV): dispatches run as generated RISC-V code
+      fprintf(stderr, ", %llu dispatches as RISC-V code", (unsigned long long)context->rv_calls);
+    fprintf(stderr, "\n");
   }
 
   iree_hal_sync_semaphore_state_deinitialize(&device->semaphore_state);

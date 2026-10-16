@@ -232,6 +232,7 @@ LogicalResult emitRiscvLL(sahw::TemplateOp t, const SerializedExport &se, std::s
                                        llvm::GlobalValue::ExternalLinkage, "sa_rv_ldparam", *e.mod);
   e.fn = llvm::Function::Create(llvm::FunctionType::get(voidTy, {e.ptr, e.ptr}, false),
                                 llvm::GlobalValue::ExternalLinkage, riscvSymbol(t.getExportName()), *e.mod);
+  e.fn->addFnAttr(llvm::Attribute::NoUnwind);      // (no unwind tables: the code is a flat image)
   e.bindArg = e.fn->getArg(0);
   e.pcArg = e.fn->getArg(1);
   e.bindArg->setName("bindings");

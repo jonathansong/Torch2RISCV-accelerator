@@ -1,7 +1,29 @@
 /* Runtime of the generated RISC-V code: sa_rv_rt.h. */
 #include "sa_rv_rt.h"
 
-#ifdef SA_RV_HOST
+#if defined(SA_RV_SIM)
+/* the sim transport (compiler/runtime/sa/sa_transport_sim.c): each command,
+ * its dynamic fields applied and its DDR address relocated, handed over as a
+ * descriptor to run on the functional simulator; loads from the shared window */
+static void (*sim_cmd)(const uint64_t *desc);
+static uint32_t (*sim_load32)(uint32_t addr);
+void sa_rv_sim_init(void (*cmd)(const uint64_t *desc), uint32_t (*load32)(uint32_t addr))
+{
+    sim_cmd = cmd;
+    sim_load32 = load32;
+}
+#define LOAD32(a)                sim_load32(a)
+#define NOTE(w, a, b)            ((void)0)
+#define MAT_CFG(k, v)            ((void)0)      /* (not reached: sa_rv_cmd returns after sim_cmd) */
+#define VEC_CFG(k, v)            ((void)0)
+#define GEMV_CFG(k, v)           ((void)0)
+#define MAT_LOAD(d, l)           ((void)0)
+#define MAT_STORE(d, l)          ((void)0)
+#define MAT_EXEC(a, b, c, k, x)  ((void)0)
+#define VEC_RUN(s1, s2)          ((void)0)
+#define GEMV_RUN(w, c, s, x)     ((void)0)
+#define MAT_FENCE(m)             ((void)0)
+#elif defined(SA_RV_HOST)
 #define MAT_CFG(k, v)            sa_rv_host_pcpi("mat_cfg", 2, (k), (v), 0, 0, 0)
 #define VEC_CFG(k, v)            sa_rv_host_pcpi("vec_cfg", 2, (k), (v), 0, 0, 0)
 #define GEMV_CFG(k, v)           sa_rv_host_pcpi("gemv_cfg", 2, (k), (v), 0, 0, 0)
@@ -62,9 +84,19 @@ void sa_rv_cmd(const uint32_t *desc, uint32_t base, uint32_t p0, uint32_t p1)
         uint64_t nv = ((slot & 0x80) ? old + p : p) & mask;
         w[t.word] = (w[t.word] & ~(mask << t.lsb)) | (nv << t.lsb);
     }
+#if defined(SA_RV_SIM)
+    if (op == OP_LD || op == OP_ST) {                  /* the address resolved, BASE no longer needed */
+        uint32_t a = fld(w[1], 0, 32) + (((hdr >> 8) & 1) ? base : 0);
+        w[1] = (w[1] & ~0xFFFFFFFFull) | a;
+    }
+    w[0] &= ~(0xFFFF0000ull | 0x6700ull);              /* no dynamic slots, no relocation (FENCE_BEFORE kept) */
+    sim_cmd(w);
+    return;
+#endif
     if (op != OP_FENCE && ((hdr >> 11) & 1))           /* FENCE_BEFORE */
         MAT_FENCE(0);
     uint32_t ddr = fld(w[1], 0, 32) + (((hdr >> 8) & 1) ? base : 0);
+    (void)ddr;
     if (op == OP_LD && fld(w[3], 32, 2) == MODE_GEMV) {
         GEMV_CFG(0, fld(w[2], 48, 16));                    /* SA_GCFG_KBYTES */
         GEMV_CFG(1, fld(w[3], 0, 32));                     /* SA_GCFG_PITCH */
@@ -113,7 +145,9 @@ void sa_rv_cmd(const uint32_t *desc, uint32_t base, uint32_t p0, uint32_t p1)
 
 uint32_t sa_rv_ldparam(uint32_t addr)
 {
-#ifdef SA_RV_HOST
+#if defined(SA_RV_SIM)
+    return LOAD32(addr);                               /* (the simulator runs each command to its end) */
+#elif defined(SA_RV_HOST)
     NOTE("fence_for_ldparam", 0, 0);           /* (not a command of the descriptor path) */
 #else
     MAT_FENCE(0);

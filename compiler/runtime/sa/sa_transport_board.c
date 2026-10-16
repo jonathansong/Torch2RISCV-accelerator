@@ -61,6 +61,7 @@ enum {
 #define RT_RUN_LIST 0x01u
 #define RT_F_PERF (1u << 9)                       // rt_fw copies the event counters into its perf area
 #define RT_RUN_SCHED 0x05u                        // rt_fw v3: the decode schedule (firmware/include/rvsched.h)
+#define RT_CALL 0x06u                             // rt_fw v4: generated RISC-V code (plan A, sa_rv.c)
 #define MBOX_PERF_COUNT 0x8Cu
 #define SA_PERF_AREA_BELOW_MBOX 0x100u            // perf area BRAM + 0x1E00, mailbox BRAM + 0x1F00
 #define SA_BOARD_CPL_OFFSET 0x2000u
@@ -168,6 +169,41 @@ static iree_status_t sa_board_run_sched(sa_transport_t* t, uint32_t table_phys, 
     return iree_make_status(IREE_STATUS_DATA_LOSS, "sa board: completion record %u has seq %u", seq, c[0]);
   }
   *out_status = c[1];
+  return iree_ok_status();
+}
+
+// One RT_CALL entry: rt_fw calls the function at |code_phys| (w1) with the
+// argument block at |args_phys| (w2), then waits for the engines.
+static iree_status_t sa_board_run_call(sa_transport_t* t, uint32_t code_phys, uint32_t args_phys, const char* symbol,
+                                       sa_completion_t* out) {
+  (void)symbol;
+  sa_board_t* b = (sa_board_t*)t->impl;
+  uint32_t seq = b->tail, slot = seq % b->ring_entries;
+  volatile uint64_t* e = (volatile uint64_t*)(t->mem + 64u * slot);
+  volatile uint32_t* c = (volatile uint32_t*)(t->mem + SA_BOARD_CPL_OFFSET + 32u * slot);
+  e[0] = (uint64_t)RT_CALL | (uint64_t)seq << 32;
+  e[1] = code_phys;
+  e[2] = args_phys;
+  for (int i = 3; i < 8; ++i) e[i] = 0;
+  __sync_synchronize();
+  b->tail = seq + 1;
+  mbox_wr(b, MBOX_RING_TAIL, b->tail);
+  double t0 = sa_now();
+  while ((int32_t)(mbox_rd(b, MBOX_RING_HEAD) - b->tail) < 0) {
+    if (sa_now() - t0 > 30.0) {
+      return iree_make_status(IREE_STATUS_DEADLINE_EXCEEDED,
+                              "sa board: RT_CALL entry %u not completed (RING_HEAD %u, FW_STATE %#x)", seq,
+                              mbox_rd(b, MBOX_RING_HEAD), mbox_rd(b, MBOX_FW_STATE));
+    }
+  }
+  __sync_synchronize();
+  if (c[0] != seq) {
+    return iree_make_status(IREE_STATUS_DATA_LOSS, "sa board: completion record %u has seq %u", seq, c[0]);
+  }
+  memset(out, 0, sizeof(*out));
+  out->status = c[1];
+  out->cycles = c[2];
+  out->end = 0x5A;
   return iree_ok_status();
 }
 
@@ -298,6 +334,7 @@ iree_status_t sa_transport_board_open(iree_allocator_t host_allocator, sa_transp
   t->caps = mbox_rd(b, MBOX_FW_VERSION) >= 2 ? mbox_rd(b, MBOX_FW_CAPS) : 0;   // (older rt_fw: unknown)
   t->run = sa_board_run;
   if (mbox_rd(b, MBOX_FW_VERSION) >= 3) t->run_sched = sa_board_run_sched;   // (older rt_fw: no schedules)
+  if (mbox_rd(b, MBOX_FW_VERSION) >= 4) t->run_call = sa_board_run_call;     // (older rt_fw: no RT_CALL)
   t->close = sa_board_close;
   t->impl = b;
   *out = t;

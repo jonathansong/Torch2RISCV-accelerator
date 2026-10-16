@@ -27,6 +27,7 @@ iree_cc_library(
     "sa_driver.c"
     "sa_driver_module.c"
     "sa_loader.c"
+    "sa_rv.c"
     "sa_rvsched.c"
     "sa_transport_board.c"
     "sa_transport_sim.c"
