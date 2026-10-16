@@ -433,6 +433,19 @@ Performance counters (`board_rvperf.py`), decode, ms per step:
 | descriptor lists | 136.0 | 136.6 (+0.4%) | 29,792 → 31,472 | — |
 | S4 code | 162.8 | 166.6 (+2.4%) | 29,792 → 31,472 | 325,932 → 342,703 |
 
+**Gemma-3-270M and Llama-3.2-1B** (bundles `gemmag`, `llamag`) likewise:
+- Sim logits bit-exact with the baseline, for decode and for prefill plus decode.
+- `rv_equiv` PASS, no dispatch on the host.
+- On the board, all ten tests pass: `llm` 17/17 bit-exact, `rvcode --embedded` 17/17 bit-exact, and both plan B loops identical over 256 tokens.
+
+| | executables | decode rv32 working set | plan B loop, lists (ms per step) | plan B loop, S4 code (ms per step) |
+|---|---|---|---|---|
+| Gemma-3-270M | 790 → 739 | 64.6 → **20.2 KB** | 61.2 → 61.2 | 75.8 → 76.4 |
+| Qwen3-0.6B | 1132 → 1051 | 288 → **34.1 KB** | 136.1 → 136.7 | 163 → 166.7 |
+| Llama-3.2-1B | 710 → 665 | 231 → **40.8 KB** | 225.1 → 225.7 | 249.4 → 253.5 |
+
+All three models' decode steps now fit a 32–64 KB instruction memory.
+
 The merged code costs a little: about 60 more commands per layer (the scales' PARAM loads and broadcasts) and 5% more core instructions, because the offsets and scales are now computed from push constants. Without an instruction memory nothing is gained, because every instruction is still fetched from DDR at about 27 cycles (§9.10). The gain is for §8: a decode step now fits a 32–64 KB TCM, which would remove that fetch cost.
 
 ### 9.7 Coexistence
