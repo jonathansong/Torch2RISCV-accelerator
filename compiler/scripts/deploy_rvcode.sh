@@ -18,7 +18,9 @@ def blobs(p):
     d, out, i = open(p, "rb").read(), [], 0
     while (i := d.find(b"SADESC1\0", i)) >= 0:
         h = struct.unpack_from("<IIIIIIIIII", d, i + 8)
-        out.append(d[i:i + h[9] + 32 * h[3]])
+        desc = bytearray(d[i:i + h[9] + 32 * h[3]])
+        desc[48:52] = b"\0\0\0\0"                     # (an S4 code table, --iree-sa-riscv, ignored)
+        out.append(bytes(desc))
         i += 8
     return sorted(out)
 a, b = blobs(sys.argv[1]), blobs(sys.argv[2])
