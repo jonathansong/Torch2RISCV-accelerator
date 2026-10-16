@@ -14,6 +14,11 @@
 # SA_WITH_LLVM_CPU=1 adds llvm-cpu (X86 + ARM) for mixed CPU / accelerator
 # execution (much larger build). CPU-only compiles for the board's ARM keep
 # using the pip iree-compile of L0 (the same IREE revision).
+# SA_WITH_RISCV=1 adds llvm-cpu with LLVM's X86 and RISCV code generators and
+# lld (docs/riscv_backend_design.md §9.3 S4: the sa backend emitting riscv32
+# objects in-process; R5: kernels for the PicoRV32 through llvm-cpu). An existing
+# build directory is reconfigured in place (run --configure first): the objects
+# already built are reused, the new targets added (2-3 hours at 4 jobs).
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 configure_only=0
@@ -32,7 +37,9 @@ if [ "$configure_only" = 0 ] && [ "$avail" -lt 20 ]; then
   [ "${SA_FORCE:-0}" = 1 ] || exit 1
 fi
 
-if [ "${SA_WITH_LLVM_CPU:-0}" = 1 ]; then
+if [ "${SA_WITH_RISCV:-0}" = 1 ]; then
+  llvm_cpu='-DIREE_TARGET_BACKEND_LLVM_CPU=ON -DIREE_DEFAULT_CPU_LLVM_TARGETS=X86;RISCV -DLLVM_TARGETS_TO_BUILD=X86;RISCV'
+elif [ "${SA_WITH_LLVM_CPU:-0}" = 1 ]; then
   llvm_cpu='-DIREE_TARGET_BACKEND_LLVM_CPU=ON -DIREE_DEFAULT_CPU_LLVM_TARGETS=X86;ARM'
 else
   llvm_cpu='-DIREE_TARGET_BACKEND_LLVM_CPU=OFF -DLLVM_TARGETS_TO_BUILD=X86'
