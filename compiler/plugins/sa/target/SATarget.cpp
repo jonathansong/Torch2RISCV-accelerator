@@ -25,6 +25,7 @@
 #include "iree/compiler/Dialect/HAL/Target/TargetDevice.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/PluginAPI/Client.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/CommandLine.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -65,6 +66,10 @@ struct SAOptions {
   bool gemvKSplit = true;
   // C6.5: rows of T per block of the tiled decode q . K^T (0: 128, at most what one SPAD_B bank holds).
   int attnBlock = 0;
+  // C7 plan A (docs/riscv_backend_design.md §9): also write each export as LLVM IR of a
+  // RISC-V function issuing its commands over PCPI, <dir>/<export>.ll (empty: off; the
+  // binary is the same either way).
+  std::string emitRiscv;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -91,6 +96,9 @@ struct SAOptions {
                      llvm::cl::desc("Decode's GEMV over a K beyond 4080 in K blocks (WP6; false: such layers on EX)."));
     binder.opt<int>("iree-sa-attn-block", attnBlock, llvm::cl::cat(category),
                     llvm::cl::desc("Rows of T per block of the tiled decode attention (C6.5; 0: 128, at most one SPAD_B bank)."));
+    binder.opt<std::string>("iree-sa-emit-riscv", emitRiscv, llvm::cl::cat(category),
+                            llvm::cl::desc("Also write each export as LLVM IR of a RISC-V function issuing its "
+                                           "commands over PCPI, into this directory (C7 plan A)."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -204,6 +212,15 @@ public:
       if (it == templates.end()) return exportOp.emitError() << "sa target: no sahw.template for this export";
       sa::SerializedExport se;
       if (failed(sa::serializeTemplate(it->second, se))) return failure();
+      if (!options.emitRiscv.empty()) {
+        std::string ll;
+        if (failed(sa::emitRiscvLL(it->second, se, ll))) return failure();
+        std::string path = options.emitRiscv + "/" + sa::riscvSymbol(exportOp.getSymName()) + ".ll";
+        std::error_code ec;
+        llvm::raw_fd_ostream f(path, ec);
+        if (ec) return exportOp.emitError() << "sa target: cannot write " << path << ": " << ec.message();
+        f << ll;
+      }
       exports.push_back({ordinal, {exportOp.getSymName().str(), se.templ, uint32_t(layout.getBindings().size()),
                                    uint32_t(layout.getConstants()), se.cycles, se.setup, se.prefix, se.prefixReads,
                                    se.writes, se.reads, se.head, se.flags, se.prefixReg}});

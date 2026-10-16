@@ -74,6 +74,12 @@ struct SerializedExport {
 };
 LogicalResult serializeTemplate(sahw::TemplateOp t, SerializedExport &out);
 
+// The export as LLVM IR of a function issuing its commands over PCPI from the
+// PicoRV32 (SahwToRiscv.cpp, docs/riscv_backend_design.md §9), from its
+// serialized descriptors; riscvSymbol: the function's name.
+LogicalResult emitRiscvLL(sahw::TemplateOp t, const SerializedExport &se, std::string &ll);
+std::string riscvSymbol(StringRef exportName);
+
 }  // namespace mlir::iree_compiler::sa
 
 #endif  // SA_TRANSFORMS_SAHWPASSES_H_

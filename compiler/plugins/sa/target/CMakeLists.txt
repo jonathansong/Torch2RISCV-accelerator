@@ -23,6 +23,7 @@ iree_cc_library(
     "../transforms/SahwPasses.cpp"
     "../transforms/SaCodegen.cpp"
     "../transforms/SahwSerialize.cpp"
+    "../transforms/SahwToRiscv.cpp"
     "../transforms/SaToSahl.cpp"
     "../transforms/SahlKernels.cpp"
     "../transforms/SahlTile.cpp"
@@ -35,6 +36,7 @@ iree_cc_library(
   DEPS
     sa::SahwDialect
     LLVMSupport
+    LLVMCore
     MLIRArithDialect
     MLIRDialectUtils
     MLIRFuncDialect

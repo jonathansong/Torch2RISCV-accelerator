@@ -10,6 +10,25 @@ ask can be measured on it before any silicon decision: how fast must the
 core issue commands, where must its code live, and which parts of a model
 should it run.
 
+## 0. The paths at a glance (2026-10-16)
+
+Two independent questions decide how a decode step reaches the accelerator: **who sequences the step** (the ARM or the PicoRV32) and **how each command is encoded** (a descriptor list the fetch unit executes, or PCPI instructions the core issues). The paths below are combinations of the two, plus the scalar code of model C.
+
+| Path | Who sequences a step | How commands reach the unit | Switch | Status |
+|---|---|---|---|---|
+| **Default** (L6-IREE) | the ARM: IREE VM + sa HAL driver build one or two lists per step; `rt_fw` only `mat_submit`s ring entries | descriptor lists (templates from the descriptor backend, `SETREG` + `CALL` per dispatch) | none | the main line; every board result of the compiler plan |
+| **Plan B** (§7.1, model B) | **the PicoRV32** runs the decode loop (`rt_fw` `RT_RUN_SCHED`); the ARM records each attention-length bucket's lists once, then waits | the same descriptor lists, recorded, patched per bucket | `sa-llm-run --rvsched` | **accepted on the board** 2026-10-16 (Gemma-3, Qwen3, Llama-3.2: tokens identical, logits bit-exact) |
+| **Plan A** (§9, model A) | per dispatch the ARM (`RT_CALL`, S2); from S3 plan B's loop on the core | **generated RISC-V code** (sahw → LLVM IR → rv32imc) issues each command over PCPI; no descriptors | `--iree-sa-emit-riscv` (compiler), `SA_RV` (runtime) | **S1 done** 2026-10-16 (host: every dispatch's PCPI stream identical to the descriptor path's, §9.6); S2 next |
+| R2 / R3 first form (§6) | a test firmware (`firmware/rvb`) | straight-line C generated from a trace, over PCPI | `board_run.py rvb` | done (12 runs bit-identical on the board); a single-dispatch experiment, superseded by plan A's code generator |
+| **Model C / R5** (§3, §5) | — (scalar kernels, not a scheduling path) | the core computes itself: kernels (argmax, top-k sampling) compiled by IREE's llvm-cpu for riscv32 | — | not started; needs iree-compile rebuilt with the RISC-V target and llvm-cpu (the same rebuild as plan A's S4) |
+
+How they relate:
+
+- **Plan B changes the sequencer, plan A the command encoding.** Plan B is the ASIC shape "small control core + command DMA": the core decides what runs next, the fetch unit streams the commands. Plan A removes the descriptors: the core's code is the command stream, which needs a real compiler backend (§9) and measures what an ASIC core without a command DMA would have to sustain.
+- **They compose.** Plan A's S3 runs inside plan B's loop: the step table marks each dispatch "call" (plan A's function) or "list" (its recorded descriptors), so a dispatch not yet covered by plan A falls back to the list in the same step. The end state is a decode step driven entirely by the core and generated code, the ARM idle.
+- **Model C is orthogonal**: it adds scalar computation on the core (today plan B's argmax is a block-max dispatch plus a scan in rt_fw, §7.1), usable from either sequencer.
+- **All coexist.** Each is opt-in (the switches above); the default path's binaries, the golden corpus and every existing bundle are unchanged. Plan B and plan A use the existing `_pcpi` overlay (GEMV over PCPI, CAPS bit 26); no path needs a new bitstream. rt_fw v3 serves the list entries, `RT_RUN_SCHED` and (S2) `RT_CALL` side by side.
+
 ## 1. What the KV260 overlay provides (checked 2026-10-15)
 
 | Item | Fact | Source |
@@ -181,3 +200,57 @@ The core runs the whole step as RISC-V code issuing PCPI commands (§3 model A),
 - **Instruction memory**: the hot loops' size (R2 gives it per dispatch) against a TCM or I-cache; PicoRV32's BRAM is 8 KB with `rt_fw` resident.
 - **Core performance**: whether a simple in-order core issuing at the §2 rates is enough, or the command DMA must stay (model B).
 - **Scalar work on the core**: sampling, small reductions, KV cache bookkeeping, the per-token scales (today the VE's REDUCE and SFU).
+
+## 9. The sahw → LLVM → riscv32 backend (plan A's code generator; plan 2026-10-16)
+
+Purpose: **feasibility**, not speed. Every dispatch the descriptor backend compiles also gets a RISC-V function that issues the same commands over PCPI; the whole model's decode must then run with every dispatch through that code, bit-exact with the descriptor path. Speed, code size and issue cost are recorded for the ASIC questions (§8), not optimized.
+
+### 9.1 Custom instructions: no custom LLVM
+
+The PCPI instructions are R-type instructions in the custom-0 opcode space (`docs/custom_isa_encoding.md`). LLVM's RISC-V assembler accepts any such encoding through the **`.insn` directive** (`.insn r CUSTOM_0, funct3, funct7, rd, rs1, rs2`), so they are emitted as inline assembly: `firmware/include/sysarray_intrinsics.h` already does exactly this for the firmware, and the same header serves the generated code. An unmodified LLVM (the system clang, or IREE's own once rebuilt with the RISC-V target) compiles it. What inline assembly costs: the compiler treats each instruction as opaque (`volatile`, a memory clobber), so it neither reorders nor schedules them; for issuing commands in program order that is the required semantics anyway. A custom LLVM (the instructions in TableGen, as intrinsics) would only matter for an ASIC: scheduling the configuration writes, a register-file model of the command fields, or proposing an ISA extension. Not needed here.
+
+### 9.2 Lowering
+
+A pass on each compiled `sahw.template` (after the descriptor serialization, which it reuses) emits one function per export:
+
+    void <export>(const uint32_t *bindings, const uint32_t *push_constants)
+
+- **Registers become variables.** `sahw.base` = binding address + f(push constant) and `sahw.param` = f(push constant), f(c) = add + ((c · mul) >> shift) in 64-bit arithmetic as the driver's setup table (`sa_loader.c`); `sahw.private` starts at 0. No limit of 16 BASE / 8 PARAM registers.
+- **Commands become one call each**: `sa_rv_cmd(desc, base, p0, p1)` with the command's 64-byte descriptor as the serializer encodes it (a constant), the value of its BASE register and of its one or two dynamic-field PARAMs. The runtime function (`firmware/include/sa_rv_rt.h`) does what the fetch unit does with a descriptor (dynamic fields replaced or added, the DDR address relocated, FENCE_BEFORE) and issues it over PCPI (`mat_cfg` / `vec_cfg` / `gemv_cfg` keys, then `mat_load` / `mat_store` / `mat_exec` / `vec_run` / `gemv_run` / `mat_fence`: the mapping proven on the board by the R2 / R3 programs, `rv_dispatch.py`). S1 keeps this split, the encoding in one place; the configuration writes can later be specialized at compile time (static fields folded) without changing the interface.
+- **Control flow is compiled**: `sahw.loop` (`LOOP_END`: the count, possibly from a PARAM, read when it is first reached; k1 += s1, k2 += s2 after every pass) becomes a loop; `sahw.setreg` assignments (with their own dynamic fields and add mask); `sahw.ldparam` a `mat_fence` (the value may come from a store just issued) and a 32-bit load from DDR, times mul plus add. The template's prefix, head and body run in order (the driver's overlap of prefixes is an optimization of the list path).
+- **Output**: LLVM IR built directly with `llvm::IRBuilder` in a private `LLVMContext` (`compiler/plugins/sa/transforms/SahwToRiscv.cpp`; thread-safe inside the parallel serialization, no MLIR dialect registration), without a target triple or data layout: the IR only uses i32 / i64 and the two pointer arguments, so the same file compiles for riscv32 (the generated code) and for the host (the checks).
+
+### 9.3 Build stages
+
+| Stage | LLVM IR → object | Rebuild |
+|---|---|---|
+| S1–S3 | `iree-compile ... --iree-sa-emit-riscv=<dir>` writes one `.ll` per export; the system `clang-18 --target=riscv32 -march=rv32imc -O2` compiles it with `sa_rv_rt.h`, `ld.lld` links | none |
+| S4 | in-process: iree-compile rebuilt with `LLVM_TARGETS_TO_BUILD="X86;RISCV"` (and lld) emits the riscv32 object itself into the sa-desc code section; the same rebuild with `IREE_TARGET_BACKEND_LLVM_CPU=ON` also enables R5 (scalar kernels for the core through llvm-cpu) | the user runs it (about 2 h) |
+
+### 9.4 Runtime (S2, S3)
+
+- **sa-desc**: an optional code section (one entry offset per export); a loader without it ignores it, the descriptor templates stay as they are (the golden corpus compares them; the option is off by default).
+- **rt_fw**: ring entry `RT_CALL` (function address, argument block: binding addresses and push constants); the code lives in DDR (speed does not matter; the 8 KB BRAM holds rt_fw).
+- **Driver**: `SA_RV=1` (or a list of exports) sends a dispatch as `RT_CALL` instead of SETREG + CALL in a list; dispatches without code fall back to the list. Plan B's step table can mark each dispatch as "call" or "list", so the whole decode loop runs on the core.
+
+### 9.5 Verification
+
+1. **Command-stream equivalence (S1, host)**: per dispatch, the `.ll` compiled for the host with the PCPI instructions replaced by a recorder (`SA_RV_HOST`) issues a sequence of PCPI operations; the descriptor template run on the functional simulator with the same bindings and push constants (`dispatch_check`'s layout, `--trace`) gives the executed commands, mapped to PCPI by the same rules. The two sequences must be identical, for every dispatch of the reference exports.
+2. **riscv32 build**: every `.ll` compiles for rv32imc; code size per dispatch and per model recorded.
+3. **RTL** (S2): a few dispatches on `tb_system` (PicoRV32 + sa_unit), as R3.
+4. **Board** (S2 one dispatch, S3 the whole decode): tokens identical and logits bit-exact against the descriptor path.
+
+### 9.6 S1 results (2026-10-16)
+
+Implemented: `compiler/plugins/sa/transforms/SahwToRiscv.cpp` (the lowering, behind `--iree-sa-emit-riscv=<dir>` in `SATarget::serializeExecutable`), `firmware/include/sa_rv_rt.h` + `firmware/rv/sa_rv_rt.c` (the runtime: 1.3 KB of rv32imc), `compiler/tests/rv_equiv.py` + `rv_host_main.c` (the equivalence harness: each dispatch's descriptor path on the functional simulator against its generated function on the host, at T = 16 and 304; the LDPARAM reads replayed in order and their addresses compared, since a dispatch may load values it stored before).
+
+| Corpus | Dispatches | PCPI streams identical | rv32imc code (generated functions) |
+|---|---:|---:|---|
+| Qwen3-0.6B long-context bundle (`qwen3_lc2048_pcpi`, D = 16, 4 GEMV ports, max 2048) | 1132 | **1132** | 1.45 MB in all, median 344 B, max 57 KB |
+| golden corpus (all cases: D = 8 / 16, EX and GEMV paths, micro-kernels on / off, max 256–2048) | 7708 | **7682** (+ 26 the corpus records as having no template: `hf_smollm2_q`'s host-fallback dispatches, failing identically without the option) | 31.0 MB in all, median 780 B, max 301 KB |
+
+The default build is unchanged (option off: the golden corpus byte-identical). Observations for S2 / the ASIC questions: the generated code is the descriptor stream's control flow (LLVM fully unrolls short `LOOP_END`s, e.g. the q_proj GEMV's 3 passes) plus one 64-byte constant per command, so its size follows the templates': most dispatches are under 1 KB, but straight-line prefill templates reach 300 KB (a template's descriptors are 64 bytes each, the code adds a call per command); a whole Qwen3 decode needs about 1.5 MB, so the code lives in DDR (§9.4), and specializing the configuration writes at compile time (§9.2) would replace the 64-byte constants by the few fields each command really sets.
+
+### 9.7 Coexistence
+
+Every part is opt-in: the compiler option (off: identical output), the sa-desc section (absent: identical files), `SA_RV` (unset: the list path), rt_fw's new entry (as `RT_RUN_SCHED`), the `_pcpi` overlay (no new bitstream). Existing bundles and board tests are unchanged.
