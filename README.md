@@ -16,6 +16,10 @@
 > SmolLM2-135M 22.1 / 60.5, Gemma-3-270M 15.0 / 62.6, Qwen3-0.6B 7.0 / 20.8,
 > Llama-3.2-1B 4.0 / 15.1 (public W8A8 checkpoints, int8 KV cache; board
 > perplexity within 1-16% of fp32).
+> Long context (2026-10-16): Qwen3-0.6B and Llama-3.2-1B compiled for 2048
+> positions, Gemma-3-270M for 512, prefill vs decode bit-exact on the board over
+> a 2032-token prompt; Qwen3 decode 7.2 tok/s at T = 64 and 3.2 at T = 2048,
+> Qwen3 teacher-forcing PPL over two 2048-token windows 18.58 (fp32 18.77).
 > The PYNQ-Z1 version is frozen at tag
 > [`v1.0-pynq-z1`](../../tree/v1.0-pynq-z1) (branch `pynq-z1`): stories15M at
 > 17.6 tok/s and SmolLM2-135M (prefill + decode, the hand-written and the
@@ -269,7 +273,7 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 | 5 | MLIR dialect + instruction-level lowering | ✅ superseded | done as the IREE compiler (`sahl` / `sahw` dialects → descriptor lists, [`compiler/`](compiler/README.md)) instead of `.insn` firmware |
 | 6 | Loose- vs tight-coupling benchmark | 🟡 partial | Phase 3 vs 4 board numbers exist; write-up pending |
 | 7 | Vector unit | ✅ done in M3 | fused int8 epilogue + standalone vector ops |
-| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T (C6.5 / C6.5b, sim: Gemma 512, Qwen3 2048, a 1104-token prompt end to end; on the board 2026-10-14: whole Qwen3 at 2048 / Gemma at 512, prefill vs decode only bit-exact over a 2032-token prompt, Qwen3 decode 1.60 tok/s at T = 2048; since 2026-10-15 on the sim: p · V on the GEMV unit with a packed V cache, the tiled q · Kᵀ's blocks of 128, query rows in one EX and a software-pipelined T loop: attention at T = 2048 431.6 → 132.7 ms per token by the cycle model; on the board (2026-10-15) all bit-exact and the device time as projected (Qwen3 decode at 2048 618.6 → 310.4 ms device), but a host copy of the packed V cache per step adds 640 ms (fix in progress); [plan §8.22](docs/iree_compiler_plan.md)) |
+| 8 | Auto-tiling + double buffering | ✅ done | double buffering (M1); compiler tiling in the IREE backend (K blocks, `sahl-tile` pieces, GEMV K split); attention over long T (C6.5 / C6.5b, sim: Gemma 512, Qwen3 2048, a 1104-token prompt end to end; on the board 2026-10-14: whole Qwen3 at 2048 / Gemma at 512, prefill vs decode only bit-exact over a 2032-token prompt, Qwen3 decode 1.60 tok/s at T = 2048; since 2026-10-15 on the sim: p · V on the GEMV unit with a packed V cache, the tiled q · Kᵀ's blocks of 128, query rows in one EX and a software-pipelined T loop: attention at T = 2048 431.6 → 132.7 ms per token by the cycle model; on the board (2026-10-15) all bit-exact and the device time as projected (Qwen3 decode at 2048 618.6 → 310.4 ms device), a host copy of the packed V cache per step, found on the board, fixed with per-layer V buffers written as a scatter: on the board 2026-10-16 wall = device, Qwen3 decode at 2048 316.8 ms per step (was 626.1), at 64 138.1, prefill 2.1× faster; KV scales calibrated on the context length: Qwen3 board KL at 2048 0.073 → 0.055; [plan §8.22](docs/iree_compiler_plan.md)) |
 | 9 | Documentation and write-up | 🟡 in progress | `docs/` (design doc, learning path) |
 
 The accelerator rebuild replaced the Phase 2–4 unit with a double-buffered
