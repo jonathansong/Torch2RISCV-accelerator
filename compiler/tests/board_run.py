@@ -21,7 +21,8 @@ Modes: llm (board_llm.py: prefill + decode, bit-exact with the sim), teacher
 mode then is profile_batch), generate (board_generate.py), longctx
 (board_longctx.py: a prompt of the context length, prefill vs decode only), rvb
 (board_rvb.py: the RISC-V backend test, a deploy_rvb.sh bundle), rvsched
-(board_rvsched.py: the decode loop on the RISC-V core, compiler/scripts/deploy_rvsched.sh).
+(board_rvsched.py: the decode loop on the RISC-V core, compiler/scripts/deploy_rvsched.sh), rvcode
+(board_rvcode.py: every dispatch as generated RISC-V code, compiler/scripts/deploy_rvcode.sh).
 """
 import glob
 import hashlib
@@ -35,9 +36,10 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = {"llm": "board_llm.py", "teacher": "board_teacher.py", "profile": "board_profile.py",
            "generate": "board_generate.py", "longctx": "board_longctx.py", "rvb": "board_rvb.py",
-           "rvsched": "board_rvsched.py"}
+           "rvsched": "board_rvsched.py", "rvcode": "board_rvcode.py"}
 OUTPUTS = {"llm": ["tokens_board.txt"], "teacher": ["tf_board.npz"], "longctx": ["longctx_board.npz", "longctx_sweep_board.json"],
-           "rvb": ["rvb_board.json"], "rvsched": ["rvsched_board.json"]}
+           "rvb": ["rvb_board.json"], "rvsched": ["rvsched_board.json"],
+           "rvcode": ["rvcode_board.json"]}
 
 
 def version():
