@@ -2,7 +2,7 @@
 # Adds plan A of the RISC-V backend (every dispatch as generated RISC-V code,
 # docs/riscv_backend_design.md §9.4) to a staged hfgen bundle: the model's code
 # image (rv/rvcode.bin + rvcode.map, compiler/tests/rv_image.py), rt_fw.bin
-# version 4 (RT_CALL), the aarch64 sa-llm-run with SA_RV, board_rvcode.py and
+# version 5 (RT_CALL, RVS2 schedules), the aarch64 sa-llm-run with SA_RV, board_rvcode.py and
 # board_run.py. The image must come from the same executables as the bundle's
 # sa.vmfb (checked: the sa-desc executables compared).
 #   compiler/scripts/deploy_rvcode.sh <deploy dir> <dir compiled with --iree-sa-emit-riscv (sa.vmfb, rv/)>
@@ -30,9 +30,10 @@ make -C "$SA_REPO/firmware/rt" >/dev/null
 "$SA_COMPILER/scripts/build_sa_runtime.sh" "$SA_RT_ARCH" | tail -1
 mkdir -p "$D/rv"
 cp "$C/rv/rvcode.bin" "$C/rv/rvcode.map" "$D/rv/"
-cp "$SA_REPO/firmware/rt/rt_fw.bin" "$SA_COMPILER/tests/board_rvcode.py" "$SA_COMPILER/tests/board_run.py" "$D/"
+cp "$SA_REPO/firmware/rt/rt_fw.bin" "$SA_COMPILER/tests/board_rvcode.py" "$SA_COMPILER/tests/board_rvsched.py" \
+   "$SA_COMPILER/tests/board_run.py" "$D/"
 llvm-strip-18 -o "$D/sa-llm-run" "$SA_RT_BUILD/runtime/plugins/hal/drivers/sa/sa-llm-run"
 sed -i '/^rvcode /d' "$D/VERSION"
-echo "rvcode $(git -C "$SA_REPO" rev-parse --short HEAD)$(git -C "$SA_REPO" diff --quiet HEAD -- compiler firmware || echo ' (dirty)'): rv/rvcode.bin $(stat -c %s "$D/rv/rvcode.bin") bytes, rt_fw.bin v4, sa-llm-run" >> "$D/VERSION"
+echo "rvcode $(git -C "$SA_REPO" rev-parse --short HEAD)$(git -C "$SA_REPO" diff --quiet HEAD -- compiler firmware || echo ' (dirty)'): rv/rvcode.bin $(stat -c %s "$D/rv/rvcode.bin") bytes, rt_fw.bin v5, sa-llm-run" >> "$D/VERSION"
 echo "$D: plan A added ($(wc -l < "$D/rv/rvcode.map") functions)"
-echo "to the board: scp -r $D/{rv,rt_fw.bin,sa-llm-run,board_rvcode.py,board_run.py,VERSION} ubuntu@<board>:~/$(basename "$D")/"
+echo "to the board: scp -r $D/{rv,rt_fw.bin,sa-llm-run,board_rvcode.py,board_rvsched.py,board_run.py,VERSION} ubuntu@<board>:~/$(basename "$D")/"
