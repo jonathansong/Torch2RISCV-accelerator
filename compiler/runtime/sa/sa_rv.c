@@ -38,13 +38,18 @@ static iree_status_t sa_rv_load(sa_context_t* c) {
   sa_rv.state = 1;
   if (!dir || !*dir) return iree_ok_status();
   if (strcmp(dir, "embedded") == 0) {                // S4: each executable's own code (sa_loader.c)
-    if (!c->transport->run_call) {
+    if (!c->transport->run_call || strcmp(c->transport->name, "board") != 0) {   // (the sim runs host builds only)
       return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                               "sa rv: the %s transport cannot call embedded RISC-V code (the board, rt_fw >= 4)",
                               c->transport->name);
     }
     const char* only = getenv("SA_RV_ONLY");
     if (only) snprintf(sa_rv.only, sizeof(sa_rv.only), "%s", only);
+    // the argument block and the transport's scratch (the image's are after its code)
+    void* raw = NULL;
+    IREE_RETURN_IF_ERROR(iree_allocator_malloc(sa_context_data_allocator(c), 64 + 64 * 4 + 256, &raw));
+    sa_rv.scratch = (uint32_t*)(((uintptr_t)raw + 63) & ~(uintptr_t)63);
+    IREE_RETURN_IF_ERROR(sa_context_phys(c, sa_rv.scratch, &sa_rv.scratch_phys));
     sa_rv.state = 3;
     fprintf(stderr, "sa rv: the executables' embedded RISC-V code\n");
     return iree_ok_status();
