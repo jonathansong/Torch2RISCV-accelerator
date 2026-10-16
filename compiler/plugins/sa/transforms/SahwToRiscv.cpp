@@ -489,6 +489,7 @@ LogicalResult compileRiscv(ArrayRef<sahw::TemplateOp> ts, ArrayRef<const Seriali
   mod.setTargetTriple(triple);
   mod.setDataLayout(tm->createDataLayout());
   for (auto [t, se] : llvm::zip(ts, ses)) {
+    if (sahw::TemplateOp(t).getUnsupported()) continue;   // (on the host: no code, the table's 0 / 0)
     RvEmitter e(ctx, mod, /*insn=*/true, se->templ);
     if (failed(buildFunction(e, t))) return failure();
   }
@@ -539,6 +540,10 @@ LogicalResult compileRiscv(ArrayRef<sahw::TemplateOp> ts, ArrayRef<const Seriali
   }
   code.clear();
   for (auto t : ts) {
+    if (t.getUnsupported()) {
+      code.emplace_back();
+      continue;
+    }
     auto it = byName.find(riscvSymbol(t.getExportName()));
     if (it == byName.end()) return t.emitError("sa riscv: no code for this export in the object");
     code.push_back(it->second);

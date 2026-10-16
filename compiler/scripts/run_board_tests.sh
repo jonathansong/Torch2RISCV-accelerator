@@ -10,7 +10,8 @@
 #   rvbc: the RVB cases with generated code (deploy_rvb.sh RVB_GEN=compiled); the models' rvcode:
 #   every dispatch as RISC-V code (deploy_rvcode.sh); their "rvsched --rv": the core's decode loop
 #   calling that code (S3); the "--embedded" variants: the code iree-compile embedded in sa.vmfb
-#   (S4, deploy_rvembed.sh); "rvsched --r5": the block argmax by a kernel IREE's llvm-cpu compiled
+#   (S4, deploy_rvembed.sh); qwen3g: Qwen3 compiled with the per-layer copies merged
+#   (--iree-flow-enable-executable-generalization; the qwen3 bundle with its own sa.vmfb); "rvsched --r5": the block argmax by a kernel IREE's llvm-cpu compiled
 #   for the core (R5, deploy_r5.sh); "rvperf": the performance-counter breakdown of plan A against the lists
 #   (board_rvperf.py; then compiler/tests/rv_perf.py on the rvperf_*.csv)
 #   (rvsched: the decode loop on the RISC-V core, after compiler/scripts/deploy_rvsched.sh; without
@@ -33,6 +34,7 @@ declare -A DIR=(
   [gemma]=deploy_hfgen_gemma_lc512_pcpi
   [qwen3]=deploy_hfgen_qwen3_lc2048_pcpi
   [llama]=deploy_hfgen_llama_lc2048_pcpi
+  [qwen3g]=deploy_hfgen_qwen3g_pcpi
 )
 tests_of() {
   case $1 in
@@ -40,6 +42,7 @@ tests_of() {
     gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
     qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
     llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
+    qwen3g) printf '%s\n' "llm" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvperf" ;;
   esac
 }
 
@@ -47,7 +50,7 @@ SEL=("$@")
 [ ${#SEL[@]} -eq 0 ] && SEL=(rvb gemma qwen3 llama)
 for b in "${SEL[@]}"; do
   d=$H/${DIR[$b]:-}
-  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama)"; continue; }
+  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama qwen3g)"; continue; }
   [ -d "$d" ] || { echo "[$b] $d not on the board: skipped"; continue; }
   while IFS= read -r t; do
     [ -n "$t" ] || continue

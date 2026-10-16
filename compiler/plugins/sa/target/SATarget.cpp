@@ -218,7 +218,7 @@ public:
       if (it == templates.end()) return exportOp.emitError() << "sa target: no sahw.template for this export";
       sa::SerializedExport se;
       if (failed(sa::serializeTemplate(it->second, se))) return failure();
-      if (!options.emitRiscv.empty()) {
+      if (!options.emitRiscv.empty() && !it->second.getUnsupported()) {   // (an export on the host: none)
         std::string ll;
         if (failed(sa::emitRiscvLL(it->second, se, ll))) return failure();
         std::string path = options.emitRiscv + "/" + sa::riscvSymbol(exportOp.getSymName()) + ".ll";

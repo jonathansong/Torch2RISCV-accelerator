@@ -353,12 +353,35 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
     }
     vals[body.getArgument(i)] = v;
   }
+  // an f32 push constant (a dispatch operand, e.g. a layer's scale once
+  // iree-flow-generalize-executables made it one): its bits into a PARAM, then a
+  // broadcast word (1.0 * v + -0 = v exactly), as the scalar gather does
+  auto pushF32 = [&](Value x) -> std::optional<Val> {
+    auto bc = x.getDefiningOp<arith::BitcastOp>();
+    if (!bc || !x.getType().isF32()) return std::nullopt;
+    auto l = linOf(bc.getIn());
+    if (!l || l->isConst() || l->mul != 1 || l->shift || l->add) return std::nullopt;
+    Value p = paramFor(*l);
+    LocalBuf ones = newLocal(::sa::VT_F32, 1, true);
+    ve({ones.la, ::sa::VT_I32}, std::nullopt, ones.la, ::sa::VT_F32, d, ::sa::VOP_COPY, 0.0f, 1.0f);
+    LocalBuf out = newLocal(::sa::VT_F32, 1, true);
+    ve({ones.la}, std::nullopt, out.la, ::sa::VT_F32, d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
+       ::sa::RED_NONE, 0, 0, {{::sa::DYN_VE_A, p, false}});
+    Val v;
+    v.kind = Val::Mem;
+    v.o = {out.la, ::sa::VT_F32, ::sa::IDX_DIV, 0xFFFF};
+    v.uni = 1;
+    return v;
+  };
   auto valOf = [&](Value x) -> Val {
     if (auto it = vals.find(x); it != vals.end()) return it->second;
     Val v;
     if (auto c = constF32(x)) {
       v.kind = Val::Const;
       v.c = *c;
+    } else if (auto pv = pushF32(x)) {
+      vals[x] = *pv;
+      return *pv;
     }
     return v;
   };
@@ -481,6 +504,12 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
         vals[res] = v;
       }
       continue;                                      // integer constants are read where used
+    }
+    if (isa<arith::BitcastOp>(op)) {
+      if (auto pv = pushF32(res)) {
+        vals[res] = *pv;
+        continue;
+      }
     }
     if (auto ix = dyn_cast<linalg::IndexOp>(op)) {
       Val v;

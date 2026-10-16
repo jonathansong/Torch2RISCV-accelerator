@@ -135,6 +135,8 @@ bool Lowerer::lowerBlock(Block &block) {
     if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp, arith::OrIOp, arith::ShRUIOp,
             arith::DivUIOp>(op))
       continue;
+    // an f32 push constant (a generalized scale): read by the element-wise op that uses it
+    if (auto bc = dyn_cast<arith::BitcastOp>(op); bc && bc.getType().isF32() && linOf(bc.getIn())) continue;
     if (isa<arith::AddIOp, arith::MulIOp>(op) && op->hasAttr("sa.index")) continue;   // (an expanded kernel's count: its Lin used)
     if (auto l = dyn_cast<sahl::LoadOp>(op)) {
       if (!load(l)) return false;
@@ -447,6 +449,9 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
     expect *= mt.getDimSize(i);
   }
   int64_t elem = 0;
+  // a subview offset that is a push constant's Lin (in elements), e.g. a layer's
+  // offset into a KV cache once iree-flow-generalize-executables made it an operand
+  std::optional<Lin> dynElems;
   Value cur = v;
   while (true) {
     Operation *op = cur.getDefiningOp();
@@ -456,9 +461,20 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
       SmallVector<int64_t> ss;
       int64_t so;
       if (failed(st.getStridesAndOffset(ss, so))) return fail("subview source strides"), std::nullopt;
+      unsigned di = 0;
       for (auto [o, str] : llvm::zip(s.getStaticOffsets(), ss)) {
         if (o == 0) continue;                      // (row 0 of rows a dynamic stride apart: a cursor's view)
-        if (ShapedType::isDynamic(o) || ShapedType::isDynamic(str)) return fail("dynamic subview"), std::nullopt;
+        if (ShapedType::isDynamic(str)) return fail("dynamic subview"), std::nullopt;
+        if (ShapedType::isDynamic(o)) {
+          auto l = linOf(s.getOffsets()[di++]);
+          if (!l || dynElems || l->shift) return fail("dynamic subview"), std::nullopt;
+          if (l->isConst()) {
+            elem += l->add * str;
+          } else {
+            dynElems = Lin{l->ord, l->mul * str, 0, l->add * str};
+          }
+          continue;
+        }
         elem += o * str;
       }
       cur = s.getSource();
@@ -481,11 +497,19 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
       off = *l;
     }
     Ddr r;
-    r.base = baseFor(int(sub.getBinding().getZExtValue()), off);
     r.et = mt.getElementType();
     uint32_t es = esize(r.et);
     if (!es) return fail("DDR element type"), std::nullopt;
-    r.off = (off.isConst() ? off.add : 0) + elem * es;
+    if (dynElems) {                                // the base: the binding + the push constant's bytes
+      if (!off.isConst()) return fail("dynamic subview of a binding at a dynamic offset"), std::nullopt;
+      Lin b{dynElems->ord, dynElems->mul * es, 0, dynElems->add * es + off.add};
+      if (b.mul % 8 || b.add % 8) return fail("dynamic subview not 8-byte aligned"), std::nullopt;
+      r.base = baseFor(int(sub.getBinding().getZExtValue()), b);
+      r.off = elem * es;
+    } else {
+      r.base = baseFor(int(sub.getBinding().getZExtValue()), off);
+      r.off = (off.isConst() ? off.add : 0) + elem * es;
+    }
     r.n = mt.getNumElements();
     r.dynRows = dynRows;
     r.dynMid = dynMid;
