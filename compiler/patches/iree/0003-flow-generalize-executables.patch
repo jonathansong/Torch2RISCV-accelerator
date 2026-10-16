@@ -1,13 +1,10 @@
-From: jonathansong <nenghui.song@gmail.com>
-Subject: [PATCH] [Flow] Generalize executables that differ only in constants before deduplication
+From: jonathansong <7958352+jonathansong@users.noreply.github.com>
+Subject: [PATCH] [Flow] Add a pass that generalizes executables differing only in constants
 
-New pass iree-flow-generalize-executables (pipeline flag
---iree-flow-enable-executable-generalization, off by default): within a
-group of executables whose dispatch functions are structurally equal up to
-the values of index / f32 constants and of static offsets of tensor loads /
-stores into globals, every value that differs becomes a dispatch operand, so
-DeduplicateExecutables merges the group (e.g. one executable per layer of a
-KV cache read at the layer offset becomes one).
+The local-tree version (IREE e4a3b04) of compiler/patches/iree-pr3 (the
+upstream PR against main): pass iree-flow-generalize-executables, pipeline
+flag --iree-flow-enable-executable-generalization (off by default), lit test
+test/generalize_executables.mlir.
 
 diff --git a/compiler/src/iree/compiler/Dialect/Flow/Transforms/BUILD.bazel b/compiler/src/iree/compiler/Dialect/Flow/Transforms/BUILD.bazel
 index 3b36757..71edf8a 100644
@@ -34,26 +31,25 @@ index 136de13..45febb3 100644
      "ExportBenchmarkFuncs.cpp"
      "FormDispatchRegions.cpp"
 diff --git a/compiler/src/iree/compiler/Dialect/Flow/Transforms/Passes.cpp b/compiler/src/iree/compiler/Dialect/Flow/Transforms/Passes.cpp
-index 412f8c8..02023d8 100644
+index 412f8c8..8af362e 100644
 --- a/compiler/src/iree/compiler/Dialect/Flow/Transforms/Passes.cpp
 +++ b/compiler/src/iree/compiler/Dialect/Flow/Transforms/Passes.cpp
-@@ -32,6 +32,15 @@ static llvm::cl::opt<bool> clExportBenchmarkFuncs(
+@@ -32,6 +32,14 @@ static llvm::cl::opt<bool> clExportBenchmarkFuncs(
          "unique flow.executable that dispatches with dummy arguments."),
      llvm::cl::init(false));
  
 +static llvm::cl::opt<bool> clGeneralizeExecutables(
 +    "iree-flow-enable-executable-generalization",
 +    llvm::cl::desc(
-+        "Turns the constants (index and f32 values, static load / store offsets into "
-+        "globals) in "
-+        "which otherwise equal executables differ into dispatch operands "
-+        "before deduplication."),
++        "Turns the constants in which otherwise equal executables differ "
++        "(index and f32 values, static load / store offsets into globals) "
++        "into dispatch operands before deduplication."),
 +    llvm::cl::init(false));
 +
  // TODO(ravishankarm): Change to a pipeline option.
  static llvm::cl::opt<bool> clTraceDispatchTensors(
      "iree-flow-trace-dispatch-tensors",
-@@ -181,6 +190,9 @@ void buildFlowTransformPassPipeline(OpPassManager &passManager,
+@@ -181,6 +189,9 @@ void buildFlowTransformPassPipeline(OpPassManager &passManager,
    // Note: this only deduplicates equivalent executables. We could in addition
    // generalize executables to prune further (e.g. by promoting a dimension to
    // an argument if two executables differ only in that one dimension).
@@ -88,12 +84,36 @@ index e19f52c..4f3cbe3 100644
  def DeduplicateExecutablesPass :
      Pass<"iree-flow-deduplicate-executables", "mlir::ModuleOp"> {
    let summary = "Deduplicates executables that are identical.";
+diff --git a/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/BUILD.bazel b/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/BUILD.bazel
+index cfa0a91..3b2bf40 100644
+--- a/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/BUILD.bazel
++++ b/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/BUILD.bazel
+@@ -24,6 +24,7 @@ iree_lit_test_suite(
+             "cleanup_tensor_shapes.mlir",
+             "deduplicate_executables.mlir",
+             "export_benchmark_funcs.mlir",
++            "generalize_executables.mlir",
+             "initialize_empty_tensors.mlir",
+             "inject_dispatch_tracing.mlir",
+             "inject_tensor_tracing.mlir",
+diff --git a/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/CMakeLists.txt b/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/CMakeLists.txt
+index b882965..ae2438f 100644
+--- a/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/CMakeLists.txt
++++ b/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/CMakeLists.txt
+@@ -21,6 +21,7 @@ iree_lit_test_suite(
+     "cleanup_tensor_shapes.mlir"
+     "deduplicate_executables.mlir"
+     "export_benchmark_funcs.mlir"
++    "generalize_executables.mlir"
+     "initialize_empty_tensors.mlir"
+     "inject_dispatch_tracing.mlir"
+     "inject_tensor_tracing.mlir"
 diff --git a/compiler/src/iree/compiler/Dialect/Flow/Transforms/GeneralizeExecutables.cpp b/compiler/src/iree/compiler/Dialect/Flow/Transforms/GeneralizeExecutables.cpp
 new file mode 100644
-index 0000000..57af572
+index 0000000..79de1e5
 --- /dev/null
 +++ b/compiler/src/iree/compiler/Dialect/Flow/Transforms/GeneralizeExecutables.cpp
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,369 @@
 +// Copyright 2026 The IREE Authors
 +//
 +// Licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -139,7 +159,7 @@ index 0000000..57af572
 +struct Slot {
 +  Operation *op;
 +  int offset = -1; // -1: the constant; else the offset's position
-+  int64_t value; // (an f32's bits)
++  int64_t value;   // (an f32's bits)
 +  Type type;
 +};
 +
@@ -150,16 +170,19 @@ index 0000000..57af572
 +
 +static bool isScalarGeneralizableConstant(Operation *op) {
 +  auto c = dyn_cast<arith::ConstantOp>(op);
-+  if (!c)
++  if (!c) {
 +    return false;
-+  if (isa<IndexType>(c.getType()))
++  }
++  if (isa<IndexType>(c.getType())) {
 +    return isa<IntegerAttr>(c.getValue());
++  }
 +  return c.getType().isF32() && isa<FloatAttr>(c.getValue());
 +}
 +
 +static int64_t constantBits(arith::ConstantOp c) {
-+  if (auto f = dyn_cast<FloatAttr>(c.getValue()))
++  if (auto f = dyn_cast<FloatAttr>(c.getValue())) {
 +    return int64_t(f.getValue().bitcastToAPInt().getZExtValue());
++  }
 +  return cast<IntegerAttr>(c.getValue()).getValue().getSExtValue();
 +}
 +
@@ -172,8 +195,8 @@ index 0000000..57af572
 +      os << "d,";
 +    } else {
 +      os << "s,";
-+      slots.push_back({op.getOperation(), int(i), v,
-+                       IndexType::get(op.getContext())});
++      slots.push_back(
++          {op.getOperation(), int(i), v, IndexType::get(op.getContext())});
 +    }
 +  }
 +  os << ")";
@@ -187,19 +210,22 @@ index 0000000..57af572
 +  DenseMap<Value, unsigned> ids;
 +  auto id = [&](Value v) {
 +    auto it = ids.find(v);
-+    if (it != ids.end())
++    if (it != ids.end()) {
 +      return it->second;
++    }
 +    unsigned n = ids.size();
 +    ids[v] = n;
 +    return n;
 +  };
 +  os << funcOp.getFunctionType();
 +  funcOp.walk<WalkOrder::PreOrder>([&](Operation *op) {
-+    if (op == funcOp.getOperation())
++    if (op == funcOp.getOperation()) {
 +      return;
++    }
 +    os << "\n" << op->getName() << "(";
-+    for (Value v : op->getOperands())
++    for (Value v : op->getOperands()) {
 +      os << id(v) << ",";
++    }
 +    os << ")->(";
 +    for (Value r : op->getResults()) {
 +      id(r);
@@ -223,7 +249,8 @@ index 0000000..57af572
 +      auto c = cast<arith::ConstantOp>(op);
 +      sig.slots.push_back({op, -1, constantBits(c), c.getType()});
 +      skip = "value";
-+    } else if (auto load = dyn_cast<IREE::TensorExt::DispatchTensorLoadOp>(op)) {
++    } else if (auto load =
++                   dyn_cast<IREE::TensorExt::DispatchTensorLoadOp>(op)) {
 +      signOffsets(load, os, sig.slots);
 +      skip = "static_offsets";
 +    } else if (auto store =
@@ -233,8 +260,9 @@ index 0000000..57af572
 +    }
 +    os << " {";
 +    for (NamedAttribute a : op->getAttrs()) {
-+      if (a.getName() == skip)
++      if (a.getName() == skip) {
 +        continue;
++      }
 +      os << a.getName() << "=" << a.getValue() << ",";
 +    }
 +    os << "}";
@@ -255,22 +283,26 @@ index 0000000..57af572
 +
 +// Whether |v| is a global's contents (a load of it, possibly through dispatches
 +// that update it in place): its binding then has the same offset at every call
-+// site, so a generalized offset into it is the only dynamic part of the address.
-+// An offset into a transient tensor is left alone (its binding offset may be
-+// dynamic already).
++// site, so a generalized offset into it is the only dynamic part of the
++// address. An offset into a transient tensor is left alone (its binding offset
++// may be dynamic already).
 +static bool isGlobalBacked(Value v) {
 +  for (int depth = 0; depth < 4096; ++depth) {
 +    Operation *op = v.getDefiningOp();
-+    if (!op)
++    if (!op) {
 +      return false;
-+    if (isa<IREE::Util::GlobalLoadOpInterface>(op))
++    }
++    if (isa<IREE::Util::GlobalLoadOpInterface>(op)) {
 +      return true;
++    }
 +    auto tied = dyn_cast<IREE::Util::TiedOpInterface>(op);
-+    if (!tied)
++    if (!tied) {
 +      return false;
++    }
 +    Value operand = tied.getTiedResultOperand(v);
-+    if (!operand)
++    if (!operand) {
 +      return false;
++    }
 +    v = operand;
 +  }
 +  return false;
@@ -295,43 +327,51 @@ index 0000000..57af572
 +    for (auto executableOp : moduleOp.getOps<IREE::Flow::ExecutableOp>()) {
 +      auto exports = executableOp.getOps<IREE::Flow::ExecutableExportOp>();
 +      auto innerModule = executableOp.getInnerModule();
-+      if (!innerModule || !llvm::hasSingleElement(exports))
++      if (!innerModule || !llvm::hasSingleElement(exports)) {
 +        continue;
++      }
 +      auto funcs = innerModule.getOps<func::FuncOp>();
-+      if (!llvm::hasSingleElement(funcs))
++      if (!llvm::hasSingleElement(funcs)) {
 +        continue;
-+      members[executableOp.getSymName()] = {executableOp, *funcs.begin(), {}, {}};
++      }
++      members[executableOp.getSymName()] = {
++          executableOp, *funcs.begin(), {}, {}};
 +    }
 +    moduleOp.walk([&](IREE::Flow::DispatchOp dispatchOp) {
-+      SmallVector<SymbolRefAttr> refs = llvm::to_vector(dispatchOp.getEntryPointRefs());
++      SmallVector<SymbolRefAttr> refs =
++          llvm::to_vector(dispatchOp.getEntryPointRefs());
 +      if (refs.size() != 1) {
-+        for (auto ref : refs)
++        for (auto ref : refs) {
 +          members.erase(ref.getRootReference().getValue());
++        }
 +        return;
 +      }
 +      auto it = members.find(refs.front().getRootReference().getValue());
-+      if (it != members.end())
++      if (it != members.end()) {
 +        it->second.callers.push_back(dispatchOp);
++      }
 +    });
 +
 +    // Group by signature (in module order, so the result is deterministic).
 +    llvm::MapVector<StringRef, SmallVector<Member *>> byKey;
 +    for (auto &[name, m] : members) {
-+      if (m.callers.empty())
++      if (m.callers.empty()) {
 +        continue;
++      }
 +      m.sig = sign(m.funcOp);
 +    }
 +    for (auto &[name, m] : members) {
-+      if (m.callers.empty())
++      if (m.callers.empty()) {
 +        continue;
++      }
 +      byKey[m.sig.key].push_back(&m);
 +    }
 +
 +    for (auto &entry : byKey) {
 +      SmallVector<Member *> &group = entry.second;
-+      // (all members' callers pass the same number of operands)
-+      if (group.size() < 2)
++      if (group.size() < 2) {
 +        continue;
++      }
 +      size_t nslots = group.front()->sig.slots.size();
 +      SmallVector<size_t> varying;
 +      for (size_t s = 0; s < nslots; ++s) {
@@ -343,45 +383,60 @@ index 0000000..57af572
 +          }
 +        }
 +      }
-+      if (varying.empty())
++      if (varying.empty()) {
 +        continue; // already identical: deduplication merges them
++      }
 +      // an offset may be generalized only into a global's contents
 +      bool ok = true;
 +      for (size_t s : varying) {
 +        for (Member *m : group) {
 +          Slot &slot = m->sig.slots[s];
-+          if (slot.offset < 0)
++          if (slot.offset < 0) {
 +            continue;
++          }
 +          Value t;
-+          if (auto load = dyn_cast<IREE::TensorExt::DispatchTensorLoadOp>(slot.op))
++          if (auto load =
++                  dyn_cast<IREE::TensorExt::DispatchTensorLoadOp>(slot.op)) {
 +            t = load.getSource();
-+          else
-+            t = cast<IREE::TensorExt::DispatchTensorStoreOp>(slot.op).getTarget();
++          } else {
++            t = cast<IREE::TensorExt::DispatchTensorStoreOp>(slot.op)
++                    .getTarget();
++          }
 +          auto arg = dyn_cast<BlockArgument>(t);
 +          unsigned nops = m->callers.front().getArguments().size();
-+          if (!arg || arg.getOwner() != &m->funcOp.front() || arg.getArgNumber() >= nops) {
++          if (!arg || arg.getOwner() != &m->funcOp.front() ||
++              arg.getArgNumber() >= nops) {
 +            ok = false;
 +            break;
 +          }
-+          for (IREE::Flow::DispatchOp caller : m->callers)
++          for (IREE::Flow::DispatchOp caller : m->callers) {
 +            ok &= isGlobalBacked(caller.getArguments()[arg.getArgNumber()]);
-+          if (!ok)
++          }
++          if (!ok) {
 +            break;
++          }
 +        }
-+        if (!ok)
++        if (!ok) {
 +          break;
++        }
 +      }
-+      if (!ok)
++      if (!ok) {
 +        continue;
++      }
++      // the new operands go after each member's operands (before its untied
++      // results): all of a member's callers must pass the same number
++      bool consistent = llvm::all_of(group, [](Member *m) {
++        size_t n = m->callers.front().getArguments().size();
++        return llvm::all_of(m->callers, [&](IREE::Flow::DispatchOp c) {
++          return c.getArguments().size() == n;
++        });
++      });
++      if (!consistent) {
++        continue;
++      }
 +      for (Member *m : group) {
 +        func::FuncOp funcOp = m->funcOp;
-+        // the dispatch's operands come first, then its untied results
 +        unsigned pos = m->callers.front().getArguments().size();
-+        bool consistent = llvm::all_of(m->callers, [&](auto c) {
-+          return c.getArguments().size() == pos;
-+        });
-+        if (!consistent)
-+          break;
 +        SmallVector<Value> newArgs;
 +        for (size_t s : varying) {
 +          Slot &slot = m->sig.slots[s];
@@ -391,8 +446,9 @@ index 0000000..57af572
 +          newArgs.push_back(arg);
 +          if (slot.offset < 0) {
 +            slot.op->getResult(0).replaceAllUsesWith(arg);
-+          } else if (auto load = dyn_cast<IREE::TensorExt::DispatchTensorLoadOp>(
-+                         slot.op)) {
++          } else if (auto load =
++                         dyn_cast<IREE::TensorExt::DispatchTensorLoadOp>(
++                             slot.op)) {
 +            makeOffsetDynamic(load, slot.offset, arg);
 +          } else {
 +            makeOffsetDynamic(
@@ -402,8 +458,9 @@ index 0000000..57af572
 +        }
 +        for (size_t s : varying) {
 +          Slot &slot = m->sig.slots[s];
-+          if (slot.offset < 0 && slot.op->use_empty())
++          if (slot.offset < 0 && slot.op->use_empty()) {
 +            slot.op->erase();
++          }
 +        }
 +        for (IREE::Flow::DispatchOp caller : m->callers) {
 +          OpBuilder b(caller);
@@ -412,8 +469,8 @@ index 0000000..57af572
 +            Slot &slot = m->sig.slots[s];
 +            TypedAttr attr =
 +                slot.type.isF32()
-+                    ? TypedAttr(b.getF32FloatAttr(llvm::bit_cast<float>(
-+                          uint32_t(slot.value))))
++                    ? TypedAttr(b.getF32FloatAttr(
++                          llvm::bit_cast<float>(uint32_t(slot.value))))
 +                    : TypedAttr(b.getIntegerAttr(slot.type, slot.value));
 +            values.push_back(
 +                arith::ConstantOp::create(b, caller.getLoc(), slot.type, attr));
@@ -426,3 +483,234 @@ index 0000000..57af572
 +};
 +
 +} // namespace mlir::iree_compiler::IREE::Flow
+diff --git a/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/generalize_executables.mlir b/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/generalize_executables.mlir
+new file mode 100644
+index 0000000..e1aa842
+--- /dev/null
++++ b/compiler/src/iree/compiler/Dialect/Flow/Transforms/test/generalize_executables.mlir
+@@ -0,0 +1,225 @@
++// RUN: iree-opt --split-input-file --iree-flow-generalize-executables %s | FileCheck %s
++// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(iree-flow-generalize-executables, iree-flow-deduplicate-executables)" %s | FileCheck %s --check-prefix=DEDUP
++
++// Two executables that read a global at different static offsets: the offset
++// becomes a dispatch operand (inserted after the operands, before the result
++// binding) and each call site passes its value; deduplication then keeps one.
++
++flow.executable private @offset_ex_0 {
++  flow.executable.export public @offset_entry_0 workgroups() -> (index, index, index) {
++    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
++    flow.return %x, %y, %z : index, index, index
++  }
++  builtin.module {
++    func.func @offset_entry_0(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>) {
++      %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [2, 0], sizes = [1, 4], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>> -> tensor<1x4xf32>
++      iree_tensor_ext.dispatch.tensor.store %0, %arg1, offsets = [0, 0], sizes = [1, 4], strides = [1, 1] : tensor<1x4xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>
++      return
++    }
++  }
++}
++flow.executable private @offset_ex_1 {
++  flow.executable.export public @offset_entry_1 workgroups() -> (index, index, index) {
++    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
++    flow.return %x, %y, %z : index, index, index
++  }
++  builtin.module {
++    func.func @offset_entry_1(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>) {
++      %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [6, 0], sizes = [1, 4], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>> -> tensor<1x4xf32>
++      iree_tensor_ext.dispatch.tensor.store %0, %arg1, offsets = [0, 0], sizes = [1, 4], strides = [1, 1] : tensor<1x4xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>
++      return
++    }
++  }
++}
++util.global private @cache : tensor<8x4xf32>
++util.func public @offset() -> (tensor<1x4xf32>, tensor<1x4xf32>) {
++  %cache = util.global.load @cache : tensor<8x4xf32>
++  %0 = flow.dispatch @offset_ex_0::@offset_entry_0(%cache) : (tensor<8x4xf32>) -> tensor<1x4xf32>
++  %1 = flow.dispatch @offset_ex_1::@offset_entry_1(%cache) : (tensor<8x4xf32>) -> tensor<1x4xf32>
++  util.return %0, %1 : tensor<1x4xf32>, tensor<1x4xf32>
++}
++
++// CHECK-LABEL: flow.executable private @offset_ex_0
++//       CHECK:   func.func @offset_entry_0(%[[SRC:.+]]: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>>, %[[OFF:.+]]: index, %{{.+}}: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>)
++//       CHECK:     iree_tensor_ext.dispatch.tensor.load %[[SRC]], offsets = [%[[OFF]], 0]
++// CHECK-LABEL: flow.executable private @offset_ex_1
++//       CHECK:   func.func @offset_entry_1(%{{.+}}: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>>, %{{.+}}: index,
++// CHECK-LABEL: util.func public @offset
++//       CHECK:   %[[C2:.+]] = arith.constant 2 : index
++//       CHECK:   flow.dispatch @offset_ex_0::@offset_entry_0(%{{.+}}, %[[C2]]) : (tensor<8x4xf32>, index) -> tensor<1x4xf32>
++//       CHECK:   %[[C6:.+]] = arith.constant 6 : index
++//       CHECK:   flow.dispatch @offset_ex_1::@offset_entry_1(%{{.+}}, %[[C6]]) : (tensor<8x4xf32>, index) -> tensor<1x4xf32>
++
++// DEDUP-LABEL: flow.executable private @offset_ex_0
++//   DEDUP-NOT: flow.executable private @offset_ex_1
++//       DEDUP: flow.dispatch @offset_ex_0::@offset_entry_0
++//       DEDUP: flow.dispatch @offset_ex_0::@offset_entry_0
++
++// -----
++
++// Two executables that differ in an f32 constant (e.g. a per-layer scale): the
++// constant becomes a dispatch operand.
++
++flow.executable private @scale_ex_0 {
++  flow.executable.export public @scale_entry_0 workgroups() -> (index, index, index) {
++    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
++    flow.return %x, %y, %z : index, index, index
++  }
++  builtin.module {
++    func.func @scale_entry_0(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4xf32>>) {
++      %cst = arith.constant 5.000000e-01 : f32
++      %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0], sizes = [4], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xf32>> -> tensor<4xf32>
++      %1 = tensor.empty() : tensor<4xf32>
++      %2 = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%0 : tensor<4xf32>) outs(%1 : tensor<4xf32>) {
++      ^bb0(%in: f32, %out: f32):
++        %3 = arith.mulf %in, %cst : f32
++        linalg.yield %3 : f32
++      } -> tensor<4xf32>
++      iree_tensor_ext.dispatch.tensor.store %2, %arg1, offsets = [0], sizes = [4], strides = [1] : tensor<4xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4xf32>>
++      return
++    }
++  }
++}
++flow.executable private @scale_ex_1 {
++  flow.executable.export public @scale_entry_1 workgroups() -> (index, index, index) {
++    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
++    flow.return %x, %y, %z : index, index, index
++  }
++  builtin.module {
++    func.func @scale_entry_1(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4xf32>>) {
++      %cst = arith.constant 2.500000e-01 : f32
++      %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0], sizes = [4], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xf32>> -> tensor<4xf32>
++      %1 = tensor.empty() : tensor<4xf32>
++      %2 = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%0 : tensor<4xf32>) outs(%1 : tensor<4xf32>) {
++      ^bb0(%in: f32, %out: f32):
++        %3 = arith.mulf %in, %cst : f32
++        linalg.yield %3 : f32
++      } -> tensor<4xf32>
++      iree_tensor_ext.dispatch.tensor.store %2, %arg1, offsets = [0], sizes = [4], strides = [1] : tensor<4xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4xf32>>
++      return
++    }
++  }
++}
++util.func public @scale(%arg0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
++  %0 = flow.dispatch @scale_ex_0::@scale_entry_0(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
++  %1 = flow.dispatch @scale_ex_1::@scale_entry_1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
++  util.return %0, %1 : tensor<4xf32>, tensor<4xf32>
++}
++
++// CHECK-LABEL: flow.executable private @scale_ex_0
++//       CHECK:   func.func @scale_entry_0(%{{.+}}: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xf32>>, %[[S:.+]]: f32,
++//   CHECK-NOT:     arith.constant
++//       CHECK:     arith.mulf %{{.+}}, %[[S]] : f32
++// CHECK-LABEL: util.func public @scale
++//       CHECK:   %[[A:.+]] = arith.constant 5.000000e-01 : f32
++//       CHECK:   flow.dispatch @scale_ex_0::@scale_entry_0(%arg0, %[[A]]) : (tensor<4xf32>, f32) -> tensor<4xf32>
++//       CHECK:   %[[B:.+]] = arith.constant 2.500000e-01 : f32
++//       CHECK:   flow.dispatch @scale_ex_1::@scale_entry_1(%arg0, %[[B]]) : (tensor<4xf32>, f32) -> tensor<4xf32>
++
++// DEDUP-LABEL: flow.executable private @scale_ex_0
++//   DEDUP-NOT: flow.executable private @scale_ex_1
++
++// -----
++
++// An offset into a tensor that is not a global's contents is left alone: its
++// binding offset may itself be dynamic, so the group is not generalized.
++
++flow.executable private @transient_ex_0 {
++  flow.executable.export public @transient_entry_0 workgroups() -> (index, index, index) {
++    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
++    flow.return %x, %y, %z : index, index, index
++  }
++  builtin.module {
++    func.func @transient_entry_0(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>) {
++      %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [2, 0], sizes = [1, 4], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>> -> tensor<1x4xf32>
++      iree_tensor_ext.dispatch.tensor.store %0, %arg1, offsets = [0, 0], sizes = [1, 4], strides = [1, 1] : tensor<1x4xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>
++      return
++    }
++  }
++}
++flow.executable private @transient_ex_1 {
++  flow.executable.export public @transient_entry_1 workgroups() -> (index, index, index) {
++    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
++    flow.return %x, %y, %z : index, index, index
++  }
++  builtin.module {
++    func.func @transient_entry_1(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>) {
++      %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [6, 0], sizes = [1, 4], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>> -> tensor<1x4xf32>
++      iree_tensor_ext.dispatch.tensor.store %0, %arg1, offsets = [0, 0], sizes = [1, 4], strides = [1, 1] : tensor<1x4xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>
++      return
++    }
++  }
++}
++util.func public @transient(%arg0: tensor<8x4xf32>) -> (tensor<1x4xf32>, tensor<1x4xf32>) {
++  %0 = flow.dispatch @transient_ex_0::@transient_entry_0(%arg0) : (tensor<8x4xf32>) -> tensor<1x4xf32>
++  %1 = flow.dispatch @transient_ex_1::@transient_entry_1(%arg0) : (tensor<8x4xf32>) -> tensor<1x4xf32>
++  util.return %0, %1 : tensor<1x4xf32>, tensor<1x4xf32>
++}
++
++// CHECK-LABEL: flow.executable private @transient_ex_0
++//       CHECK:   func.func @transient_entry_0(%{{.+}}: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x4xf32>>, %{{.+}}: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4xf32>>)
++//       CHECK:     offsets = [2, 0]
++// CHECK-LABEL: util.func public @transient
++//       CHECK:   flow.dispatch @transient_ex_0::@transient_entry_0(%arg0) : (tensor<8x4xf32>) -> tensor<1x4xf32>
++
++// DEDUP-LABEL: flow.executable private @transient_ex_0
++//       DEDUP: flow.executable private @transient_ex_1
++
++// -----
++
++// Integer constants other than index values compute values a backend may need
++// to see as constants: executables differing in one are not generalized.
++
++flow.executable private @int_ex_0 {
++  flow.executable.export public @int_entry_0 workgroups() -> (index, index, index) {
++    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
++    flow.return %x, %y, %z : index, index, index
++  }
++  builtin.module {
++    func.func @int_entry_0(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xi32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4xi32>>) {
++      %c3 = arith.constant 3 : i32
++      %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0], sizes = [4], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xi32>> -> tensor<4xi32>
++      %1 = tensor.empty() : tensor<4xi32>
++      %2 = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%0 : tensor<4xi32>) outs(%1 : tensor<4xi32>) {
++      ^bb0(%in: i32, %out: i32):
++        %3 = arith.addi %in, %c3 : i32
++        linalg.yield %3 : i32
++      } -> tensor<4xi32>
++      iree_tensor_ext.dispatch.tensor.store %2, %arg1, offsets = [0], sizes = [4], strides = [1] : tensor<4xi32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4xi32>>
++      return
++    }
++  }
++}
++flow.executable private @int_ex_1 {
++  flow.executable.export public @int_entry_1 workgroups() -> (index, index, index) {
++    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
++    flow.return %x, %y, %z : index, index, index
++  }
++  builtin.module {
++    func.func @int_entry_1(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xi32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4xi32>>) {
++      %c5 = arith.constant 5 : i32
++      %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0], sizes = [4], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4xi32>> -> tensor<4xi32>
++      %1 = tensor.empty() : tensor<4xi32>
++      %2 = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%0 : tensor<4xi32>) outs(%1 : tensor<4xi32>) {
++      ^bb0(%in: i32, %out: i32):
++        %3 = arith.addi %in, %c5 : i32
++        linalg.yield %3 : i32
++      } -> tensor<4xi32>
++      iree_tensor_ext.dispatch.tensor.store %2, %arg1, offsets = [0], sizes = [4], strides = [1] : tensor<4xi32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4xi32>>
++      return
++    }
++  }
++}
++util.func public @int(%arg0: tensor<4xi32>) -> (tensor<4xi32>, tensor<4xi32>) {
++  %0 = flow.dispatch @int_ex_0::@int_entry_0(%arg0) : (tensor<4xi32>) -> tensor<4xi32>
++  %1 = flow.dispatch @int_ex_1::@int_entry_1(%arg0) : (tensor<4xi32>) -> tensor<4xi32>
++  util.return %0, %1 : tensor<4xi32>, tensor<4xi32>
++}
++
++// CHECK-LABEL: flow.executable private @int_ex_0
++//       CHECK:   arith.constant 3 : i32
++// CHECK-LABEL: util.func public @int
++//       CHECK:   flow.dispatch @int_ex_0::@int_entry_0(%arg0) : (tensor<4xi32>) -> tensor<4xi32>
++
++// DEDUP-LABEL: flow.executable private @int_ex_0
++//       DEDUP: flow.executable private @int_ex_1
