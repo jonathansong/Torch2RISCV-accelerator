@@ -20,11 +20,19 @@
 > positions, Gemma-3-270M for 512, prefill vs decode bit-exact on the board over
 > a 2032-token prompt; Qwen3 decode 7.2 tok/s at T = 64 and 3.2 at T = 2048,
 > Qwen3 teacher-forcing PPL over two 2048-token windows 18.58 (fp32 18.77).
-> RISC-V backend pre-research (C7, [design](docs/riscv_backend_design.md)): the
-> decode loop runs on the PicoRV32 control core instead of the ARM (the ARM
-> records the step's lists once per attention-length bucket; the core patches
-> them at bucket changes, submits them and takes the argmax), bit-exact on the
-> board for Gemma-3, Qwen3 and Llama-3.2.
+> RISC-V backend pre-research (C7, [design](docs/riscv_backend_design.md)), all
+> on the board for Gemma-3, Qwen3 and Llama-3.2, bit-exact:
+> - **Plan B**: the decode loop runs on the PicoRV32 control core instead of the
+>   ARM. The ARM records the step's lists once per attention-length bucket; the
+>   core patches them at bucket changes, submits them and takes the argmax.
+> - **Plan A**: every dispatch as RISC-V code that iree-compile generates
+>   (`sahw` → LLVM IR → rv32imc) and embeds in `sa.vmfb`, which issues the
+>   commands over PCPI with no descriptors, also inside plan B's loop.
+> - **R5**: a scalar kernel compiled by IREE's llvm-cpu for the core.
+>
+> The counters put plan A's remaining gap to the lists (Qwen3 163 against 136
+> ms per step) entirely on instruction fetch from DDR: about 27 cycles per
+> instruction, 9–11 instructions per command.
 > The PYNQ-Z1 version is frozen at tag
 > [`v1.0-pynq-z1`](../../tree/v1.0-pynq-z1) (branch `pynq-z1`): stories15M at
 > 17.6 tok/s and SmolLM2-135M (prefill + decode, the hand-written and the
@@ -224,7 +232,8 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   command ring, in stages C0-C7 (C4 closed 2026-10-15, its fusions continued on
   the KV260; C7, a RISC-V backend, is pre-research for an ASIC NPU:
   [design](docs/riscv_backend_design.md); since 2026-10-16 the PicoRV32 can run
-  the whole decode loop on the board, bit-exact, the ARM out of the loop). Done: a full MLIR code generator (the `sahl`
+  the whole decode loop on the board, bit-exact, the ARM out of the loop, every
+  dispatch also as RISC-V code generated and embedded by iree-compile). Done: a full MLIR code generator (the `sahl`
   / `sahw` dialects, templates as micro-kernels); stories15M (17.7 tok/s) and
   HuggingFace SmolLM2-135M (2.22 tok/s) run on the board bit-exact with the
   references, and generate text interactively there (on the KV260 also the

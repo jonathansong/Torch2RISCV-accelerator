@@ -1,6 +1,12 @@
-# C7: a RISC-V backend for the sa accelerator (design, 2026-10-15)
+# C7: a RISC-V backend for the sa accelerator (design 2026-10-15, done 2026-10-16)
 
-Status: **design and pre-research**; plan B (§7.1, the decode loop on the PicoRV32) implemented and **accepted on the board 2026-10-16** (Gemma-3-270M, Qwen3-0.6B, Llama-3.2-1B: tokens identical, logits bit-exact). C7 is the optional stage of
+Status: **done 2026-10-16**. Everything below is accepted on the board for Gemma-3-270M, Qwen3-0.6B and Llama-3.2-1B (tokens identical, logits bit-exact); §0 has the overview, and the answers to the ASIC questions are in §8 and §9.10:
+- plan B, the decode loop on the PicoRV32 (§7.1);
+- plan A, every dispatch as generated RISC-V code, from the `.ll` (S1–S3) and embedded in `sa.vmfb` by iree-compile (S4) (§9);
+- R5, an llvm-cpu kernel on the core (§5);
+- the code size against a TCM / I-cache (§8) and the performance-counter breakdown (§9.10).
+
+C7 is the optional stage of
 [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.10. Its purpose here is to
 prepare a future ASIC NPU: a small programmable core next to the
 accelerator that issues its commands and runs the scalar code the
@@ -27,7 +33,7 @@ How they relate:
 - **Plan B changes the sequencer, plan A the command encoding.** Plan B is the ASIC shape "small control core + command DMA": the core decides what runs next, the fetch unit streams the commands. Plan A removes the descriptors: the core's code is the command stream, which needs a real compiler backend (§9) and measures what an ASIC core without a command DMA would have to sustain.
 - **They compose.** Plan A's S3 runs inside plan B's loop: the step table marks each dispatch "call" (plan A's function) or "list" (its recorded descriptors), so a dispatch not yet covered by plan A falls back to the list in the same step. The end state is a decode step driven entirely by the core and generated code, the ARM idle.
 - **Model C is orthogonal**: it adds scalar computation on the core (today plan B's argmax is a block-max dispatch plus a scan in rt_fw, §7.1), usable from either sequencer.
-- **All coexist.** Each is opt-in (the switches above); the default path's binaries, the golden corpus and every existing bundle are unchanged. Plan B and plan A use the existing `_pcpi` overlay (GEMV over PCPI, CAPS bit 26); no path needs a new bitstream. rt_fw v3 serves the list entries, `RT_RUN_SCHED` and (S2) `RT_CALL` side by side.
+- **All coexist.** Each is opt-in (the switches above); the default path's binaries, the golden corpus and every existing bundle are unchanged. Plan B and plan A use the existing `_pcpi` overlay (GEMV over PCPI, CAPS bit 26); no path needs a new bitstream. rt_fw serves the list entries, `RT_RUN_SCHED` (v3; RVS2 tables with calls v5, the R5 kernel v6) and `RT_CALL` (v4) side by side; v7 adds the core's instructions retired and the event counters on calls and schedules (§9.10).
 
 ## 1. What the KV260 overlay provides (checked 2026-10-15)
 
@@ -279,7 +285,7 @@ Prefill with every dispatch as code: 7.98 s → 3.64 s for the 40-token prompt. 
 
 - **sa-desc**: an optional code section (one entry offset per export); a loader without it ignores it, the descriptor templates stay as they are (the golden corpus compares them; the option is off by default).
 - **rt_fw**: ring entry `RT_CALL` (function address, argument block: binding addresses and push constants); the code lives in DDR (speed does not matter; the 8 KB BRAM holds rt_fw).
-- **Driver**: `SA_RV=1` (or a list of exports) sends a dispatch as `RT_CALL` instead of SETREG + CALL in a list; dispatches without code fall back to the list. Plan B's step table can mark each dispatch as "call" or "list", so the whole decode loop runs on the core.
+- **Driver**: `SA_RV=<image dir>` (S2/S3: `rvcode.bin`) or `SA_RV=embedded` (S4: the code in `sa.vmfb`), optionally narrowed by `SA_RV_ONLY=<substrings>`, sends a dispatch as `RT_CALL` instead of SETREG + CALL in a list; dispatches without code fall back to the list. Plan B's step table marks each item as "call" or "list" (RVS2), so the whole decode loop runs on the core.
 
 ### 9.5 Verification
 

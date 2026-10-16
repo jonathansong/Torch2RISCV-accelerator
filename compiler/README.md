@@ -367,3 +367,22 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   python3 compiler/runtime/tools/sadis.py <file.sadesc>   # disassembler
   $IREE_BUILD/llvm-project/bin/llvm-lit -v compiler/plugins/sa/test
   ```
+- **C7 RISC-V backend done** (2026-10-16, docs/riscv_backend_design.md; all on
+  the board for Gemma-3, Qwen3 and Llama-3.2, bit-exact):
+  - plan B: the decode loop on the PicoRV32 (`sa-llm-run --rvsched`);
+  - plan A: every dispatch as generated rv32 code (`--iree-sa-emit-riscv=<dir>` for
+    the portable `.ll`, `--iree-sa-riscv` for the code embedded in `sa.vmfb`;
+    runtime `SA_RV=<dir>|embedded`);
+  - R5: an llvm-cpu kernel on the core (`SA_R5`);
+  - the code-size and performance-counter analysis.
+
+  ```sh
+  compiler/scripts/build_iree_compiler.sh                # with SA_WITH_RISCV=1: llvm-cpu + the RISC-V target (S4, R5)
+  python3 compiler/tests/rv_equiv.py <sa_sources> --flags=--iree-sa-max-dynamic=2048   # plan A: PCPI streams = descriptor templates
+  python3 compiler/tests/rv_image.py <ll dir> --out <dir>/rv                          # S2 image (rvcode.bin, rvcode_host.so)
+  compiler/scripts/deploy_rvsched.sh / deploy_rvcode.sh / deploy_rvembed.sh / deploy_r5.sh <deploy dir> ...
+  compiler/tests/test_r5.sh                              # R5 on the sim: tokens identical in the ARM / core / core + R5 loops
+  python3 compiler/tests/rv_codesize.py <sa.vmfb with code> <profile.csv> --layers 28   # §8: working set per step
+  python3 compiler/tests/rv_perf.py <dir with rvperf_*.csv>                           # §9.10: counters (board_run.py rvperf)
+  # board: python3 board_run.py rvsched [--rv [--embedded]] [--r5] | rvcode [--embedded] | rvperf
+  ```

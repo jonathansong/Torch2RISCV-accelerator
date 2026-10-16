@@ -431,7 +431,11 @@ At run time (`compiler/runtime/sa/`):
    `mat_submit` and waits (`mat_fence`). With
    [plan B](riscv_backend_design.md#71-plan-b-the-core-schedules-the-descriptor-lists-existing-bitstream)
    (`sa-llm-run --rvsched`) the PicoRV32 runs the whole decode loop and
-   resubmits the same recorded lists itself.
+   resubmits the same recorded lists itself. With
+   [plan A](riscv_backend_design.md#9-the-sahw--llvm--riscv32-backend-plan-as-code-generator-plan-2026-10-16)
+   (`SA_RV=embedded`) there is no list at all: iree-compile also emits each
+   dispatch as rv32 code (`gemv_cfg` / `gemv_run` and the other commands as
+   PCPI instructions), and the core calls it.
 
 ## 7. What the hardware does
 

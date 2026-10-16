@@ -304,6 +304,8 @@ for (uint32_t i = 0; i < n && i < PERF_AREA_WORDS; i++)      /* write into the c
     PERF_AREA[i] = mat_perf_read(i);
 ```
 
+From rt_fw version 7 (2026-10-16, `docs/riscv_backend_design.md` §9.10), the same window also brackets an `RT_CALL`, which covers the generated RISC-V code of one dispatch, and a whole `RT_RUN_SCHED`, which covers plan B's decode loop. Every completion record also carries the core's instructions retired over the entry in word 5 (`rdinstret`). The driver adds an `instret` column to the `SA_PROFILE_PERF` CSV, and `compiler/tests/board_rvperf.py` / `rv_perf.py` use both.
+
 **Counter area: in the program BRAM, below the mailbox**
 
 ```
