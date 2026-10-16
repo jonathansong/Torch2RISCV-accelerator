@@ -221,22 +221,39 @@ static void sa_emit(uint64_t* w, uint32_t* k, uint32_t op, uint64_t w1) {
   ++*k;
 }
 
-// A copy of the list just built for the recorder (context->record).
-static void sa_record_list(sa_context_t* c, const uint64_t* w, uint32_t k) {
-  sa_record_t* r = c->record;
-  if (!r) return;
-  if (r->count == SA_RECORD_MAX_LISTS) {
-    r->dropped++;
-    return;
+void sa_record_add(sa_record_t* r, uint32_t code_phys, const uint32_t* words, uint32_t nwords) {
+  if (r->count == r->cap) {
+    uint32_t cap = r->cap ? 2 * r->cap : 64;
+    sa_record_item_t* items = (sa_record_item_t*)realloc(r->items, cap * sizeof(*items));
+    if (!items) {
+      r->dropped++;
+      return;
+    }
+    r->items = items;
+    r->cap = cap;
   }
-  uint64_t* copy = (uint64_t*)malloc(64ull * k);
+  uint32_t* copy = (uint32_t*)malloc(4ull * nwords);
   if (!copy) {
     r->dropped++;
     return;
   }
-  memcpy(copy, w, 64ull * k);
-  r->lists[r->count] = copy;
-  r->descriptors[r->count++] = k;
+  memcpy(copy, words, 4ull * nwords);
+  r->items[r->count].code_phys = code_phys;
+  r->items[r->count].nwords = nwords;
+  r->items[r->count++].words = copy;
+}
+
+void sa_record_free(sa_record_t* r) {
+  for (uint32_t i = 0; i < r->count; ++i) free(r->items[i].words);
+  free(r->items);
+  bool dry = r->dry;
+  memset(r, 0, sizeof(*r));
+  r->dry = dry;
+}
+
+// A copy of the list just built for the recorder (context->record).
+static void sa_record_list(sa_context_t* c, const uint64_t* w, uint32_t k) {
+  if (c->record) sa_record_add(c->record, 0, (const uint32_t*)w, 16 * k);
 }
 
 iree_status_t sa_context_dispatch(sa_context_t* c, const sa_dispatch_t* x, sa_completion_t* out) {

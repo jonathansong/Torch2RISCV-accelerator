@@ -108,6 +108,16 @@ iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbo
   return iree_ok_status();
 }
 
+// The symbol of the function at |phys| (the sim's schedule emulation calls it by name), or NULL.
+const char* sa_rv_symbol_at(uint32_t phys) {
+  for (uint32_t i = 0; i < sa_rv.count; ++i)
+    if (sa_rv.code_phys + sa_rv.entries[i].offset == phys) return sa_rv.entries[i].symbol;
+  return NULL;
+}
+
+// The transport's scratch for a call: 128 bytes after the argument block (sa_transport_sim.c's one-command lists).
+uint32_t sa_rv_scratch_phys(void) { return sa_rv.scratch_phys; }
+
 iree_status_t sa_rv_call(sa_context_t* c, iree_string_view_t name, const char* symbol, uint32_t code_phys,
                          uint32_t binding_count, const uint32_t* binding_phys, uint32_t constant_count,
                          const uint32_t* constants) {
@@ -117,9 +127,20 @@ iree_status_t sa_rv_call(sa_context_t* c, iree_string_view_t name, const char* s
   }
   IREE_RETURN_IF_ERROR(sa_context_batch_flush(c));   // (the dispatches before it, in order)
   iree_slim_mutex_lock(&c->mutex);
+  uint32_t block[64] = {0};
+  for (uint32_t i = 0; i < 16; ++i) block[i] = i < binding_count ? binding_phys[i] : 0;
+  for (uint32_t i = 0; i < constant_count; ++i) block[16 + i] = constants[i];
+  if (c->record) {                                   // (plan B's recording: the call as an item)
+    sa_record_add(c->record, code_phys, block, 64);
+    if (c->record->dry) {
+      c->dispatches++;
+      c->rv_calls++;
+      iree_slim_mutex_unlock(&c->mutex);
+      return iree_ok_status();
+    }
+  }
   volatile uint32_t* args = sa_rv.scratch;
-  for (uint32_t i = 0; i < 16; ++i) args[i] = i < binding_count ? binding_phys[i] : 0;
-  for (uint32_t i = 0; i < constant_count; ++i) args[16 + i] = constants[i];
+  for (uint32_t i = 0; i < 64; ++i) args[i] = block[i];
   __sync_synchronize();
   sa_completion_t done = {0};
   uint64_t t0 = iree_time_now();

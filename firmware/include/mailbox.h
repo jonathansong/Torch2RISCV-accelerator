@@ -71,7 +71,7 @@
 #define MBOX_HEARTBEAT     0xCC  /* out: idle-loop counter                                */
 #define MBOX_FW_CAPS       0xD0  /* out: the unit's CAPS register (RT_VERSION >= 2)       */
 #define RT_READY           0x52554E00u   /* "RUN\0"                                     */
-#define RT_VERSION         4u    /* 2: MBOX_FW_CAPS; 3: RT_RUN_SCHED; 4: RT_CALL       */
+#define RT_VERSION         5u    /* 2: MBOX_FW_CAPS; 3: RT_RUN_SCHED; 4: RT_CALL; 5: RVS2 */
 #define RT_RUN_LIST        0x01u /* ring entry types (w0[7:0])                           */
 #define RT_NOP             0x02u
 #define RT_RESET           0x03u /* mat_reset, then go on                                */

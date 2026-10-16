@@ -74,17 +74,23 @@ typedef struct sa_range_t {
 struct sa_batch_entry_t;
 
 // Recording (docs/riscv_backend_design.md §7.1, sa_rvsched.c): while
-// context->record is set, every list a flush builds is copied here; dry: the
-// lists are not run (success, END 0x5A), so a step's lists can be taken for
-// any input without changing the device's memory beyond the host's writes.
-#define SA_RECORD_MAX_LISTS 8
+// context->record is set, every list a flush builds and every call of
+// generated RISC-V code (sa_rv.c) is copied here as an item; dry: they are not
+// run (success, END 0x5A), so a step can be taken for any input without
+// changing the device's memory beyond the host's writes.
+typedef struct sa_record_item_t {
+  uint32_t code_phys;      // 0: a descriptor list; else the function called (plan A)
+  uint32_t nwords;         // the list's descriptors (16 words each), or the call's argument block (64 words)
+  uint32_t* words;         // (malloc)
+} sa_record_item_t;
 typedef struct sa_record_t {
   bool dry;
-  uint32_t count;                               // lists recorded
-  uint64_t* lists[SA_RECORD_MAX_LISTS];         // copies of their descriptors (malloc)
-  uint32_t descriptors[SA_RECORD_MAX_LISTS];    // descriptors each (END included)
-  uint32_t dropped;                             // lists beyond SA_RECORD_MAX_LISTS
+  uint32_t count, cap;
+  sa_record_item_t* items;
+  uint32_t dropped;        // items not recorded (no memory)
 } sa_record_t;
+void sa_record_add(sa_record_t* r, uint32_t code_phys, const uint32_t* words, uint32_t nwords);
+void sa_record_free(sa_record_t* r);
 
 typedef struct sa_context_t {
   sa_transport_t* transport;
@@ -190,6 +196,8 @@ void sa_context_profile_reset(void);
 // the descriptor list then) and its symbol; a dispatch through it (the pending
 // batch flushed first).
 iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap, uint32_t* out_phys);
+const char* sa_rv_symbol_at(uint32_t phys);
+uint32_t sa_rv_scratch_phys(void);
 iree_status_t sa_rv_call(sa_context_t* c, iree_string_view_t name, const char* symbol, uint32_t code_phys,
                          uint32_t binding_count, const uint32_t* binding_phys, uint32_t constant_count,
                          const uint32_t* constants);

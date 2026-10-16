@@ -1,4 +1,9 @@
 // sa HAL driver: the step table of the decode loop on the RISC-V core (sa_rvsched.h).
+// A step is a sequence of items (sa_record_t): descriptor lists, or with
+// SA_RV calls of the dispatches' generated RISC-V code (plan A inside plan B,
+// docs/riscv_backend_design.md §0, S3). Bucket 0's items are copied into the
+// table once (a list's descriptors, a call's 64-word argument block); the
+// words that differ between buckets are patched by the core at a bucket change.
 #include "sa_rvsched.h"
 
 #include <stdio.h>
@@ -13,27 +18,30 @@ typedef struct sa_rvs_bucket_t {
   bool have;
 } sa_rvs_bucket_t;
 
+// a patched word: item, word in it
+typedef struct sa_rvs_word_t {
+  uint32_t item, word;
+} sa_rvs_word_t;
+
 struct sa_rvsched_t {
   sa_context_t* c;
   uint32_t pad, b0, nb, max_steps, nblocks, block;
   int pass;                          // 1, 2; 3 after the second (record_end then checks)
   sa_rvs_bucket_t* buckets;          // this pass's recordings
   sa_record_t rec;                   // the recording in progress
-  // from pass 1: the lists' shape and the room for the patched words
-  uint32_t nlists, ndesc[SA_RECORD_MAX_LISTS], cap;
+  // from pass 1: the items' shape and the room for the patched words
+  uint32_t nitems, cap;
+  uint32_t* item_code;               // per item: 0 (a list) or the function
+  uint32_t* item_words;              // per item: its words
+  uint32_t* off_copy;                // per item: its copy in the table
   // the table in the device window
   void* raw;
   uint8_t* table;
   uint32_t table_phys, table_bytes;
-  uint32_t off_copy[SA_RECORD_MAX_LISTS], off_lists, off_words, off_buckets, off_values, off_out;
+  uint32_t off_items, off_words, off_buckets, off_values, off_out;
   uint32_t nwords;
   uint32_t last_pos;                 // position of the last step run
 };
-
-static void sa_record_free(sa_record_t* r) {
-  for (uint32_t i = 0; i < r->count; ++i) free(r->lists[i]);
-  memset(r, 0, sizeof(*r));
-}
 
 static void sa_rvs_clear(sa_rvsched_t* s) {
   for (uint32_t b = 0; b < s->nb; ++b) {
@@ -76,9 +84,11 @@ void sa_rvsched_record_begin(sa_rvsched_t* s) {
 
 static bool sa_rvs_same(const sa_record_t* a, const sa_record_t* b) {
   if (a->count != b->count) return false;
-  for (uint32_t l = 0; l < a->count; ++l)
-    if (a->descriptors[l] != b->descriptors[l] || memcmp(a->lists[l], b->lists[l], 64ull * a->descriptors[l]))
+  for (uint32_t i = 0; i < a->count; ++i) {
+    const sa_record_item_t *x = &a->items[i], *y = &b->items[i];
+    if (x->code_phys != y->code_phys || x->nwords != y->nwords || memcmp(x->words, y->words, 4ull * x->nwords))
       return false;
+  }
   return true;
 }
 
@@ -88,11 +98,11 @@ iree_status_t sa_rvsched_record_end(sa_rvsched_t* s, uint32_t bucket, const sa_r
     return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa rvsched: bucket %u outside the table", bucket);
   }
   if (s->rec.dropped || s->rec.count == 0) {
-    return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa rvsched: %u lists in a step (at most %d)",
-                            s->rec.count + s->rec.dropped, SA_RECORD_MAX_LISTS);
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "sa rvsched: a step of %u items, %u not recorded",
+                            s->rec.count, s->rec.dropped);
   }
   sa_rvs_bucket_t* e = &s->buckets[bucket - s->b0];
-  if (s->pass == 3) {                // a check: the same lists as the bucket's recording
+  if (s->pass == 3) {                // a check: the same items as the bucket's recording
     bool same = e->have && sa_rvs_same(&e->rec, &s->rec) && !memcmp(&e->io, io, sizeof(*io));
     sa_record_free(&s->rec);
     if (!same) {
@@ -109,33 +119,30 @@ iree_status_t sa_rvsched_record_end(sa_rvsched_t* s, uint32_t bucket, const sa_r
   return iree_ok_status();
 }
 
-// The lists' 32-bit words that differ from bucket 0's in any bucket; returns
-// their count, fills idx (list << 24 | word) up to cap.
-static iree_status_t sa_rvs_diff(sa_rvsched_t* s, uint32_t* idx, uint32_t cap, uint32_t* out_n) {
+// The items' words that differ from bucket 0's in any bucket: their count,
+// the first cap of them in idx.
+static iree_status_t sa_rvs_diff(sa_rvsched_t* s, sa_rvs_word_t* idx, uint32_t cap, uint32_t* out_n) {
   const sa_record_t* r0 = &s->buckets[0].rec;
   for (uint32_t b = 0; b < s->nb; ++b) {
     const sa_rvs_bucket_t* e = &s->buckets[b];
     if (!e->have) return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "sa rvsched: bucket %u not recorded", s->b0 + b);
     if (e->rec.count != r0->count) {
-      return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "sa rvsched: bucket %u has %u lists, bucket %u %u",
+      return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "sa rvsched: bucket %u has %u items, bucket %u %u",
                               s->b0 + b, e->rec.count, s->b0, r0->count);
     }
-    for (uint32_t l = 0; l < r0->count; ++l)
-      if (e->rec.descriptors[l] != r0->descriptors[l]) {
+    for (uint32_t i = 0; i < r0->count; ++i)
+      if (e->rec.items[i].nwords != r0->items[i].nwords || e->rec.items[i].code_phys != r0->items[i].code_phys) {
         return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                "sa rvsched: list %u has %u descriptors in bucket %u, %u in bucket %u", l,
-                                e->rec.descriptors[l], s->b0 + b, r0->descriptors[l], s->b0);
+                                "sa rvsched: item %u differs in shape between buckets %u and %u", i, s->b0 + b, s->b0);
       }
   }
   uint32_t n = 0;
-  for (uint32_t l = 0; l < r0->count; ++l) {
-    const uint32_t* w0 = (const uint32_t*)r0->lists[l];
-    uint32_t nw = r0->descriptors[l] * 16;
-    if (nw >= (1u << 24)) return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "sa rvsched: list too long");
-    for (uint32_t w = 0; w < nw; ++w) {
+  for (uint32_t i = 0; i < r0->count; ++i) {
+    const uint32_t* w0 = r0->items[i].words;
+    for (uint32_t w = 0; w < r0->items[i].nwords; ++w) {
       for (uint32_t b = 1; b < s->nb; ++b) {
-        if (((const uint32_t*)s->buckets[b].rec.lists[l])[w] != w0[w]) {
-          if (idx && n < cap) idx[n] = l << 24 | w;
+        if (s->buckets[b].rec.items[i].words[w] != w0[w]) {
+          if (idx && n < cap) idx[n] = (sa_rvs_word_t){i, w};
           ++n;
           break;
         }
@@ -154,16 +161,21 @@ iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
     uint32_t n = 0;
     IREE_RETURN_IF_ERROR(sa_rvs_diff(s, NULL, 0, &n));
     const sa_record_t* r0 = &s->buckets[0].rec;
-    s->nlists = r0->count;
+    s->nitems = r0->count;
     s->cap = n + n / 4 + 64;         // the second pass's addresses differ: room for a few more
+    s->item_code = (uint32_t*)calloc(s->nitems, 4);
+    s->item_words = (uint32_t*)calloc(s->nitems, 4);
+    s->off_copy = (uint32_t*)calloc(s->nitems, 4);
+    if (!s->item_code || !s->item_words || !s->off_copy) return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "sa rvsched");
     uint32_t o = sa_align64(RVS_T_WORDS_ * 4u);
-    for (uint32_t l = 0; l < s->nlists; ++l) {
-      s->ndesc[l] = r0->descriptors[l];
-      s->off_copy[l] = o;
-      o += 64u * s->ndesc[l];
+    for (uint32_t i = 0; i < s->nitems; ++i) {
+      s->item_code[i] = r0->items[i].code_phys;
+      s->item_words[i] = r0->items[i].nwords;
+      s->off_copy[i] = o;
+      o = sa_align64(o + 4u * r0->items[i].nwords);
     }
-    s->off_lists = o;
-    o = sa_align64(o + 4u * s->nlists);
+    s->off_items = o;
+    o = sa_align64(o + 8u * s->nitems);
     s->off_words = o;
     o = sa_align64(o + 4u * s->cap);
     s->off_buckets = o;
@@ -183,27 +195,23 @@ iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
   }
   if (s->pass != 2) return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "sa rvsched: both passes done");
   const sa_record_t* r0 = &s->buckets[0].rec;
-  if (r0->count != s->nlists) {
-    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "sa rvsched: %u lists in pass 2, %u in pass 1",
-                            r0->count, s->nlists);
+  if (r0->count != s->nitems) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "sa rvsched: %u items in pass 2, %u in pass 1",
+                            r0->count, s->nitems);
   }
-  for (uint32_t l = 0; l < s->nlists; ++l)
-    if (r0->descriptors[l] != s->ndesc[l]) {
-      return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "sa rvsched: list %u changed between the passes", l);
+  for (uint32_t i = 0; i < s->nitems; ++i)
+    if (r0->items[i].nwords != s->item_words[i] || r0->items[i].code_phys != s->item_code[i]) {
+      return iree_make_status(IREE_STATUS_FAILED_PRECONDITION, "sa rvsched: item %u changed between the passes", i);
     }
-  uint32_t* idx = (uint32_t*)malloc(4ull * s->cap);
+  sa_rvs_word_t* idx = (sa_rvs_word_t*)malloc(sizeof(*idx) * s->cap);
   if (!idx) return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "sa rvsched");
   uint32_t n = 0;
   iree_status_t status = sa_rvs_diff(s, idx, s->cap, &n);
   if (iree_status_is_ok(status) && n > s->cap) {
     status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "sa rvsched: %u patched words, room for %u", n, s->cap);
   }
-  if (!iree_status_is_ok(status)) {
-    free(idx);
-    return status;
-  }
   const sa_rvsched_io_t* io0 = &s->buckets[0].io;
-  for (uint32_t b = 1; b < s->nb; ++b)
+  for (uint32_t b = 1; iree_status_is_ok(status) && b < s->nb; ++b)
     if (s->buckets[b].io.vocab != io0->vocab || s->buckets[b].io.nblocks != io0->nblocks) status = iree_make_status(
         IREE_STATUS_FAILED_PRECONDITION, "sa rvsched: the logits' shape differs between buckets");
   if (iree_status_is_ok(status) && (io0->nblocks == 0 || io0->vocab % io0->nblocks)) {
@@ -222,8 +230,8 @@ iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
   uint32_t* hdr = (uint32_t*)t;
   memset(hdr, 0, RVS_T_WORDS_ * 4u);
   hdr[RVS_T_MAGIC] = RVS_MAGIC;
-  hdr[RVS_T_NLISTS] = s->nlists;
-  hdr[RVS_T_LISTS] = P + s->off_lists;
+  hdr[RVS_T_NITEMS] = s->nitems;
+  hdr[RVS_T_ITEMS] = P + s->off_items;
   hdr[RVS_T_NWORDS] = n;
   hdr[RVS_T_WORDS] = P + s->off_words;
   hdr[RVS_T_PAD] = s->pad;
@@ -234,13 +242,14 @@ iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
   hdr[RVS_T_NBLOCKS] = s->nblocks;
   hdr[RVS_T_BLOCK] = s->block;
   hdr[RVS_T_OUT] = P + s->off_out;
-  uint32_t* lists = (uint32_t*)(t + s->off_lists);
-  for (uint32_t l = 0; l < s->nlists; ++l) {
-    memcpy(t + s->off_copy[l], r0->lists[l], 64ull * s->ndesc[l]);
-    lists[l] = P + s->off_copy[l];
+  uint32_t* items = (uint32_t*)(t + s->off_items);
+  for (uint32_t i = 0; i < s->nitems; ++i) {
+    memcpy(t + s->off_copy[i], r0->items[i].words, 4ull * s->item_words[i]);
+    items[2 * i] = P + s->off_copy[i];
+    items[2 * i + 1] = s->item_code[i];
   }
   uint32_t* words = (uint32_t*)(t + s->off_words);
-  for (uint32_t i = 0; i < n; ++i) words[i] = P + s->off_copy[idx[i] >> 24] + 4u * (idx[i] & 0xFFFFFFu);
+  for (uint32_t i = 0; i < n; ++i) words[i] = P + s->off_copy[idx[i].item] + 4u * idx[i].word;
   for (uint32_t b = 0; b < s->nb; ++b) {
     const sa_rvs_bucket_t* e = &s->buckets[b];
     uint32_t* bw = (uint32_t*)(t + s->off_buckets) + RVS_B_WORDS_ * b;
@@ -251,7 +260,7 @@ iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
     bw[RVS_B_LOGITS] = e->io.logits;
     bw[RVS_B_BMAX] = e->io.bmax;
     uint32_t* v = (uint32_t*)(t + s->off_values) + (size_t)n * b;
-    for (uint32_t i = 0; i < n; ++i) v[i] = ((const uint32_t*)e->rec.lists[idx[i] >> 24])[idx[i] & 0xFFFFFFu];
+    for (uint32_t i = 0; i < n; ++i) v[i] = e->rec.items[idx[i].item].words[idx[i].word];
   }
   free(idx);
   __sync_synchronize();
@@ -261,8 +270,14 @@ iree_status_t sa_rvsched_end_pass(sa_rvsched_t* s) {
 
 void sa_rvsched_info(const sa_rvsched_t* s, sa_rvsched_info_t* out) {
   memset(out, 0, sizeof(*out));
-  out->lists = s->nlists;
-  for (uint32_t l = 0; l < s->nlists; ++l) out->descriptors += s->ndesc[l];
+  for (uint32_t i = 0; i < s->nitems; ++i) {
+    if (s->item_code[i]) {
+      out->calls++;
+    } else {
+      out->lists++;
+      out->descriptors += s->item_words[i] / 16;
+    }
+  }
   out->words = s->nwords;
   out->table_bytes = s->table_bytes;
   out->table_phys = s->table_phys;
@@ -283,7 +298,7 @@ iree_status_t sa_rvsched_run(sa_rvsched_t* s, uint32_t pos, uint32_t steps, uint
   __sync_synchronize();
   uint32_t st = 0;
   sa_transport_t* t = s->c->transport;
-  iree_status_t status = t->run_sched(t, s->table_phys, 10.0 + 2.0 * steps, &st);
+  iree_status_t status = t->run_sched(t, s->table_phys, 10.0 + 10.0 * steps, &st);
   __sync_synchronize();
   uint32_t done = hdr[RVS_T_DONE];
   if (done > steps) done = steps;
@@ -300,7 +315,7 @@ iree_status_t sa_rvsched_run(sa_rvsched_t* s, uint32_t pos, uint32_t steps, uint
                               done, st,
                               st == RVS_E_RANGE   ? " (a position outside the table)"
                               : st == RVS_E_MAGIC ? " (no table)"
-                                                  : " (a list failed)");
+                                                  : " (an item failed)");
   }
   return status;
 }
@@ -319,6 +334,9 @@ void sa_rvsched_destroy(sa_rvsched_t* s) {
   sa_record_free(&s->rec);
   sa_rvs_clear(s);
   free(s->buckets);
+  free(s->item_code);
+  free(s->item_words);
+  free(s->off_copy);
   if (s->raw) iree_allocator_free(sa_context_data_allocator(s->c), s->raw);
   free(s);
 }

@@ -80,6 +80,29 @@ def pcpi_lines(r):
     return out
 
 
+USES = {"mat_load": ("mat_cfg", (0, 1, 2, 3)), "mat_store": ("mat_cfg", (4, 5, 6)), "mat_exec": ("mat_cfg", (7, 8, 9, 10)),
+        "vec_run": ("vec_cfg", tuple(range(16))), "gemv_run": ("gemv_cfg", (0, 1, 2, 3))}
+
+
+class Canon:
+    """PCPI lines -> the effective stream: per command the values its keys hold
+    when it is issued, then the command (the generated code writes a key only
+    when its value changes; the reference writes every key)"""
+
+    def __init__(self):
+        self.state = {"mat_cfg": {}, "vec_cfg": {}, "gemv_cfg": {}}
+
+    def feed(self, line):
+        p = line.split()
+        if p[0] in self.state:
+            self.state[p[0]][p[1]] = p[2]
+            return []
+        if p[0] in USES:
+            t, keys = USES[p[0]]
+            return [f"{t} {k:x} {self.state[t].get(f'{k:x}', '?')}" for k in keys] + [line.strip()]
+        return [line.strip()]
+
+
 def layout(src, blob, t, seed=1):
     """rv_dispatch.layout without the oracle: (sim, phys, constants, list address, window bytes)"""
     keep = DC.O.load_dispatch(src)
@@ -151,14 +174,15 @@ def one(item):
             wantf = os.path.join(tmp, "want.txt")
             reads, rd = [], sim.ddr_read
 
-            class Sink:                            # the trace as PCPI lines, straight to a file
+            class Sink:                            # the trace as effective PCPI lines, straight to a file
                 def __init__(self, fh):
-                    self.fh, self.n = fh, 0
+                    self.fh, self.n, self.c = fh, 0, Canon()
 
                 def append(self, row):
                     for l in pcpi_lines(row):
-                        self.fh.write(l + "\n")
-                        self.n += 1
+                        for e in self.c.feed(l):
+                            self.fh.write(e + "\n")
+                            self.n += 1
 
             def logged(a, n, *rest):               # (LDPARAM reads 4 bytes through ddr_read)
                 v = rd(a, n, *rest)
@@ -183,18 +207,20 @@ def one(item):
             if r.returncode:
                 return sym, "host run", r.stderr[-500:], rvbytes
             # compare line by line, the "#" notes aside (their LDPARAM addresses against the reads)
-            gaddr, k, ngot, diff = [], 0, 0, None
+            gaddr, k, ngot, diff, canon, npcpi = [], 0, 0, None, Canon(), 0
             with open(gotf) as fg, open(wantf) as fw:
-                for l in fg:
-                    if l.startswith("#"):
-                        if l.startswith("# ldparam "):
-                            gaddr.append(int(l.split()[2], 16))
+                for raw in fg:
+                    if raw.startswith("#"):
+                        if raw.startswith("# ldparam "):
+                            gaddr.append(int(raw.split()[2], 16))
                         continue
-                    ngot += 1
-                    w = fw.readline()
-                    if diff is None and l != w:
-                        diff = (k, l.strip(), w.strip() or "-")
-                    k += 1
+                    npcpi += 1
+                    for l in canon.feed(raw):
+                        ngot += 1
+                        w = fw.readline().strip()
+                        if diff is None and l != w:
+                            diff = (k, l, w or "-")
+                        k += 1
                 if diff is None and fw.readline():
                     diff = (k, "-", "(more)")
             if gaddr != [a for a, _ in reads]:
@@ -204,8 +230,8 @@ def one(item):
                 k, g, w = diff or (ngot, "-", "-")
                 return sym, "MISMATCH", (f"T = {t}: {ngot} vs {nwant} PCPI operations, first difference at "
                                          f"{k}: got {g} want {w}"), rvbytes
-            want = range(nwant)
-        return sym, "ok", f"{len(want)} PCPI operations", rvbytes
+            want = range(npcpi)                    # (the generated code's PCPI instructions)
+        return sym, "ok", f"{len(want)} PCPI instructions", rvbytes
     except Exception as e:                       # (a dispatch the harness cannot lay out)
         return os.path.basename(path), "harness", f"{type(e).__name__}: {str(e)[:300]}", 0
     finally:

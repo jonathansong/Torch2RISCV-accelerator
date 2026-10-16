@@ -6,11 +6,15 @@
 //   binding address + f(push constant), sahw.param = f(push constant) with
 //   f(c) = add + ((c * mul) >> shift) in 64-bit arithmetic (sa_loader.c),
 //   sahw.private = 0;
-// - each command is one call sa_rv_cmd(descriptor, base, p0, p1): the 64-byte
-//   descriptor exactly as the serializer encodes it (a constant), the value of
-//   its BASE register and of its dynamic-field PARAMs (slot 0, slot 1); the
-//   runtime (firmware/rv/sa_rv_rt.c) applies them as the fetch unit does and
-//   issues the command over PCPI;
+// - each command is specialized at compile time: its descriptor words as the
+//   serializer encodes them are constants, the dynamic fields applied in the
+//   IR (the fetch unit's rule), the DDR address relocated by its BASE; then
+//   the PCPI operations of the command (the configuration keys it uses, then
+//   the command: sa_rv_mat_cfg / sa_rv_mat_load / ..., one custom instruction
+//   each in firmware/rv/sa_rv_rt.c). Static fields fold to immediates; a key
+//   whose constant value the code already wrote is not written again (the
+//   values tracked through the template; unknown at entry and at a loop's
+//   head, the body's end state after it: the body runs at least once);
 // - control flow is compiled: LOOP_END a loop (the count, possibly from a
 //   PARAM, taken when it is first reached; k1 += s1, k2 += s2 after every
 //   pass), SETREG assignments, LDPARAM a call sa_rv_ldparam(address) (a fence,
@@ -21,7 +25,10 @@
 #include <cstring>
 
 #include "SahwPasses.h"
+#include <map>
+
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -37,14 +44,16 @@ struct RvEmitter {
   llvm::LLVMContext ctx;
   std::unique_ptr<llvm::Module> mod;
   llvm::IRBuilder<> b{ctx};
-  llvm::Function *fn = nullptr, *cmdFn = nullptr, *ldparamFn = nullptr;
+  llvm::Function *fn = nullptr, *ldparamFn = nullptr;
+  llvm::StringMap<llvm::Function *> pcpi;   // sa_rv_<operation>: one PCPI instruction each
+  // the configuration keys' values written so far, when constant (mat_cfg, vec_cfg, gemv_cfg)
+  std::map<uint32_t, uint64_t> known[3];
   llvm::Type *i32 = nullptr, *i64 = nullptr, *ptr = nullptr;
   llvm::Value *bindArg = nullptr, *pcArg = nullptr;
   llvm::BasicBlock *entry = nullptr;
   llvm::DenseMap<Value, llvm::AllocaInst *> slots;
   const std::string &templ;
   size_t cursor = 0, rows = 0;
-  unsigned ndesc = 0;
   std::string err;
 
   explicit RvEmitter(const std::string &t) : templ(t), rows(t.size() / 64) {}
@@ -110,30 +119,121 @@ struct RvEmitter {
     }
     return v;
   }
-  // the descriptor of row `row` as a constant [16 x i32]
-  llvm::Constant *descriptor(size_t row) {
-    std::vector<uint32_t> w(16);
-    std::memcpy(w.data(), templ.data() + 64 * row, 64);
-    auto *ty = llvm::ArrayType::get(i32, 16);
-    auto *init = llvm::ConstantDataArray::get(ctx, llvm::ArrayRef<uint32_t>(w));
-    auto *g = new llvm::GlobalVariable(*mod, ty, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, init,
-                                       "desc" + std::to_string(ndesc++));
-    g->setAlignment(llvm::Align(8));
-    return g;
-  }
   bool takeRow(Operation *op, size_t &row) {
     if (cursor >= rows) return fail(op, "more operations than descriptors");
     row = cursor++;
+    return true;
+  }
+  llvm::Function *prim(const char *name, unsigned nargs) {
+    auto it = pcpi.find(name);
+    if (it != pcpi.end()) return it->second;
+    SmallVector<llvm::Type *> args(nargs, i32);
+    auto *f = llvm::Function::Create(llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), args, false),
+                                     llvm::GlobalValue::ExternalLinkage, std::string("sa_rv_") + name, *mod);
+    pcpi[name] = f;
+    return f;
+  }
+  void call(const char *name, std::initializer_list<llvm::Value *> args) {
+    b.CreateCall(prim(name, unsigned(args.size())), args);
+  }
+  // a configuration key (table 0 mat_cfg, 1 vec_cfg, 2 gemv_cfg), unless the same constant is there
+  void cfg(unsigned table, uint32_t key, llvm::Value *v) {
+    static const char *names[3] = {"mat_cfg", "vec_cfg", "gemv_cfg"};
+    if (auto *c = llvm::dyn_cast<llvm::ConstantInt>(v)) {
+      auto it = known[table].find(key);
+      if (it != known[table].end() && it->second == c->getZExtValue()) return;
+      known[table][key] = c->getZExtValue();
+    } else {
+      known[table].erase(key);
+    }
+    call(names[table], {c32(key), v});
+  }
+  // bits [lo, lo + n) of a descriptor word (i64) as i32
+  llvm::Value *bits(llvm::Value *w, unsigned lo, unsigned n) {
+    uint64_t mask = n >= 64 ? ~0ull : ((1ull << n) - 1);
+    return b.CreateTrunc(b.CreateAnd(b.CreateLShr(w, c64(lo)), c64(int64_t(mask))), i32);
+  }
+  // dynamic fields: field -> (word, lsb, width) per opcode (llm/sa_funcsim.py DYN_FIELDS)
+  static bool dynField(uint32_t op, uint32_t f, unsigned &wd, unsigned &lsb, unsigned &width) {
+    static const uint8_t DMA[6][3] = {{0, 0, 0}, {1, 0, 32}, {2, 0, 16}, {2, 32, 16}, {2, 48, 16}, {3, 0, 32}};
+    static const uint8_t EX[8][3] = {{0, 0, 0}, {1, 0, 16}, {1, 16, 16}, {1, 32, 16}, {1, 48, 12},
+                                     {2, 0, 12}, {2, 16, 16}, {2, 32, 16}};
+    static const uint8_t VE[12][3] = {{0, 0, 0}, {1, 0, 16}, {1, 32, 16}, {2, 0, 16}, {2, 32, 32}, {7, 16, 16},
+                                      {7, 0, 16}, {7, 32, 16}, {3, 16, 16}, {6, 0, 32}, {6, 32, 32}, {5, 32, 32}};
+    const uint8_t(*t)[3] = op == 1 || op == 2 ? DMA : op == 3 ? EX : op == 4 ? VE : nullptr;
+    unsigned n = op == 1 || op == 2 ? 6 : op == 3 ? 8 : op == 4 ? 12 : 0;
+    if (!t || f == 0 || f >= n) return false;
+    wd = t[f][0];
+    lsb = t[f][1];
+    width = t[f][2];
     return true;
   }
   bool command(Operation *op, Value base, ValueRange dyn) {
     size_t row;
     if (!takeRow(op, row)) return false;
     if (dyn.size() > 2) return fail(op, "more than two dynamic fields");
-    llvm::Value *bv = base ? load(op, base) : c32(0);
-    llvm::Value *p0 = dyn.size() > 0 ? load(op, dyn[0]) : c32(0);
-    llvm::Value *p1 = dyn.size() > 1 ? load(op, dyn[1]) : c32(0);
-    b.CreateCall(cmdFn, {descriptor(row), bv, p0, p1});
+    uint32_t hdr = uint32_t(word(row, 0)), opc = hdr & 0xFF;
+    llvm::Value *w[8];
+    for (int i = 0; i < 8; ++i) w[i] = c64(int64_t(word(row, i)));
+    for (unsigned s = 0; s < 2; ++s) {           // the dynamic fields (the fetch unit's rule)
+      uint32_t slot = (hdr >> (16 + 8 * s)) & 0xFF, f = slot & 0xF;
+      if (!f) continue;
+      unsigned wd, lsb, width;
+      if (!dynField(opc, f, wd, lsb, width)) return fail(op, "a dynamic field undefined for its command");
+      if (s >= dyn.size()) return fail(op, "a dynamic slot without its PARAM");
+      uint64_t mask = width >= 64 ? ~0ull : ((1ull << width) - 1);
+      llvm::Value *p = b.CreateZExt(load(op, dyn[s]), i64);
+      llvm::Value *old = b.CreateAnd(b.CreateLShr(w[wd], c64(lsb)), c64(int64_t(mask)));
+      llvm::Value *nv = b.CreateAnd((slot & 0x80) ? b.CreateAdd(old, p) : p, c64(int64_t(mask)));
+      w[wd] = b.CreateOr(b.CreateAnd(w[wd], c64(int64_t(~(mask << lsb)))), b.CreateShl(nv, c64(lsb)));
+    }
+    if (opc != 0x10 && ((hdr >> 11) & 1)) call("mat_fence", {c32(0)});   // FENCE_BEFORE
+    llvm::Value *ddr = bits(w[1], 0, 32);
+    if ((hdr >> 8) & 1) {
+      if (!base) return fail(op, "a relocated command without its BASE");
+      ddr = b.CreateAdd(ddr, load(op, base));
+    }
+    auto isGemv = [&] {
+      auto *c = llvm::dyn_cast<llvm::ConstantInt>(bits(w[3], 32, 2));
+      return c && c->getZExtValue() == 2;
+    };
+    if (opc == 0x01 && isGemv()) {
+      if (((word(row, 2) >> 28) & 0xF) != 3) return fail(op, "a GEMV result outside ACC (gemv_run takes ACC words)");
+      cfg(2, 0, bits(w[2], 48, 16));            // SA_GCFG_KBYTES
+      cfg(2, 1, bits(w[3], 0, 32));             // SA_GCFG_PITCH
+      cfg(2, 2, bits(w[3], 34, 16));            // SA_GCFG_XWORD
+      cfg(2, 3, bits(w[3], 50, 8));             // SA_GCFG_CSTEP
+      call("gemv_run", {ddr, b.CreateAnd(bits(w[2], 0, 32), c32(0xFFFF)), bits(w[2], 32, 16), bits(w[3], 58, 1)});
+    } else if (opc == 0x01) {
+      if (!llvm::isa<llvm::ConstantInt>(bits(w[3], 32, 2))) return fail(op, "a dynamic LD mode");
+      cfg(0, 0, bits(w[2], 32, 16));            // SA_CFG_LD_ROWS
+      cfg(0, 1, bits(w[2], 48, 16));            // SA_CFG_LD_ROW_BYTES
+      cfg(0, 2, bits(w[3], 0, 32));             // SA_CFG_LD_PITCH
+      cfg(0, 3, bits(w[3], 32, 2));             // SA_CFG_LD_MODE
+      call("mat_load", {ddr, bits(w[2], 0, 32)});
+    } else if (opc == 0x02) {
+      cfg(0, 4, bits(w[2], 32, 16));            // SA_CFG_ST_ROWS
+      cfg(0, 5, bits(w[2], 48, 16));            // SA_CFG_ST_ROW_BYTES
+      cfg(0, 6, bits(w[3], 0, 32));             // SA_CFG_ST_PITCH
+      call("mat_store", {ddr, bits(w[2], 0, 32)});
+    } else if (opc == 0x03) {
+      cfg(0, 7, bits(w[2], 0, 12));             // SA_CFG_EX_REPEAT
+      cfg(0, 8, bits(w[2], 16, 16));            // SA_CFG_EX_B_STEP
+      cfg(0, 9, bits(w[2], 32, 16));            // SA_CFG_EX_C_STEP
+      cfg(0, 10, bits(w[2], 48, 16));           // SA_CFG_EX_C_ROW
+      call("mat_exec", {bits(w[1], 0, 16), bits(w[1], 16, 16), bits(w[1], 32, 16), bits(w[1], 48, 12),
+                        bits(w[1], 60, 1)});
+    } else if (opc == 0x04) {
+      static const unsigned K[16][3] = {{3, 0, 8},   {2, 32, 32}, {2, 0, 32},  {3, 8, 6},  {3, 16, 16}, {3, 32, 16},
+                                        {3, 48, 5},  {4, 0, 32},  {4, 32, 32}, {5, 0, 32}, {3, 53, 11}, {5, 32, 32},
+                                        {6, 0, 32},  {6, 32, 32}, {7, 0, 32},  {7, 32, 32}};
+      for (unsigned k = 0; k < 16; ++k) cfg(1, k, bits(w[K[k][0]], K[k][1], K[k][2]));   // SA_VCFG_*
+      call("vec_run", {bits(w[1], 0, 32), bits(w[1], 32, 32)});
+    } else if (opc == 0x10) {
+      call("mat_fence", {bits(w[1], 0, 4)});
+    } else {
+      return fail(op, "an unexpected command");
+    }
     return err.empty();
   }
 
@@ -148,6 +248,7 @@ struct RvEmitter {
         auto *exit = llvm::BasicBlock::Create(ctx, "loop.end", fn);
         b.CreateBr(body);
         b.SetInsertPoint(body);
+        for (auto &k : known) k.clear();          // (reached from before and from the body's end)
         if (!emitBlock(o.getRegion().front())) return false;
         size_t row;
         if (!takeRow(op, row)) return false;
@@ -226,8 +327,6 @@ LogicalResult emitRiscvLL(sahw::TemplateOp t, const SerializedExport &se, std::s
   e.i64 = llvm::Type::getInt64Ty(e.ctx);
   e.ptr = llvm::PointerType::getUnqual(e.ctx);
   auto *voidTy = llvm::Type::getVoidTy(e.ctx);
-  e.cmdFn = llvm::Function::Create(llvm::FunctionType::get(voidTy, {e.ptr, e.i32, e.i32, e.i32}, false),
-                                   llvm::GlobalValue::ExternalLinkage, "sa_rv_cmd", *e.mod);
   e.ldparamFn = llvm::Function::Create(llvm::FunctionType::get(e.i32, {e.i32}, false),
                                        llvm::GlobalValue::ExternalLinkage, "sa_rv_ldparam", *e.mod);
   e.fn = llvm::Function::Create(llvm::FunctionType::get(voidTy, {e.ptr, e.ptr}, false),

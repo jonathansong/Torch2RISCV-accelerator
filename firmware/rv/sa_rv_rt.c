@@ -2,157 +2,96 @@
 #include "sa_rv_rt.h"
 
 #if defined(SA_RV_SIM)
-/* the sim transport (compiler/runtime/sa/sa_transport_sim.c): each command,
- * its dynamic fields applied and its DDR address relocated, handed over as a
- * descriptor to run on the functional simulator; loads from the shared window */
+/* ---------------------------------------------------------------- the sim transport
+ * (compiler/runtime/sa/sa_transport_sim.c): the PCPI configuration kept here,
+ * each command rebuilt as the descriptor it stands for (the inverse of the
+ * mapping in SahwToRiscv.cpp) and handed over to run on the functional
+ * simulator; loads from the shared window */
 static void (*sim_cmd)(const uint64_t *desc);
 static uint32_t (*sim_load32)(uint32_t addr);
+static uint32_t mat[11], vec[16], gemv[4];
 void sa_rv_sim_init(void (*cmd)(const uint64_t *desc), uint32_t (*load32)(uint32_t addr))
 {
     sim_cmd = cmd;
     sim_load32 = load32;
 }
-#define LOAD32(a)                sim_load32(a)
-#define NOTE(w, a, b)            ((void)0)
-#define MAT_CFG(k, v)            ((void)0)      /* (not reached: sa_rv_cmd returns after sim_cmd) */
-#define VEC_CFG(k, v)            ((void)0)
-#define GEMV_CFG(k, v)           ((void)0)
-#define MAT_LOAD(d, l)           ((void)0)
-#define MAT_STORE(d, l)          ((void)0)
-#define MAT_EXEC(a, b, c, k, x)  ((void)0)
-#define VEC_RUN(s1, s2)          ((void)0)
-#define GEMV_RUN(w, c, s, x)     ((void)0)
-#define MAT_FENCE(m)             ((void)0)
-#elif defined(SA_RV_HOST)
-#define MAT_CFG(k, v)            sa_rv_host_pcpi("mat_cfg", 2, (k), (v), 0, 0, 0)
-#define VEC_CFG(k, v)            sa_rv_host_pcpi("vec_cfg", 2, (k), (v), 0, 0, 0)
-#define GEMV_CFG(k, v)           sa_rv_host_pcpi("gemv_cfg", 2, (k), (v), 0, 0, 0)
-#define MAT_LOAD(d, l)           sa_rv_host_pcpi("mat_load", 2, (d), (l), 0, 0, 0)
-#define MAT_STORE(d, l)          sa_rv_host_pcpi("mat_store", 2, (d), (l), 0, 0, 0)
-#define MAT_EXEC(a, b, c, k, x)  sa_rv_host_pcpi("mat_exec", 5, (a), (b), (c), (k), (x))
-#define VEC_RUN(s1, s2)          sa_rv_host_pcpi("vec_run", 2, (s1), (s2), 0, 0, 0)
-#define GEMV_RUN(w, c, s, x)     sa_rv_host_pcpi("gemv_run", 4, (w), (c), (s), (x), 0)
-#define MAT_FENCE(m)             sa_rv_host_pcpi("mat_fence", 1, (m), 0, 0, 0, 0)
-#define LOAD32(a)                sa_rv_host_load32(a)
-#define NOTE(w, a, b)            sa_rv_host_note((w), (a), (b))
-#else
-#include "sysarray_intrinsics.h"
-#define MAT_CFG(k, v)            mat_cfg((k), (v))
-#define VEC_CFG(k, v)            vec_cfg((k), (v))
-#define GEMV_CFG(k, v)           gemv_cfg((k), (v))
-#define MAT_LOAD(d, l)           mat_load((d), (l))
-#define MAT_STORE(d, l)          mat_store((d), (l))
-#define MAT_EXEC(a, b, c, k, x)  mat_exec((a), (b), (c), (k), (x))
-#define VEC_RUN(s1, s2)          vec_run((s1), (s2))
-#define GEMV_RUN(w, c, s, x)     gemv_run((w), (c), (s), (x))
-#define MAT_FENCE(m)             ((void)mat_fence(m))
-#define LOAD32(a)                (*(volatile uint32_t *)(uintptr_t)(a))
-#define NOTE(w, a, b)            ((void)0)
-#endif
-
-enum { OP_LD = 0x01, OP_ST = 0x02, OP_EX = 0x03, OP_VE = 0x04, OP_FENCE = 0x10 };
-#define MODE_GEMV 2u
-
-/* dynamic fields: field -> (word, lsb, width) per opcode (llm/sa_funcsim.py DYN_FIELDS) */
-typedef struct { uint8_t word, lsb, width; } field_t;
-static const field_t F_DMA[6] = {{0, 0, 0}, {1, 0, 32}, {2, 0, 16}, {2, 32, 16}, {2, 48, 16}, {3, 0, 32}};
-static const field_t F_EX[8] = {{0, 0, 0}, {1, 0, 16}, {1, 16, 16}, {1, 32, 16}, {1, 48, 12},
-                                {2, 0, 12}, {2, 16, 16}, {2, 32, 16}};
-static const field_t F_VE[12] = {{0, 0, 0}, {1, 0, 16}, {1, 32, 16}, {2, 0, 16}, {2, 32, 32}, {7, 16, 16},
-                                 {7, 0, 16}, {7, 32, 16}, {3, 16, 16}, {6, 0, 32}, {6, 32, 32}, {5, 32, 32}};
-
-static inline uint32_t fld(uint64_t x, unsigned lo, unsigned n)
+static void run(uint64_t w0, uint64_t w1, uint64_t w2, uint64_t w3, uint64_t w4, uint64_t w5, uint64_t w6,
+                uint64_t w7)
 {
-    return (uint32_t)((x >> lo) & (n >= 64 ? ~0ull : ((1ull << n) - 1)));
-}
-
-void sa_rv_cmd(const uint32_t *desc, uint32_t base, uint32_t p0, uint32_t p1)
-{
-    uint64_t w[8];
-    for (int i = 0; i < 8; ++i)
-        w[i] = (uint64_t)desc[2 * i] | (uint64_t)desc[2 * i + 1] << 32;
-    uint32_t hdr = (uint32_t)w[0], op = hdr & 0xFF;
-    const field_t *tab = op == OP_LD || op == OP_ST ? F_DMA : op == OP_EX ? F_EX : op == OP_VE ? F_VE : 0;
-    unsigned ntab = op == OP_LD || op == OP_ST ? 6 : op == OP_EX ? 8 : op == OP_VE ? 12 : 0;
-    for (unsigned s = 0; s < 2; ++s) {
-        uint32_t slot = (hdr >> (16 + 8 * s)) & 0xFF, f = slot & 0xF;
-        if (!f || f >= ntab)
-            continue;
-        field_t t = tab[f];
-        uint64_t mask = t.width == 32 ? 0xFFFFFFFFull : ((1ull << t.width) - 1);
-        uint64_t p = s ? p1 : p0, old = (w[t.word] >> t.lsb) & mask;
-        uint64_t nv = ((slot & 0x80) ? old + p : p) & mask;
-        w[t.word] = (w[t.word] & ~(mask << t.lsb)) | (nv << t.lsb);
-    }
-#if defined(SA_RV_SIM)
-    if (op == OP_LD || op == OP_ST) {                  /* the address resolved, BASE no longer needed */
-        uint32_t a = fld(w[1], 0, 32) + (((hdr >> 8) & 1) ? base : 0);
-        w[1] = (w[1] & ~0xFFFFFFFFull) | a;
-    }
-    w[0] &= ~(0xFFFF0000ull | 0x6700ull);              /* no dynamic slots, no relocation (FENCE_BEFORE kept) */
+    uint64_t w[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
     sim_cmd(w);
-    return;
-#endif
-    if (op != OP_FENCE && ((hdr >> 11) & 1))           /* FENCE_BEFORE */
-        MAT_FENCE(0);
-    uint32_t ddr = fld(w[1], 0, 32) + (((hdr >> 8) & 1) ? base : 0);
-    (void)ddr;
-    if (op == OP_LD && fld(w[3], 32, 2) == MODE_GEMV) {
-        GEMV_CFG(0, fld(w[2], 48, 16));                    /* SA_GCFG_KBYTES */
-        GEMV_CFG(1, fld(w[3], 0, 32));                     /* SA_GCFG_PITCH */
-        GEMV_CFG(2, fld(w[3], 34, 16));                    /* SA_GCFG_XWORD */
-        GEMV_CFG(3, fld(w[3], 50, 8));                     /* SA_GCFG_CSTEP */
-        GEMV_RUN(ddr, fld(w[2], 0, 32) & 0xFFFF, fld(w[2], 32, 16), fld(w[3], 58, 1));
-    } else if (op == OP_LD) {
-        MAT_CFG(0, fld(w[2], 32, 16));                     /* SA_CFG_LD_ROWS */
-        MAT_CFG(1, fld(w[2], 48, 16));                     /* SA_CFG_LD_ROW_BYTES */
-        MAT_CFG(2, fld(w[3], 0, 32));                      /* SA_CFG_LD_PITCH */
-        MAT_CFG(3, fld(w[3], 32, 2));                      /* SA_CFG_LD_MODE */
-        MAT_LOAD(ddr, fld(w[2], 0, 32));
-    } else if (op == OP_ST) {
-        MAT_CFG(4, fld(w[2], 32, 16));                     /* SA_CFG_ST_ROWS */
-        MAT_CFG(5, fld(w[2], 48, 16));                     /* SA_CFG_ST_ROW_BYTES */
-        MAT_CFG(6, fld(w[3], 0, 32));                      /* SA_CFG_ST_PITCH */
-        MAT_STORE(ddr, fld(w[2], 0, 32));
-    } else if (op == OP_EX) {
-        MAT_CFG(7, fld(w[2], 0, 12));                      /* SA_CFG_EX_REPEAT */
-        MAT_CFG(8, fld(w[2], 16, 16));                     /* SA_CFG_EX_B_STEP */
-        MAT_CFG(9, fld(w[2], 32, 16));                     /* SA_CFG_EX_C_STEP */
-        MAT_CFG(10, fld(w[2], 48, 16));                    /* SA_CFG_EX_C_ROW */
-        MAT_EXEC(fld(w[1], 0, 16), fld(w[1], 16, 16), fld(w[1], 32, 16), fld(w[1], 48, 12), fld(w[1], 60, 1));
-    } else if (op == OP_VE) {
-        VEC_CFG(0, fld(w[3], 0, 8));                       /* SA_VCFG_OP */
-        VEC_CFG(1, fld(w[2], 32, 32));                     /* SA_VCFG_LEN */
-        VEC_CFG(2, fld(w[2], 0, 32));                      /* SA_VCFG_DST */
-        VEC_CFG(3, fld(w[3], 8, 6));                       /* SA_VCFG_TYPES */
-        VEC_CFG(4, fld(w[3], 16, 16));                     /* SA_VCFG_SRC2_MOD */
-        VEC_CFG(5, fld(w[3], 32, 16));                     /* SA_VCFG_SCALE */
-        VEC_CFG(6, fld(w[3], 48, 5));                      /* SA_VCFG_SHIFT */
-        VEC_CFG(7, fld(w[4], 0, 32));                      /* SA_VCFG_ZP */
-        VEC_CFG(8, fld(w[4], 32, 32));                     /* SA_VCFG_CLAMP_LO */
-        VEC_CFG(9, fld(w[5], 0, 32));                      /* SA_VCFG_CLAMP_HI */
-        VEC_CFG(10, fld(w[3], 53, 11));                    /* SA_VCFG_FLAGS */
-        VEC_CFG(11, fld(w[5], 32, 32));                    /* SA_VCFG_IMM */
-        VEC_CFG(12, fld(w[6], 0, 32));                     /* SA_VCFG_A */
-        VEC_CFG(13, fld(w[6], 32, 32));                    /* SA_VCFG_B */
-        VEC_CFG(14, fld(w[7], 0, 32));                     /* SA_VCFG_ROW */
-        VEC_CFG(15, fld(w[7], 32, 32));                    /* SA_VCFG_P1S */
-        VEC_RUN(fld(w[1], 0, 32), fld(w[1], 32, 32));
-    } else if (op == OP_FENCE) {
-        MAT_FENCE(fld(w[1], 0, 4));
-    }
 }
+void sa_rv_mat_cfg(uint32_t key, uint32_t value) { if (key < 11) mat[key] = value; }
+void sa_rv_vec_cfg(uint32_t key, uint32_t value) { if (key < 16) vec[key] = value; }
+void sa_rv_gemv_cfg(uint32_t key, uint32_t value) { if (key < 4) gemv[key] = value; }
+void sa_rv_mat_load(uint32_t ddr, uint32_t laddr)
+{
+    run(0x01, ddr, laddr | (uint64_t)mat[0] << 32 | (uint64_t)mat[1] << 48, mat[2] | (uint64_t)(mat[3] & 3) << 32,
+        0, 0, 0, 0);
+}
+void sa_rv_mat_store(uint32_t ddr, uint32_t laddr)
+{
+    run(0x02, ddr, laddr | (uint64_t)mat[4] << 32 | (uint64_t)mat[5] << 48, mat[6], 0, 0, 0, 0);
+}
+void sa_rv_mat_exec(uint32_t a, uint32_t b, uint32_t c, uint32_t kt, uint32_t accumulate)
+{
+    run(0x03, a | (uint64_t)b << 16 | (uint64_t)c << 32 | (uint64_t)kt << 48 | (uint64_t)accumulate << 60,
+        mat[7] | (uint64_t)mat[8] << 16 | (uint64_t)mat[9] << 32 | (uint64_t)mat[10] << 48, 0, 0, 0, 0, 0);
+}
+void sa_rv_vec_run(uint32_t src1, uint32_t src2)
+{
+    run(0x04, src1 | (uint64_t)src2 << 32, vec[2] | (uint64_t)vec[1] << 32,
+        vec[0] | (uint64_t)vec[3] << 8 | (uint64_t)vec[4] << 16 | (uint64_t)vec[5] << 32 | (uint64_t)vec[6] << 48 |
+            (uint64_t)vec[10] << 53,
+        vec[7] | (uint64_t)vec[8] << 32, vec[9] | (uint64_t)vec[11] << 32, vec[12] | (uint64_t)vec[13] << 32,
+        vec[14] | (uint64_t)vec[15] << 32);
+}
+void sa_rv_gemv_run(uint32_t w, uint32_t c, uint32_t strips, uint32_t accumulate)
+{
+    run(0x01, w, (0x30000000u | c) | (uint64_t)strips << 32 | (uint64_t)gemv[0] << 48,
+        gemv[1] | 2ull << 32 | (uint64_t)gemv[2] << 34 | (uint64_t)gemv[3] << 50 | (uint64_t)accumulate << 58,
+        0, 0, 0, 0);
+}
+void sa_rv_mat_fence(uint32_t mask) { run(0x10, mask, 0, 0, 0, 0, 0, 0); }
+uint32_t sa_rv_ldparam(uint32_t addr) { return sim_load32(addr); }   /* (each command ran to its end) */
 
+#elif defined(SA_RV_HOST)
+/* ---------------------------------------------------------------- the host's recorder */
+void sa_rv_mat_cfg(uint32_t k, uint32_t v) { sa_rv_host_pcpi("mat_cfg", 2, k, v, 0, 0, 0); }
+void sa_rv_vec_cfg(uint32_t k, uint32_t v) { sa_rv_host_pcpi("vec_cfg", 2, k, v, 0, 0, 0); }
+void sa_rv_gemv_cfg(uint32_t k, uint32_t v) { sa_rv_host_pcpi("gemv_cfg", 2, k, v, 0, 0, 0); }
+void sa_rv_mat_load(uint32_t d, uint32_t l) { sa_rv_host_pcpi("mat_load", 2, d, l, 0, 0, 0); }
+void sa_rv_mat_store(uint32_t d, uint32_t l) { sa_rv_host_pcpi("mat_store", 2, d, l, 0, 0, 0); }
+void sa_rv_mat_exec(uint32_t a, uint32_t b, uint32_t c, uint32_t kt, uint32_t x)
+{
+    sa_rv_host_pcpi("mat_exec", 5, a, b, c, kt, x);
+}
+void sa_rv_vec_run(uint32_t s1, uint32_t s2) { sa_rv_host_pcpi("vec_run", 2, s1, s2, 0, 0, 0); }
+void sa_rv_gemv_run(uint32_t w, uint32_t c, uint32_t s, uint32_t x) { sa_rv_host_pcpi("gemv_run", 4, w, c, s, x, 0); }
+void sa_rv_mat_fence(uint32_t m) { sa_rv_host_pcpi("mat_fence", 1, m, 0, 0, 0, 0); }
 uint32_t sa_rv_ldparam(uint32_t addr)
 {
-#if defined(SA_RV_SIM)
-    return LOAD32(addr);                               /* (the simulator runs each command to its end) */
-#elif defined(SA_RV_HOST)
-    NOTE("fence_for_ldparam", 0, 0);           /* (not a command of the descriptor path) */
-#else
-    MAT_FENCE(0);
-#endif
-    uint32_t v = LOAD32(addr);
-    NOTE("ldparam", addr, v);
+    sa_rv_host_note("fence_for_ldparam", 0, 0);       /* (not a command of the descriptor path) */
+    uint32_t v = sa_rv_host_load32(addr);
+    sa_rv_host_note("ldparam", addr, v);
     return v;
 }
+
+#else
+/* ---------------------------------------------------------------- the PicoRV32 */
+#include "sysarray_intrinsics.h"
+void sa_rv_mat_cfg(uint32_t k, uint32_t v) { mat_cfg(k, v); }
+void sa_rv_vec_cfg(uint32_t k, uint32_t v) { vec_cfg(k, v); }
+void sa_rv_gemv_cfg(uint32_t k, uint32_t v) { gemv_cfg(k, v); }
+void sa_rv_mat_load(uint32_t d, uint32_t l) { mat_load(d, l); }
+void sa_rv_mat_store(uint32_t d, uint32_t l) { mat_store(d, l); }
+void sa_rv_mat_exec(uint32_t a, uint32_t b, uint32_t c, uint32_t kt, uint32_t x) { mat_exec(a, b, c, kt, x); }
+void sa_rv_vec_run(uint32_t s1, uint32_t s2) { vec_run(s1, s2); }
+void sa_rv_gemv_run(uint32_t w, uint32_t c, uint32_t s, uint32_t x) { gemv_run(w, c, s, x); }
+void sa_rv_mat_fence(uint32_t m) { (void)mat_fence(m); }
+uint32_t sa_rv_ldparam(uint32_t addr)
+{
+    (void)mat_fence(0);
+    return *(volatile uint32_t *)(uintptr_t)addr;
+}
+#endif

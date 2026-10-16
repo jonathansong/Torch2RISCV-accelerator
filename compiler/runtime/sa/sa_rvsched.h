@@ -40,6 +40,7 @@ typedef struct sa_rvsched_io_t {
 // Statistics of the table (after pass 2).
 typedef struct sa_rvsched_info_t {
   uint32_t lists, descriptors;  // lists per step, their descriptors
+  uint32_t calls;               // calls of generated RISC-V code per step (SA_RV: plan A inside plan B)
   uint32_t words;               // list words patched between buckets
   uint32_t table_bytes;
   uint32_t table_phys;

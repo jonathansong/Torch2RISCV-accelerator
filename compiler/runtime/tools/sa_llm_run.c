@@ -427,9 +427,9 @@ static iree_status_t run(iree_allocator_t host) {
     if (iree_status_is_ok(status)) {
       sa_rvsched_info(s, &rvs_info);
       fprintf(stderr,
-              "rvsched: %u buckets of %d positions recorded in %.3f s; %u lists per step (%u descriptors), %u words "
-              "patched per bucket, table %.1f KB at %#x\n",
-              b1 - b0 + 1, FLAG_pad, t_rec, rvs_info.lists, rvs_info.descriptors, rvs_info.words,
+              "rvsched: %u buckets of %d positions recorded in %.3f s; %u lists per step (%u descriptors), %u calls "
+              "of RISC-V code, %u words patched per bucket, table %.1f KB at %#x\n",
+              b1 - b0 + 1, FLAG_pad, t_rec, rvs_info.lists, rvs_info.descriptors, rvs_info.calls, rvs_info.words,
               rvs_info.table_bytes / 1024.0, rvs_info.table_phys);
       t0 = now();
       if (!getenv("SA_RVSCHED_RECORD_ONLY"))          // (tests: the table without the run)

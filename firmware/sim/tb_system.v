@@ -682,7 +682,7 @@ module tb_system;
     localparam [31:0] L_COPY = LISTS, L_PARAM = LISTS + 32'h400, L_BAD = LISTS + 32'h800, L_LOOP = LISTS + 32'hC00;
     localparam integer RSIZE = 4, NENT = 12;
     localparam [31:0] S = DDR_BASE + 32'h4C000, S_TAB = S, S_TAB2 = S + 32'h80, S_L0 = S + 32'h100, S_L1 = S + 32'h140,
-                      S_LISTS = S + 32'h180, S_WORDS = S + 32'h190, S_BK = S + 32'h1C0, S_VAL = S + 32'h200,
+                      S_LISTS = S + 32'h180, S_WORDS = S + 32'h1A0, S_BK = S + 32'h1C0, S_VAL = S + 32'h200,
                       S_OUT = S + 32'h240, S_OUT2 = S + 32'h500, S_TOK0 = S + 32'h300, S_POS0 = S + 32'h308,
                       S_VALID0 = S + 32'h340, S_VALID1 = S + 32'h380, S_TOK1 = S + 32'h3C0, S_POS1 = S + 32'h3C8,
                       S_LG0 = S + 32'h400, S_BM0 = S + 32'h440, S_LG1 = S + 32'h480, S_BM1 = S + 32'h4C0;
@@ -713,10 +713,11 @@ module tb_system;
         integer j;
         for (j = 0; j < 4; j = j + 1) ddr[a - DDR_BASE + j] = v[8*j +: 8];
     endtask
-    // a schedule header (rvsched.h RVS_T_*): 2 lists, 2 patched words, pad 4, buckets 0-1, 4 blocks of 4
+    // a schedule header (rvsched.h RVS_T_*, RVS2): 3 items (2 lists, a call of RT_CALL's function),
+    // 2 patched words, pad 4, buckets 0-1, 4 blocks of 4
     task sched_table(input [31:0] t, input [31:0] stop, input [31:0] out);
         begin
-            put32(t, 32'h31535652); put32(t + 4, 2); put32(t + 8, S_LISTS); put32(t + 12, 2); put32(t + 16, S_WORDS);
+            put32(t, 32'h32535652); put32(t + 4, 3); put32(t + 8, S_LISTS); put32(t + 12, 2); put32(t + 16, S_WORDS);
             put32(t + 20, 4); put32(t + 24, 0); put32(t + 28, 2); put32(t + 32, S_BK); put32(t + 36, S_VAL);
             put32(t + 40, 4); put32(t + 44, 4); put32(t + 48, 2); put32(t + 52, 6); put32(t + 56, 7);
             put32(t + 60, stop); put32(t + 64, out); put32(t + 68, 32'hDEAD); put32(t + 72, 32'hDEAD);
@@ -816,7 +817,9 @@ module tb_system;
         sched_table(S_TAB2, 32'd14, S_OUT2);
         wdesc(S_L0, 8'h12, 0, 0, 64'h5A, 0, 0, 0);                                             // END
         wdesc(S_L1, 8'h12, 0, 0, 64'h5A, 0, 0, 0);
-        put32(S_LISTS, S_L0); put32(S_LISTS + 4, S_L1);
+        put32(S_LISTS, S_L0); put32(S_LISTS + 4, 0); put32(S_LISTS + 8, S_L1); put32(S_LISTS + 12, 0);
+        put32(S_LISTS + 16, S + 32'h700); put32(S_LISTS + 20, S + 32'h600);      // the call: args, code
+        put32(S + 32'h700, 0); put32(S + 32'h740, 32'h10);                         // (args[0] <- 0x11 each step)
         put32(S_WORDS, S_L0 + 40); put32(S_WORDS + 4, S_L1 + 48);                             // (unused words of END)
         put32(S_VAL, 32'h11111111); put32(S_VAL + 4, 32'h22222222);                           // bucket 0
         put32(S_VAL + 8, 32'h33333333); put32(S_VAL + 12, 32'h44444444);                      // bucket 1
@@ -847,8 +850,8 @@ module tb_system;
         if (bram[MBOX + MB_FW_STATE] !== 32'h52554E00) begin
             $display("TB ERROR: rt_fw not ready (FW_STATE %08x)", bram[MBOX + MB_FW_STATE]); errors = errors + 1;
         end
-        // RT_VERSION 4: the unit's CAPS for the host's executable check, RT_RUN_SCHED, RT_CALL
-        if (bram[MBOX + 32'hC8 / 4] !== 4 || bram[MBOX + 32'hD0 / 4] !== mm.legacy.CAPS) begin
+        // RT_VERSION 5: the unit's CAPS for the host's executable check, RT_RUN_SCHED (RVS2), RT_CALL
+        if (bram[MBOX + 32'hC8 / 4] !== 5 || bram[MBOX + 32'hD0 / 4] !== mm.legacy.CAPS) begin
             $display("TB ERROR: rt_fw version %0d, FW_CAPS %08x (CAPS %08x)", bram[MBOX + 32'hC8 / 4],
                      bram[MBOX + 32'hD0 / 4], mm.legacy.CAPS); errors = errors + 1;
         end
@@ -924,6 +927,7 @@ module tb_system;
         check32(S_VALID1, 32'h3F800000, "valid 1"); check32(S_VALID1 + 16, 32'h3F800000, "valid 1 [4]");
         check32(S_VALID1 + 20, 0, "valid 1 [5]");   // (rewritten by the stop schedule at position 4)
         check32(S + 32'h640, 32'h42, "RT_CALL result");
+        check32(S + 32'h700, 32'h11, "schedule call result");
         check32(S_L0 + 40, 32'h33333333, "patch 0"); check32(S_L1 + 48, 32'h44444444, "patch 1");
         if (nirq_edges !== 7) begin
             $display("TB ERROR: %0d notify_irq edges, expected 7", nirq_edges); errors = errors + 1;

@@ -61,40 +61,11 @@ static iree_status_t sa_sim_run(sa_transport_t* t, uint32_t list_phys, sa_comple
   return iree_ok_status();
 }
 
-// The decode schedule (firmware/include/rvsched.h) as rt_fw runs it on the
-// board, its accesses on the shared window, its lists through RUN.
-static sa_transport_t* sa_sim_rvs_t;
-static iree_status_t sa_sim_rvs_error;
-static uint32_t sa_sim_rvs_submit(uint32_t list) {
-  sa_completion_t done = {0};
-  iree_status_t st = sa_sim_run(sa_sim_rvs_t, list, &done);
-  if (!iree_status_is_ok(st)) {
-    if (iree_status_is_ok(sa_sim_rvs_error)) sa_sim_rvs_error = st; else iree_status_ignore(st);
-    return 0xFFFFFFFFu;
-  }
-  return done.status ? done.status : (done.end != 0x5A ? 0xFFFFFFFEu : 0u);
-}
-#define RVS_RD(a) (*(volatile uint32_t*)(sa_sim_rvs_t->mem + ((uint32_t)(a) - sa_sim_rvs_t->mem_phys)))
-#define RVS_WR(a, v) (RVS_RD(a) = (uint32_t)(v))
-#define RVS_SUBMIT(l) sa_sim_rvs_submit(l)
-#define RVS_CYCLES() 0u
-#include "../../../firmware/include/rvsched.h"  // the decode schedule shared with rt_fw
-
-static iree_status_t sa_sim_run_sched(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status) {
-  (void)timeout_s;
-  sa_sim_rvs_t = t;
-  sa_sim_rvs_error = iree_ok_status();
-  *out_status = rvs_run(table_phys);
-  iree_status_t st = sa_sim_rvs_error;
-  sa_sim_rvs_error = iree_ok_status();
-  return st;
-}
-
 #if defined(__x86_64__)
 // Generated RISC-V code on the sim (plan A, sa_rv.c): the host build of the
 // same code (SA_RV's rvcode_host.so, firmware/rv/sa_rv_rt.c SA_RV_SIM), each
-// command handed back here and run as a one-command list in the transport's
-// scratch (128 bytes after the argument block).
+// command handed back here and run as a one-command list in sa_rv.c's
+// scratch (after its argument block).
 #include <dlfcn.h>
 static void* sa_sim_rv_so;
 static sa_transport_t* sa_sim_rv_tp;
@@ -134,7 +105,7 @@ static iree_status_t sa_sim_run_call(sa_transport_t* t, uint32_t code_phys, uint
   void (*fn)(const uint32_t*, const uint32_t*) = (void (*)(const uint32_t*, const uint32_t*))dlsym(sa_sim_rv_so, symbol);
   if (!fn) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa sim: no function %s in rvcode_host.so", symbol);
   sa_sim_rv_tp = t;
-  sa_sim_rv_list = args_phys + 256;
+  sa_sim_rv_list = sa_rv_scratch_phys() + 256;     // (sa_rv.c's scratch: an argument block may sit in a table)
   sa_sim_rv_err = 0;
   sa_sim_rv_status = iree_ok_status();
   const uint32_t* args = (const uint32_t*)(t->mem + (args_phys - t->mem_phys));
@@ -147,6 +118,62 @@ static iree_status_t sa_sim_run_call(sa_transport_t* t, uint32_t code_phys, uint
   return st;
 }
 #endif
+
+// a call inside a schedule (RVS2 items: the code address, the symbol from sa_rv.c's map)
+static uint32_t sa_sim_rvs_call(uint32_t code, uint32_t args);
+
+// The decode schedule (firmware/include/rvsched.h) as rt_fw runs it on the
+// board, its accesses on the shared window, its lists through RUN.
+static sa_transport_t* sa_sim_rvs_t;
+static iree_status_t sa_sim_rvs_error;
+static uint32_t sa_sim_rvs_submit(uint32_t list) {
+  sa_completion_t done = {0};
+  iree_status_t st = sa_sim_run(sa_sim_rvs_t, list, &done);
+  if (!iree_status_is_ok(st)) {
+    if (iree_status_is_ok(sa_sim_rvs_error)) sa_sim_rvs_error = st; else iree_status_ignore(st);
+    return 0xFFFFFFFFu;
+  }
+  return done.status ? done.status : (done.end != 0x5A ? 0xFFFFFFFEu : 0u);
+}
+#define RVS_RD(a) (*(volatile uint32_t*)(sa_sim_rvs_t->mem + ((uint32_t)(a) - sa_sim_rvs_t->mem_phys)))
+#define RVS_WR(a, v) (RVS_RD(a) = (uint32_t)(v))
+#define RVS_SUBMIT(l) sa_sim_rvs_submit(l)
+#if defined(__x86_64__)
+#define RVS_CALL(c, a) sa_sim_rvs_call(c, a)
+#else
+#define RVS_CALL(c, a) 0xFFFFFFFFu
+#endif
+#define RVS_CYCLES() 0u
+#include "../../../firmware/include/rvsched.h"  // the decode schedule shared with rt_fw
+
+#if defined(__x86_64__)
+static uint32_t sa_sim_rvs_call(uint32_t code, uint32_t args) {
+  const char* sym = sa_rv_symbol_at(code);
+  if (!sym) {
+    if (iree_status_is_ok(sa_sim_rvs_error))
+      sa_sim_rvs_error = iree_make_status(IREE_STATUS_NOT_FOUND, "sa sim: no function at %#x", code);
+    return 0xFFFFFFFFu;
+  }
+  sa_completion_t done = {0};
+  iree_status_t st = sa_sim_run_call(sa_sim_rvs_t, code, args, sym, &done);
+  if (!iree_status_is_ok(st)) {
+    if (iree_status_is_ok(sa_sim_rvs_error)) sa_sim_rvs_error = st; else iree_status_ignore(st);
+    return 0xFFFFFFFFu;
+  }
+  return done.status;
+}
+#endif
+
+static iree_status_t sa_sim_run_sched(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status) {
+  (void)timeout_s;
+  sa_sim_rvs_t = t;
+  sa_sim_rvs_error = iree_ok_status();
+  *out_status = rvs_run(table_phys);
+  iree_status_t st = sa_sim_rvs_error;
+  sa_sim_rvs_error = iree_ok_status();
+  return st;
+}
+
 
 static void sa_sim_close(sa_transport_t* t) {
   sa_sim_t* s = (sa_sim_t*)t->impl;

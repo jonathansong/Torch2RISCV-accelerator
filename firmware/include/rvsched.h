@@ -15,6 +15,9 @@
  *   RVS_RD(a), RVS_WR(a, v)  32-bit access at device (physical) address a
  *   RVS_SUBMIT(list)         runs the descriptor list at list to its END and
  *                            waits; evaluates to 0 or the unit's error status
+ *   RVS_CALL(code, args)     calls generated RISC-V code (plan A, §9) as
+ *                            code(args, args + 16 words), waits for the engines;
+ *                            0 or the unit's error status
  *   RVS_CYCLES()             a cycle counter (uint32_t)
  *
  * Table (u32 words at a 64-byte aligned address; addresses are physical):
@@ -24,12 +27,14 @@
 
 #include <stdint.h>
 
-#define RVS_MAGIC 0x31535652u            /* "RVS1" */
+#define RVS_MAGIC 0x32535652u            /* "RVS2": items (lists or calls of generated code) */
 enum {
   RVS_T_MAGIC = 0,
-  RVS_T_NLISTS,      /* lists per step, submitted in order (the step's, then the block maxima's) */
-  RVS_T_LISTS,       /*   their addresses (nlists words) */
-  RVS_T_NWORDS,      /* list words that differ between buckets */
+  RVS_T_NITEMS,      /* items per step, in order (the step's dispatches, then the block maxima's) */
+  RVS_T_ITEMS,       /*   two words each: an address and a code address (0: a descriptor list at the
+                      *   address, submitted; else generated code, called with the 64-word argument
+                      *   block at the address: 16 binding addresses, the push constants) */
+  RVS_T_NWORDS,      /* list / argument words that differ between buckets */
   RVS_T_WORDS,       /*   their addresses (nwords words) */
   RVS_T_PAD,         /* positions per bucket: bucket b holds positions [b pad, (b + 1) pad), valid length (b + 1) pad */
   RVS_T_BUCKET0,     /* first bucket in the table */
@@ -66,7 +71,7 @@ static uint32_t rvs_run(uint32_t tab)
         RVS_WR(tab + 4u * RVS_T_STATUS, RVS_E_MAGIC);
         return RVS_E_MAGIC;
     }
-    uint32_t nlists = RVS_T(RVS_T_NLISTS), lists = RVS_T(RVS_T_LISTS);
+    uint32_t nitems = RVS_T(RVS_T_NITEMS), items = RVS_T(RVS_T_ITEMS);
     uint32_t nwords = RVS_T(RVS_T_NWORDS), words = RVS_T(RVS_T_WORDS);
     uint32_t pad = RVS_T(RVS_T_PAD), b0 = RVS_T(RVS_T_BUCKET0), nb = RVS_T(RVS_T_NBUCKETS);
     uint32_t buckets = RVS_T(RVS_T_BUCKETS), values = RVS_T(RVS_T_VALUES);
@@ -101,8 +106,9 @@ static uint32_t rvs_run(uint32_t tab)
         RVS_WR(pa, pos);
         RVS_WR(pa + 4u, 0u);
         uint32_t t1 = RVS_CYCLES(), l;
-        for (l = 0; l < nlists; ++l) {
-            uint32_t st = RVS_SUBMIT(RVS_RD(lists + 4u * l));
+        for (l = 0; l < nitems; ++l) {
+            uint32_t a = RVS_RD(items + 8u * l), code = RVS_RD(items + 8u * l + 4u);
+            uint32_t st = code ? RVS_CALL(code, a) : RVS_SUBMIT(a);
             if (st) {
                 status = st;
                 break;
