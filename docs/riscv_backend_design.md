@@ -421,7 +421,12 @@ What remains per layer is the KV write (`slow_memcpy`, 28 × 0.2 KB), whose laye
 - No dispatch on the host.
 - `run_tests.sh golden` passes with the flag off.
 
-**On the board** (bundle `qwen3g`: the Qwen3 bundle with the generalized `sa.vmfb`, `run_board_tests.sh qwen3g`): plan B's loop generates the reference's 57 tokens with descriptor lists and with the S4 code. Performance counters (`board_rvperf.py`), decode, ms per step:
+**On the board** (bundle `qwen3g`: the Qwen3 bundle with the generalized `sa.vmfb`, `run_board_tests.sh qwen3g`), all five tests pass:
+- `llm`: logits bit-exact with the functional simulator in 17/17 steps, no dispatch on the host.
+- `rvcode --embedded`: 17/17 bit-exact, 179.1 ms per step (before: 173).
+- `rvsched` and `rvsched --rv --embedded`: tokens identical over 256 tokens and the last logits bit-exact.
+
+Performance counters (`board_rvperf.py`), decode, ms per step:
 
 | plan B loop | before | generalized | commands per step | core instructions per step |
 |---|---|---|---|---|
