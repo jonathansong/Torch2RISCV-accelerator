@@ -71,11 +71,12 @@
 #define MBOX_HEARTBEAT     0xCC  /* out: idle-loop counter                                */
 #define MBOX_FW_CAPS       0xD0  /* out: the unit's CAPS register (RT_VERSION >= 2)       */
 #define RT_READY           0x52554E00u   /* "RUN\0"                                     */
-#define RT_VERSION         2u    /* 2: MBOX_FW_CAPS                                    */
+#define RT_VERSION         3u    /* 2: MBOX_FW_CAPS; 3: RT_RUN_SCHED                   */
 #define RT_RUN_LIST        0x01u /* ring entry types (w0[7:0])                           */
 #define RT_NOP             0x02u
 #define RT_RESET           0x03u /* mat_reset, then go on                                */
 #define RT_EXIT            0x04u /* complete it, then leave (the core halts)             */
+#define RT_RUN_SCHED       0x05u /* w1: a decode schedule (rvsched.h), run to its end    */
 #define RT_F_IRQ           (1u << 8)     /* entry flags: mat_notify after completion      */
 #define RT_F_PERF          (1u << 9)     /*              counters into the perf area      */
 #define GEMM_NO_PREFETCH   (1u << 0)

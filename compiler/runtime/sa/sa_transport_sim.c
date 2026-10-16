@@ -61,6 +61,35 @@ static iree_status_t sa_sim_run(sa_transport_t* t, uint32_t list_phys, sa_comple
   return iree_ok_status();
 }
 
+// The decode schedule (firmware/include/rvsched.h) as rt_fw runs it on the
+// board, its accesses on the shared window, its lists through RUN.
+static sa_transport_t* sa_sim_rvs_t;
+static iree_status_t sa_sim_rvs_error;
+static uint32_t sa_sim_rvs_submit(uint32_t list) {
+  sa_completion_t done = {0};
+  iree_status_t st = sa_sim_run(sa_sim_rvs_t, list, &done);
+  if (!iree_status_is_ok(st)) {
+    if (iree_status_is_ok(sa_sim_rvs_error)) sa_sim_rvs_error = st; else iree_status_ignore(st);
+    return 0xFFFFFFFFu;
+  }
+  return done.status ? done.status : (done.end != 0x5A ? 0xFFFFFFFEu : 0u);
+}
+#define RVS_RD(a) (*(volatile uint32_t*)(sa_sim_rvs_t->mem + ((uint32_t)(a) - sa_sim_rvs_t->mem_phys)))
+#define RVS_WR(a, v) (RVS_RD(a) = (uint32_t)(v))
+#define RVS_SUBMIT(l) sa_sim_rvs_submit(l)
+#define RVS_CYCLES() 0u
+#include "../../../firmware/include/rvsched.h"  // the decode schedule shared with rt_fw
+
+static iree_status_t sa_sim_run_sched(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status) {
+  (void)timeout_s;
+  sa_sim_rvs_t = t;
+  sa_sim_rvs_error = iree_ok_status();
+  *out_status = rvs_run(table_phys);
+  iree_status_t st = sa_sim_rvs_error;
+  sa_sim_rvs_error = iree_ok_status();
+  return st;
+}
+
 static void sa_sim_close(sa_transport_t* t) {
   sa_sim_t* s = (sa_sim_t*)t->impl;
   if (write(s->fd, "QUIT\n", 5) != 5) { /* the server may be gone */ }
@@ -108,6 +137,7 @@ iree_status_t sa_transport_sim_open(iree_allocator_t host_allocator, sa_transpor
   const char* caps = getenv("SA_SIM_CAPS");
   if (caps) t->caps = (uint32_t)strtoul(caps, NULL, 0);
   t->run = sa_sim_run;
+  t->run_sched = sa_sim_run_sched;
   t->close = sa_sim_close;
   t->impl = s;
   *out = t;

@@ -16,6 +16,9 @@
  *   w7 [31:0] parameter block address (8 x u32, 0 = keep PARAM0..7).
  * Completion (8 x u32): seq, status (0 or extended status), cycles
  *   (mat_submit .. fence), descriptors decoded, END value, 0, 0, 0.
+ * RT_RUN_SCHED (version 3): w1 is a decode schedule (rvsched.h,
+ *   docs/riscv_backend_design.md §7.1): the core runs the decode loop itself,
+ *   the lists one after another; status = the schedule's, cycles = the whole run.
  */
 #include <stdint.h>
 #include "mailbox.h"
@@ -29,6 +32,24 @@ static inline uint32_t rdcycle(void)
     __asm__ volatile ("rdcycle %0" : "=r"(c));
     return c;
 }
+
+/* one list of a schedule: to its END, then all engines idle; 0 or the error status */
+static uint32_t rt_submit(uint32_t list)
+{
+    mat_submit(list, 0);
+    uint32_t st = mat_fence(SA_ENG_ALL);
+    if (st & SA_XST_ERROR) {
+        mat_reset();
+        return st;
+    }
+    return 0;
+}
+
+#define RVS_RD(a)     (*(volatile uint32_t *)(a))
+#define RVS_WR(a, v)  (*(volatile uint32_t *)(a) = (v))
+#define RVS_SUBMIT(l) rt_submit(l)
+#define RVS_CYCLES()  rdcycle()
+#include "rvsched.h"
 
 int main(void)
 {
@@ -80,6 +101,10 @@ int main(void)
                 status = st;
                 mat_reset();
             }
+        } else if (type == RT_RUN_SCHED) {
+            uint32_t t0 = rdcycle();
+            status = rvs_run(e[2]);
+            cycles = rdcycle() - t0;
         } else if (type == RT_RESET) {
             mat_reset();
         } else if (type != RT_NOP && type != RT_EXIT) {

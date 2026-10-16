@@ -672,15 +672,23 @@ module tb_system;
     // ------------------------------------------------------- RING_TEST
     // The "ARM" writes 64-byte ring entries into DDR, rings the doorbell
     // (mailbox RING_TAIL) and consumes completion records in order; ring of
-    // 4 entries, 9 submissions (wrap-around, at most 4 outstanding).
+    // 4 entries, 11 submissions (wrap-around, at most 4 outstanding). Entries
+    // 8, 9: decode schedules (RT_RUN_SCHED, firmware/include/rvsched.h): two
+    // buckets of 4 positions, lists of one END each with a patched word, block
+    // maxima and logits prefilled, 6 steps from position 2 (9: stop token 14).
     localparam [31:0] RING = DDR_BASE + 32'h48000, CPL = DDR_BASE + 32'h49000, PBLK = DDR_BASE + 32'h4A000,
                       LISTS = DDR_BASE + 32'h4B000, SRC = DDR_BASE + 32'h10000, DST = DDR_BASE + 32'h20000;
     localparam [31:0] L_COPY = LISTS, L_PARAM = LISTS + 32'h400, L_BAD = LISTS + 32'h800, L_LOOP = LISTS + 32'hC00;
-    localparam integer RSIZE = 4, NENT = 9;
+    localparam integer RSIZE = 4, NENT = 11;
+    localparam [31:0] S = DDR_BASE + 32'h4C000, S_TAB = S, S_TAB2 = S + 32'h80, S_L0 = S + 32'h100, S_L1 = S + 32'h140,
+                      S_LISTS = S + 32'h180, S_WORDS = S + 32'h190, S_BK = S + 32'h1C0, S_VAL = S + 32'h200,
+                      S_OUT = S + 32'h240, S_OUT2 = S + 32'h500, S_TOK0 = S + 32'h300, S_POS0 = S + 32'h308,
+                      S_VALID0 = S + 32'h340, S_VALID1 = S + 32'h380, S_TOK1 = S + 32'h3C0, S_POS1 = S + 32'h3C8,
+                      S_LG0 = S + 32'h400, S_BM0 = S + 32'h440, S_LG1 = S + 32'h480, S_BM1 = S + 32'h4C0;
     localparam [31:0] MB_RING_BASE = 32'hB0 / 4, MB_RING_SIZE = 32'hB4 / 4, MB_RING_TAIL = 32'hB8 / 4,
                       MB_RING_HEAD = 32'hBC / 4, MB_CPL_BASE = 32'hC0 / 4, MB_FW_STATE = 32'hC4 / 4,
                       MB_HEARTBEAT = 32'hCC / 4;
-    localparam [7:0] T_RUN = 1, T_NOP = 2, T_RESET = 3, T_EXIT = 4;
+    localparam [7:0] T_RUN = 1, T_NOP = 2, T_RESET = 3, T_EXIT = 4, T_SCHED = 5;
     localparam [15:0] F_IRQ = 16'h100, F_PERF = 16'h200;
     integer nirq_edges = 0, runs = 0, ri, rj, rbad;
     reg     nirq_d = 0;
@@ -700,6 +708,25 @@ module tb_system;
     function [31:0] get32(input [31:0] a);
         get32 = {ddr[a - DDR_BASE + 3], ddr[a - DDR_BASE + 2], ddr[a - DDR_BASE + 1], ddr[a - DDR_BASE]};
     endfunction
+    task put32(input [31:0] a, input [31:0] v);
+        integer j;
+        for (j = 0; j < 4; j = j + 1) ddr[a - DDR_BASE + j] = v[8*j +: 8];
+    endtask
+    // a schedule header (rvsched.h RVS_T_*): 2 lists, 2 patched words, pad 4, buckets 0-1, 4 blocks of 4
+    task sched_table(input [31:0] t, input [31:0] stop, input [31:0] out);
+        begin
+            put32(t, 32'h31535652); put32(t + 4, 2); put32(t + 8, S_LISTS); put32(t + 12, 2); put32(t + 16, S_WORDS);
+            put32(t + 20, 4); put32(t + 24, 0); put32(t + 28, 2); put32(t + 32, S_BK); put32(t + 36, S_VAL);
+            put32(t + 40, 4); put32(t + 44, 4); put32(t + 48, 2); put32(t + 52, 6); put32(t + 56, 7);
+            put32(t + 60, stop); put32(t + 64, out); put32(t + 68, 32'hDEAD); put32(t + 72, 32'hDEAD);
+        end
+    endtask
+    task check32(input [31:0] a, input [31:0] want, input [8*16-1:0] what);
+        if (get32(a) !== want) begin
+            $display("TB ERROR: schedule %0s at %08x: %08x, expected %08x", what, a, get32(a), want);
+            errors = errors + 1;
+        end
+    endtask
     // descriptor: header {tag, dyn slots [31:16], flags [15:8], opcode}, w1..w7
     task wdesc(input [31:0] a, input [7:0] op, input [15:0] dyn, input [7:0] fl, input [63:0] w1,
                input [63:0] w2, input [63:0] w3, input [63:0] w4);
@@ -773,7 +800,32 @@ module tb_system;
         e_list[5] = L_PARAM; e_pb[5] = PBLK;
         e_list[6] = L_LOOP; e_pb[6] = PBLK + 32; e_b0[6] = SRC + 1024; e_b1[6] = DST + 1024; e_flags[6] = F_IRQ | F_PERF;
         e_count[7] = 1; e_flags[7] = 0; e_b0[7] = SRC + 2048; e_b1[7] = DST + 2048;       // only the LD runs
-        e_type[8] = T_EXIT;
+        e_type[8] = T_SCHED; e_list[8] = S_TAB; e_flags[8] = 0;
+        e_type[9] = T_SCHED; e_list[9] = S_TAB2; e_flags[9] = 0;
+        e_type[10] = T_EXIT;
+        // the schedules' data
+        sched_table(S_TAB, 32'hFFFFFFFF, S_OUT);
+        sched_table(S_TAB2, 32'd14, S_OUT2);
+        wdesc(S_L0, 8'h12, 0, 0, 64'h5A, 0, 0, 0);                                             // END
+        wdesc(S_L1, 8'h12, 0, 0, 64'h5A, 0, 0, 0);
+        put32(S_LISTS, S_L0); put32(S_LISTS + 4, S_L1);
+        put32(S_WORDS, S_L0 + 40); put32(S_WORDS + 4, S_L1 + 48);                             // (unused words of END)
+        put32(S_VAL, 32'h11111111); put32(S_VAL + 4, 32'h22222222);                           // bucket 0
+        put32(S_VAL + 8, 32'h33333333); put32(S_VAL + 12, 32'h44444444);                      // bucket 1
+        put32(S_BK, S_TOK0); put32(S_BK + 4, S_POS0); put32(S_BK + 8, S_VALID0); put32(S_BK + 12, S_LG0);
+        put32(S_BK + 16, S_BM0);
+        put32(S_BK + 32, S_TOK1); put32(S_BK + 36, S_POS1); put32(S_BK + 40, S_VALID1); put32(S_BK + 44, S_LG1);
+        put32(S_BK + 48, S_BM1);
+        // bucket 0: maxima 1, 3, 2, 3 -> block 1; its logits 0.5, 3, 3, -1 -> 1: token 5
+        put32(S_BM0, 32'h3F800000); put32(S_BM0 + 4, 32'h40400000); put32(S_BM0 + 8, 32'h40000000);
+        put32(S_BM0 + 12, 32'h40400000);
+        put32(S_LG0 + 16, 32'h3F000000); put32(S_LG0 + 20, 32'h40400000); put32(S_LG0 + 24, 32'h40400000);
+        put32(S_LG0 + 28, 32'hBF800000);
+        // bucket 1: maxima -2, -1, -3, -0.5 -> block 3; its logits -1, -0.75, -0.5, -0.5 -> 2: token 14
+        put32(S_BM1, 32'hC0000000); put32(S_BM1 + 4, 32'hBF800000); put32(S_BM1 + 8, 32'hC0400000);
+        put32(S_BM1 + 12, 32'hBF000000);
+        put32(S_LG1 + 48, 32'hBF800000); put32(S_LG1 + 52, 32'hBF400000); put32(S_LG1 + 56, 32'hBF000000);
+        put32(S_LG1 + 60, 32'hBF000000);
         // firmware + mailbox
         for (ri = 0; ri < BRAM_WORDS; ri = ri + 1) bram[ri] = 0;
         $readmemh("fw.hex", bram);
@@ -787,8 +839,8 @@ module tb_system;
         if (bram[MBOX + MB_FW_STATE] !== 32'h52554E00) begin
             $display("TB ERROR: rt_fw not ready (FW_STATE %08x)", bram[MBOX + MB_FW_STATE]); errors = errors + 1;
         end
-        // RT_VERSION 2: the unit's CAPS for the host's executable check
-        if (bram[MBOX + 32'hC8 / 4] !== 2 || bram[MBOX + 32'hD0 / 4] !== mm.legacy.CAPS) begin
+        // RT_VERSION 3: the unit's CAPS for the host's executable check, RT_RUN_SCHED
+        if (bram[MBOX + 32'hC8 / 4] !== 3 || bram[MBOX + 32'hD0 / 4] !== mm.legacy.CAPS) begin
             $display("TB ERROR: rt_fw version %0d, FW_CAPS %08x (CAPS %08x)", bram[MBOX + 32'hC8 / 4],
                      bram[MBOX + 32'hD0 / 4], mm.legacy.CAPS); errors = errors + 1;
         end
@@ -804,6 +856,9 @@ module tb_system;
                         2: check_cpl(2, 1, 32'hFFFFFFFF, 32'hFFFFFFFF);
                         3: check_cpl(3, 0, 3, 32'h100);
                         4: check_cpl(4, 0, 0, 32'hFFFFFFFF);
+                        5: check_cpl(5, 0, 3, 32'h200);
+                        6: check_cpl(6, 0, 1 + 3 * 3, 32'h300);
+                        7: check_cpl(7, 0, 1, 32'hFFFFFFFF);
                         default: ;
                     endcase
                     rj = rj + 1;
@@ -822,6 +877,8 @@ module tb_system;
                 6: check_cpl(6, 0, 1 + 3 * 3, 32'h300);        // LD, ST, LOOP_END x 3 + END
                 7: check_cpl(7, 0, 1, 32'hFFFFFFFF);
                 8: check_cpl(8, 0, 0, 32'hFFFFFFFF);
+                9: check_cpl(9, 0, 0, 32'hFFFFFFFF);
+                10: check_cpl(10, 0, 0, 32'hFFFFFFFF);
                 default: ;
             endcase
         if (!trap || bram[MBOX] !== 32'h600D600D || bram[MBOX + MB_RING_HEAD] !== NENT) begin
@@ -843,6 +900,21 @@ module tb_system;
         if (rbad) begin
             $display("TB ERROR: ring data: %0d bytes wrong", rbad); errors = errors + rbad;
         end
+        // schedules: tokens, steps done, the last inputs, the valid masks, the words patched for bucket 1
+        check32(S_TAB + 68, 6, "done"); check32(S_TAB + 72, 0, "status");
+        check32(S_OUT, 5, "token 0"); check32(S_OUT + 16, 5, "token 1"); check32(S_OUT + 32, 14, "token 2");
+        check32(S_OUT + 80, 14, "token 5");
+        if (get32(S_OUT + 4) == 0 || get32(S_OUT + 8) == 0) begin
+            $display("TB ERROR: schedule cycles %0d, device %0d", get32(S_OUT + 4), get32(S_OUT + 8)); errors = errors + 1;
+        end
+        check32(S_TAB2 + 68, 3, "done (stop)"); check32(S_TAB2 + 72, 0, "status (stop)");
+        check32(S_OUT2 + 32, 14, "stop token");
+        check32(S_TOK0, 5, "token in 0"); check32(S_TOK0 + 4, 0, "token hi 0"); check32(S_POS0, 3, "pos 0");
+        check32(S_TOK1, 5, "token in 1"); check32(S_POS1, 4, "pos 1 (stop)"); check32(S_POS1 + 4, 0, "pos hi 1");
+        for (ri = 0; ri < 4; ri = ri + 1) check32(S_VALID0 + 4 * ri, 32'h3F800000, "valid 0");
+        check32(S_VALID1, 32'h3F800000, "valid 1"); check32(S_VALID1 + 16, 32'h3F800000, "valid 1 [4]");
+        check32(S_VALID1 + 20, 0, "valid 1 [5]");   // (rewritten by the stop schedule at position 4)
+        check32(S_L0 + 40, 32'h33333333, "patch 0"); check32(S_L1 + 48, 32'h44444444, "patch 1");
         if (nirq_edges !== 7) begin
             $display("TB ERROR: %0d notify_irq edges, expected 7", nirq_edges); errors = errors + 1;
         end

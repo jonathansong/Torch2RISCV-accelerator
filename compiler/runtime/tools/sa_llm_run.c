@@ -25,6 +25,7 @@
 #include "iree/tooling/context_util.h"
 #include "iree/vm/api.h"
 #include "sa_context.h"
+#include "sa_rvsched.h"
 
 IREE_FLAG(string, tokens, "1", "Comma-separated token ids fed in order.");
 IREE_FLAG(int32_t, generate, 0, "Then generate this many tokens greedily.");
@@ -45,6 +46,12 @@ IREE_FLAG(string, prefill_all_out, "",
           "With --prefill: every chunk through the module's prefill_all (the logits of all M positions) and the "
           "logits of every prompt position written here (float32 [P, vocab]): teacher forcing on the device "
           "(generality plan §13.1).");
+
+IREE_FLAG(bool, rvsched, false,
+          "Generate on the device's RISC-V core (docs/riscv_backend_design.md §7.1, plan B): after the prompt, the "
+          "decode steps' lists are recorded per attention-length bucket (--pad) and the core runs the generation "
+          "loop, argmax included (through the sa_argmax module's blockmax, given as an earlier --module); "
+          "--logits_out then gets the last step's logits only.");
 
 // The device clock for cycles -> ms: SA_DEVICE_HZ (the launcher passes the
 // overlay's, e.g. 100 MHz on the KV260's K1b), else the PYNQ-Z1's 50 MHz.
@@ -109,6 +116,89 @@ static iree_status_t call3(iree_vm_context_t* context, iree_vm_function_t functi
   }
   iree_vm_list_release(inputs);
   iree_vm_list_release(outputs);
+  return status;
+}
+
+// The physical address of a buffer view's buffer in the device window.
+static iree_status_t view_phys(iree_hal_buffer_view_t* v, uint32_t* out) {
+  sa_context_t* sc = NULL;
+  IREE_RETURN_IF_ERROR(sa_context_get(&sc));
+  iree_hal_buffer_mapping_t m = {{0}};
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(iree_hal_buffer_view_buffer(v), IREE_HAL_MAPPING_MODE_PERSISTENT,
+                                                 IREE_HAL_MEMORY_ACCESS_ANY, 0, IREE_HAL_WHOLE_BUFFER, &m));
+  return sa_context_phys(sc, m.contents.data, out);
+}
+
+// One decode step at |pos| recorded dry (main, then the block maxima of its
+// logits) as bucket |bucket| of |s|; the inputs' data do not matter.
+static iree_status_t rvs_record(sa_rvsched_t* s, uint32_t bucket, int pos, iree_vm_context_t* context,
+                                iree_vm_function_t fmain, iree_vm_function_t fbm, iree_hal_device_t* device,
+                                iree_hal_allocator_t* allocator, iree_allocator_t host, float* valid) {
+  sa_context_t* sc = NULL;
+  IREE_RETURN_IF_ERROR(sa_context_get(&sc));
+  int64_t tok = 0, p64 = pos;
+  iree_host_size_t vlen = (iree_host_size_t)((pos / FLAG_pad + 1) * FLAG_pad);
+  for (int i = 0; i < (int)vlen; ++i) valid[i] = i <= pos ? 1.0f : 0.0f;
+  iree_hal_buffer_view_t *bt = NULL, *bp = NULL, *bv = NULL, *lv = NULL;
+  iree_vm_list_t *in = NULL, *out = NULL, *in2 = NULL, *out2 = NULL;
+  sa_rvsched_io_t io = {0};
+  iree_status_t status = make_view(device, allocator, &tok, 1, IREE_HAL_ELEMENT_TYPE_INT_64, &bt);
+  if (iree_status_is_ok(status)) status = make_view(device, allocator, &p64, 1, IREE_HAL_ELEMENT_TYPE_INT_64, &bp);
+  if (iree_status_is_ok(status)) status = make_view(device, allocator, valid, vlen, IREE_HAL_ELEMENT_TYPE_FLOAT_32, &bv);
+  if (iree_status_is_ok(status)) status = view_phys(bt, &io.token);
+  if (iree_status_is_ok(status)) status = view_phys(bp, &io.pos);
+  if (iree_status_is_ok(status)) status = view_phys(bv, &io.valid);
+  if (iree_status_is_ok(status)) status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 3, host, &in);
+  iree_hal_buffer_view_t* views[3] = {bt, bp, bv};
+  for (int i = 0; i < 3 && iree_status_is_ok(status); ++i) {
+    iree_vm_ref_t r = iree_hal_buffer_view_retain_ref(views[i]);
+    status = iree_vm_list_push_ref_move(in, &r);
+  }
+  if (iree_status_is_ok(status)) status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 1, host, &out);
+  if (iree_status_is_ok(status)) status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 1, host, &in2);
+  if (iree_status_is_ok(status)) status = iree_vm_list_create(iree_vm_make_undefined_type_def(), 1, host, &out2);
+  uint64_t host_ops = sc->host_ops, host_disp = sc->host_dispatches;
+  if (iree_status_is_ok(status)) {
+    sa_rvsched_record_begin(s);
+    status = iree_vm_invoke(context, fmain, IREE_VM_INVOCATION_FLAG_NONE, NULL, in, out, host);
+    iree_hal_buffer_view_t* lo = iree_status_is_ok(status) ? iree_vm_list_get_buffer_view_assign(out, 0) : NULL;
+    if (iree_status_is_ok(status) && !lo) status = iree_make_status(IREE_STATUS_INTERNAL, "no output");
+    if (iree_status_is_ok(status)) {
+      iree_hal_dim_t n = iree_hal_buffer_view_element_count(lo);
+      io.vocab = (uint32_t)n;
+      status = view_phys(lo, &io.logits);
+      if (iree_status_is_ok(status))
+        status = iree_hal_buffer_view_create(iree_hal_buffer_view_buffer(lo), 1, &n, IREE_HAL_ELEMENT_TYPE_FLOAT_32,
+                                             IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, host, &lv);
+    }
+    if (iree_status_is_ok(status)) {
+      iree_vm_ref_t r = iree_hal_buffer_view_retain_ref(lv);
+      status = iree_vm_list_push_ref_move(in2, &r);
+    }
+    if (iree_status_is_ok(status)) status = iree_vm_invoke(context, fbm, IREE_VM_INVOCATION_FLAG_NONE, NULL, in2, out2, host);
+    iree_hal_buffer_view_t* bo = iree_status_is_ok(status) ? iree_vm_list_get_buffer_view_assign(out2, 0) : NULL;
+    if (iree_status_is_ok(status) && !bo) status = iree_make_status(IREE_STATUS_INTERNAL, "no block maxima");
+    if (iree_status_is_ok(status)) {
+      io.nblocks = (uint32_t)iree_hal_buffer_view_element_count(bo);
+      status = view_phys(bo, &io.bmax);
+    }
+    if (iree_status_is_ok(status) && (sc->host_ops != host_ops || sc->host_dispatches != host_disp)) {
+      status = iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                                "rvsched: a decode step has %u host operations and %u host dispatches (the core "
+                                "runs descriptor lists only)",
+                                (unsigned)(sc->host_ops - host_ops), (unsigned)(sc->host_dispatches - host_disp));
+    }
+    iree_status_t st = sa_rvsched_record_end(s, bucket, &io);
+    if (iree_status_is_ok(status)) status = st; else iree_status_ignore(st);
+  }
+  iree_vm_list_release(in);
+  iree_vm_list_release(out);
+  iree_vm_list_release(in2);
+  iree_vm_list_release(out2);
+  iree_hal_buffer_view_release(bt);
+  iree_hal_buffer_view_release(bp);
+  iree_hal_buffer_view_release(bv);
+  iree_hal_buffer_view_release(lv);
   return status;
 }
 
@@ -246,7 +336,9 @@ static iree_status_t run(iree_allocator_t host) {
       sa_context_profile_reset();
     }
   }
-  for (int pos = pos0; pos < steps && iree_status_is_ok(status); ++pos) {
+  // --rvsched: the host runs the prompt's steps, the core the rest
+  int host_end = FLAG_rvsched ? (steps < ntok ? steps : ntok) : steps;
+  for (int pos = pos0; pos < host_end && iree_status_is_ok(status); ++pos) {
     if (pos < ntok) token = toks[pos];
     valid[pos] = 1.0f;
     int64_t pos64 = pos;
@@ -303,16 +395,82 @@ static iree_status_t run(iree_allocator_t host) {
     iree_vm_list_release(inputs);
     iree_vm_list_release(outputs);
   }
+  int start = pos0 > host_end ? pos0 : host_end;
+  double rvs_wall = 0, rvs_core = 0, rvs_dev = 0;
+  uint32_t rvs_done = 0;
+  sa_rvsched_info_t rvs_info = {0};
+  if (iree_status_is_ok(status) && FLAG_rvsched && steps > start) {
+    sa_context_t* sc = NULL;
+    iree_vm_function_t fbm;
+    sa_rvsched_t* s = NULL;
+    uint32_t n = (uint32_t)(steps - start);
+    if (FLAG_pad <= 0) status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "--rvsched needs --pad");
+    if (iree_status_is_ok(status))
+      status = iree_vm_context_resolve_function(context, IREE_SV("sa_argmax.blockmax"), &fbm);
+    if (iree_status_is_ok(status)) status = sa_context_get(&sc);
+    uint32_t b0 = (uint32_t)(start / FLAG_pad), b1 = (uint32_t)((steps - 1) / FLAG_pad);
+    if (iree_status_is_ok(status)) status = sa_rvsched_create(sc, (uint32_t)FLAG_pad, b0, b1 - b0 + 1, n, &s);
+    double t0 = now();
+    for (int pass = 0; pass < 2 && iree_status_is_ok(status); ++pass) {
+      for (uint32_t b = b0; b <= b1 && iree_status_is_ok(status); ++b)
+        status = rvs_record(s, b, b == b0 ? start : (int)(b * FLAG_pad), context, function, fbm, device, allocator,
+                            host, valid);
+      if (iree_status_is_ok(status)) status = sa_rvsched_end_pass(s);
+    }
+    // the lists do not depend on the position within a bucket: another one of the first and the last bucket
+    if (iree_status_is_ok(status) && (start + 1) / FLAG_pad == (int)b0 && start + 1 < steps)
+      status = rvs_record(s, b0, start + 1, context, function, fbm, device, allocator, host, valid);
+    if (iree_status_is_ok(status) && b1 > b0)
+      status = rvs_record(s, b1, (int)((b1 + 1) * FLAG_pad - 1), context, function, fbm, device, allocator, host, valid);
+    double t_rec = now() - t0;
+    uint32_t* toks_out = calloc(3 * (size_t)n, sizeof(uint32_t));
+    if (iree_status_is_ok(status)) {
+      sa_rvsched_info(s, &rvs_info);
+      fprintf(stderr,
+              "rvsched: %u buckets of %d positions recorded in %.3f s; %u lists per step (%u descriptors), %u words "
+              "patched per bucket, table %.1f KB at %#x\n",
+              b1 - b0 + 1, FLAG_pad, t_rec, rvs_info.lists, rvs_info.descriptors, rvs_info.words,
+              rvs_info.table_bytes / 1024.0, rvs_info.table_phys);
+      t0 = now();
+      if (!getenv("SA_RVSCHED_RECORD_ONLY"))          // (tests: the table without the run)
+        status = sa_rvsched_run(s, (uint32_t)start, n, (uint32_t)token, FLAG_stop_token, toks_out, toks_out + n,
+                                toks_out + 2 * n, &rvs_done);
+      rvs_wall = now() - t0;
+    }
+    if (rvs_done) {
+      for (uint32_t i = 0; i < rvs_done; ++i) {
+        printf(" %" PRId64, token);
+        token = toks_out[i];
+        rvs_core += toks_out[n + i];
+        rvs_dev += toks_out[2 * n + i];
+      }
+      fflush(stdout);
+      steps = start + (int)rvs_done;
+      if (lf) {
+        const float* last = sa_rvsched_logits(s, (uint32_t)(steps - 1));
+        if (last) fwrite(last, sizeof(float), vocab, lf);
+      }
+    }
+    free(toks_out);
+    sa_rvsched_destroy(s);
+  }
   if (iree_status_is_ok(status) && FLAG_generate) printf(" %" PRId64, token);
   printf("\n");
+  if (iree_status_is_ok(status) && rvs_done) {
+    double hz = sa_device_hz();
+    printf("rvsched: %u decode steps on the RISC-V core, %.1f ms per step (%.2f tokens/s); core %.2f ms per step, "
+           "its lists %.2f ms\n",
+           rvs_done, 1e3 * rvs_wall / rvs_done, rvs_done / rvs_wall, 1e3 * rvs_core / rvs_done / hz,
+           1e3 * rvs_dev / rvs_done / hz);
+  }
   if (iree_status_is_ok(status) && pos0 > 0) {
     printf("prefill: %d prompt tokens in %d chunks of %d, %.1f ms (%.2f tokens/s; the first chunk includes loading)",
            ntok, chunks, M, 1e3 * prefill_time, ntok / prefill_time);
-    if (steps > pos0)
+    if (steps > pos0 && !rvs_done)
       printf("; %d decode steps, %.1f ms per step (%.2f tokens/s)", steps - pos0, 1e3 * total / (steps - pos0),
              (steps - pos0) / total);
     printf("\n");
-  } else if (iree_status_is_ok(status) && steps > 1) {
+  } else if (iree_status_is_ok(status) && steps > 1 && !rvs_done) {
     printf("%d steps, %.1f ms per step after the first (%.2f tokens/s)\n", steps, 1e3 * total / (steps - 1),
            (steps - 1) / total);
   }
@@ -325,7 +483,7 @@ static iree_status_t run(iree_allocator_t host) {
   // the steps profiled: decode after the prefill (the profile is reset after
   // it), else every step after the first
   int np = pos0 > 0 ? steps - pos0 : steps - 1;
-  if (iree_status_is_ok(status) && np > 0 && getenv("SA_PROFILE")) {
+  if (iree_status_is_ok(status) && np > 0 && getenv("SA_PROFILE") && !rvs_done) {
     uint64_t nd, cyc, ns;
     sa_context_profile_totals(&nd, &cyc, &ns);
     printf("per step (%s): %.1f %s, device %.2f ms (%.0f cycles at %.1f MHz), "

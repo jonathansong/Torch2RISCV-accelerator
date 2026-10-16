@@ -60,6 +60,7 @@ enum {
 #define RT_READY 0x52554E00u
 #define RT_RUN_LIST 0x01u
 #define RT_F_PERF (1u << 9)                       // rt_fw copies the event counters into its perf area
+#define RT_RUN_SCHED 0x05u                        // rt_fw v3: the decode schedule (firmware/include/rvsched.h)
 #define MBOX_PERF_COUNT 0x8Cu
 #define SA_PERF_AREA_BELOW_MBOX 0x100u            // perf area BRAM + 0x1E00, mailbox BRAM + 0x1F00
 #define SA_BOARD_CPL_OFFSET 0x2000u
@@ -137,6 +138,36 @@ static iree_status_t sa_board_run(sa_transport_t* t, uint32_t list_phys, sa_comp
     out->perf_n = n > 32 ? 32 : n;
     for (uint32_t k = 0; k < out->perf_n; ++k) out->perf[k] = b->perf_area[k];
   }
+  return iree_ok_status();
+}
+
+// One RT_RUN_SCHED entry: rt_fw runs the decode schedule at |table_phys|
+// (w1); its completion record carries the schedule's status.
+static iree_status_t sa_board_run_sched(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status) {
+  sa_board_t* b = (sa_board_t*)t->impl;
+  uint32_t seq = b->tail, slot = seq % b->ring_entries;
+  volatile uint64_t* e = (volatile uint64_t*)(t->mem + 64u * slot);
+  volatile uint32_t* c = (volatile uint32_t*)(t->mem + SA_BOARD_CPL_OFFSET + 32u * slot);
+  e[0] = (uint64_t)RT_RUN_SCHED | (uint64_t)seq << 32;
+  e[1] = table_phys;
+  for (int i = 2; i < 8; ++i) e[i] = 0;
+  __sync_synchronize();
+  b->tail = seq + 1;
+  mbox_wr(b, MBOX_RING_TAIL, b->tail);
+  double t0 = sa_now();
+  while ((int32_t)(mbox_rd(b, MBOX_RING_HEAD) - b->tail) < 0) {
+    if (sa_now() - t0 > timeout_s) {
+      return iree_make_status(IREE_STATUS_DEADLINE_EXCEEDED,
+                              "sa board: schedule entry %u not completed in %.0f s (RING_HEAD %u, FW_STATE %#x)", seq,
+                              timeout_s, mbox_rd(b, MBOX_RING_HEAD), mbox_rd(b, MBOX_FW_STATE));
+    }
+    usleep(1000);
+  }
+  __sync_synchronize();
+  if (c[0] != seq) {
+    return iree_make_status(IREE_STATUS_DATA_LOSS, "sa board: completion record %u has seq %u", seq, c[0]);
+  }
+  *out_status = c[1];
   return iree_ok_status();
 }
 
@@ -266,6 +297,7 @@ iree_status_t sa_transport_board_open(iree_allocator_t host_allocator, sa_transp
   t->d = sa_board_attached.d;
   t->caps = mbox_rd(b, MBOX_FW_VERSION) >= 2 ? mbox_rd(b, MBOX_FW_CAPS) : 0;   // (older rt_fw: unknown)
   t->run = sa_board_run;
+  if (mbox_rd(b, MBOX_FW_VERSION) >= 3) t->run_sched = sa_board_run_sched;   // (older rt_fw: no schedules)
   t->close = sa_board_close;
   t->impl = b;
   *out = t;

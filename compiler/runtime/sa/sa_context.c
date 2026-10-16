@@ -221,6 +221,24 @@ static void sa_emit(uint64_t* w, uint32_t* k, uint32_t op, uint64_t w1) {
   ++*k;
 }
 
+// A copy of the list just built for the recorder (context->record).
+static void sa_record_list(sa_context_t* c, const uint64_t* w, uint32_t k) {
+  sa_record_t* r = c->record;
+  if (!r) return;
+  if (r->count == SA_RECORD_MAX_LISTS) {
+    r->dropped++;
+    return;
+  }
+  uint64_t* copy = (uint64_t*)malloc(64ull * k);
+  if (!copy) {
+    r->dropped++;
+    return;
+  }
+  memcpy(copy, w, 64ull * k);
+  r->lists[r->count] = copy;
+  r->descriptors[r->count++] = k;
+}
+
 iree_status_t sa_context_dispatch(sa_context_t* c, const sa_dispatch_t* x, sa_completion_t* out) {
   uint32_t n = x->count;
   if (n > 24 || (n + 3) / 3 + 4 > c->list_capacity) {
@@ -238,8 +256,15 @@ iree_status_t sa_context_dispatch(sa_context_t* c, const sa_dispatch_t* x, sa_co
   sa_emit(w, &k, SA_OP_CALL, x->body_phys);
   sa_emit(w, &k, SA_OP_END, 0x5A);
   __sync_synchronize();
+  sa_record_list(c, w, k);
   c->transport->tag = x->name;
-  iree_status_t status = c->transport->run(c->transport, c->list_phys, out);
+  iree_status_t status = iree_ok_status();
+  if (c->record && c->record->dry) {
+    memset(out, 0, sizeof(*out));
+    out->end = 0x5A;
+  } else {
+    status = c->transport->run(c->transport, c->list_phys, out);
+  }
   c->transport->tag = iree_string_view_empty();
   c->dispatches++;
   c->lists++;
@@ -415,11 +440,16 @@ iree_status_t sa_context_batch_flush(sa_context_t* c) {
     iree_slim_mutex_unlock(&c->mutex);
     return iree_ok_status();
   }
-  sa_batch_build(c);
+  uint32_t built = sa_batch_build(c);
   __sync_synchronize();
+  sa_record_list(c, c->batch, built);
   sa_completion_t done = {0};
   uint64_t t0 = iree_time_now();
-  iree_status_t status = c->transport->run(c->transport, c->batch_phys, &done);
+  iree_status_t status = iree_ok_status();
+  if (c->record && c->record->dry)
+    done.end = 0x5A;
+  else
+    status = c->transport->run(c->transport, c->batch_phys, &done);
   uint64_t host_ns = (uint64_t)(iree_time_now() - t0);
   c->lists++;
   uint32_t ndisp = c->entry_count;

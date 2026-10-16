@@ -7,6 +7,8 @@
 #   sudo bash ~/run_board_tests.sh               all: rvb gemma qwen3 llama
 #   sudo bash ~/run_board_tests.sh qwen3 llama   only those bundles
 #   sudo REDO=1 bash ~/run_board_tests.sh rvb
+#   (rvsched: the decode loop on the RISC-V core, after compiler/scripts/deploy_rvsched.sh; without
+#   REDO only the tests not passed yet run)
 # Logs: ~/board_tests_pcpi/<bundle>.<mode>.log, markers .done / .failed, summary.txt.
 set -u
 H=${BUNDLE_HOME:-/home/ubuntu}
@@ -27,8 +29,8 @@ declare -A DIR=(
 tests_of() {
   case $1 in
     rvb)   echo "rvb" ;;
-    gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" ;;
-    qwen3|llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" ;;
+    gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" ;;
+    qwen3|llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" ;;
   esac
 }
 

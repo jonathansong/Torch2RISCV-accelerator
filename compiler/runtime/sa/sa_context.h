@@ -43,6 +43,9 @@ struct sa_transport_t {
   iree_string_view_t tag; // the dispatch being run (single-dispatch lists; else empty): sim traces
   // Runs the descriptor list at |list_phys| and waits for its completion.
   iree_status_t (*run)(sa_transport_t* t, uint32_t list_phys, sa_completion_t* out);
+  // Runs the decode schedule (firmware/include/rvsched.h) at |table_phys| on
+  // the device's RISC-V core and waits; NULL: not supported (sa_rvsched.c).
+  iree_status_t (*run_sched)(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status);
   void (*close)(sa_transport_t* t);
   void* impl;
 };
@@ -63,6 +66,19 @@ typedef struct sa_range_t {
 } sa_range_t;
 
 struct sa_batch_entry_t;
+
+// Recording (docs/riscv_backend_design.md §7.1, sa_rvsched.c): while
+// context->record is set, every list a flush builds is copied here; dry: the
+// lists are not run (success, END 0x5A), so a step's lists can be taken for
+// any input without changing the device's memory beyond the host's writes.
+#define SA_RECORD_MAX_LISTS 8
+typedef struct sa_record_t {
+  bool dry;
+  uint32_t count;                               // lists recorded
+  uint64_t* lists[SA_RECORD_MAX_LISTS];         // copies of their descriptors (malloc)
+  uint32_t descriptors[SA_RECORD_MAX_LISTS];    // descriptors each (END included)
+  uint32_t dropped;                             // lists beyond SA_RECORD_MAX_LISTS
+} sa_record_t;
 
 typedef struct sa_context_t {
   sa_transport_t* transport;
@@ -87,6 +103,8 @@ typedef struct sa_context_t {
   } batch_names[1024];
   uint64_t lists;                  // lists submitted (batches or single dispatches)
   uint64_t host_dispatches;        // dispatches run on the host (the VMVX fallback)
+  uint64_t host_ops;               // fills, updates and copies done by the host (sa_command_buffer.c)
+  sa_record_t* record;             // recording (sa_rvsched.c), else NULL
   // statistics: prefixes run inside an earlier dispatch / before their FENCE,
   // barriers, FENCEs emitted
   uint64_t batch_hosted, batch_hoisted, batch_barriers, batch_fences;
