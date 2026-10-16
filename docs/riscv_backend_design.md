@@ -18,7 +18,7 @@ Two independent questions decide how a decode step reaches the accelerator: **wh
 |---|---|---|---|---|
 | **Default** (L6-IREE) | the ARM: IREE VM + sa HAL driver build one or two lists per step; `rt_fw` only `mat_submit`s ring entries | descriptor lists (templates from the descriptor backend, `SETREG` + `CALL` per dispatch) | none | the main line; every board result of the compiler plan |
 | **Plan B** (§7.1, model B) | **the PicoRV32** runs the decode loop (`rt_fw` `RT_RUN_SCHED`); the ARM records each attention-length bucket's lists once, then waits | the same descriptor lists, recorded, patched per bucket | `sa-llm-run --rvsched` | **accepted on the board** 2026-10-16 (Gemma-3, Qwen3, Llama-3.2: tokens identical, logits bit-exact) |
-| **Plan A** (§9, model A) | per dispatch the ARM (`RT_CALL`, S2); from S3 plan B's loop on the core | **generated RISC-V code** (sahw → LLVM IR → rv32imc) issues each command over PCPI; no descriptors | `--iree-sa-emit-riscv` (compiler), `SA_RV` (runtime) | **S1 done** 2026-10-16 (host: every dispatch's PCPI stream identical to the descriptor path's, §9.6); S2 next |
+| **Plan A** (§9, model A) | per dispatch the ARM (`RT_CALL`, S2); from S3 plan B's loop on the core | **generated RISC-V code** (sahw → LLVM IR → rv32imc) issues each command over PCPI; no descriptors | `--iree-sa-emit-riscv` (compiler), `SA_RV` (runtime) | **S1 done**, **S2 accepted on the board** 2026-10-16: the whole Qwen3-0.6B with every dispatch as generated RISC-V code (34039 `RT_CALL`s, no descriptor list), logits bit-exact in 17/17 steps (§9.6, §9.8) |
 | R2 / R3 first form (§6) | a test firmware (`firmware/rvb`) | straight-line C generated from a trace, over PCPI | `board_run.py rvb` | done (12 runs bit-identical on the board); a single-dispatch experiment, superseded by plan A's code generator |
 | **Model C / R5** (§3, §5) | — (scalar kernels, not a scheduling path) | the core computes itself: kernels (argmax, top-k sampling) compiled by IREE's llvm-cpu for riscv32 | — | not started; needs iree-compile rebuilt with the RISC-V target and llvm-cpu (the same rebuild as plan A's S4) |
 
@@ -250,6 +250,20 @@ Implemented: `compiler/plugins/sa/transforms/SahwToRiscv.cpp` (the lowering, beh
 | golden corpus (all cases: D = 8 / 16, EX and GEMV paths, micro-kernels on / off, max 256–2048) | 7708 | **7682** (+ 26 the corpus records as having no template: `hf_smollm2_q`'s host-fallback dispatches, failing identically without the option) | 31.0 MB in all, median 780 B, max 301 KB |
 
 The default build is unchanged (option off: the golden corpus byte-identical). Observations for S2 / the ASIC questions: the generated code is the descriptor stream's control flow (LLVM fully unrolls short `LOOP_END`s, e.g. the q_proj GEMV's 3 passes) plus one 64-byte constant per command, so its size follows the templates': most dispatches are under 1 KB, but straight-line prefill templates reach 300 KB (a template's descriptors are 64 bytes each, the code adds a call per command); a whole Qwen3 decode needs about 1.5 MB, so the code lives in DDR (§9.4), and specializing the configuration writes at compile time (§9.2) would replace the 64-byte constants by the few fields each command really sets.
+
+### 9.8 S2 results (2026-10-16)
+
+Implemented: `rv_dispatch.py --code compiled` (firmware/rvb calls an export's generated function: BRAM, or DDR position independent: `-mcmodel=medany -fno-jump-tables -mno-relax`, no unwind tables), rt_fw v4's `RT_CALL` entry, `compiler/tests/rv_image.py` (a model's functions + runtime as one position-independent `rvcode.bin` + map, and `rvcode_host.so` for the sim), the driver's `SA_RV=<dir>` (`sa_rv.c`: an export with a function is flushed out of the batch and sent as `RT_CALL` with its raw binding addresses and push constants; the sim calls the host build, each command run on the functional simulator as a one-command list), `deploy_rvcode.sh` / `board_rvcode.py`, `deploy_rvb.sh RVB_GEN=compiled`.
+
+| Check | Result |
+|---|---|
+| RTL (`RVB_TEST`): the six SmolLM2 dispatches (norm reduction, quantization, q / up projections on GEMV, q · Kᵀ, p · V) as their generated functions | **bit-identical in BRAM and in DDR mode**; time against the list ×1.01–4.75 (BRAM), ×1.10–31 (DDR, 40 cycles per instruction fetch) |
+| RTL (`RING_TEST`): `RT_CALL` of a function in DDR | 12/12 completions |
+| sim: SmolLM2 2-layer, prefill + 12 decode steps, `SA_RV` | all 1536 dispatches as RISC-V code, logits identical to the descriptor path |
+| **board** (`run_board_tests.sh rvbc`): the six dispatches, BRAM and DDR | **12/12 runs bit-identical** |
+| **board** (`board_rvcode.py`, Qwen3-0.6B long-context bundle): the 40-token prompt (3 prefill chunks) + 16 decode steps, `SA_RV` | **34039 dispatches as RISC-V code, 0 descriptor lists; logits bit-exact with the sim in 17/17 steps, tokens identical** |
+
+Speed on the board (not the aim of plan A): decode 1434 ms per step against 138 ms with descriptor lists (×10.4), prefill 36.7 s for the 3 chunks against 2.6 s. Every command costs the core its 64-byte descriptor read from DDR, the dynamic fields applied in 64-bit software arithmetic, all of its configuration keys written over PCPI and the instruction fetches from uncached DDR (the 1.4 MB image cannot sit in the 8 KB BRAM); the accelerator mostly waits. These are the numbers §8 asks for: without a command DMA a control core needs local instruction memory and a command format it can issue in a few instructions; the next step on the compiler side is specializing the configuration writes at compile time (§9.2: only the fields a command really sets, static ones as immediates), which removes most of the per-command work.
 
 ### 9.7 Coexistence
 
