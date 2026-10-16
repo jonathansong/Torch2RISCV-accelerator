@@ -41,7 +41,64 @@ struct Decider {
     for (int64_t t : T) n *= ShapedType::isDynamic(t) ? maxDynamic : t;
     return n;
   }
-  // A dispatch whose operations go row by row over [R, C] (R != C) or
+  // [R, C] with R == C: the [R] vectors of the rows (sliced per piece), told
+  // from the [C] ones of a row's shape (the same in every piece) by their use
+  // (rowPieceable); empty otherwise
+  llvm::DenseSet<Value> rowVecs;
+  bool square = false;
+  // Square [R, R]: each 1-D [R] operand's role from the 2-D generics' maps ((d0):
+  // a row's value, (d1): a column's), carried through loads, stores, fills and
+  // 1-D generics; false when one stays unknown or has both.
+  bool squareRoles(int64_t R) {
+    llvm::DenseSet<Value> col;
+    auto vec = [&](Value v) {
+      auto mt = dyn_cast<MemRefType>(v.getType());
+      return mt && mt.getRank() == 1 && mt.hasStaticShape() && mt.getDimSize(0) == R;
+    };
+    MLIRContext *ctx = f.getContext();
+    AffineMap mr = AffineMap::get(2, 0, {getAffineDimExpr(0, ctx)}, ctx);
+    AffineMap mc = AffineMap::get(2, 0, {getAffineDimExpr(1, ctx)}, ctx);
+    SmallVector<Value> all;
+    for (Operation &op : f.getBody().front())
+      for (Value v : op.getOperands())
+        if (vec(v) && !llvm::is_contained(all, v)) all.push_back(v);
+    for (bool changed = true; changed;) {
+      changed = false;
+      auto join = [&](ArrayRef<Value> vs) {       // operands that share a role
+        bool r = llvm::any_of(vs, [&](Value v) { return rowVecs.contains(v); });
+        bool c = llvm::any_of(vs, [&](Value v) { return col.contains(v); });
+        for (Value v : vs) {
+          if (r && rowVecs.insert(v).second) changed = true;
+          if (c && col.insert(v).second) changed = true;
+        }
+      };
+      for (Operation &op : f.getBody().front()) {
+        if (auto g = dyn_cast<linalg::GenericOp>(&op)) {
+          if (g.getNumLoops() == 2) {
+            for (auto [v, m] : llvm::zip(g->getOperands(), g.getIndexingMapsArray())) {
+              if (!vec(v)) continue;
+              if (m == mr && rowVecs.insert(v).second) changed = true;
+              if (m == mc && col.insert(v).second) changed = true;
+            }
+          } else {
+            SmallVector<Value> vs;
+            for (Value v : g->getOperands())
+              if (vec(v)) vs.push_back(v);
+            join(vs);
+          }
+        } else if (auto l = dyn_cast<sahl::LoadOp>(&op)) {
+          if (vec(l.getSrc()) && vec(l.getDst())) join({l.getSrc(), l.getDst()});
+        } else if (auto st = dyn_cast<sahl::StoreOp>(&op)) {
+          if (vec(st.getSrc()) && vec(st.getDst())) join({st.getSrc(), st.getDst()});
+        }
+      }
+    }
+    for (Value v : all)
+      if (rowVecs.contains(v) == col.contains(v)) return false;
+    return true;
+  }
+  // A dispatch whose operations go row by row over [R, C] (R == C: its [R]
+  // vectors' roles from their use, squareRoles) or
   // [R, C1, C2, ...] (a row's shape T = [C] or [C1, C2, ...]): generics over all
   // the dimensions with maps (r, c...), (r), (c...) or () (reductions over c...
   // only, no indices or gathers) or over [R] / [C]; loads / stores of [R, T]
@@ -57,7 +114,10 @@ struct Decider {
           R = mt.getDimSize(0);
           T.assign(mt.getShape().begin() + 1, mt.getShape().end());
         }
-    if (R <= 1 || T.empty() || rowElems(T) <= 1 || (T.size() == 1 && R == T[0])) return std::nullopt;
+    if (R <= 1 || T.empty() || rowElems(T) <= 1) return std::nullopt;
+    rowVecs.clear();
+    square = T.size() == 1 && R == T[0];
+    if (square && !squareRoles(R)) return std::nullopt;
     // ([R, ?]: a dynamic length only as the whole row)
     if (llvm::any_of(T, ShapedType::isDynamic) && T.size() != 1) return std::nullopt;
     const unsigned rank = T.size() + 1;
@@ -308,7 +368,9 @@ void flatPieces(func::FuncOp f, int64_t N, int64_t len) {
 }
 
 // row pieces [r0, r0 + rn) of the [R, T] and [R] operands
-void rowPieces(func::FuncOp f, int64_t R, ArrayRef<int64_t> T, int64_t rn, bool rowByRow) {
+// (rowVecs: a square dispatch's [R] vectors of the rows, Decider::squareRoles; else null)
+void rowPieces(func::FuncOp f, int64_t R, ArrayRef<int64_t> T, int64_t rn, bool rowByRow,
+               const llvm::DenseSet<Value> *rowVecs) {
   Block &blk = f.getBody().front();
   SmallVector<Operation *> work;
   for (Operation &op : blk)
@@ -316,8 +378,9 @@ void rowPieces(func::FuncOp f, int64_t R, ArrayRef<int64_t> T, int64_t rn, bool 
   OpBuilder b(blk.getTerminator());
   auto byRow = [&](Value v) {
     auto mt = dyn_cast<MemRefType>(v.getType());
-    return mt && mt.getRank() >= 1 && !mt.isDynamicDim(0) && mt.getDimSize(0) == R &&
-           (mt.getRank() == 1 ? mt.hasStaticShape() : mt.getShape().drop_front() == T);
+    if (!mt || mt.getRank() < 1 || mt.isDynamicDim(0) || mt.getDimSize(0) != R) return false;
+    if (mt.getRank() == 1) return mt.hasStaticShape() && (!rowVecs || rowVecs->contains(v));
+    return mt.getShape().drop_front() == T;
   };
   for (int64_t r0 = 0; r0 < R; r0 += rn) {
     int64_t n = std::min(rn, R - r0);
@@ -407,7 +470,7 @@ struct SahlTilePass : public PassWrapper<SahlTilePass, OperationPass<func::FuncO
         bool rowByRow = rn < 2;
         if (rowByRow) rn = 2;
         if (rn >= R) return;
-        rowPieces(f, R, T, rn, rowByRow);
+        rowPieces(f, R, T, rn, rowByRow, dc.square ? &dc.rowVecs : nullptr);
       }
     }
   }

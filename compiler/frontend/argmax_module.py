@@ -61,7 +61,7 @@ def main():
     if args.vocab % cands[0]:
         raise SystemExit(f"block {cands[0]} does not divide vocab {args.vocab}")
     src = os.path.splitext(args.out)[0] + ".mlir"
-    for block in cands:     # (some shapes do not fit the ACC planning: the next cheapest)
+    for block in cands:     # (a shape that does not compile: the next cheapest)
         with open(src, "w") as f:
             f.write(mlir(args.vocab, block))
         r = subprocess.run([COMPILE, src, "--iree-hal-target-device=sa", "--iree-hal-link-executables=false",
