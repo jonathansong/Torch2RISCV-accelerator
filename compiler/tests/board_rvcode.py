@@ -12,8 +12,10 @@ identical.
 Files: the hfgen bundle plus rv/rvcode.bin, rv/rvcode.map, rt_fw.bin version
 4 and an sa-llm-run with SA_RV (compiler/scripts/deploy_rvcode.sh).
 
-    python3 board_rvcode.py [--decode-only]    (or python3 board_run.py rvcode)
-Writes rvcode_board.json.
+    python3 board_rvcode.py [--decode-only] [--embedded]    (or python3 board_run.py rvcode)
+--embedded (S4): the code iree-compile embedded in sa.vmfb (--iree-sa-riscv,
+compiler/scripts/deploy_rvembed.sh) instead of rv/rvcode.bin (SA_RV=embedded).
+Writes rvcode_board.json (rvcode_embedded_board.json).
 """
 import json
 import os
@@ -35,6 +37,7 @@ def main():
     n_gen = len(want_tokens) - len(prompt)
     mb = int(open(os.path.join(HERE, "board.txt")).read().split()[-1])
     extra = open(os.path.join(HERE, "sa_args.txt")).read().split()
+    embedded = "--embedded" in sys.argv[1:]
     if "--decode-only" in sys.argv[1:]:
         extra = [a for a in extra if not a.startswith("--prefill")]
     M = max([int(a.split("=")[1]) for a in extra if a.startswith("--prefill=")] or [0])
@@ -47,7 +50,7 @@ def main():
                f"--parameters=model={HERE}/sa_packed.irpa", "--tokens=" + ",".join(str(int(t)) for t in prompt),
                f"--generate={n_gen}", f"--logits_out={lp}"] + extra
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           env=dict(env, SA_RV=os.path.join(HERE, "rv"), SA_STATS="1"))
+                           env=dict(env, SA_RV="embedded" if embedded else os.path.join(HERE, "rv"), SA_STATS="1"))
     finally:
         BL.stop(mm, buf)
     if r.returncode:
@@ -70,7 +73,7 @@ def main():
     ok = exact == n == len(want_logits) and same and calls and calls[0] > 0
     json.dump({"exact": exact, "rows": n, "tokens_identical": same, "rv_calls": calls[0] if calls else 0,
                "lists": lists[0] if lists else None, "timing": lines[1] if len(lines) > 1 else "", "stats": stats},
-              open(os.path.join(HERE, "rvcode_board.json"), "w"), indent=1)
+              open(os.path.join(HERE, "rvcode_embedded_board.json" if embedded else "rvcode_board.json"), "w"), indent=1)
     print("rvcode PASS" if ok else "rvcode FAILED")
     return 0 if ok else 1
 

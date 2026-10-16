@@ -9,7 +9,8 @@
 #   sudo REDO=1 bash ~/run_board_tests.sh rvb
 #   rvbc: the RVB cases with generated code (deploy_rvb.sh RVB_GEN=compiled); qwen3's / gemma's rvcode:
 #   every dispatch as RISC-V code (deploy_rvcode.sh); their "rvsched --rv": the core's decode loop
-#   calling that code (S3)
+#   calling that code (S3); qwen3's "--embedded" variants: the code iree-compile embedded in sa.vmfb
+#   (S4, deploy_rvembed.sh)
 #   (rvsched: the decode loop on the RISC-V core, after compiler/scripts/deploy_rvsched.sh; without
 #   REDO only the tests not passed yet run)
 # Logs: ~/board_tests_pcpi/<bundle>.<mode>.log, markers .done / .failed, summary.txt.
@@ -26,15 +27,16 @@ source /etc/profile.d/xrt_setup.sh 2>/dev/null
 declare -A DIR=(
   [rvb]=deploy_rvb_$CFG
   [rvbc]=deploy_rvb_${CFG}_compiled
+  [rvbe]=deploy_rvb_${CFG}_embedded
   [gemma]=deploy_hfgen_gemma_lc512_pcpi
   [qwen3]=deploy_hfgen_qwen3_lc2048_pcpi
   [llama]=deploy_hfgen_llama_lc2048_pcpi
 )
 tests_of() {
   case $1 in
-    rvb|rvbc) echo "rvb" ;;
+    rvb|rvbc|rvbe) echo "rvb" ;;
     gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" "rvcode" "rvsched --rv" ;;
-    qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" ;;
+    qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" ;;
     llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" ;;
   esac
 }
@@ -43,7 +45,7 @@ SEL=("$@")
 [ ${#SEL[@]} -eq 0 ] && SEL=(rvb gemma qwen3 llama)
 for b in "${SEL[@]}"; do
   d=$H/${DIR[$b]:-}
-  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc gemma qwen3 llama)"; continue; }
+  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama)"; continue; }
   [ -d "$d" ] || { echo "[$b] $d not on the board: skipped"; continue; }
   while IFS= read -r t; do
     [ -n "$t" ] || continue

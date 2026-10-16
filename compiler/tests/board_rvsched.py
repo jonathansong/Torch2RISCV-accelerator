@@ -39,12 +39,13 @@ import board_launcher as BL  # noqa: E402
 
 
 def run(env, extra, tokens, gen, rvsched, logits_path, rv=False):
+    """rv: False, or the SA_RV value (an image directory, or "embedded")"""
     cmd = [os.path.join(HERE, "sa-llm-run"), "--device=sa", f"--module={HERE}/argmax.vmfb",
            f"--module={HERE}/sa.vmfb", f"--parameters=model={HERE}/sa_packed.irpa",
            "--tokens=" + ",".join(str(int(t)) for t in tokens), f"--generate={gen}",
            f"--logits_out={logits_path}"] + extra + (["--rvsched"] if rvsched else [])
     r = subprocess.run(cmd, capture_output=True, text=True,
-                       env=dict(env, SA_STATS="1", **({"SA_RV": os.path.join(HERE, "rv")} if rv else {})))
+                       env=dict(env, SA_STATS="1", **({"SA_RV": rv} if rv else {})))
     if r.returncode:
         raise SystemExit(f"sa-llm-run{' --rvsched' if rvsched else ''} failed ({r.returncode})\n"
                          f"{r.stdout[-2000:]}\n{r.stderr[-3000:]}")
@@ -69,6 +70,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gen", type=int, default=256, help="tokens generated in the long run (0: skip it)")
     ap.add_argument("--rv", action="store_true", help="the core calls the generated RISC-V code (S3)")
+    ap.add_argument("--embedded", action="store_true",
+                    help="with --rv: the code iree-compile embedded in sa.vmfb (S4, SA_RV=embedded)")
     args = ap.parse_args()
     prompt = np.load(os.path.join(HERE, "prompt.npy"))
     want_tokens = [int(t) for t in np.load(os.path.join(HERE, "expected_tokens.npy"))]
@@ -82,7 +85,8 @@ def main():
     out = {}
     try:
         # 1. the bundle's prompt, the generation on the core, against the sim's reference
-        a = run(env, extra, prompt, n_gen, True, lp, args.rv)
+        rv = ("embedded" if args.embedded else os.path.join(HERE, "rv")) if args.rv else False
+        a = run(env, extra, prompt, n_gen, True, lp, rv)
         got = np.fromfile(lp, np.float32).reshape(-1, want_logits.shape[1])
         same = a["tokens"][:len(want_tokens)] == want_tokens
         last = got[-1].tobytes() == want_logits[-1].tobytes()
@@ -99,7 +103,7 @@ def main():
         g = min(args.gen, vlen - len(prompt))
         if g > 0:
             h = run(env, extra, prompt, g, False, os.path.join(HERE, "logits_arm.f32"))
-            c = run(env, extra, prompt, g, True, lp, args.rv)
+            c = run(env, extra, prompt, g, True, lp, rv)
             same2 = h["tokens"] == c["tokens"]
             arm = np.fromfile(os.path.join(HERE, "logits_arm.f32"), np.float32).reshape(-1, want_logits.shape[1])
             last2 = np.fromfile(lp, np.float32).reshape(-1, want_logits.shape[1])[-1].tobytes() == arm[-1].tobytes()
@@ -114,7 +118,9 @@ def main():
             ok = ok and same2 and last2
     finally:
         BL.stop(mm, buf)
-    with open(os.path.join(HERE, "rvsched_rv_board.json" if args.rv else "rvsched_board.json"), "w") as f:
+    out_name = ("rvsched_rv_embedded_board.json" if args.embedded else "rvsched_rv_board.json") if args.rv \
+        else "rvsched_board.json"
+    with open(os.path.join(HERE, out_name), "w") as f:
         json.dump(out, f, indent=1)
     print("rvsched PASS" if ok else "rvsched FAILED")
     return 0 if ok else 1

@@ -38,8 +38,8 @@ SCRIPTS = {"llm": "board_llm.py", "teacher": "board_teacher.py", "profile": "boa
            "generate": "board_generate.py", "longctx": "board_longctx.py", "rvb": "board_rvb.py",
            "rvsched": "board_rvsched.py", "rvcode": "board_rvcode.py"}
 OUTPUTS = {"llm": ["tokens_board.txt"], "teacher": ["tf_board.npz"], "longctx": ["longctx_board.npz", "longctx_sweep_board.json"],
-           "rvb": ["rvb_board.json"], "rvsched": ["rvsched_board.json", "rvsched_rv_board.json"],
-           "rvcode": ["rvcode_board.json"]}
+           "rvb": ["rvb_board.json"], "rvsched": ["rvsched_board.json", "rvsched_rv_board.json", "rvsched_rv_embedded_board.json"],
+           "rvcode": ["rvcode_board.json", "rvcode_embedded_board.json"]}
 
 
 def version():

@@ -11,6 +11,8 @@
 #   RVB_GEN=compiled           rvb_gen calls each export's generated function (plan A, §9:
 #                              rv_dispatch.py --code compiled) instead of the traced commands
 #                              -> build/deploy_rvb_<config>_compiled (default: trace)
+#   RVB_GEN=embedded           the rv32 code iree-compile embedded in the sa-desc file (S4,
+#                              rv_dispatch.py --code embedded) -> build/deploy_rvb_<config>_embedded
 set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 source "$(dirname "$0")/board_env.sh"
@@ -19,7 +21,8 @@ T=${RVB_T:-64}
 GEN=${RVB_GEN:-trace}
 case $GEN in trace) W=rvb; D=$SA_REPO/build/deploy_rvb_$SA_KV260_CONFIG ;;
              compiled) W=rvc; D=$SA_REPO/build/deploy_rvb_${SA_KV260_CONFIG}_compiled ;;
-             *) echo "RVB_GEN: trace or compiled" >&2; exit 2 ;; esac
+             embedded) W=rve; D=$SA_REPO/build/deploy_rvb_${SA_KV260_CONFIG}_embedded ;;
+             *) echo "RVB_GEN: trace, compiled or embedded" >&2; exit 2 ;; esac
 [ -d "$SRC" ] || { echo "no dispatch sources in $SRC (a 2-layer SmolLM2 export compiled for the overlay)" >&2; exit 1; }
 rm -rf "$D"
 mkdir -p "$D/cases"
