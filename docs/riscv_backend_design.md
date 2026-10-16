@@ -230,7 +230,7 @@ The core runs the whole step as RISC-V code issuing PCPI commands (§3 model A),
 
   Most of a decode step's working set is per-layer copies of the attention kernels: QK `batch_matmul` (5.7 KB in Qwen3, 7.2 KB in Llama), PV `matmul_like` and the KV write. Each layer has its own export, and two copies of Qwen3's PV kernel differ in 19 halfwords. The layer's KV cache offset is compiled into immediates (the commands are specialized at compile time, §9.9), so the copies cannot share code; in Qwen3 they are 244 of the 288 KB. Consequences for an ASIC:
   - **Today's code does not fit a small TCM**: no decode step fits 8–16 KB. The part called every layer (10–17 KB) does, and covers 85–88% of the calls. The per-layer copies are called once per step, so an I-cache of that size misses on them every step; they are about 12% of the calls.
-  - **Code shared between layers**: with the per-layer offsets passed as runtime values (a push constant or a binding offset instead of an immediate; one export per kernel shape), a decode step needs 15–33 KB for all three models. A 32–64 KB TCM then holds the whole decode step, and the core never fetches code from DRAM. This is a compiler change (keep the KV layer offset dynamic for the attention dispatches); it costs a register add per address computation.
+  - **Code shared between layers** (implemented 2026-10-16, §9.11: Qwen3's decode step 288 → 34 KB): with the per-layer offsets passed as runtime values (a push constant or a binding offset instead of an immediate; one export per kernel shape), a decode step needs 15–33 KB for all three models. A 32–64 KB TCM then holds the whole decode step, and the core never fetches code from DRAM. This is a compiler change (keep the KV layer offset dynamic for the attention dispatches); it costs a register add per address computation.
   - **Prefill is larger**: 562 KB per chunk, 103 KB of it called every layer. It needs DRAM with an I-cache, or the same de-specialization; a decode-only TCM is the realistic target.
   - Not measured yet: the dynamic fetch traffic (instructions executed per call, the loop bodies' reuse). The next step is the performance counters per call (`rdinstret` / `rdcycle` on the core, the unit's STARVE / ALL_IDLE).
 - **Core performance**: whether a simple in-order core issuing at the §2 rates is enough, or the command DMA must stay (model B).
@@ -385,6 +385,50 @@ Hazard and queue full mean the issuer is ahead; `ALL_IDLE` and `STARVE` mean it 
 - **The cost is the instruction fetch, not the instruction count.** The code needs 9–11 instructions per command; specialization at compile time keeps them near the minimum of building a few configuration words and issuing. Every instruction comes from DDR over the core's AXI port without a cache, so an instruction costs about 27 cycles while the core issues; this is the CPI with the PCPI stalls removed, the same in all three models. That makes one command about 250–300 cycles (2.5–3 µs). The descriptor fetch unit reads a 64-byte descriptor in a burst and needs about 3.5–8 ms of idle time per step in all.
 - **Where it hurts: small commands.** The largest per-kernel losses are the attention dispatches that loop over T with little work per command: Qwen3's `reduction_16xD` (softmax) +5.5 ms, PV `matmul_like` +4.8 ms, and Llama's +5.8 / +5.0 / +4.6 ms. The weight GEMVs lose under 4% (Qwen3's 192×16×1024: 33.5 → 34.8 ms), because each GEMV command keeps the engines busy longer than the core needs to issue the next one. There the core waits on a full queue: Llama's core spends 152 ms of a step in `PCPI_QFULL`.
 - **Consequence for an ASIC (§8).** With the code in a TCM or an I-cache the core's CPI drops from about 27 to PicoRV32's few cycles (single-cycle instruction memory), so the active issue time falls by 5–7×. Qwen3's 86.8 ms of active issue becomes about 13–17 ms, which the engines' work mostly hides: plan A would be about as fast as the descriptor lists. The decode step must fit that memory, which needs the per-layer code shared (15–33 KB, §8 answer). A shorter command format (fewer than 9–11 instructions per command) is the second lever, but it matters only once the fetch latency is gone.
+
+### 9.11 One executable per kernel instead of one per layer (2026-10-16)
+
+§8's answer found most of a decode step's code in per-layer copies of the same kernels. IREE's `DeduplicateExecutables` merges only identical executables, and these copies differ in constants:
+- the layer's offset into the one-buffer K cache: a static offset of the load, or of the store;
+- the layer's quantization scale: an f32 constant, in the PV dispatch and in the weight GEMVs.
+
+IREE's own comment at the deduplication suggests generalizing executables that differ in one value; nothing implements it.
+
+**Compiler.**
+- **IREE pass `iree-flow-generalize-executables`** (`compiler/patches/iree/0003-flow-generalize-executables.patch`; pipeline flag `--iree-flow-enable-executable-generalization`, off by default), run just before deduplication. It groups the executables whose dispatch functions are structurally equal up to the values of index and f32 constants and of the static offsets of tensor loads and stores. In each group, every such value that differs becomes a new operand of the dispatch, passed by each call site as a constant, and deduplication then merges the group.
+  - An offset is generalized only into a global's contents, traced through dispatches that update it in place, because the global's binding then has the same offset at every call site.
+  - Other integer constants (a position's wrap-around and clamping in the KV write) stay part of the signature, because the backend needs them constant.
+- **sa codegen for the new operands.**
+  - A subview offset that is a push constant goes into the BASE register's `Lin` (`ddrOf`).
+  - An f32 push constant is broadcast as the scalar gather already does: its bits go into a PARAM, then a VE copy with `DYN_VE_A` (`SahlLowerGeneric`).
+  - `--iree-sa-riscv` skips an export that runs on the host instead of failing.
+
+**Qwen3-0.6B** (`build/gen/qwen3_gen2`, also compiled with `--iree-sa-riscv`):
+
+| | before | generalized |
+|---|---|---|
+| executables | 1132 | 1051 |
+| decode step: exports, rv32 working set | 140, 288 KB | **59, 34.1 KB** (the 28 exports called every layer: 26.0 KB, 97% of the calls) |
+| all rv32 code (S4) | 607 KB | 354 KB |
+| largest generated function | 176 KB | 34 KB |
+
+What remains per layer is the KV write (`slow_memcpy`, 28 × 0.2 KB), whose layer offset is i64 arithmetic in the dispatch.
+
+**Checks.**
+- Sim logits bit-exact with the baseline: 4 decode steps, and 32 prompt tokens through prefill plus decode.
+- The packed parameters are byte-identical.
+- `rv_equiv` 1051/1051 (`oracle.py` learned `arith.bitcast`).
+- No dispatch on the host.
+- `run_tests.sh golden` passes with the flag off.
+
+**On the board** (bundle `qwen3g`: the Qwen3 bundle with the generalized `sa.vmfb`, `run_board_tests.sh qwen3g`): plan B's loop generates the reference's 57 tokens with descriptor lists and with the S4 code. Performance counters (`board_rvperf.py`), decode, ms per step:
+
+| plan B loop | before | generalized | commands per step | core instructions per step |
+|---|---|---|---|---|
+| descriptor lists | 136.0 | 136.6 (+0.4%) | 29,792 → 31,472 | — |
+| S4 code | 162.8 | 166.6 (+2.4%) | 29,792 → 31,472 | 325,932 → 342,703 |
+
+The merged code costs a little: about 60 more commands per layer (the scales' PARAM loads and broadcasts) and 5% more core instructions, because the offsets and scales are now computed from push constants. Without an instruction memory nothing is gained, because every instruction is still fetched from DDR at about 27 cycles (§9.10). The gain is for §8: a decode step now fits a 32–64 KB TCM, which would remove that fetch cost.
 
 ### 9.7 Coexistence
 
