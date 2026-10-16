@@ -106,13 +106,13 @@ def main():
         sr = {k: v / pr for k, v in split(agg(rr)).items()}
         print(f"1. one {a.section} step, every dispatch in its own window ({sd['calls']:.0f} dispatches; the unit's cycles, ms):")
         print(f"   {'':12}{'window':>9}{'all idle':>10}{'starve':>9}{'hazard':>9}{'q full':>9}{'moving':>9}"
-              f"{'commands':>10}{'core instr':>12}{'instr/cmd':>10}{'CPI':>7}")
+              f"{'commands':>10}{'core instr':>12}{'instr/cmd':>10}{'CPI':>9}")
         for name, s in (("lists", sd), ("S4 code", sr)):
             ipc = s["instret"] / s["cmds"] if s["cmds"] else 0
             cpi = s["core_cycles"] / s["instret"] if s["instret"] else 0
             print(f"   {name:12}" + "".join(f"{ms(s[k], a.mhz):9.2f}" for k in ("cycles", "all_idle", "starve", "haz",
                                                                                  "disp_full", "moving"))
-                  + f" {s['cmds']:9.0f}{s['instret']:12.0f}{ipc:10.1f}{cpi:7.2f}")
+                  + f" {s['cmds']:9.0f}{s['instret']:12.0f}{ipc:10.1f}{cpi:9.1f}")
         dl = {k: sr[k] - sd[k] for k in ("cycles", "all_idle", "starve", "haz", "disp_full", "moving")}
         print("   difference  " + "".join(f"{ms(dl[k], a.mhz):+9.2f}" for k in dl))
         print(f"   S4: the core stalled on PCPI {ms(sr['pcpi_qfull'], a.mhz):.2f} ms (queue full) + "
@@ -132,19 +132,19 @@ def main():
         rows.sort(key=lambda t: -(t[2]["cycles"] - t[1]["cycles"]))
         print(f"\n2. by kernel kind, the largest differences first (per step; ms of the unit's window):")
         print(f"   {'kernel':46}{'calls':>6}{'lists':>8}{'S4':>8}{'diff':>8}{'S4 idle+starve':>15}"
-              f"{'instr/cmd':>10}{'CPI':>7}")
+              f"{'instr/cmd':>10}{'CPI':>9}")
         for k, x, y in rows[:a.top]:
             ipc = y["instret"] / y["cmds"] if y["cmds"] else 0
             cpi = y["core_cycles"] / y["instret"] if y["instret"] else 0
             print(f"   {k[:46]:46}{y['calls']:6.0f}{ms(x['cycles'], a.mhz):8.2f}{ms(y['cycles'], a.mhz):8.2f}"
                   f"{ms(y['cycles'] - x['cycles'], a.mhz):+8.2f}{ms(y['all_idle'] + y['starve'], a.mhz):15.2f}"
-                  f"{ipc:10.1f}{cpi:7.2f}")
+                  f"{ipc:10.1f}{cpi:9.1f}")
         res["kinds"] = [{"kind": k, "lists": x, "s4": y} for k, x, y in rows]
     # 3. plan B's loop: the whole run (lists against code)
     if os.path.exists(f["sched"]) and os.path.exists(f["sched_rv"]):
         print("\n3. plan B's decode loop on the core, counters over the whole run (per step, ms):")
         print(f"   {'':12}{'window':>9}{'all idle':>10}{'starve':>9}{'hazard':>9}{'q full':>9}{'moving':>9}"
-              f"{'commands':>10}{'core instr':>12}{'CPI':>6}")
+              f"{'commands':>10}{'core instr':>12}{'CPI':>9}")
         out = {}
         for name, key in (("lists", "sched"), ("S4 code", "sched_rv")):
             S = read(f[key])
@@ -153,7 +153,7 @@ def main():
             cpi = s["core_cycles"] / s["instret"] if s["instret"] else 0
             print(f"   {name:12}" + "".join(f"{ms(s[k], a.mhz):9.2f}" for k in ("cycles", "all_idle", "starve", "haz",
                                                                                  "disp_full", "moving"))
-                  + f" {s['cmds']:9.0f}{s['instret']:12.0f}{cpi:6.2f}")
+                  + f" {s['cmds']:9.0f}{s['instret']:12.0f}{cpi:9.1f}")
             out[key] = s
         d = {k: out["sched_rv"][k] - out["sched"][k] for k in ("cycles", "all_idle", "starve", "haz", "disp_full", "moving")}
         print("   difference  " + "".join(f"{ms(d[k], a.mhz):+9.2f}" for k in d))

@@ -350,6 +350,36 @@ Host checks before the board: `rv_equiv.py` on the specialized code, Qwen3 1132 
 
 The board's per-command core cost after specialization: smol_16 (54 commands) (35462 − 8673) / 54 ≈ 500 cycles from the BRAM, 1000 from DDR (before 2900 / 5000), still 3–5× the trace C (§6), whose commands are inline immediates: the primitives are calls (not inlined across the .ll and the runtime) and the configuration of a VE command is 16 keys. A whole decode step as generated code costs 2.3× the descriptor lists (338 against 146 ms on the core's loop): about 190 ms of core time for ~4000 commands from uncached DDR, ~0.5 µs each. Next levers, all on the compiler / build side: inlining the primitives (LTO, or emitting the `.insn` inline assembly directly for riscv32), and fewer VE keys per command (the 16 keys written only when they change across commands, as LD / ST already are); for an ASIC the same data argue for a core-local instruction memory and a one-instruction command format.
 
+### 9.10 Where plan A's time goes: the performance counters (2026-10-16)
+
+rt_fw version 7 brackets an `RT_CALL` and a whole `RT_RUN_SCHED` with the unit's event counters (`rtl/sysarray/sa_perf.v`, as it already did for descriptor lists) and reports the core's instructions retired (`rdinstret`). `compiler/tests/board_rvperf.py` runs each model four ways, `compiler/tests/rv_perf.py` splits the counts:
+- the lists, one per dispatch;
+- the S4 code, one call per dispatch;
+- plan B's loop with lists;
+- plan B's loop with the S4 code.
+
+The unit's cycles split into:
+- `ALL_IDLE`: nothing queued and no engine busy, so the unit waits for whoever issues;
+- `STARVE`: an engine is busy but no command is at the head, so issue is partly hidden;
+- hazard: the head command waits on a dependency while engines work;
+- queue full;
+- the rest.
+
+Hazard and queue full mean the issuer is ahead; `ALL_IDLE` and `STARVE` mean it is behind. Decode step, overlay `d16_100mhz_w128_p6_gemv_np4_pcpi`, 100 MHz, ms per step:
+
+| | plan B loop: lists → S4 | gap | of which ALL_IDLE + STARVE | hazard | commands per step | core instructions per command | core CPI while issuing | core stalled on PCPI (queue full + fences) |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 136.0 → 162.8 | +26.8 | 8.2 → 44.0 (+35.8) | −7.7 | 29,792 | 11.0 | 26.7 | 73.0 of 159.8 |
+| Gemma-3-270M | 61.0 → 75.6 | +14.6 | 5.1 → 23.8 (+18.7) | −3.5 | 15,967 | 11.3 | 26.2 | 24.7 of 71.8 |
+| Llama-3.2-1B | 225.2 → 249.3 | +24.1 | 4.4 → 38.0 (+33.6) | −8.2 | 28,170 | 9.2 | 27.3 | 177.1 of 247.4 |
+
+(The per-dispatch windows agree with plan B's runs within 1–3 ms: Qwen3 134.3 → 162.0.)
+
+- **The whole gap is issue latency.** The S4 runs add 19–36 ms of `ALL_IDLE` + `STARVE` per step, in which the unit waits for the core. The hazard time drops by 3–8 ms, because a slow issuer finds the dependencies already resolved. The engines' work is the same: the same 29,792 commands, and the busy and moving cycles are unchanged.
+- **The cost is the instruction fetch, not the instruction count.** The code needs 9–11 instructions per command; specialization at compile time keeps them near the minimum of building a few configuration words and issuing. Every instruction comes from DDR over the core's AXI port without a cache, so an instruction costs about 27 cycles while the core issues; this is the CPI with the PCPI stalls removed, the same in all three models. That makes one command about 250–300 cycles (2.5–3 µs). The descriptor fetch unit reads a 64-byte descriptor in a burst and needs about 3.5–8 ms of idle time per step in all.
+- **Where it hurts: small commands.** The largest per-kernel losses are the attention dispatches that loop over T with little work per command: Qwen3's `reduction_16xD` (softmax) +5.5 ms, PV `matmul_like` +4.8 ms, and Llama's +5.8 / +5.0 / +4.6 ms. The weight GEMVs lose under 4% (Qwen3's 192×16×1024: 33.5 → 34.8 ms), because each GEMV command keeps the engines busy longer than the core needs to issue the next one. There the core waits on a full queue: Llama's core spends 152 ms of a step in `PCPI_QFULL`.
+- **Consequence for an ASIC (§8).** With the code in a TCM or an I-cache the core's CPI drops from about 27 to PicoRV32's few cycles (single-cycle instruction memory), so the active issue time falls by 5–7×. Qwen3's 86.8 ms of active issue becomes about 13–17 ms, which the engines' work mostly hides: plan A would be about as fast as the descriptor lists. The decode step must fit that memory, which needs the per-layer code shared (15–33 KB, §8 answer). A shorter command format (fewer than 9–11 instructions per command) is the second lever, but it matters only once the fetch latency is gone.
+
 ### 9.7 Coexistence
 
 Every part is opt-in: the compiler option (off: identical output), the sa-desc section (absent: identical files), `SA_RV` (unset: the list path), rt_fw's new entry (as `RT_RUN_SCHED`), the `_pcpi` overlay (no new bitstream). Existing bundles and board tests are unchanged.
