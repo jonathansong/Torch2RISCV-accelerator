@@ -721,6 +721,7 @@ module tb_system;
             put32(t + 20, 4); put32(t + 24, 0); put32(t + 28, 2); put32(t + 32, S_BK); put32(t + 36, S_VAL);
             put32(t + 40, 4); put32(t + 44, 4); put32(t + 48, 2); put32(t + 52, 6); put32(t + 56, 7);
             put32(t + 60, stop); put32(t + 64, out); put32(t + 68, 32'hDEAD); put32(t + 72, 32'hDEAD);
+            put32(t + 76, 0); put32(t + 80, 0);                    // RVS_T_ARGMAX: no R5 kernel (the core's scan)
         end
     endtask
     task check32(input [31:0] a, input [31:0] want, input [8*16-1:0] what);
@@ -802,9 +803,9 @@ module tb_system;
         e_list[5] = L_PARAM; e_pb[5] = PBLK;
         e_list[6] = L_LOOP; e_pb[6] = PBLK + 32; e_b0[6] = SRC + 1024; e_b1[6] = DST + 1024; e_flags[6] = F_IRQ | F_PERF;
         e_count[7] = 1; e_flags[7] = 0; e_b0[7] = SRC + 2048; e_b1[7] = DST + 2048;       // only the LD runs
-        e_type[8] = T_SCHED; e_list[8] = S_TAB; e_flags[8] = 0;
+        e_type[8] = T_SCHED; e_list[8] = S_TAB; e_flags[8] = F_PERF;
         e_type[9] = T_SCHED; e_list[9] = S_TAB2; e_flags[9] = 0;
-        e_type[10] = T_CALL; e_list[10] = S + 32'h600; e_count[10] = S + 32'h640; e_flags[10] = 0;
+        e_type[10] = T_CALL; e_list[10] = S + 32'h600; e_count[10] = S + 32'h640; e_flags[10] = F_PERF;
         e_type[11] = T_EXIT;
         // RT_CALL's function (in DDR): args[0] = push_constants[0] + 1; ret
         put32(S + 32'h600, 32'h0005A283);                       // lw   t0, 0(a1)
@@ -850,8 +851,8 @@ module tb_system;
         if (bram[MBOX + MB_FW_STATE] !== 32'h52554E00) begin
             $display("TB ERROR: rt_fw not ready (FW_STATE %08x)", bram[MBOX + MB_FW_STATE]); errors = errors + 1;
         end
-        // RT_VERSION 5: the unit's CAPS for the host's executable check, RT_RUN_SCHED (RVS2), RT_CALL
-        if (bram[MBOX + 32'hC8 / 4] !== 5 || bram[MBOX + 32'hD0 / 4] !== mm.legacy.CAPS) begin
+        // RT_VERSION 7: the unit's CAPS, RT_RUN_SCHED (RVS2, R5), RT_CALL, instret + PERF on calls and schedules
+        if (bram[MBOX + 32'hC8 / 4] !== 7 || bram[MBOX + 32'hD0 / 4] !== mm.legacy.CAPS) begin
             $display("TB ERROR: rt_fw version %0d, FW_CAPS %08x (CAPS %08x)", bram[MBOX + 32'hC8 / 4],
                      bram[MBOX + 32'hD0 / 4], mm.legacy.CAPS); errors = errors + 1;
         end
@@ -935,6 +936,17 @@ module tb_system;
         if (bram[MBOX + 32'h8C / 4] !== 32) begin
             $display("TB ERROR: PERF entry: MBOX_PERF_COUNT %0d", bram[MBOX + 32'h8C / 4]); errors = errors + 1;
         end
+        // version 7: the core's instructions retired (completion w5), the RT_CALL's counter window (the last PERF entry)
+        if (get32(CPL + 32 * 2 + 20) < 4 || get32(CPL + 32 * 2 + 20) > 200 || get32(CPL + 32 * 0 + 20) < 100) begin
+            $display("TB ERROR: instret: RT_CALL %0d, schedule %0d", get32(CPL + 32 * 2 + 20), get32(CPL + 32 * 0 + 20));
+            errors = errors + 1;
+        end
+        if (bram[MBOX - 64] < get32(CPL + 32 * 2 + 8) || bram[MBOX - 64] > get32(CPL + 32 * 2 + 8) + 200) begin   // (+ the window's own begin / end)
+            $display("TB ERROR: RT_CALL PERF window: CYCLES %0d, call cycles %0d", bram[MBOX - 64], get32(CPL + 32 * 2 + 8));
+            errors = errors + 1;
+        end
+        $display("TB rt_fw v7: RT_CALL %0d instructions in %0d cycles (CYCLES counter %0d); schedule %0d instructions in %0d cycles",
+                 get32(CPL + 32 * 2 + 20), get32(CPL + 32 * 2 + 8), bram[MBOX - 64], get32(CPL + 32 * 0 + 20), get32(CPL + 32 * 0 + 8));
         $display("TB %s: rt_fw ring: %0d entries (ring of %0d), %0d completions checked, %0d notify edges, heartbeat %0d, %0d errors",
                  errors ? "FAIL" : "PASS", NENT, RSIZE, runs, nirq_edges, bram[MBOX + MB_HEARTBEAT], errors);
         $finish;

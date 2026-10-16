@@ -11,7 +11,8 @@
 #   every dispatch as RISC-V code (deploy_rvcode.sh); their "rvsched --rv": the core's decode loop
 #   calling that code (S3); the "--embedded" variants: the code iree-compile embedded in sa.vmfb
 #   (S4, deploy_rvembed.sh); "rvsched --r5": the block argmax by a kernel IREE's llvm-cpu compiled
-#   for the core (R5, deploy_r5.sh)
+#   for the core (R5, deploy_r5.sh); "rvperf": the performance-counter breakdown of plan A against the lists
+#   (board_rvperf.py; then compiler/tests/rv_perf.py on the rvperf_*.csv)
 #   (rvsched: the decode loop on the RISC-V core, after compiler/scripts/deploy_rvsched.sh; without
 #   REDO only the tests not passed yet run)
 # Logs: ~/board_tests_pcpi/<bundle>.<mode>.log, markers .done / .failed, summary.txt.
@@ -36,9 +37,9 @@ declare -A DIR=(
 tests_of() {
   case $1 in
     rvb|rvbc|rvbe) echo "rvb" ;;
-    gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" ;;
-    qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" ;;
-    llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" ;;
+    gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
+    qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
+    llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
   esac
 }
 

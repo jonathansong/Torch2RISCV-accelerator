@@ -437,6 +437,9 @@ static iree_status_t run(iree_allocator_t host) {
         status = sa_rvsched_run(s, (uint32_t)start, n, (uint32_t)token, FLAG_stop_token, toks_out, toks_out + n,
                                 toks_out + 2 * n, &rvs_done);
       rvs_wall = now() - t0;
+      if (iree_status_is_ok(status) && rvs_done)       // SA_PROFILE_PERF: the run's counters as one section
+        sa_context_profile_append("rvsched", (double)rvs_done, getenv("SA_RV") ? "rvsched_rv" : "rvsched", rvs_done,
+                                  sa_rvsched_last_run(s));
     }
     if (rvs_done) {
       for (uint32_t i = 0; i < rvs_done; ++i) {

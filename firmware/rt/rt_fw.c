@@ -15,7 +15,11 @@
  *   w1 list address; w2 [31:0] count (0 = until END); w3..w6 BASE0..3;
  *   w7 [31:0] parameter block address (8 x u32, 0 = keep PARAM0..7).
  * Completion (8 x u32): seq, status (0 or extended status), cycles
- *   (mat_submit .. fence), descriptors decoded, END value, 0, 0, 0.
+ *   (mat_submit .. fence), descriptors decoded, END value, the core's
+ *   instructions retired over the same window (version 7), 0, 0.
+ * PERF (w0 bit 9): the unit's event counters over the entry into the perf
+ *   area (RT_RUN_LIST; from version 7 also RT_CALL and RT_RUN_SCHED, the
+ *   latter over the whole run).
  * RT_RUN_SCHED (version 3): w1 is a decode schedule (rvsched.h,
  *   docs/riscv_backend_design.md §7.1): the core runs the decode loop itself,
  *   the lists one after another; status = the schedule's, cycles = the whole run.
@@ -36,6 +40,13 @@ static inline uint32_t rdcycle(void)
 {
     uint32_t c;
     __asm__ volatile ("rdcycle %0" : "=r"(c));
+    return c;
+}
+
+static inline uint32_t rdinstret(void)
+{
+    uint32_t c;
+    __asm__ volatile ("rdinstret %0" : "=r"(c));
     return c;
 }
 
@@ -97,7 +108,7 @@ int main(void)
         volatile uint32_t *e = (volatile uint32_t *)(ring + 64u * slot);
         volatile uint32_t *c = (volatile uint32_t *)(cpl + 32u * slot);
         uint32_t type = e[0] & 0xFFu, flags = e[0], seq = e[1];
-        uint32_t status = 0, cycles = 0, exec = 0, dstat = 0;
+        uint32_t status = 0, cycles = 0, exec = 0, dstat = 0, instret = 0;
 
         if (type == RT_RUN_LIST) {
             for (uint32_t i = 0; i < 4; i++)
@@ -108,10 +119,11 @@ int main(void)
                     mat_cfg(SA_CFG_PARAM(k), ((volatile uint32_t *)pb)[k]);
             if (flags & RT_F_PERF)
                 sa_perf_begin();
-            uint32_t t0 = rdcycle();
+            uint32_t i0 = rdinstret(), t0 = rdcycle();
             mat_submit(e[2], e[4]);
             uint32_t st = mat_fence(SA_ENG_ALL);
             cycles = rdcycle() - t0;
+            instret = rdinstret() - i0;
             if (flags & RT_F_PERF)
                 MBOX(MBOX_PERF_COUNT) = sa_perf_end(PERF_AREA, PERF_AREA_WORDS);
             exec  = SA_CSR(SA_CSR_DESC_EXEC);
@@ -120,14 +132,15 @@ int main(void)
                 status = st;
                 mat_reset();
             }
-        } else if (type == RT_RUN_SCHED) {
-            uint32_t t0 = rdcycle();
-            status = rvs_run(e[2]);
+        } else if (type == RT_RUN_SCHED || type == RT_CALL) {
+            if (flags & RT_F_PERF)
+                sa_perf_begin();
+            uint32_t i0 = rdinstret(), t0 = rdcycle();
+            status = type == RT_CALL ? rt_call(e[2], e[4]) : rvs_run(e[2]);
             cycles = rdcycle() - t0;
-        } else if (type == RT_CALL) {
-            uint32_t t0 = rdcycle();
-            status = rt_call(e[2], e[4]);
-            cycles = rdcycle() - t0;
+            instret = rdinstret() - i0;
+            if (flags & RT_F_PERF)
+                MBOX(MBOX_PERF_COUNT) = sa_perf_end(PERF_AREA, PERF_AREA_WORDS);
         } else if (type == RT_RESET) {
             mat_reset();
         } else if (type != RT_NOP && type != RT_EXIT) {
@@ -135,7 +148,7 @@ int main(void)
         }
 
         c[1] = status; c[2] = cycles; c[3] = exec; c[4] = dstat;
-        c[5] = 0; c[6] = 0; c[7] = 0;
+        c[5] = instret; c[6] = 0; c[7] = 0;
         c[0] = seq;                                     /* stores complete in order (B response) */
         MBOX(MBOX_RING_HEAD) = ++head;
         if (flags & RT_F_IRQ)

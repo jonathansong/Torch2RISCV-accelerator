@@ -41,7 +41,7 @@ make -C "$SA_REPO/firmware/rt" >/dev/null
 "$SA_COMPILER/scripts/build_sa_runtime.sh" "$SA_RT_ARCH" | tail -1
 [ -f "$D/sa.vmfb.descriptors" ] || cp "$D/sa.vmfb" "$D/sa.vmfb.descriptors"
 cp "$C/sa.vmfb" "$D/sa.vmfb"
-cp "$SA_REPO/firmware/rt/rt_fw.bin" "$SA_COMPILER/tests/board_rvcode.py" "$SA_COMPILER/tests/board_rvsched.py" \
+cp "$SA_REPO/firmware/rt/rt_fw.bin" "$SA_COMPILER/tests/board_rvcode.py" "$SA_COMPILER/tests/board_rvsched.py" "$SA_COMPILER/tests/board_rvperf.py" \
    "$SA_COMPILER/tests/board_run.py" "$D/"
 llvm-strip-18 -o "$D/sa-llm-run" "$SA_RT_BUILD/runtime/plugins/hal/drivers/sa/sa-llm-run"
 sed -i '/^rvembed /d' "$D/VERSION"

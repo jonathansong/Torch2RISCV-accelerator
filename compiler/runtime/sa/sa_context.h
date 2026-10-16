@@ -29,6 +29,7 @@ typedef struct sa_completion_t {
   uint32_t end;          // the END value
   uint32_t perf_n;       // board with SA_PROFILE_PERF: the unit's event counters over this list
   uint32_t perf[32];     //   (rtl/sysarray/sa_defs.vh PC_*; rt_fw's perf area), else 0
+  uint32_t instret;      // board, rt_fw >= 7: the core's instructions retired over the entry (0: unknown)
 } sa_completion_t;
 
 typedef struct sa_transport_t sa_transport_t;
@@ -46,7 +47,9 @@ struct sa_transport_t {
   iree_status_t (*run)(sa_transport_t* t, uint32_t list_phys, sa_completion_t* out);
   // Runs the decode schedule (firmware/include/rvsched.h) at |table_phys| on
   // the device's RISC-V core and waits; NULL: not supported (sa_rvsched.c).
-  iree_status_t (*run_sched)(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status);
+  // |out| (may be NULL): the run's cycles, instructions and (SA_PROFILE_PERF) event counters.
+  iree_status_t (*run_sched)(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status,
+                             sa_completion_t* out);
   // Calls generated RISC-V code (sa_rv.c, docs/riscv_backend_design.md §9.4) at |code_phys|
   // with the argument block at |args_phys| (16 binding addresses, then the push constants;
   // 128 bytes after it are the transport's scratch) and waits; |symbol| names the function
@@ -189,6 +192,11 @@ void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, u
 // of the SA_PROFILE_PERF csv. No-op without SA_PROFILE. Host fallbacks are
 // recorded as "host:<export>" (no cycles; host_ns their time on the CPU).
 void sa_context_profile_report(void* f, double per_step, const char* label);
+// SA_PROFILE_PERF: one more section |label| with the single row |name| (|count|
+// calls, |done|'s cycles, counters and instructions), e.g. a whole decode
+// schedule on the core (sa-llm-run --rvsched).
+void sa_context_profile_append(const char* label, double per_step, const char* name, uint64_t count,
+                               const sa_completion_t* done);
 // Totals since the last reset: dispatches, device cycles, host ns.
 void sa_context_profile_totals(uint64_t* dispatches, uint64_t* cycles, uint64_t* host_ns);
 void sa_context_profile_reset(void);

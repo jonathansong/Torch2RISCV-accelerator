@@ -106,6 +106,19 @@ static double sa_now(void) {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+// The entry's instructions retired (rt_fw >= 7) and, with SA_PROFILE_PERF, the
+// event counters rt_fw copied into its perf area before the completion record.
+static void sa_board_perf(sa_transport_t* t, volatile uint32_t* c, sa_completion_t* out) {
+  sa_board_t* b = (sa_board_t*)t->impl;
+  out->instret = t->fw_version >= 7 ? c[5] : 0;
+  out->perf_n = 0;
+  if (b->perf_area) {
+    uint32_t n = mbox_rd(b, MBOX_PERF_COUNT);
+    out->perf_n = n > 32 ? 32 : n;
+    for (uint32_t k = 0; k < out->perf_n; ++k) out->perf[k] = b->perf_area[k];
+  }
+}
+
 static iree_status_t sa_board_run(sa_transport_t* t, uint32_t list_phys, sa_completion_t* out) {
   sa_board_t* b = (sa_board_t*)t->impl;
   uint32_t seq = b->tail, slot = seq % b->ring_entries;
@@ -133,23 +146,20 @@ static iree_status_t sa_board_run(sa_transport_t* t, uint32_t list_phys, sa_comp
   out->cycles = c[2];
   out->descriptors = c[3];
   out->end = c[4];
-  out->perf_n = 0;
-  if (b->perf_area) {                            // written by rt_fw before the completion record
-    uint32_t n = mbox_rd(b, MBOX_PERF_COUNT);
-    out->perf_n = n > 32 ? 32 : n;
-    for (uint32_t k = 0; k < out->perf_n; ++k) out->perf[k] = b->perf_area[k];
-  }
+  sa_board_perf(t, c, out);
   return iree_ok_status();
 }
 
 // One RT_RUN_SCHED entry: rt_fw runs the decode schedule at |table_phys|
 // (w1); its completion record carries the schedule's status.
-static iree_status_t sa_board_run_sched(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status) {
+static iree_status_t sa_board_run_sched(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status,
+                                        sa_completion_t* out) {
   sa_board_t* b = (sa_board_t*)t->impl;
   uint32_t seq = b->tail, slot = seq % b->ring_entries;
   volatile uint64_t* e = (volatile uint64_t*)(t->mem + 64u * slot);
   volatile uint32_t* c = (volatile uint32_t*)(t->mem + SA_BOARD_CPL_OFFSET + 32u * slot);
-  e[0] = (uint64_t)RT_RUN_SCHED | (uint64_t)seq << 32;
+  bool perf = out && b->perf_area && t->fw_version >= 7;   // (the counters over the whole run)
+  e[0] = (uint64_t)(RT_RUN_SCHED | (perf ? RT_F_PERF : 0u)) | (uint64_t)seq << 32;
   e[1] = table_phys;
   for (int i = 2; i < 8; ++i) e[i] = 0;
   __sync_synchronize();
@@ -169,6 +179,16 @@ static iree_status_t sa_board_run_sched(sa_transport_t* t, uint32_t table_phys, 
     return iree_make_status(IREE_STATUS_DATA_LOSS, "sa board: completion record %u has seq %u", seq, c[0]);
   }
   *out_status = c[1];
+  if (out) {
+    memset(out, 0, sizeof(*out));
+    out->status = c[1];
+    out->cycles = c[2];
+    if (perf) {
+      sa_board_perf(t, c, out);
+    } else {
+      out->instret = t->fw_version >= 7 ? c[5] : 0;
+    }
+  }
   return iree_ok_status();
 }
 
@@ -181,7 +201,7 @@ static iree_status_t sa_board_run_call(sa_transport_t* t, uint32_t code_phys, ui
   uint32_t seq = b->tail, slot = seq % b->ring_entries;
   volatile uint64_t* e = (volatile uint64_t*)(t->mem + 64u * slot);
   volatile uint32_t* c = (volatile uint32_t*)(t->mem + SA_BOARD_CPL_OFFSET + 32u * slot);
-  e[0] = (uint64_t)RT_CALL | (uint64_t)seq << 32;
+  e[0] = (uint64_t)(RT_CALL | (b->perf_area && t->fw_version >= 7 ? RT_F_PERF : 0u)) | (uint64_t)seq << 32;
   e[1] = code_phys;
   e[2] = args_phys;
   for (int i = 3; i < 8; ++i) e[i] = 0;
@@ -204,6 +224,7 @@ static iree_status_t sa_board_run_call(sa_transport_t* t, uint32_t code_phys, ui
   out->status = c[1];
   out->cycles = c[2];
   out->end = 0x5A;
+  sa_board_perf(t, c, out);
   return iree_ok_status();
 }
 

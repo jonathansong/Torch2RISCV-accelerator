@@ -170,8 +170,10 @@ static uint32_t sa_sim_rvs_call(uint32_t code, uint32_t args) {
 }
 #endif
 
-static iree_status_t sa_sim_run_sched(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status) {
+static iree_status_t sa_sim_run_sched(sa_transport_t* t, uint32_t table_phys, double timeout_s, uint32_t* out_status,
+                                      sa_completion_t* out) {
   (void)timeout_s;
+  if (out) memset(out, 0, sizeof(*out));
   sa_sim_rvs_t = t;
   sa_sim_rvs_error = iree_ok_status();
   *out_status = rvs_run(table_phys);

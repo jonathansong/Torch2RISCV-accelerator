@@ -48,6 +48,7 @@ struct sa_rvsched_t {
   // R5: the block argmax kernel (code, then its argument block) in the device window
   void* r5_raw;
   uint32_t r5_bytes, r5_n, r5_phys, r5_args_phys;
+  sa_completion_t last_run;          // the last run's cycles, instructions, event counters
   char r5_symbol[160];
 };
 
@@ -372,7 +373,7 @@ iree_status_t sa_rvsched_run(sa_rvsched_t* s, uint32_t pos, uint32_t steps, uint
   __sync_synchronize();
   uint32_t st = 0;
   sa_transport_t* t = s->c->transport;
-  iree_status_t status = t->run_sched(t, s->table_phys, 10.0 + 10.0 * steps, &st);
+  iree_status_t status = t->run_sched(t, s->table_phys, 10.0 + 10.0 * steps, &st, &s->last_run);
   __sync_synchronize();
   uint32_t done = hdr[RVS_T_DONE];
   if (done > steps) done = steps;
@@ -394,6 +395,8 @@ iree_status_t sa_rvsched_run(sa_rvsched_t* s, uint32_t pos, uint32_t steps, uint
   }
   return status;
 }
+
+const sa_completion_t* sa_rvsched_last_run(const sa_rvsched_t* s) { return &s->last_run; }
 
 const float* sa_rvsched_logits(const sa_rvsched_t* s, uint32_t pos) {
   uint32_t b = pos / s->pad;

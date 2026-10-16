@@ -63,6 +63,9 @@ void sa_rvsched_info(const sa_rvsched_t* s, sa_rvsched_info_t* out);
 // the steps done (*out_done).
 iree_status_t sa_rvsched_run(sa_rvsched_t* s, uint32_t pos, uint32_t steps, uint32_t token, int32_t stop,
                              uint32_t* out_tokens, uint32_t* out_cycles, uint32_t* out_device, uint32_t* out_done);
+// The last run's completion: its cycles, the core's instructions and (board,
+// SA_PROFILE_PERF) the unit's event counters over the whole run.
+const sa_completion_t* sa_rvsched_last_run(const sa_rvsched_t* s);
 // The logits of the last step run (f32 [vocab]) in the device window.
 const float* sa_rvsched_logits(const sa_rvsched_t* s, uint32_t pos);
 void sa_rvsched_destroy(sa_rvsched_t* s);

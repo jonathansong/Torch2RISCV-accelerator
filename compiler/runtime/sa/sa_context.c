@@ -508,6 +508,7 @@ typedef struct sa_profile_entry_t {
   char name[96];
   uint64_t count, cycles, host_ns;
   uint64_t perf[32];                       // event counter sums (SA_PROFILE_PERF)
+  uint64_t instret;                        // the core's instructions (board, rt_fw >= 7)
 } sa_profile_entry_t;
 static uint32_t sa_profile_perf_n;         // counters seen (0: none)
 static int sa_profile_section;
@@ -544,6 +545,7 @@ void sa_context_profile_record(sa_context_t* context, iree_string_view_t name, u
   sa_profile[i].host_ns += host_ns;
   uint32_t pn = done && done->perf_n <= 32 ? done->perf_n : 0;
   for (uint32_t k = 0; k < pn; ++k) sa_profile[i].perf[k] += done->perf[k];
+  if (done) sa_profile[i].instret += done->instret;
   if (pn > sa_profile_perf_n) sa_profile_perf_n = pn;
 }
 
@@ -567,6 +569,21 @@ void sa_context_profile_reset(void) {
 static int sa_profile_cmp(const void* a, const void* b) {
   const sa_profile_entry_t *x = a, *y = b;
   return x->cycles < y->cycles ? 1 : x->cycles > y->cycles ? -1 : 0;
+}
+
+void sa_context_profile_append(const char* label, double per_step, const char* name, uint64_t count,
+                               const sa_completion_t* done) {
+  const char* path = getenv("SA_PROFILE_PERF");
+  if (!path || !done) return;
+  FILE* c = fopen(path, sa_profile_section++ ? "a" : "w");
+  if (!c) return;
+  uint32_t pn = done->perf_n <= 32 ? done->perf_n : 0;
+  fprintf(c, "# section %d %s per_step %.3f\nexport,calls,cycles,host_ns", sa_profile_section - 1, label, per_step);
+  for (uint32_t k = 0; k < pn; ++k) fprintf(c, ",c%u", k);
+  fprintf(c, ",instret\n%s,%llu,%u,0", name, (unsigned long long)count, done->cycles);
+  for (uint32_t k = 0; k < pn; ++k) fprintf(c, ",%u", done->perf[k]);
+  fprintf(c, ",%u\n", done->instret);
+  fclose(c);
 }
 
 void sa_context_profile_report(void* fp, double per_step, const char* label) {
@@ -596,13 +613,13 @@ void sa_context_profile_report(void* fp, double per_step, const char* label) {
       fprintf(c, "# section %d %s per_step %.3f\nexport,calls,cycles,host_ns", sa_profile_section - 1,
               label ? label : "-", per_step);
       for (uint32_t k = 0; k < sa_profile_perf_n; ++k) fprintf(c, ",c%u", k);
-      fprintf(c, "\n");
+      fprintf(c, ",instret\n");
       for (int i = 0; i < sa_profile_n; ++i) {
         const sa_profile_entry_t* e = &sa_profile[i];
         fprintf(c, "%s,%llu,%llu,%llu", e->name, (unsigned long long)e->count, (unsigned long long)e->cycles,
                 (unsigned long long)e->host_ns);
         for (uint32_t k = 0; k < sa_profile_perf_n; ++k) fprintf(c, ",%llu", (unsigned long long)e->perf[k]);
-        fprintf(c, "\n");
+        fprintf(c, ",%llu\n", (unsigned long long)e->instret);
       }
       fclose(c);
     }
