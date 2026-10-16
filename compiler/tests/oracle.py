@@ -169,6 +169,18 @@ class Interp:
     op_arith_extsi = _cast_int
     op_arith_trunci = _cast_int
 
+    def op_arith_bitcast(self, op):
+        # i32 <-> f32 (an f32 push constant: iree-flow-generalize-executables); f32 values are held as bits
+        x = self.val(op.operands[0])
+        et = str(op.results[0].type)
+        if et == "f32" and x.et in ("i32", "index"):
+            self.set(op.results[0], T((np.asarray(x.arr, np.int64) & 0xFFFFFFFF).astype(np.uint32), "f32"))
+        elif et == "i32" and x.et == "f32":
+            v = np.asarray(x.arr, np.uint32).astype(np.int64)
+            self.set(op.results[0], T(np.where(v >= 1 << 31, v - (1 << 32), v), "i32"))
+        else:
+            raise NotImplementedError(f"oracle: bitcast {x.et} -> {et}")
+
     def op_arith_extui(self, op):
         x = self.val(op.operands[0])
         w = width(x.et)
