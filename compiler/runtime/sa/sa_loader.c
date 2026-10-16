@@ -29,7 +29,8 @@ typedef struct sa_file_header_t {
   uint32_t version, d, caps, export_count, export_offset;
   uint32_t templates_offset, templates_bytes, strings_offset, strings_bytes;
   uint32_t ext_offset;      // version 3: the export extensions
-  uint32_t reserved[4];
+  uint32_t code_offset;     // 0, or the RISC-V code table (C7 S4): per export u32 offset, u32 bytes
+  uint32_t reserved[3];
 } sa_file_header_t;
 static_assert(sizeof(sa_file_header_t) == 64, "sa-desc-v1 header");
 
@@ -77,6 +78,7 @@ typedef struct sa_export_t {
   const sa_setup_t* setup;  // in the executable's host allocation
   int rv_state;             // generated RISC-V code (sa_rv.c): 0 not looked up, 1 none, 2 rv_phys
   uint32_t rv_phys;
+  uint32_t rv_embedded;     // the executable's own code for it (S4: the sa-desc code table), 0: none
   char rv_symbol[160];
 } sa_export_t;
 
@@ -84,6 +86,7 @@ typedef struct sa_executable_t {
   iree_hal_local_executable_t base;
   sa_context_t* context;
   void* templates;          // in the arena (data allocator)
+  void* rvcode;             // the embedded RISC-V code (S4), in the arena, or NULL
   iree_host_size_t export_count;
   sa_export_t* exports;
   iree_hal_executable_dispatch_attrs_v0_t* attrs;
@@ -98,6 +101,7 @@ static void sa_executable_destroy(iree_hal_executable_t* base) {
   sa_executable_t* e = sa_executable_cast(base);
   iree_allocator_t host = e->base.host_allocator;
   if (e->templates) iree_allocator_free_aligned(sa_context_data_allocator(e->context), e->templates);
+  if (e->rvcode) iree_allocator_free_aligned(sa_context_data_allocator(e->context), e->rvcode);
   iree_hal_local_executable_deinitialize(&e->base);
   iree_allocator_free(host, e);
 }
@@ -238,7 +242,8 @@ iree_status_t sa_executable_append(iree_hal_executable_t* executable, uint32_t o
   // plan A (SA_RV): the export's generated RISC-V code instead of its descriptor list
   sa_export_t* xm = &e->exports[ordinal];
   if (xm->rv_state == 0) {
-    IREE_RETURN_IF_ERROR(sa_rv_lookup(e->context, x->name, xm->rv_symbol, sizeof(xm->rv_symbol), &xm->rv_phys));
+    IREE_RETURN_IF_ERROR(sa_rv_lookup(e->context, x->name, xm->rv_symbol, sizeof(xm->rv_symbol), xm->rv_embedded,
+                                      &xm->rv_phys));
     xm->rv_state = xm->rv_phys ? 2 : 1;
   }
   if (xm->rv_state == 2) {
@@ -445,6 +450,36 @@ static iree_status_t sa_executable_create(sa_context_t* context, iree_const_byte
     e->attrs[i].binding_count = (uint8_t)x.binding_count;
     e->attrs[i].constant_count = (uint8_t)x.constant_count;
     e->attrs[i].workgroup_size_x = e->attrs[i].workgroup_size_y = e->attrs[i].workgroup_size_z = 1;
+  }
+  // S4: the exports' RISC-V code (SA_RV=embedded), copied into device memory
+  if (iree_status_is_ok(status) && h.code_offset) {
+    uint64_t table = h.code_offset, total = 0;
+    if (table + 8ull * h.export_count > data.data_length) {
+      status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa-desc: code table out of range");
+    }
+    for (uint32_t i = 0; iree_status_is_ok(status) && i < h.export_count; ++i) {
+      uint32_t off, n;
+      memcpy(&off, data.data + table + 8 * i, 4);
+      memcpy(&n, data.data + table + 8 * i + 4, 4);
+      if (n && (uint64_t)off + n > data.data_length) {
+        status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "sa-desc: code of export %u out of range", i);
+      }
+      total += (n + 63u) & ~63u;
+    }
+    if (iree_status_is_ok(status) && total) {
+      status = iree_allocator_malloc_aligned(sa_context_data_allocator(context), total, 64, 0, &e->rvcode);
+    }
+    uint32_t code_phys = 0, pos = 0;
+    if (iree_status_is_ok(status) && total) status = sa_context_phys(context, e->rvcode, &code_phys);
+    for (uint32_t i = 0; iree_status_is_ok(status) && total && i < h.export_count; ++i) {
+      uint32_t off, n;
+      memcpy(&off, data.data + table + 8 * i, 4);
+      memcpy(&n, data.data + table + 8 * i + 4, 4);
+      if (!n) continue;
+      memcpy((uint8_t*)e->rvcode + pos, data.data + off, n);
+      e->exports[i].rv_embedded = code_phys + pos;
+      pos += (n + 63u) & ~63u;
+    }
   }
   __sync_synchronize();  // the templates are in memory before any list refers to them
 

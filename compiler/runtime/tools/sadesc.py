@@ -14,7 +14,10 @@ File layout (little-endian):
     16 u32 required CAPS bits  20 u32 export count    24 u32 export table offset
     28 u32 templates offset (64-aligned)  32 u32 templates bytes
     36 u32 strings offset      40 u32 strings bytes
-    44 u32 export extensions offset (version 3)       48..63 reserved (0)
+    44 u32 export extensions offset (version 3)
+    48 u32 RISC-V code table offset (0: none; iree-compile --iree-sa-riscv, docs/riscv_backend_design.md
+       §9.3 S4): per export u32 code offset (from the file start, 64-aligned), u32 code bytes (0 / 0: none);
+       position-independent rv32imc functions f(bindings, push constants)   52..63 reserved (0)
   export table, 32 bytes per export:
     0  u32 name offset (in strings)   4  u32 name length
     8  u32 template offset (bytes, from the templates start, 64-aligned)

@@ -4,6 +4,17 @@
 # C++ package names below this directory start with "sa" (sa::SATarget).
 iree_setup_c_src_root(PACKAGE_ROOT_PREFIX sa)
 
+# C7 S4 (riscv_backend_design.md §9.3): in-process rv32 code when LLVM's RISCV target is built
+# (build_iree_compiler.sh SA_WITH_RISCV=1), as the llvm-cpu plugin keys off it
+set(_SA_RISCV_DEPS)
+set(_SA_RISCV_DEFINES)
+if(TARGET LLVMRISCVCodeGen)
+  set(_SA_RISCV_DEPS LLVMRISCVAsmParser LLVMRISCVCodeGen LLVMRISCVDesc LLVMRISCVInfo LLVMPasses LLVMTarget
+                     LLVMObject LLVMMC)
+  iree_redirect_llvm_dylib_deps(_SA_RISCV_DEPS)
+  set(_SA_RISCV_DEFINES SA_HAVE_RISCV)
+endif()
+
 iree_cc_library(
   NAME
     SATarget
@@ -33,7 +44,10 @@ iree_cc_library(
     "../transforms/SahlToSahw.cpp"
     "../transforms/SahlLowerGeneric.cpp"
     "../transforms/SahlPipeline.cpp"
+  DEFINES
+    ${_SA_RISCV_DEFINES}
   DEPS
+    ${_SA_RISCV_DEPS}
     sa::SahwDialect
     LLVMSupport
     LLVMCore

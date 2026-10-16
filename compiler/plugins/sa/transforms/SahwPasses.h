@@ -79,6 +79,11 @@ LogicalResult serializeTemplate(sahw::TemplateOp t, SerializedExport &out);
 // serialized descriptors; riscvSymbol: the function's name.
 LogicalResult emitRiscvLL(sahw::TemplateOp t, const SerializedExport &se, std::string &ll);
 std::string riscvSymbol(StringRef exportName);
+// S4: the exports of one executable compiled in-process to rv32imc code, one
+// position-independent blob per export (no relocations, no data); an error when
+// iree-compile lacks LLVM's RISCV target (SA_HAVE_RISCV).
+LogicalResult compileRiscv(ArrayRef<sahw::TemplateOp> ts, ArrayRef<const SerializedExport *> ses,
+                           std::vector<std::string> &code, Operation *where);
 
 }  // namespace mlir::iree_compiler::sa
 

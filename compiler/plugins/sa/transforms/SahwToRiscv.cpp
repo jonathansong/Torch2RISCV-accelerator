@@ -32,8 +32,27 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
+#ifdef SA_HAVE_RISCV
+#include <mutex>
+
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Object/ObjectFile.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Triple.h"
+extern "C" {
+void LLVMInitializeRISCVTargetInfo();
+void LLVMInitializeRISCVTarget();
+void LLVMInitializeRISCVTargetMC();
+void LLVMInitializeRISCVAsmPrinter();
+void LLVMInitializeRISCVAsmParser();
+}
+#endif
 
 namespace mlir::iree_compiler::sa {
 namespace {
@@ -41,8 +60,11 @@ namespace {
 constexpr uint32_t OP_LOOP_END = 0x13, OP_RET = 0x16;
 
 struct RvEmitter {
-  llvm::LLVMContext ctx;
-  std::unique_ptr<llvm::Module> mod;
+  llvm::LLVMContext &ctx;
+  llvm::Module &mod;
+  // false: the PCPI primitives as calls of sa_rv_* (portable IR: the host's checks, the sim);
+  // true: as riscv32 inline assembly (.insn), compiled in-process (S4)
+  bool insn;
   llvm::IRBuilder<> b{ctx};
   llvm::Function *fn = nullptr, *ldparamFn = nullptr;
   llvm::StringMap<llvm::Function *> pcpi;   // sa_rv_<operation>: one PCPI instruction each
@@ -56,7 +78,12 @@ struct RvEmitter {
   size_t cursor = 0, rows = 0;
   std::string err;
 
-  explicit RvEmitter(const std::string &t) : templ(t), rows(t.size() / 64) {}
+  RvEmitter(llvm::LLVMContext &c, llvm::Module &m, bool asInsn, const std::string &t)
+      : ctx(c), mod(m), insn(asInsn), templ(t), rows(t.size() / 64) {
+    i32 = llvm::Type::getInt32Ty(ctx);
+    i64 = llvm::Type::getInt64Ty(ctx);
+    ptr = llvm::PointerType::getUnqual(ctx);
+  }
 
   bool fail(Operation *op, const std::string &m) {
     if (err.empty()) {
@@ -129,12 +156,60 @@ struct RvEmitter {
     if (it != pcpi.end()) return it->second;
     SmallVector<llvm::Type *> args(nargs, i32);
     auto *f = llvm::Function::Create(llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), args, false),
-                                     llvm::GlobalValue::ExternalLinkage, std::string("sa_rv_") + name, *mod);
+                                     llvm::GlobalValue::ExternalLinkage, std::string("sa_rv_") + name, mod);
     pcpi[name] = f;
     return f;
   }
+  // .insn r CUSTOM_0 (0x0B), funct3, funct7 (firmware/include/sysarray_intrinsics.h)
+  void insnCall(unsigned f3, unsigned f7, llvm::Value *rs1, llvm::Value *rs2, bool memory) {
+    auto *fty = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), {i32, i32}, false);
+    std::string text = ".insn r 0x0B, " + std::to_string(f3) + ", " + std::to_string(f7) + ", x0, $0, $1";
+    b.CreateCall(llvm::InlineAsm::get(fty, text, memory ? "r,r,~{memory}" : "r,r", /*hasSideEffects=*/true),
+                 {rs1, rs2});
+  }
+  void fenceInsn(llvm::Value *mask) {
+    auto *fty = llvm::FunctionType::get(i32, {i32}, false);
+    b.CreateCall(llvm::InlineAsm::get(fty, ".insn r 0x0B, 4, 1, $0, $1, x0", "=r,r,~{memory}", true), {mask});
+  }
   void call(const char *name, std::initializer_list<llvm::Value *> args) {
-    b.CreateCall(prim(name, unsigned(args.size())), args);
+    if (!insn) {
+      b.CreateCall(prim(name, unsigned(args.size())), args);
+      return;
+    }
+    std::vector<llvm::Value *> a(args);
+    std::string n(name);
+    if (n == "mat_cfg") insnCall(0, 1, a[0], a[1], false);
+    else if (n == "mat_load") insnCall(1, 1, a[0], a[1], true);
+    else if (n == "mat_store") insnCall(2, 1, a[0], a[1], true);
+    else if (n == "mat_exec")                    // rs1 = b << 16 | a, rs2 = acc << 28 | kt << 16 | c (as mat_exec)
+      insnCall(3, 1, b.CreateOr(b.CreateShl(a[1], c32(16)), b.CreateAnd(a[0], c32(0xFFFF))),
+               b.CreateOr(b.CreateOr(b.CreateShl(a[4], c32(28)), b.CreateShl(b.CreateAnd(a[3], c32(0xFFF)), c32(16))),
+                          b.CreateAnd(a[2], c32(0xFFFF))),
+               true);
+    else if (n == "mat_fence") fenceInsn(a[0]);
+    else if (n == "vec_cfg") insnCall(0, 2, a[0], a[1], false);
+    else if (n == "vec_run") insnCall(1, 2, a[0], a[1], true);
+    else if (n == "gemv_cfg") insnCall(0, 3, a[0], a[1], false);
+    else if (n == "gemv_run")                    // rs2 = acc << 28 | (strips - 1) << 16 | c (as gemv_run)
+      insnCall(1, 3, a[0],
+               b.CreateOr(b.CreateOr(b.CreateShl(a[3], c32(28)),
+                                     b.CreateShl(b.CreateAnd(b.CreateSub(a[2], c32(1)), c32(7)), c32(16))),
+                          b.CreateAnd(a[1], c32(0xFFFF))),
+               true);
+    else fail(nullptr, "no instruction for " + n);
+  }
+  // LDPARAM: the word at a DDR address once the engines are idle (it may have just been stored)
+  llvm::Value *ldparam(llvm::Value *addr) {
+    if (!insn) {
+      if (!ldparamFn)
+        ldparamFn = llvm::Function::Create(llvm::FunctionType::get(i32, {i32}, false),
+                                           llvm::GlobalValue::ExternalLinkage, "sa_rv_ldparam", mod);
+      return b.CreateCall(ldparamFn, {addr});
+    }
+    fenceInsn(c32(0));
+    auto *ld = b.CreateLoad(i32, b.CreateIntToPtr(addr, ptr));
+    ld->setVolatile(true);
+    return ld;
   }
   // a configuration key (table 0 mat_cfg, 1 vec_cfg, 2 gemv_cfg), unless the same constant is there
   void cfg(unsigned table, uint32_t key, llvm::Value *v) {
@@ -281,7 +356,7 @@ struct RvEmitter {
         if (!takeRow(op, row)) return false;
         llvm::Value *a = dynField(op, row, 1, uint64_t(o.getAddr()), 0xFFFFFFFFull, o.getDyn());
         if (o.getBase()) a = b.CreateAdd(a, load(op, o.getBase()));
-        llvm::Value *v = b.CreateCall(ldparamFn, {a});
+        llvm::Value *v = ldparam(a);
         v = b.CreateAdd(b.CreateMul(v, c32(uint64_t(o.getMul()) & 0xFFFF)), c32(uint64_t(o.getAdd())));
         store(op, o.getTarget(), v);
       } else if (auto o = dyn_cast<sahw::LdOp>(op)) {
@@ -319,19 +394,15 @@ std::string riscvSymbol(StringRef exportName) {
   return s;
 }
 
-LogicalResult emitRiscvLL(sahw::TemplateOp t, const SerializedExport &se, std::string &ll) {
+namespace {
+// The export's function into the emitter's module.
+LogicalResult buildFunction(RvEmitter &e, sahw::TemplateOp t) {
   if (t.getUnsupported()) return t.emitError("sahw to riscv: an unsupported export");
-  RvEmitter e(se.templ);
-  e.mod = std::make_unique<llvm::Module>(t.getExportName().str(), e.ctx);
-  e.i32 = llvm::Type::getInt32Ty(e.ctx);
-  e.i64 = llvm::Type::getInt64Ty(e.ctx);
-  e.ptr = llvm::PointerType::getUnqual(e.ctx);
   auto *voidTy = llvm::Type::getVoidTy(e.ctx);
-  e.ldparamFn = llvm::Function::Create(llvm::FunctionType::get(e.i32, {e.i32}, false),
-                                       llvm::GlobalValue::ExternalLinkage, "sa_rv_ldparam", *e.mod);
   e.fn = llvm::Function::Create(llvm::FunctionType::get(voidTy, {e.ptr, e.ptr}, false),
-                                llvm::GlobalValue::ExternalLinkage, riscvSymbol(t.getExportName()), *e.mod);
+                                llvm::GlobalValue::ExternalLinkage, riscvSymbol(t.getExportName()), e.mod);
   e.fn->addFnAttr(llvm::Attribute::NoUnwind);      // (no unwind tables: the code is a flat image)
+  e.fn->addFnAttr("no-jump-tables", "true");        // (position independent, no data)
   e.bindArg = e.fn->getArg(0);
   e.pcArg = e.fn->getArg(1);
   e.bindArg->setName("bindings");
@@ -368,14 +439,118 @@ LogicalResult emitRiscvLL(sahw::TemplateOp t, const SerializedExport &se, std::s
   }
   if (e.cursor != e.rows) return t.emitError("sahw to riscv: descriptors left over");
   e.b.CreateRetVoid();
+  return success();
+}
+}  // namespace
+
+LogicalResult emitRiscvLL(sahw::TemplateOp t, const SerializedExport &se, std::string &ll) {
+  llvm::LLVMContext ctx;
+  llvm::Module mod(t.getExportName().str(), ctx);
+  RvEmitter e(ctx, mod, /*insn=*/false, se.templ);
+  if (failed(buildFunction(e, t))) return failure();
   std::string verr;
   llvm::raw_string_ostream vos(verr);
-  if (llvm::verifyModule(*e.mod, &vos)) return t.emitError("sahw to riscv: invalid LLVM IR: ") << verr;
+  if (llvm::verifyModule(mod, &vos)) return t.emitError("sahw to riscv: invalid LLVM IR: ") << verr;
   ll.clear();
   llvm::raw_string_ostream os(ll);
   os << "; " << t.getExportName() << ": the sa export's commands over PCPI (docs/riscv_backend_design.md §9)\n";
-  e.mod->print(os, nullptr);
+  mod.print(os, nullptr);
   return success();
 }
+
+#ifdef SA_HAVE_RISCV
+// S4: the exports of one executable compiled in-process for rv32imc (the PCPI
+// instructions as inline assembly, -O2, medany, no linker relaxation, no jump
+// tables, one section per function); each function's code taken out of the
+// object as it is, which requires it to have no relocations and no data (the
+// specialized code: immediates, PC-relative branches only).
+LogicalResult compileRiscv(ArrayRef<sahw::TemplateOp> ts, ArrayRef<const SerializedExport *> ses,
+                           std::vector<std::string> &code, Operation *where) {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    LLVMInitializeRISCVTargetInfo();
+    LLVMInitializeRISCVTarget();
+    LLVMInitializeRISCVTargetMC();
+    LLVMInitializeRISCVAsmPrinter();
+    LLVMInitializeRISCVAsmParser();
+  });
+  llvm::Triple triple("riscv32-unknown-elf");
+  std::string terr;
+  const llvm::Target *target = llvm::TargetRegistry::lookupTarget(triple, terr);
+  if (!target) return where->emitError("sa riscv: ") << terr;
+  llvm::TargetOptions opts;
+  opts.FunctionSections = true;
+  std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
+      triple, "generic-rv32", "+m,+c,-relax", opts, llvm::Reloc::Static, llvm::CodeModel::Medium,
+      llvm::CodeGenOptLevel::Default));
+  if (!tm) return where->emitError("sa riscv: no target machine");
+  llvm::LLVMContext ctx;
+  llvm::Module mod("sa_riscv", ctx);
+  mod.setTargetTriple(triple);
+  mod.setDataLayout(tm->createDataLayout());
+  for (auto [t, se] : llvm::zip(ts, ses)) {
+    RvEmitter e(ctx, mod, /*insn=*/true, se->templ);
+    if (failed(buildFunction(e, t))) return failure();
+  }
+  std::string verr;
+  llvm::raw_string_ostream vos(verr);
+  if (llvm::verifyModule(mod, &vos)) return where->emitError("sa riscv: invalid LLVM IR: ") << verr;
+  {                                                 // -O2 (the slots promoted, the loops simplified)
+    llvm::LoopAnalysisManager lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager cgam;
+    llvm::ModuleAnalysisManager mam;
+    llvm::PassBuilder pb(tm.get());
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+    pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2).run(mod, mam);
+  }
+  llvm::SmallVector<char, 0> obj;
+  {
+    llvm::raw_svector_ostream os(obj);
+    llvm::legacy::PassManager pm;
+    if (tm->addPassesToEmitFile(pm, os, nullptr, llvm::CodeGenFileType::ObjectFile))
+      return where->emitError("sa riscv: cannot emit an object");
+    pm.run(mod);
+  }
+  auto file = llvm::object::ObjectFile::createObjectFile(
+      llvm::MemoryBufferRef(llvm::StringRef(obj.data(), obj.size()), "sa_riscv.o"));
+  if (!file) return where->emitError("sa riscv: ") << llvm::toString(file.takeError());
+  llvm::StringMap<std::string> byName;
+  for (const llvm::object::SectionRef &sec : (*file)->sections()) {
+    auto name = sec.getName();
+    if (!name) continue;
+    if (sec.relocations().begin() != sec.relocations().end()) {
+      auto target = sec.getRelocatedSection();
+      std::string what = target && *target != (*file)->section_end() ? std::string(*(*target)->getName()) : "?";
+      return where->emitError("sa riscv: relocations in ") << what << " (the code is taken without linking)";
+    }
+    bool data = name->starts_with(".rodata") || name->starts_with(".srodata") || name->starts_with(".data") ||
+                name->starts_with(".sdata") || name->starts_with(".bss") || name->starts_with(".sbss");
+    if (data && sec.getSize()) return where->emitError("sa riscv: data in ") << *name;
+    if (name->starts_with(".text.")) {
+      auto contents = sec.getContents();
+      if (!contents) return where->emitError("sa riscv: ") << llvm::toString(contents.takeError());
+      byName[name->drop_front(6)] = contents->str();
+    }
+  }
+  code.clear();
+  for (auto t : ts) {
+    auto it = byName.find(riscvSymbol(t.getExportName()));
+    if (it == byName.end()) return t.emitError("sa riscv: no code for this export in the object");
+    code.push_back(it->second);
+  }
+  return success();
+}
+#else
+LogicalResult compileRiscv(ArrayRef<sahw::TemplateOp>, ArrayRef<const SerializedExport *>, std::vector<std::string> &,
+                           Operation *where) {
+  return where->emitError("sa riscv: iree-compile was built without LLVM's RISCV target "
+                          "(compiler/scripts/build_iree_compiler.sh with SA_WITH_RISCV=1)");
+}
+#endif
 
 }  // namespace mlir::iree_compiler::sa

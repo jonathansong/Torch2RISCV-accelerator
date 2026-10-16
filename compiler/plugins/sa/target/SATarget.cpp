@@ -70,6 +70,9 @@ struct SAOptions {
   // RISC-V function issuing its commands over PCPI, <dir>/<export>.ll (empty: off; the
   // binary is the same either way).
   std::string emitRiscv;
+  // C7 plan A, S4 (§9.3): each export's code compiled in-process for the PicoRV32 (rv32imc)
+  // and added to the sa-desc file as an optional code table (the descriptor templates unchanged).
+  bool riscv = false;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -99,6 +102,9 @@ struct SAOptions {
     binder.opt<std::string>("iree-sa-emit-riscv", emitRiscv, llvm::cl::cat(category),
                             llvm::cl::desc("Also write each export as LLVM IR of a RISC-V function issuing its "
                                            "commands over PCPI, into this directory (C7 plan A)."));
+    binder.opt<bool>("iree-sa-riscv", riscv, llvm::cl::cat(category),
+                     llvm::cl::desc("Also compile each export to rv32imc code for the PicoRV32 and embed it in the "
+                                    "sa-desc file (C7 plan A, S4; needs iree-compile built with the RISCV target)."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -227,6 +233,22 @@ public:
     }
     llvm::sort(exports, [](auto &a, auto &b) { return a.first < b.first; });
 
+    // S4: the exports' rv32 code (in the sorted order), appended after the extensions with a table
+    // (header word 48: its offset; per export the code's offset and bytes, 0 / 0: none)
+    std::vector<std::string> rvcode;
+    if (options.riscv) {
+      SmallVector<sa::sahw::TemplateOp> ts;
+      std::vector<sa::SerializedExport> sev(exports.size());
+      SmallVector<const sa::SerializedExport *> ses;
+      for (auto [i, ex] : llvm::enumerate(exports)) {
+        sa::sahw::TemplateOp t = templates.lookup(ex.second.name);
+        if (failed(sa::serializeTemplate(t, sev[i]))) return failure();
+        ts.push_back(t);
+        ses.push_back(&sev[i]);
+      }
+      if (failed(sa::compileRiscv(ts, ses, rvcode, variantOp))) return failure();
+    }
+
     // sa-desc version 3 (compiler/runtime/tools/sadesc.py): header, export
     // table, templates (64-byte aligned), names, register setup tables, the
     // export extensions (prefix, head, bindings read / written, SPAD_B use)
@@ -283,6 +305,23 @@ public:
     blob += setups;
     blob.resize(extOff, '\0');
     blob += ext;
+    if (!rvcode.empty()) {
+      uint32_t tabOff = (uint32_t(blob.size()) + 15) / 16 * 16;
+      blob.resize(tabOff, '\0');
+      uint32_t pos = (tabOff + 8 * n + 63) / 64 * 64;
+      std::string tab;
+      for (const std::string &c : rvcode) {
+        u32(tab, c.empty() ? 0 : pos);
+        u32(tab, uint32_t(c.size()));
+        pos = (pos + uint32_t(c.size()) + 63) / 64 * 64;
+      }
+      blob += tab;
+      for (const std::string &c : rvcode) {
+        blob.resize((blob.size() + 63) / 64 * 64, '\0');
+        blob += c;
+      }
+      std::memcpy(&blob[48], &tabOff, 4);
+    }
 
     if (!serOptions.dumpBinariesPath.empty()) {
       dumpDataToPath(serOptions.dumpBinariesPath, serOptions.dumpBaseName, variantOp.getName(), ".sadesc",

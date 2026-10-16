@@ -195,7 +195,9 @@ void sa_context_profile_reset(void);
 // Generated RISC-V code (sa_rv.c; SA_RV=<dir>): the function of an export (0: none,
 // the descriptor list then) and its symbol; a dispatch through it (the pending
 // batch flushed first).
-iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap, uint32_t* out_phys);
+// SA_RV=embedded: the executables' own code (S4; |embedded_phys|, 0: none) instead of an image.
+iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap,
+                           uint32_t embedded_phys, uint32_t* out_phys);
 const char* sa_rv_symbol_at(uint32_t phys);
 uint32_t sa_rv_scratch_phys(void);
 iree_status_t sa_rv_call(sa_context_t* c, iree_string_view_t name, const char* symbol, uint32_t code_phys,

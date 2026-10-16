@@ -1,5 +1,6 @@
 // sa HAL driver: dispatches through the generated RISC-V code (plan A,
-// docs/riscv_backend_design.md §9.4): SA_RV=<dir> holds a model's code image
+// docs/riscv_backend_design.md §9.4): SA_RV=embedded takes each executable's
+// own code (iree-compile --iree-sa-riscv, S4); SA_RV=<dir> holds a model's code image
 // (compiler/tests/rv_image.py: rvcode.bin, rvcode.map, rvcode_host.so for the
 // sim). The image is loaded once into the device window; a dispatch whose
 // export has a function there runs as that function (the board: rt_fw's
@@ -36,6 +37,18 @@ static iree_status_t sa_rv_load(sa_context_t* c) {
   const char* dir = getenv("SA_RV");
   sa_rv.state = 1;
   if (!dir || !*dir) return iree_ok_status();
+  if (strcmp(dir, "embedded") == 0) {                // S4: each executable's own code (sa_loader.c)
+    if (!c->transport->run_call) {
+      return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                              "sa rv: the %s transport cannot call embedded RISC-V code (the board, rt_fw >= 4)",
+                              c->transport->name);
+    }
+    const char* only = getenv("SA_RV_ONLY");
+    if (only) snprintf(sa_rv.only, sizeof(sa_rv.only), "%s", only);
+    sa_rv.state = 3;
+    fprintf(stderr, "sa rv: the executables' embedded RISC-V code\n");
+    return iree_ok_status();
+  }
   if (!c->transport->run_call) {
     return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "sa rv: the %s transport cannot call RISC-V code (rt_fw >= 4)",
                             c->transport->name);
@@ -84,12 +97,13 @@ static iree_status_t sa_rv_load(sa_context_t* c) {
 
 // The function of an export (the symbol: the export's name with every
 // character but letters and digits as '_', SahwToRiscv.cpp riscvSymbol).
-iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap, uint32_t* out_phys) {
+iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap,
+                           uint32_t embedded_phys, uint32_t* out_phys) {
   *out_phys = 0;
   if (sa_rv.state == 0) {
     IREE_RETURN_IF_ERROR(sa_rv_load(c));
   }
-  if (sa_rv.state != 2 || name.size + 1 > cap) return iree_ok_status();
+  if ((sa_rv.state != 2 && sa_rv.state != 3) || name.size + 1 > cap) return iree_ok_status();
   for (size_t i = 0; i < name.size; ++i) {
     char ch = name.data[i];
     symbol[i] = ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) ? ch : '_';
@@ -101,6 +115,10 @@ iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbo
     snprintf(list, sizeof(list), "%s", sa_rv.only);
     for (char* t = strtok(list, ","); t && !hit; t = strtok(NULL, ",")) hit = strstr(symbol, t) != NULL;
     if (!hit) return iree_ok_status();
+  }
+  if (sa_rv.state == 3) {
+    *out_phys = embedded_phys;
+    return iree_ok_status();
   }
   sa_rv_entry_t key = {symbol, 0};
   sa_rv_entry_t* e = (sa_rv_entry_t*)bsearch(&key, sa_rv.entries, sa_rv.count, sizeof(*sa_rv.entries), sa_rv_cmp);
