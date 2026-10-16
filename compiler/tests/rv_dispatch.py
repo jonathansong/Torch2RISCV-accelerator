@@ -186,10 +186,11 @@ def main():
     ap.add_argument("source")
     ap.add_argument("--t", type=int, default=16)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--code", choices=["trace", "compiled"], default="trace",
+    ap.add_argument("--code", choices=["trace", "compiled", "embedded"], default="trace",
                     help="rvb_gen: the traced commands as straight-line C (R2's first form), or a call of the "
                          "export's compiled function (sahw -> LLVM -> riscv32, riscv_backend_design.md §9: "
-                         "rvb_gen.ll, linked with firmware/rv/sa_rv_rt.c)")
+                         "rvb_gen.ll, linked with firmware/rv/sa_rv_rt.c), or the rv32 code iree-compile "
+                         "embedded in the sa-desc file (--iree-sa-riscv, S4: rvb_code.bin, included as it is)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     text = G.sa_only(open(args.source).read())
@@ -197,7 +198,11 @@ def main():
     open(src, "w").write(text)
     for old_ll in glob.glob(os.path.join(args.out, "*.ll")):
         os.remove(old_ll)
-    emit = [f"--iree-sa-emit-riscv={args.out}"] if args.code == "compiled" else []
+    emit = ([f"--iree-sa-emit-riscv={args.out}"] if args.code == "compiled" else
+            ["--iree-sa-riscv"] if args.code == "embedded" else [])
+    for stale in ("rvb_code.bin", "rvb_embed.S"):
+        if os.path.exists(os.path.join(args.out, stale)):
+            os.remove(os.path.join(args.out, stale))
     blob, err = G.compile_one(src, emit, os.path.join(args.out, "dispatch.sadesc"))
     if blob is None:
         raise SystemExit(err)
@@ -230,7 +235,34 @@ def main():
         fh.write(f"/* {name}, T = {args.t} (compiler/tests/rv_dispatch.py) */\n")
         fh.write(f"#define RVB_LIST_OFF 0x{lst_addr - DDR_BASE:x}u\n#define RVB_DDR_BYTES {size}\n")
         fh.write(f"#define RVB_COMMANDS {sum(v for k, v in em.counts.items() if k != 'FENCE')}\n")
-    if args.code == "compiled":
+    if args.code == "embedded":
+        # the export's rv32 code from the sa-desc code table (header word 48), as iree-compile made it
+        import struct
+        tab = struct.unpack_from("<I", blob, 48)[0]
+        if not tab:
+            raise SystemExit(f"{name}: no RISC-V code table (iree-compile --iree-sa-riscv)")
+        off, n = struct.unpack_from("<II", blob, tab)
+        open(os.path.join(args.out, "rvb_code.bin"), "wb").write(blob[off:off + n])
+        with open(os.path.join(args.out, "rvb_embed.S"), "w") as fh:
+            fh.write('/* the export\'s code from the sa-desc file (iree-compile --iree-sa-riscv), as it is */\n'
+                     '    .section .rvb_gen, "ax"\n    .balign 4\n    .globl rvb_code\nrvb_code:\n'
+                     f'    .incbin "{os.path.join(os.path.abspath(args.out), "rvb_code.bin")}"\n')
+        keep = DC.O.load_dispatch(src)           # (the tuple holds the MLIR context alive)
+        consts = [int(c) & 0xFFFFFFFF for c in DC.push_constants(keep[2], args.t)]
+        with open(os.path.join(args.out, "rvb_gen.c"), "w") as fh:
+            fh.write(f"/* {name}, T = {args.t}: the export's rv32 code embedded by iree-compile (rvb_code.bin, {n} bytes)\n"
+                     f" * with the dispatch's bindings and push constants (rv_dispatch.py --code embedded) */\n"
+                     f"#include <stdint.h>\n\nvoid rvb_code(const uint32_t *bindings, const uint32_t *push_constants);\n\n"
+                     f'__attribute__((section(".rvb_gen"), noinline)) void rvb_gen(uint32_t W)\n{{\n'
+                     f"    uint32_t b[{max(len(phys), 1)}], pc[{max(len(consts), 1)}];\n")
+            for i, a in enumerate(phys):
+                fh.write(f"    b[{i}] = W + 0x{int(a) - DDR_BASE:x}u;\n" if a else f"    b[{i}] = 0;\n")
+            for i, c in enumerate(consts):
+                fh.write(f"    pc[{i}] = 0x{c:x}u;\n")
+            fh.write("    rvb_code(b, pc);\n}\n")
+        if os.path.exists(os.path.join(args.out, "rvb_gen.ll")):
+            os.remove(os.path.join(args.out, "rvb_gen.ll"))
+    elif args.code == "compiled":
         # the export's generated function, called with the dispatch's bindings (relative to the
         # window W) and push constants
         lls = [x for x in glob.glob(os.path.join(args.out, "*.ll")) if not x.endswith("rvb_gen.ll")]

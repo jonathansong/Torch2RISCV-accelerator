@@ -41,11 +41,13 @@ $(if $(RVLL),$(CC) $(RVFLAGS) -c $(RVLL) -o $(1)/rvb_gen_ll.o && \
   $(CC) $(RVFLAGS) -c $(FW_ROOT)/rv/sa_rv_rt.c -o $(1)/sa_rv_rt.o,true)
 endef
 RVOBJS = $(if $(RVLL),$(1)/rvb_gen_ll.o $(1)/sa_rv_rt.o)
+# rv_dispatch.py --code embedded: the export's rv32 code from the sa-desc file (S4), included as it is
+RVEMB := $(wildcard $(RVB)/rvb_embed.S)
 
 sim:
 	mkdir -p $(SIM)
 	$(call rvobjs,$(SIM))
-	$(CC) $(CFLAGS) $(LDFLAGS) -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(call RVOBJS,$(SIM)) -o $(SIM)/rvb_fw.elf
+	$(CC) $(CFLAGS) $(LDFLAGS) -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(RVEMB) $(call RVOBJS,$(SIM)) -o $(SIM)/rvb_fw.elf
 	$(OBJCOPY) -O binary $(if $(filter ddr,$(RVB_CODE)),--remove-section=.rvb_gen) $(SIM)/rvb_fw.elf $(SIM)/fw.bin
 	$(PYTHON) -c "import struct; d=open('$(SIM)/fw.bin','rb').read(); d+=b'\0'*(-len(d)%4); \
 	open('$(SIM)/fw.hex','w').write('\n'.join('%08x'%w for w in struct.unpack('<%dI'%(len(d)//4),d))+'\n'); \
@@ -72,10 +74,10 @@ OUT ?= $(RVB)/board
 bundle:
 	mkdir -p $(OUT)
 	$(call rvobjs,$(OUT))
-	$(CC) $(CFLAGS) -fuse-ld=lld -T $(FW_ROOT)/common/link.ld -Wl,--gc-sections -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(call RVOBJS,$(OUT)) -o $(OUT)/fw_bram.elf
+	$(CC) $(CFLAGS) -fuse-ld=lld -T $(FW_ROOT)/common/link.ld -Wl,--gc-sections -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(RVEMB) $(call RVOBJS,$(OUT)) -o $(OUT)/fw_bram.elf
 	$(OBJCOPY) -O binary $(OUT)/fw_bram.elf $(OUT)/fw_bram.bin
 	$(CC) $(CFLAGS) -DRVB_CODE_DDR -fuse-ld=lld -T link_ddr.ld -Wl,--defsym=RVB_CODE_ADDR=$(CODE_ADDR) -Wl,--gc-sections \
-	  -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(call RVOBJS,$(OUT)) -o $(OUT)/fw_ddr.elf
+	  -Wl,--no-relax $(FW_ROOT)/common/start.S rvb_fw.c $(RVB)/rvb_gen.c $(RVEMB) $(call RVOBJS,$(OUT)) -o $(OUT)/fw_ddr.elf
 	$(OBJCOPY) -O binary --remove-section=.rvb_gen $(OUT)/fw_ddr.elf $(OUT)/fw_ddr.bin
 	$(OBJCOPY) -O binary --only-section=.rvb_gen $(OUT)/fw_ddr.elf $(OUT)/code.bin
 	@ls -l $(OUT)/fw_bram.bin $(OUT)/fw_ddr.bin $(OUT)/code.bin | awk '{print $$5, $$9}'
