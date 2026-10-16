@@ -212,6 +212,21 @@ The core runs the whole step as RISC-V code issuing PCPI commands (§3 model A),
 
 - **Command format**: one-instruction issue (a descriptor written from registers, or a command FIFO the core stores to) instead of `mat_cfg` sequences; which fields must be dynamic.
 - **Instruction memory**: the hot loops' size (R2 gives it per dispatch) against a TCM or I-cache; PicoRV32's BRAM is 8 KB with `rt_fw` resident.
+
+  **Answer from plan A's code (2026-10-16, `compiler/tests/rv_codesize.py`):** the S4 code tables give each export's rv32 bytes, and a sim profile of one step gives which exports the step calls and how often (the calls do not depend on the device). Static working set, one step:
+
+  | | all rv32 code | step: calls, exports | step working set | called every layer: exports, code, share of calls | per-layer copies merged |
+  |---|---|---|---|---|---|
+  | Qwen3-0.6B decode | 607 KB | 932, 140 | 288 KB | 25, 14.4 KB, 88% | 25.6 KB |
+  | Gemma-3-270M decode | 656 KB | 618, 98 | 64.6 KB | 22, 10.4 KB, 85% | 14.5 KB |
+  | Llama-3.2-1B decode | 627 KB | 472, 86 | 231 KB | 19, 17.2 KB, 86% | 32.9 KB |
+  | Qwen3-0.6B prefill (chunk of 16) | | 6376, 1056 | 562 KB | 67, 102.7 KB, 71% | |
+
+  Most of a decode step's working set is per-layer copies of the attention kernels: QK `batch_matmul` (5.7 KB in Qwen3, 7.2 KB in Llama), PV `matmul_like` and the KV write. Each layer has its own export, and two copies of Qwen3's PV kernel differ in 19 halfwords. The layer's KV cache offset is compiled into immediates (the commands are specialized at compile time, §9.9), so the copies cannot share code; in Qwen3 they are 244 of the 288 KB. Consequences for an ASIC:
+  - **Today's code does not fit a small TCM**: no decode step fits 8–16 KB. The part called every layer (10–17 KB) does, and covers 85–88% of the calls. The per-layer copies are called once per step, so an I-cache of that size misses on them every step; they are about 12% of the calls.
+  - **Code shared between layers**: with the per-layer offsets passed as runtime values (a push constant or a binding offset instead of an immediate; one export per kernel shape), a decode step needs 15–33 KB for all three models. A 32–64 KB TCM then holds the whole decode step, and the core never fetches code from DRAM. This is a compiler change (keep the KV layer offset dynamic for the attention dispatches); it costs a register add per address computation.
+  - **Prefill is larger**: 562 KB per chunk, 103 KB of it called every layer. It needs DRAM with an I-cache, or the same de-specialization; a decode-only TCM is the realistic target.
+  - Not measured yet: the dynamic fetch traffic (instructions executed per call, the loop bodies' reuse). The next step is the performance counters per call (`rdinstret` / `rdcycle` on the core, the unit's STARVE / ALL_IDLE).
 - **Core performance**: whether a simple in-order core issuing at the §2 rates is enough, or the command DMA must stay (model B).
 - **Scalar work on the core**: sampling, small reductions, KV cache bookkeeping, the per-token scales (today the VE's REDUCE and SFU).
 
