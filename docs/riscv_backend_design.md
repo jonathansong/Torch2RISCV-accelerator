@@ -260,7 +260,20 @@ Implemented: `rv_dispatch.py --code compiled` (firmware/rvb calls an export's ge
 | RTL (`RVB_TEST`): the six SmolLM2 dispatches (norm reduction, quantization, q / up projections on GEMV, q · Kᵀ, p · V) as their generated functions | **bit-identical in BRAM and in DDR mode**; time against the list ×1.01–4.75 (BRAM), ×1.10–31 (DDR, 40 cycles per instruction fetch) |
 | RTL (`RING_TEST`): `RT_CALL` of a function in DDR | 12/12 completions |
 | sim: SmolLM2 2-layer, prefill + 12 decode steps, `SA_RV` | all 1536 dispatches as RISC-V code, logits identical to the descriptor path |
-| **board** (`run_board_tests.sh rvbc`): the six dispatches, BRAM and DDR | **12/12 runs bit-identical** |
+| **board** (`run_board_tests.sh rvbc`): the six dispatches, BRAM and DDR | **12/12 runs bit-identical**; time against the list ×3.4–48.9 (BRAM), ×5.6–80.9 (DDR) |
+
+The six dispatches on the board (rdcycle at 100 MHz; list = the descriptor path, PCPI = the generated function; the trace-based straight-line C of §6 for comparison):
+
+| Dispatch | Commands | List | Generated, BRAM | Generated, DDR | Trace C, BRAM / DDR (§6) |
+|---|---:|---:|---:|---:|---:|
+| smol_3 RMSNorm reduction | 3 | 948 | 7242 (×7.6) | 11599 (×12.0) | ×1.41 / ×2.05 |
+| smol_6 quantization | 6 | 743 | 14551 (×19.6) | 23496 (×31.0) | ×2.02 / ×3.56 |
+| smol_7 q projection (GEMV) | 9 | 5838 | 19970 (×3.4) | 32387 (×5.6) | ×1.03 / ×1.08 |
+| smol_16 q · Kᵀ | 54 | 8675 | 164061 (×18.9) | 274645 (×31.8) | ×1.18 / ×1.67 |
+| smol_19 p · V | 57 | 3324 | 162574 (×48.9) | 266531 (×80.9) | ×2.02 / ×3.82 |
+| smol_28 up projection (GEMV) | 67 | 23870 | 160132 (×6.7) | 261746 (×11.0) | ×1.05 / ×1.11 |
+
+The ratios are higher than in RTL (×1.01–4.75 in BRAM) because the board's accelerator is faster than the testbench's DDR model (smol_7's list: 5838 cycles on the board, 87142 in RTL) while the core is slower (every fetch, even from the BRAM, is an AXI transaction; the testbench's BRAM answers in one cycle). Per command the generated code costs the core about 2900 cycles from the BRAM and 5000 from DDR (smol_16: (164061 − 8675) / 54), against one or two hundred for the trace C, whose commands are immediates: the runtime's generic path (the 64-byte descriptor read, 64-bit field arithmetic, every key written), not the accelerator, sets the time.
 | **board** (`board_rvcode.py`, Qwen3-0.6B long-context bundle): the 40-token prompt (3 prefill chunks) + 16 decode steps, `SA_RV` | **34039 dispatches as RISC-V code, 0 descriptor lists; logits bit-exact with the sim in 17/17 steps, tokens identical** |
 
 Speed on the board (not the aim of plan A): decode 1434 ms per step against 138 ms with descriptor lists (×10.4), prefill 36.7 s for the 3 chunks against 2.6 s. Every command costs the core its 64-byte descriptor read from DDR, the dynamic fields applied in 64-bit software arithmetic, all of its configuration keys written over PCPI and the instruction fetches from uncached DDR (the 1.4 MB image cannot sit in the 8 KB BRAM); the accelerator mostly waits. These are the numbers §8 asks for: without a command DMA a control core needs local instruction memory and a command format it can issue in a few instructions; the next step on the compiler side is specializing the configuration writes at compile time (§9.2: only the fields a command really sets, static ones as immediates), which removes most of the per-command work.
