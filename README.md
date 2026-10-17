@@ -222,6 +222,12 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   (tag `v2.2-kv260`): speed, quality, long context, decode bandwidth and the
   RISC-V backend paths for SmolLM2, Gemma-3, Qwen3 and Llama-3.2, with the
   bundle, commit and log behind each
+- [LLM learning path](docs/llm_learning_path.md) - the models, their
+  numerics, W8A8 and KV-cache quantization, the inference system, prefill /
+  decode, long context, and measuring speed and quality on the board
+- [Compiler learning path](docs/compiler_learning_path.md) - MLIR and IREE,
+  the export, the `sa` backend pass by pass, the HAL driver, verification,
+  the RISC-V backend and upstreaming to IREE
 - [Hardware learning path](docs/hardware_learning_path.md) - a staged guide
   from digital design fundamentals to the accelerator RTL, verification,
   timing closure and board measurements, with labs on this repository
