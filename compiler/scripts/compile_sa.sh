@@ -16,8 +16,9 @@
 # that differ only in constants, e.g. a layer's KV cache offset or scale, merged:
 # --iree-flow-enable-executable-generalization, IREE patch 0003,
 # docs/riscv_backend_design.md §9.11).
-# SA_FUSE_FFN=1: decode's gated FFN (two projections, gating, amax, int8 output)
-# in one dispatch (--iree-sa-fuse-ffn, docs/fusion_design.md; default off).
+# SA_FUSE_FFN=0: decode's gated FFN in separate dispatches as before (default 1:
+# the two projections, gating, amax and int8 output in one dispatch,
+# --iree-sa-fuse-ffn, docs/fusion_design.md §4.9).
 # SA_HOST_FALLBACK=0: no host fallback (default 1: every dispatch also gets a
 # VMVX variant; one the sa backend cannot compile runs on the ARM host, plan
 # §8.15; IREE's executable linking is off, it would merge the VMVX variants of
@@ -34,7 +35,7 @@ rm -f "$dir"/sa_sources/*.mlir      # (a source left from an earlier compile has
   --iree-dispatch-creation-enable-aggressive-fusion \
   --iree-opt-strip-assertions \
   $( [ "${SA_GENERALIZE:-1}" = 1 ] && echo --iree-flow-enable-executable-generalization ) \
-  $( [ "${SA_FUSE_FFN:-0}" = 1 ] && echo --iree-sa-fuse-ffn ) \
+  $( [ "${SA_FUSE_FFN:-1}" = 1 ] && echo --iree-sa-fuse-ffn ) \
   $( [ "${SA_HOST_FALLBACK:-1}" = 1 ] && echo --iree-sa-host-fallback --iree-hal-link-executables=false ) \
   $( [ -n "${SA_D:-}" ] && [ "$SA_D" != 8 ] && echo --iree-sa-d="$SA_D" ) \
   $( [ "${SA_GEMV_PORTS:-0}" != 0 ] && echo --iree-sa-gemv-ports="$SA_GEMV_PORTS" ) \

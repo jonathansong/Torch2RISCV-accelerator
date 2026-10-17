@@ -2,8 +2,8 @@
 
 Status: evaluation done (2026-10-17, `compiler/tests/fusion_whatif.py`,
 [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.23); the SwiGLU fusion is
-implemented (`97a3323`, `--iree-sa-fuse-ffn` / `SA_FUSE_FFN=1`, default off)
-and accepted on the board on all four models (2026-10-17, §4.8): bit-exact,
+implemented (`97a3323`, `--iree-sa-fuse-ffn`; on by default in
+`compile_sa.sh` since 2026-10-18, `SA_FUSE_FFN=0` turns it off) and accepted on the board on all four models (2026-10-17, §4.8): bit-exact,
 decode −1.1% to −2.7% of device time, about half of the model's −2.3% to
 −4.4%, for a reason found in §4.8 (the fused gating is not chunked enough to
 overlap the weight streaming). The schedule is fixed in `ea7ca80` (§4.9)
@@ -188,8 +188,9 @@ are packed, the scales materialized):
   reads it, which today nothing does).
 - **Decode only** in the first version: M = 1 (vectors). Prefill's chain
   (M = 16) is left to IREE: its intermediates do not fit (§4.4).
-- Flag `--iree-sa-fuse-ffn` (default off), `compile_sa.sh` `SA_FUSE_FFN=1`.
-  With the flag off nothing changes (golden corpus identical).
+- Flag `--iree-sa-fuse-ffn` (off in `iree-compile`; `compile_sa.sh` passes it
+  by default since 2026-10-18, `SA_FUSE_FFN=0` to leave it out). With the
+  flag off nothing changes (golden corpus identical).
 - Lit test: a two-layer FFN in linalg, the region formed; a near miss (two
   contractions with different LHS) left alone.
 

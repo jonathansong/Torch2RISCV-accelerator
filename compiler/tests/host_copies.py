@@ -32,7 +32,7 @@ def stream_ir(d):
              f"--iree-sa-d={os.environ.get('SA_D', '16')}", f"--iree-sa-gemv-ports={os.environ.get('SA_GEMV_PORTS', '4')}"]
     if os.environ.get("SA_GENERALIZE", "1") == "1":
         flags.append("--iree-flow-enable-executable-generalization")
-    if os.environ.get("SA_FUSE_FFN", "0") == "1":
+    if os.environ.get("SA_FUSE_FFN", "1") == "1":
         flags.append("--iree-sa-fuse-ffn")
     cf = os.path.join(d, "compile_flags.txt")
     if os.path.exists(cf):
