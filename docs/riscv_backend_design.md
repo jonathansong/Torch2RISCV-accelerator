@@ -395,7 +395,7 @@ Hazard and queue full mean the issuer is ahead; `ALL_IDLE` and `STARVE` mean it 
 IREE's own comment at the deduplication suggests generalizing executables that differ in one value; nothing implements it.
 
 **Compiler.**
-- **IREE pass `iree-flow-generalize-executables`** (`compiler/patches/iree/0003-flow-generalize-executables.patch`; pipeline flag `--iree-flow-enable-executable-generalization`, off by default), run just before deduplication. It groups the executables whose dispatch functions are structurally equal up to the values of index and f32 constants and of the static offsets of tensor loads and stores. In each group, every such value that differs becomes a new operand of the dispatch, passed by each call site as a constant, and deduplication then merges the group.
+- **IREE pass `iree-flow-generalize-executables`** (`compiler/patches/iree/0003-flow-generalize-executables.patch`; pipeline flag `--iree-flow-enable-executable-generalization`, off by default in IREE; `compile_sa.sh` turns it on, see below), run just before deduplication. It groups the executables whose dispatch functions are structurally equal up to the values of index and f32 constants and of the static offsets of tensor loads and stores. In each group, every such value that differs becomes a new operand of the dispatch, passed by each call site as a constant, and deduplication then merges the group.
   - An offset is generalized only into a global's contents, traced through dispatches that update it in place, because the global's binding then has the same offset at every call site.
   - Other integer constants (a position's wrap-around and clamping in the KV write) stay part of the signature, because the backend needs them constant.
 - **sa codegen for the new operands.**
@@ -447,6 +447,15 @@ Performance counters (`board_rvperf.py`), decode, ms per step:
 All three models' decode steps now fit a 32–64 KB instruction memory.
 
 The merged code costs a little: about 60 more commands per layer (the scales' PARAM loads and broadcasts) and 5% more core instructions, because the offsets and scales are now computed from push constants. Without an instruction memory nothing is gained, because every instruction is still fetched from DDR at about 27 cycles (§9.10). The gain is for §8: a decode step now fits a 32–64 KB TCM, which would remove that fetch cost.
+
+**On by default (2026-10-17).** `compile_sa.sh` passes the flag unless `SA_GENERALIZE=0`.
+- Long context on the board, the generalized bundles (`run_board_tests.sh qwen3g gemmag llamag`, `longctx` and `longctx --sweep`): all six pass, every list on the accelerator.
+  - Qwen3 and Llama over a 2031-token prompt: PPL 14.17 (fp32 14.17) and 10.06 (fp32 9.81), top-1 vs fp32 89.2% and 93.3%.
+  - Gemma over 495 tokens (its 512 window): prefill and decode logits bit-exact in 17/17 rows, PPL 35.20 (fp32 31.17).
+  - Decode at T = 64 → 2048: Qwen3 138.9 → 317.8 ms per step, Llama 226.7 → 321.5; Gemma at T = 64 → 512: 60.8 → 67.2.
+- Host tests (`run_tests.sh fallback hfgen ctimport gemvk gemvks longctx longctxq longctxq2k c3 c5 c5cfg smollm2 qwen3l2 synth`): all pass.
+- One fix was needed on the D = 8 path without the GEMV unit: a contraction whose input stays in ACC expands only if no operation before it emits commands (`firstToEmit`, `SahlExpandKernels`). The scale's `arith.bitcast` of a push constant emits none but was not in that list, so stories15M's attention contractions failed to expand (with `SA_HOST_FALLBACK=0` the compile failed, with the fallback two dispatches went to the host). With the fix stories15M compiles with 147 executables instead of 176, all on the accelerator. The three board models' per-dispatch binaries are identical with and without the fix (2102, 1478 and 1330 files), so the board results above stand.
+- `compile_sa.sh` now clears `<dir>/sa_sources` before it compiles. A source left there by an earlier compile with more executables has no binary, and `dispatch_check.py` reported it as a failure.
 
 ### 9.7 Coexistence
 

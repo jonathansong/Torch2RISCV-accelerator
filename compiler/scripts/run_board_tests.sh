@@ -44,7 +44,8 @@ tests_of() {
     gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
     qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
     llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
-    qwen3g|gemmag|llamag) printf '%s\n' "llm" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvperf" ;;
+    gemmag) printf '%s\n' "llm" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvperf" "longctx" "longctx --sweep 64,128,256,512" ;;
+    qwen3g|llamag) printf '%s\n' "llm" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvperf" "longctx" "longctx --sweep 64,256,512,1024,2048" ;;
   esac
 }
 

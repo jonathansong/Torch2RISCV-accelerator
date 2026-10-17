@@ -339,7 +339,7 @@ bool firstToEmit(Operation *op) {
   static const char *quiet[] = {"arith.constant", "memref.alloc", "memref.dealloc", "memref.subview", "memref.cast",
                                 "memref.dim", "memref.collapse_shape", "hal.interface.binding.subspan",
                                 "hal.interface.constant.load", "iree_tensor_ext.dispatch.workload.ordinal",
-                                "arith.index_cast", "arith.index_castui", "arith.extui", "arith.shli", "arith.ori",
+                                "arith.index_cast", "arith.index_castui", "arith.extui", "arith.shli", "arith.ori", "arith.bitcast",
                                 "linalg.fill"};
   if (op->getParentOp() && !isa<func::FuncOp>(op->getParentOp())) return false;
   for (Operation *o = op->getPrevNode(); o; o = o->getPrevNode()) {

@@ -12,6 +12,10 @@
 # SA_GEMV_PORTS: the overlay's GEMV unit (--iree-sa-gemv-ports; default 0 = none).
 # <dir>/compile_flags.txt (the export's, hf_generic.export): flags the model needs, e.g.
 # --iree-sa-max-dynamic=<the KV cache's length> beyond the default 256.
+# SA_GENERALIZE=0: one executable per layer as before (default 1: executables
+# that differ only in constants, e.g. a layer's KV cache offset or scale, merged:
+# --iree-flow-enable-executable-generalization, IREE patch 0003,
+# docs/riscv_backend_design.md §9.11).
 # SA_HOST_FALLBACK=0: no host fallback (default 1: every dispatch also gets a
 # VMVX variant; one the sa backend cannot compile runs on the ARM host, plan
 # §8.15; IREE's executable linking is off, it would merge the VMVX variants of
@@ -20,12 +24,14 @@ set -euo pipefail
 source "$(dirname "$0")/../env.sh"
 dir=$1; shift
 mkdir -p "$dir/sa_sources"
+rm -f "$dir"/sa_sources/*.mlir      # (a source left from an earlier compile has no binary)
 "$IREE_BUILD/tools/iree-compile" "$dir/qllama.mlir" --iree-hal-target-device=sa \
   --iree-opt-const-expr-max-size-increase-threshold=0 \
   --iree-parameter-import=model="$dir/qllama.irpa" --iree-parameter-import-maximum-size=4294967295 \
   --iree-parameter-export=model="$dir/sa_packed.irpa" --iree-parameter-export-minimum-size=256 \
   --iree-dispatch-creation-enable-aggressive-fusion \
   --iree-opt-strip-assertions \
+  $( [ "${SA_GENERALIZE:-1}" = 1 ] && echo --iree-flow-enable-executable-generalization ) \
   $( [ "${SA_HOST_FALLBACK:-1}" = 1 ] && echo --iree-sa-host-fallback --iree-hal-link-executables=false ) \
   $( [ -n "${SA_D:-}" ] && [ "$SA_D" != 8 ] && echo --iree-sa-d="$SA_D" ) \
   $( [ "${SA_GEMV_PORTS:-0}" != 0 ] && echo --iree-sa-gemv-ports="$SA_GEMV_PORTS" ) \

@@ -283,6 +283,14 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   compiler/scripts/run_tests.sh fallback             # test_fallback.py (sim)
   ```
 
+- **Per-layer executables merged by default** (docs/riscv_backend_design.md
+  §9.11): `compile_sa.sh` passes `--iree-flow-enable-executable-generalization`
+  (IREE patch `compiler/patches/iree/0003`). Executables that differ only in
+  constants (a layer's KV cache offset, a quantization scale) become one, with
+  those values as push constants: Qwen3-0.6B 1132 → 1051 executables, a decode
+  step's rv32 code 288 → 34 KB, outputs bit-exact. `SA_GENERALIZE=0` compiles
+  one executable per layer as before.
+
 - **C8 done** (docs/iree_compiler_plan.md §8.14): the code generator's
   decisions are passes with lit tests, visible in the IR: `iree-sa-to-sahl`
   groups each micro-kernel / generic contraction into a `sahl.kernel` and
