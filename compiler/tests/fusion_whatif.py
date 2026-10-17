@@ -23,7 +23,10 @@ Scenarios, cycles per prefill chunk (16 tokens) / per decode step:
                 unlimited local memory
   on chip, no barriers   both: every dispatch of a step fused (the ideal)
 Every scenario keeps the dispatches' commands and engine timing otherwise, so
-the gaps are upper bounds (no capacity limit, no extra local copies).
+the gaps are upper bounds (no capacity limit, no extra local copies). --only
+REGEX fuses one chain: only intermediates whose producer and consumer kinds
+both match (e.g. the FFN's gate / up projections, the reduction and the
+quantization of h).
 
     compiler/scripts/perf_trace.sh                      (DEPLOY / MODEL / OUT: the trace)
     compiler/tests/fusion_whatif.py --trace build/perfmodel/qwen3g.trace \\
@@ -253,6 +256,7 @@ def main():
     ap.add_argument("--gemv-ports", type=int, default=4)
     ap.add_argument("--logits", default=r"matvec_like_\d{4,}x", help="the vocabulary projection (left out of the prefill chunk)")
     ap.add_argument("--top", type=int, default=12, help="producer -> consumer pairs shown")
+    ap.add_argument("--only", help="regex of dispatch kinds: fuse only the chains among them (e.g. one FFN)")
     ap.add_argument("--json")
     args = ap.parse_args()
     arch = P.Arch(gemv_ports=args.gemv_ports)
@@ -280,6 +284,9 @@ def main():
         sub[s] = step
         pairs = {}
         drop = intermediates(sub, s, pairs)
+        if args.only:                                  # one chain: producer and consumer both of these kinds
+            rx = re.compile(args.only)
+            drop = {t for t in drop if rx.search(kind(step[pairs[t][0]][0])) and rx.search(kind(step[pairs[t][1]][0]))}
         per_list = sum(P.run_list(arch, cmds, gemv=False)[0] for _, cmds, _ in step)
         rows = []
         for name, dr, bar in (("joined", frozenset(), True), ("no barriers", frozenset(), False),

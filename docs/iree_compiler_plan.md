@@ -1712,6 +1712,8 @@ With k = 1.11 the part outside attention at T = 2048 comes to 626.1 − 1.11 · 
 
 **What it would take.** IREE forms one dispatch per contraction, and the sa backend lowers one contraction (or kernel) per dispatch. Fusion means dispatches with several contractions and their tails: a preprocessing step forming dispatch regions for the chains above (an extension point of §8.8), and kernels in `sahl-expand-kernels` sequencing them with the intermediates in local memory, with the numerics unchanged (bit-exact with the unfused form, as C6.5 kept attention). By chain: SwiGLU (two GEMVs sharing x, the product and the quantization in one template) first, then residual + RMSNorm into the following projection, then the attention chain (dynamic T, the T-block loop of §8.22).
 
+**Per chain, and the design** ([`fusion_design.md`](fusion_design.md)): fused one at a time (`fusion_whatif.py --only`), the chains are worth much less than the standalone cycles above suggest, because those overlap other engines' work: on Qwen3 SwiGLU −2.4% prefill / −2.3% decode, the attention core −3.7 / −1.1%, attention with its q / k preparation −6.1 / −3.7%, residual + RMSNorm with the projections −3.7 / −1.6%; SwiGLU on the four models −2.3% to −4.4% of decode. The total needs the whole layer fused. SwiGLU is designed first (a sa preprocessing pass forming the dispatch region, two GEMV kernels in one template, the intermediates in ACC, bit-exact with the unfused build), as the step that builds what the other chains need.
+
 ## 9. Verification system
 
 | Level | Content | Tools |

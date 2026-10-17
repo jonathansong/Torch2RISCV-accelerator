@@ -228,6 +228,10 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 - [Compiler learning path](docs/compiler_learning_path.md) - MLIR and IREE,
   the export, the `sa` backend pass by pass, the HAL driver, verification,
   the RISC-V backend and upstreaming to IREE
+- [Cross-operator fusion](docs/fusion_design.md) - what keeping the
+  intermediates of consecutive dispatches on chip would gain (the performance
+  model's upper bound per model and per operator chain) and the design of the
+  first step, the SwiGLU fusion
 - [Hardware learning path](docs/hardware_learning_path.md) - a staged guide
   from digital design fundamentals to the accelerator RTL, verification,
   timing closure and board measurements, with labs on this repository
