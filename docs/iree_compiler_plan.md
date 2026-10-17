@@ -1690,6 +1690,28 @@ With k = 1.11 the part outside attention at T = 2048 comes to 626.1 − 1.11 · 
   Wall − device is 4–7 ms (Qwen3 6.5, Llama 3.5, Gemma 4.3), as before the packed V cache. Against the bundles before the 2026-10-14/15 changes Qwen3 decodes 2.0× faster at 2048 and 1.4× at 64, prefill 2.1×. A 2048-step decode-only run of the whole window averages 227.1 ms per step (Qwen3, 4.40 tok/s) and 273.1 ms (Llama, 3.66 tok/s); `board_llm.py`'s 40-token prompt: Qwen3 138.0 ms per step (7.25 tok/s), Llama 225.9 (4.43), Gemma 60.4 (16.54).
   Teacher forcing over two windows (`board_quality.py score`, `build/quality/*_pcpi_vfix_board.json`): **Qwen3 PPL 18.581 (fp32 18.767), top-1 88.4%, KL 0.0546** (calibrated on 1024: 18.990, 86.8%, 0.0728; −25% KL), KL by range 0.037 / 0.041 / 0.049 / 0.058 / 0.073 for [0, 256) / [256, 512) / [512, 1024) / [1024, 1536) / [1536, 2048) (the host's sa:kch calibrated on 1024: 0.055 / 0.041 / 0.049 / 0.080 / 0.137); **Llama PPL 13.564 (fp32 13.208), top-1 91.9%, KL 0.0365** (was 13.550, 90.6%, 0.0387), by range 0.033 / 0.025 / 0.027 / 0.040 / 0.050; Gemma unchanged (43.592, 76.9%, 0.2125; same calibration). `board_longctx.py`'s 2032-token prompt: Qwen3 PPL 14.170 against fp32 14.171, top-1 89.2%; Llama 10.057 against 9.814, 93.3%. The board matches the host attribution: with the KV scales calibrated over the whole context, the remaining growth of KL with position is about half of what it was (Qwen3 [1536, 2048) 0.137 → 0.073), close to the host's fp32 KV cache (0.074).
 
+### 8.23 Cross-operator fusion: an upper bound from the performance model (2026-10-17)
+
+**Question.** Every dispatch stores its output to DDR and the next loads it back. How much would fusing dispatches (the intermediates kept in SPAD / ACC, no barrier between them) gain, and which operator chains carry it? Local-memory planning by lifetime (§8.17 item 3, 3a / 3b) is a different, within-dispatch question.
+
+**Method** (`compiler/tests/fusion_whatif.py`, on `perf_model.py`). A sim trace of each `v2.2-kv260` bundle (`perf_trace.sh`: two prefill chunks and two decode steps, one list per dispatch), the model calibrated on the same bundle's per-dispatch board profile (weighted error 2.3–6.2%). A step's dispatches are joined into one list as the batched runtime runs them, with a FENCE before a dispatch that touches DDR written (or writes DDR read) since the last FENCE. An *intermediate* is a ST whose bytes a later dispatch of the same step reads back and that no later step reads before rewriting them (IREE's transient buffers, rewritten within a step, are tracked by their latest writer; the KV cache, the logits and the parameters are not intermediates). Scenarios: the joined list; no barriers between dispatches; the intermediates' STs and the LDs reading only them dropped (fusion with unlimited local memory); both. The joined list's device time is within 4% of the board's `profile --batch` for every model (decode: SmolLM2 37.8 / 36.3 ms, Gemma 57.6 / 56.3, Qwen3 134.4 / 132.1, Llama 226.1 / 223.0). Fixed in `perf_model.py` along the way: a FENCE did not hold back the dispatch of the commands after it (unnoticed because the per-dispatch lists have almost no FENCEs).
+
+**Result** (time per prefill chunk of 16 tokens / per decode step, intermediates on chip, barriers dropped, against the joined list):
+
+| | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| Prefill: intermediates' ST / their LDs (share of LD bytes) | 17.9 / 30.3 MB (19%) | 16.7 / 28.4 MB (19%) | 50.7 / 82.5 MB (13%) | 39.7 / 65.1 MB (6%) |
+| Prefill, upper bound | **−19.6%** | **−17.7%** | **−14.6%** | **−10.2%** |
+| Decode: intermediates' ST / their LDs (share of LD bytes) | 1.2 / 2.1 MB (1.5%) | 1.0 / 1.8 MB (0.7%) | 3.4 / 5.4 MB (0.9%) | 2.7 / 4.4 MB (0.4%) |
+| Decode, upper bound | **−14.1%** | **−6.8%** | **−7.6%** | **−4.5%** |
+| Barriers alone (traffic kept) | −0.1 / −0.7% | −0.3 / −0.2% | −0.0 / −0.2% | −0.1 / −0.1% |
+
+- **The barriers cost nothing**: consecutive dispatches are serial through their data anyway. The gain is the commands: decode drops 1.4–3.1 thousand small LD / ST per step, each paying the DMA's fixed latency (about 65 cycles), far more than their bytes (≤ 1.5% of LD) suggest.
+- **Where it is** (the dropped commands' standalone cycles by producer → consumer kind, decode; prefill similar): the SwiGLU pair (gate GEMV → up GEMV, then the quantization of h before `down_proj`) 15–31%; the attention chain (scores → max → exp / sum → p · V → the quantization before `o_proj`) about 25% (less for Gemma's single KV head); residual add → RMSNorm 4–21% (Gemma the most).
+- **Upper bounds**: unlimited local memory and no extra local copies. In decode the intermediates are small (a vector per token), so the bound is close to reachable; in prefill a chunk's FFN activations (16 × 8192 fp32 for Llama) exceed ACC, so less is.
+
+**What it would take.** IREE forms one dispatch per contraction, and the sa backend lowers one contraction (or kernel) per dispatch. Fusion means dispatches with several contractions and their tails: a preprocessing step forming dispatch regions for the chains above (an extension point of §8.8), and kernels in `sahl-expand-kernels` sequencing them with the intermediates in local memory, with the numerics unchanged (bit-exact with the unfused form, as C6.5 kept attention). By chain: SwiGLU (two GEMVs sharing x, the product and the quantization in one template) first, then residual + RMSNorm into the following projection, then the attention chain (dynamic T, the T-block loop of §8.22).
+
 ## 9. Verification system
 
 | Level | Content | Tools |

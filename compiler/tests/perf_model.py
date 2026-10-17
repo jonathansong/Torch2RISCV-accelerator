@@ -277,8 +277,9 @@ def run_list(arch, cmds, gemv=False):
             tf = max(tf, disp_hist[-10])
         if c.op == OP_FENCE or c.fence_before:
             tf = max(tf, last_done)
-        if c.op == OP_FENCE:
-            disp_hist.append(max(tf, t_disp))
+        if c.op == OP_FENCE:                # in-order dispatch: nothing after it goes before it completes
+            t_disp = max(tf, t_disp)
+            disp_hist.append(t_disp)
             continue
         e = c.eng
         t = max(tf, t_disp + 1)
