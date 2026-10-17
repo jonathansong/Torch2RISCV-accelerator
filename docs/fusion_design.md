@@ -2,7 +2,11 @@
 
 Status: evaluation done (2026-10-17, `compiler/tests/fusion_whatif.py`,
 [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.23); the SwiGLU fusion is
-designed here and not implemented. Measured against tag `v2.2-kv260`.
+implemented (`97a3323`, `--iree-sa-fuse-ffn` / `SA_FUSE_FFN=1`, default off)
+and accepted on the board on all four models (2026-10-17, §4.8): bit-exact,
+decode −1.1% to −2.7% of device time, about half of the model's −2.3% to
+−4.4%, for a reason found in §4.8 (the fused gating is not chunked enough to
+overlap the weight streaming). Measured against tag `v2.2-kv260`.
 
 **In one paragraph.** Every IREE dispatch on the sa device stores its outputs
 to DDR and the next dispatch loads them back. Keeping those intermediates in
@@ -267,6 +271,76 @@ bit-exact with the unfused one**: logits identical, not within a tolerance.
   next to b and h for some shape (caught at compile time, falls back
   unfused); the generalization pass merging the fused executables per layer
   (it should: they differ only in offsets).
+
+### 4.8 Board results (2026-10-17)
+
+Bundles `build/deploy_hfgen_{smollm2f,gemmaf,qwen3f,llamaf}_pcpi`: the
+`v2.2` generalized bundles (`smollm2_lc2048`, `gemmag`, `qwen3g`, `llamag`)
+with `sa.vmfb` recompiled at `97a3323` with `SA_FUSE_FFN=1`, same parameters,
+prompt and overlay. `run_board_tests.sh smollm2f gemmaf qwen3f llamaf`; logs
+`build/bundles_pcpi/board_tests_s3/<b>f.*.log`, results
+`build/deploy_hfgen_<b>f_pcpi/results/`.
+
+**Correctness: all PASS.** `llm`: logits bit-exact with the sim in 17/17
+steps; long context (SmolLM2 / Qwen3 / Llama 2032-token prompt, Gemma 496):
+prefill + decode bit-exact with decode only; `rvsched` (plan B) and
+`rvcode --embedded` / `rvsched --rv --embedded` (plan A): tokens identical,
+logits bit-exact. Every dispatch on the accelerator.
+
+**Speed** (decode after a 32-token prompt, `profile --batch`, one list per step):
+
+| | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| Dispatches per decode step | 878 → 788 | 618 → 564 | 932 → 848 | 472 → 424 |
+| Device ms per step, unfused → fused | 36.25 → 35.28 | 56.25 → 55.45 | 132.11 → 130.72 | 222.95 → 220.19 |
+| Device time | **−2.7%** | **−1.4%** | **−1.1%** | **−1.2%** |
+| Decode ms per step (with the runtime) | 42.4 → 40.9 | 60.7 → 59.6 | 138.7 → 136.8 | 226.5 → 223.5 |
+| Model's prediction (§2.3, `--only`) | −4.4% | −2.5% | −2.3% | −2.3% |
+| Plan B (`rvsched`), ms per step | 37.8 → 36.8 | 61.2 → 60.4 | 136.7 → 135.2 | 225.7 → 222.9 |
+
+The long-context sweep shows the same saving at every T (decode 1–3 ms per
+step less from T = 64 to 2048). Prefill is unchanged (decode only, as
+designed): 276.7 / 233.6 / 843.0 / 1041.7 ms per chunk.
+
+**Why half of the prediction.** The board's per-dispatch profile (decode,
+cycles per layer) shows where it goes:
+
+| Cycles per layer | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| gate + up GEMV dispatches, unfused | 38 676 | 56 646 | 119 501 | 581 433 |
+| the fused dispatch | 37 518 | 55 167 | 118 425 | 573 729 |
+| amax + quantization dispatches removed | 2 571 | 3 120 | 4 198 | 9 842 |
+| Saved per layer | 3 729 | 4 599 | 5 274 | 17 546 |
+| The model's saving per layer | ≈ 5 300 | ≈ 7 800 | ≈ 10 900 | ≈ 32 000 |
+
+The fused dispatch is barely faster than the two GEMV dispatches it replaces,
+although it no longer stores b, loads it back or loads x twice. The model
+agrees with the board on the fused code (SmolLM2: a trace of the fused bundle
+modelled with the unfused bundle's calibration gives −2.9% against −2.7%
+measured), so the difference is the code, not the model:
+
+- **The gating is not overlapped with the streaming.** The unfused gating
+  dispatch (`expandLinear`) runs in chunks (SmolLM2: 4 × 24 tiles, ACC banks
+  alternating): chunk i's SiLU · mul runs on the VE while chunk i + 1's
+  weights stream into the GEMV unit. `expandFfn` sizes its chunks by ACC
+  capacity only, so SmolLM2 and Gemma get one chunk (N = 1536 / 2048) and
+  Qwen3 two: the whole gating, with its two SFU passes over N (about 3
+  thousand cycles each on SmolLM2), runs after the last weight byte. That is
+  what the removed round trip saved, spent again.
+- **The amax and the quantization run after all chunks** (in pieces only
+  for capacity), serially after the streaming as the separate dispatches
+  did: only their dispatch boundaries are saved (Llama: the 9.8 thousand
+  cycles of the two dispatches are mostly VE work over 8192 elements).
+
+**Next (compiler only, `expandFfn`).** (1) At least four chunks whatever the
+capacity allows (as `expandLinear` chooses), banks alternating; (2) chunk i's
+amax piece right after its gating (`sahl.accumulate` into the reserved
+scalar), leaving only the quantization (one VE pass over N) after the last
+chunk; (3) chunk i + 1's GEMVs emitted before chunk i's gating, so that the VE
+queue (4 deep, in-order dispatch) never holds back the next chunk's streaming.
+Each step is checked with a sim trace and `perf_model.py` on the two-layer
+builds before rebuilding the bundles; the numerics do not change (the same
+operations on the same values; the amax is order-free).
 
 ## 5. After SwiGLU
 
