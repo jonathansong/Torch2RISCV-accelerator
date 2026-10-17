@@ -6,8 +6,9 @@ implemented (`97a3323`, `--iree-sa-fuse-ffn` / `SA_FUSE_FFN=1`, default off)
 and accepted on the board on all four models (2026-10-17, §4.8): bit-exact,
 decode −1.1% to −2.7% of device time, about half of the model's −2.3% to
 −4.4%, for a reason found in §4.8 (the fused gating is not chunked enough to
-overlap the weight streaming). The schedule is fixed in `ea7ca80` (§4.9):
-the model gives −3.4% to −6.3% of decode, the board run is pending. Measured
+overlap the weight streaming). The schedule is fixed in `ea7ca80` (§4.9)
+and accepted on the board (2026-10-18): bit-exact, decode −3.3% to −6.1% of
+device time, within 0.4 points of the model's −3.4% to −6.3%. Measured
 against tag `v2.2-kv260`.
 
 **In one paragraph.** Every IREE dispatch on the sa device stores its outputs
@@ -391,6 +392,27 @@ schedule's model numbers match its board run within the model's error):
 | Old schedule: model / board | 3.6k / 3.7k | 4.7k / 4.6k | 5.6k / 5.3k | 20.3k / 17.5k |
 | Overlapped schedule: model | **7.6k** | **11.8k** | **16.0k** | **49.5k** |
 | Projected decode device time (× layers, against v2.2) | **−6.3%** | **−3.8%** | **−3.4%** | **−3.6%** |
+
+**Board (2026-10-18, bundles `deploy_hfgen_*f2_pcpi`, logs
+`build/bundles_pcpi/board_tests_s3/*f2.*`).** All tests PASS: `llm`
+(logits bit-exact with the sim, 17/17 steps), long context and its sweep,
+plan B and plan A (`rvsched`, `rvcode`, tokens identical, logits bit-exact).
+Decode device time per step (`profile --batch`, 32-token prompt):
+
+| | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| v2.2, unfused (ms) | 36.25 | 56.25 | 132.11 | 222.95 |
+| Old schedule, `97a3323` (ms) | 35.28 | 55.45 | 130.72 | 220.19 |
+| Overlapped schedule, `ea7ca80` (ms) | **34.04** | **54.15** | **127.77** | **215.42** |
+| Against v2.2 | **−6.1%** | **−3.7%** | **−3.3%** | **−3.4%** |
+| Projected (model) | −6.3% | −3.8% | −3.4% | −3.6% |
+| Cycles saved per layer, board / model | 7.4k / 7.6k | 11.7k / 11.8k | 15.5k / 16.0k | 47.1k / 49.5k |
+
+Decode end to end (host loop included): 39.7 / 58.3 / 133.9 / 218.7 ms per
+step (25.2 / 17.2 / 7.47 / 4.57 tokens/s). Prefill and device memory are
+unchanged (the fusion is decode-only). Plan B (the decode loop on the RISC-V
+core) gains the same: 35.5 / 59.1 / 132.2 / 218.1 ms per step against the old
+schedule's 36.8 / 60.4 / 135.2 / 222.9.
 
 This beats the SwiGLU bound of §2.3 (−2.3% to −4.4%). That bound kept the
 unfused code's commands and order, including its own serialization: the
