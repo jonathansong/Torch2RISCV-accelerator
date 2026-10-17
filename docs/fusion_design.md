@@ -6,7 +6,9 @@ implemented (`97a3323`, `--iree-sa-fuse-ffn` / `SA_FUSE_FFN=1`, default off)
 and accepted on the board on all four models (2026-10-17, §4.8): bit-exact,
 decode −1.1% to −2.7% of device time, about half of the model's −2.3% to
 −4.4%, for a reason found in §4.8 (the fused gating is not chunked enough to
-overlap the weight streaming). Measured against tag `v2.2-kv260`.
+overlap the weight streaming). The schedule is fixed in `ea7ca80` (§4.9):
+the model gives −3.4% to −6.3% of decode, the board run is pending. Measured
+against tag `v2.2-kv260`.
 
 **In one paragraph.** Every IREE dispatch on the sa device stores its outputs
 to DDR and the next dispatch loads them back. Keeping those intermediates in
@@ -332,7 +334,7 @@ measured), so the difference is the code, not the model:
   did: only their dispatch boundaries are saved (Llama: the 9.8 thousand
   cycles of the two dispatches are mostly VE work over 8192 elements).
 
-**Next (compiler only, `expandFfn`).** (1) At least four chunks whatever the
+**Next (compiler only, `expandFfn`; done in §4.9).** (1) At least four chunks whatever the
 capacity allows (as `expandLinear` chooses), banks alternating; (2) chunk i's
 amax piece right after its gating (`sahl.accumulate` into the reserved
 scalar), leaving only the quantization (one VE pass over N) after the last
@@ -341,6 +343,60 @@ queue (4 deep, in-order dispatch) never holds back the next chunk's streaming.
 Each step is checked with a sim trace and `perf_model.py` on the two-layer
 builds before rebuilding the bundles; the numerics do not change (the same
 operations on the same values; the amax is order-free).
+
+### 4.9 The overlapped schedule (2026-10-17, `ea7ca80`)
+
+`expandFfn` now writes:
+
+```
+LD x; LD each scalar input into both banks
+GEMV chunk 0 (W₂, then W₁); LD its scale slices
+for chunk i (bank i mod 2):
+    GEMV chunk i+1, first projection            (streams while the VE works on chunk i)
+    scope: gating(i) → h slice i; amax piece(i)  (VE; everything in bank i mod 2)
+    GEMV chunk i+1, second projection; LD its scale slices
+int8 output, piece by piece (it needs the whole amax); ST h_q, ST amax
+```
+
+- **Chunks**: about six whatever the capacity allows (`kFfnChunks`; three to
+  eight model within 2% of each other on SmolLM2, six is the best on all four
+  models). SmolLM2 6 × 16 tiles, Gemma 8 × 16, Qwen3 6 × 32, Llama 16 × 32
+  (capacity-bound).
+- **Issue order**: commands issue in order with engine queues of four, so
+  chunk i+1's second projection is issued after chunk i's gating. The
+  gating's VE commands then get dispatched while the first projection
+  streams, and the GEMV unit never waits on the dispatcher.
+- **Banks**: the scoreboard tracks hazards per bank half, so a VE command
+  reading or writing a bank the in-flight GEMV writes would wait for the whole
+  GEMV. Everything one chunk's VE work touches is therefore in its own bank:
+  its accumulators and scale slices (as before), its slice of h (even chunks'
+  in bank 0, odd chunks' in bank 1, in the chunk scratch), its own copy of the
+  scalar inputs (broadcast inside the chunk's scope), and its temporaries.
+  h is no longer one buffer; the amax and int8-output pieces read the slices.
+- **The amax** is reduced piece by piece right after each chunk's gating
+  (`sahl.accumulate`), overlapped like the gating. Only the int8 output (one
+  VE pass per piece) follows the last chunk.
+
+Same operations on the same values: bit-exact with the unfused build on the
+two-layer models of all four (sim logits, 40-token prompt + 8 decode steps),
+every dispatch OK against the oracle, golden corpus otherwise unchanged.
+
+**Decode cycles saved per layer** (performance model on sim traces of the
+two-layer builds, calibrated on each full bundle's board profile; the old
+schedule's model numbers match its board run within the model's error):
+
+| | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| Chunks × tiles | 6 × 16 | 8 × 16 | 6 × 32 | 16 × 32 |
+| Old schedule: model / board | 3.6k / 3.7k | 4.7k / 4.6k | 5.6k / 5.3k | 20.3k / 17.5k |
+| Overlapped schedule: model | **7.6k** | **11.8k** | **16.0k** | **49.5k** |
+| Projected decode device time (× layers, against v2.2) | **−6.3%** | **−3.8%** | **−3.4%** | **−3.6%** |
+
+This beats the SwiGLU bound of §2.3 (−2.3% to −4.4%). That bound kept the
+unfused code's commands and order, including its own serialization: the
+unfused gating dispatch also leaves part of its gating after its last weight
+chunk. The overlapped schedule removes that too, so a whole-layer bound
+computed the same way also understates what fused, re-scheduled code can reach.
 
 ## 5. After SwiGLU
 

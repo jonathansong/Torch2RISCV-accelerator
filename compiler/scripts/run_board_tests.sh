@@ -20,6 +20,8 @@
 # ~/board_tests<suffix>). smollm2: SmolLM2-135M at 2048, every test of the release set.
 # smollm2f / gemmaf / qwen3f / llamaf: the same models with decode's gated FFN in one dispatch
 # (SA_FUSE_FFN=1, docs/fusion_design.md; build/fuse/bundles.sh), against the g bundles' speed.
+# smollm2f2 / gemmaf2 / qwen3f2 / llamaf2: the same with each chunk's gating overlapping the next
+# chunk's weight streaming (fusion_design.md §4.9).
 # Logs: ~/board_tests<LC_SUFFIX, default _pcpi>/<bundle>.<mode>.log, markers .done / .failed, summary.txt.
 set -u
 H=${BUNDLE_HOME:-/home/ubuntu}
@@ -47,6 +49,10 @@ declare -A DIR=(
   [gemmaf]=deploy_hfgen_gemmaf_pcpi
   [qwen3f]=deploy_hfgen_qwen3f_pcpi
   [llamaf]=deploy_hfgen_llamaf_pcpi
+  [smollm2f2]=deploy_hfgen_smollm2f2_pcpi
+  [gemmaf2]=deploy_hfgen_gemmaf2_pcpi
+  [qwen3f2]=deploy_hfgen_qwen3f2_pcpi
+  [llamaf2]=deploy_hfgen_llamaf2_pcpi
 )
 tests_of() {
   case $1 in
@@ -61,9 +67,9 @@ tests_of() {
     smollm2) printf '%s\n' "llm" "teacher" "profile 40 --prompt 32" "profile 40 --prompt 32 --batch" "longctx" "longctx --sweep 64,256,512,1024,2048" \
       "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
     # the SwiGLU fusion (SA_FUSE_FFN=1, docs/fusion_design.md): bit-exact checks, decode speed, the RISC-V paths
-    gemmaf) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" "longctx --sweep 64,128,256,512" \
+    gemmaf|gemmaf2) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" "longctx --sweep 64,128,256,512" \
       "rvsched" "rvcode --embedded" "rvsched --rv --embedded" ;;
-    smollm2f|qwen3f|llamaf) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" \
+    smollm2f|qwen3f|llamaf|smollm2f2|qwen3f2|llamaf2) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" \
       "longctx --sweep 64,256,512,1024,2048" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" ;;
   esac
 }
@@ -72,7 +78,7 @@ SEL=("$@")
 [ ${#SEL[@]} -eq 0 ] && SEL=(rvb gemma qwen3 llama)
 for b in "${SEL[@]}"; do
   d=$H/${DIR[$b]:-}
-  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama smollm2 qwen3g gemmag llamag smollm2f gemmaf qwen3f llamaf)"; continue; }
+  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama smollm2 qwen3g gemmag llamag smollm2f gemmaf qwen3f llamaf smollm2f2 gemmaf2 qwen3f2 llamaf2)"; continue; }
   [ -d "$d" ] || { echo "[$b] $d not on the board: skipped"; continue; }
   while IFS= read -r t; do
     [ -n "$t" ] || continue
