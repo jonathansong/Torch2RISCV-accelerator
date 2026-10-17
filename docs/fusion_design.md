@@ -8,9 +8,11 @@ designed here and not implemented. Measured against tag `v2.2-kv260`.
 to DDR and the next dispatch loads them back. Keeping those intermediates in
 the accelerator's local memory (SPAD / ACC) would save at most 10–20% of a
 prefill chunk and 4.5–14% of a decode step (the model's upper bound, four
-models). The gain is not the bytes (under 1.5% of a decode step's reads) but
-the commands: each small LD / ST pays the DMA's fixed latency. It is spread
-over the whole layer: no single operator chain carries more than about a third
+models). The gain is not the bytes (under 1.5% of a decode step's reads):
+it is the round trip on the dependency path, a producer's last STs that the
+next dispatch waits for and the consumer's first LDs that its work waits for.
+Loads off that path cost nothing to remove (batching the constant scale loads
+saves 0–0.7%). The gain is spread over the whole layer: no single operator chain carries more than about a third
 of it. The SwiGLU chain alone (the two FFN projections, the gating, and the
 quantization of its output) is worth 2.3–4.4% of decode and 2.4–4.2% of
 prefill; it is the first step because its structure is the simplest and it
@@ -83,8 +85,17 @@ Time per prefill chunk (16 tokens) / decode step, against the joined list:
 
 - **Barriers cost nothing**: consecutive dispatches are serial through their
   data anyway.
-- **Commands, not bytes**: decode drops 1.4–3.1 thousand small LD / ST per
-  step, each with about 65 cycles of fixed latency. Small models gain most.
+- **The round trip, not the bytes**: on Qwen3's decode step removing only
+  the intermediates' STs gains −4.0% (0.43M ST-engine cycles), only their LDs
+  −4.1% (0.57M LD-engine cycles), both −7.6%: each is almost entirely on the
+  critical path. A dispatch's last ST must finish before the dependent
+  dispatch starts (and consecutive templates allocate the same local words
+  from 0, so the bank hazards serialize them even without a FENCE), and the
+  consumer's first LDs gate its work. Loads that are not on such a path are
+  hidden in the LD engine's idle time (about 20% in decode): batching the
+  constant scale loads (§5) removes 1.3–1.8 thousand LDs per decode step and
+  saves nothing. Small models gain most because their steps have the same
+  number of boundaries over less weight-streaming time.
 - **Decode is close to reachable** (its intermediates are vectors of a few
   KB); **prefill less so**: a chunk's FFN activations (16 × 8192 fp32 for
   Llama, 512 KB) exceed ACC (256 KB).
@@ -259,11 +270,13 @@ bit-exact with the unfused one**: logits identical, not within a tolerance.
 
 ## 5. After SwiGLU
 
-1. **Batch the constant tail inputs** (independent of fusion): a GEMV
-   dispatch loads its per-channel scale slices chunk by chunk (`32`: 16 LDs
-   of 1.5 KB). They are parameters; one LD per scale vector before the chunk
-   loop saves their fixed latency in every linear layer. Cheap to try; its
-   gain is not yet estimated.
+1. **Batching the constant tail inputs: not worth it** (estimated
+   2026-10-17, `fusion_whatif.py --merge-consts`). A GEMV dispatch loads its
+   per-channel scale slices chunk by chunk (`32`: 16 LDs of 1.5 KB); merging
+   each dispatch's chains of constant, ACC-bound loads into one removes
+   367–1830 LDs per decode step and 1.8–11.7 thousand per prefill chunk, and
+   changes the time by +0.1% to +0.7% (decode) and −0.4% to −0.7% (prefill),
+   within the model's error: these loads are off the critical path.
 2. **Attention with its preparation** (q / k norm, RoPE, the quantization
    before `o_proj`): −3.7% decode, −6.1% prefill on Qwen3; needs the region
    pass to take a dynamic-T chain and the T-block loop of §8.22 inside the

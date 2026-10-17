@@ -178,6 +178,66 @@ def intermediates(steps, s, pairs=None):
     return drop
 
 
+def never_written(steps):
+    """the DDR ranges no ST of the trace writes: an Intervals of every ST (query: no overlap)"""
+    iv = Intervals()
+    for st in steps:
+        for _, cmds, rngs in st:
+            for c, rg in zip(cmds, rngs):
+                if c.op == P.OP_ST and rg:
+                    iv.add(*rg)
+    return iv
+
+
+def merge_consts(arch, step, written, max_bytes=4096):
+    """the constant tail inputs batched: in each dispatch, LDs into ACC from DDR that nothing writes
+    (the parameters: per-channel scales), small, following one another in DDR, become one LD at
+    the first one's place. Returns (the new step, LDs removed)."""
+    out, removed = [], 0
+    for name, cmds, rngs in step:
+        keep = [True] * len(cmds)
+        chains = {}                                    # DDR end of a chain -> index of its head
+        for i, (c, rg) in enumerate(zip(cmds, rngs)):
+            if (c.op != P.OP_LD or c.gemv or not rg or rg[1] - rg[0] > max_bytes or not c.rng
+                    or c.rng[0][0] != P.MEM_ACC or written.overlapping(*rg)):
+                continue
+            h = chains.pop(rg[0], None)
+            if h is None:
+                chains[rg[1]] = i
+                continue
+            head = cmds[h]
+            head.bytes += c.bytes                      # (a fresh copy, below)
+            head.rng = head.rng + c.rng
+            head.w |= c.w
+            keep[i] = False
+            removed += 1
+            chains[rg[1]] = h
+        new_cmds, new_rngs = [], []
+        for i, (c, rg) in enumerate(zip(cmds, rngs)):
+            if keep[i]:
+                new_cmds.append(c)
+                new_rngs.append(rg)
+        for c in new_cmds:                             # the merged heads: one transfer of all their bytes
+            if c.op == P.OP_LD and not c.gemv and c.rng and len(c.rng) > 1:
+                c.beats, c.bursts = P.dma_shape(arch, 0, 1, c.bytes, c.bytes, P.MEM_ACC)
+        out.append((name, new_cmds, new_rngs))
+    return out, removed
+
+
+def copy_step(step):
+    out = []
+    for name, cmds, rngs in step:
+        cc = []
+        for c in cmds:
+            c2 = P.Cmd()
+            for f in P.Cmd.__slots__:
+                setattr(c2, f, getattr(c, f))
+            c2.rng = list(c.rng)
+            cc.append(c2)
+        out.append((name, cc, list(rngs)))
+    return out
+
+
 def fence_cmd(n):
     c = P.Cmd()
     c.op, c.eng, c.n, c.fence_before, c.mask = P.OP_FENCE, -1, n, 0, 0xF
@@ -257,6 +317,8 @@ def main():
     ap.add_argument("--logits", default=r"matvec_like_\d{4,}x", help="the vocabulary projection (left out of the prefill chunk)")
     ap.add_argument("--top", type=int, default=12, help="producer -> consumer pairs shown")
     ap.add_argument("--only", help="regex of dispatch kinds: fuse only the chains among them (e.g. one FFN)")
+    ap.add_argument("--merge-consts", action="store_true",
+                    help="also: no fusion, the constant tail inputs (per-channel scales) of each dispatch in one LD")
     ap.add_argument("--json")
     args = ap.parse_args()
     arch = P.Arch(gemv_ports=args.gemv_ports)
@@ -276,6 +338,7 @@ def main():
         json.dump(dict(ve_a=list(map(float, arch.ve_a)), ve_b=list(map(float, arch.ve_b)), f_desc=arch.f_desc,
                        list_ovh=arch.list_ovh), open(args.save_cal, "w"), indent=1)
     res = {}
+    written = never_written(steps) if args.merge_consts else None
     for label, s in (("prefill chunk", args.prefill_seg), ("decode step", args.prefill_seg + 1)):
         step = steps[s]
         if label.startswith("prefill"):
@@ -294,6 +357,11 @@ def main():
             cmds, fences = join(step, dr, bar)
             cy, busy = P.run_list(arch, cmds)
             rows.append((name, cy, fences, busy))
+        if args.merge_consts:                          # no fusion: the constant tail inputs in one LD each
+            merged, nrem = merge_consts(arch, copy_step(step), written)
+            cmds, fences = join(merged)
+            cy, busy = P.run_list(arch, cmds)
+            rows.append((f"constants batched (-{nrem} LD)", cy, fences, busy))
         ld_all = sum(c.bytes for _, cmds, _ in step for c in cmds if c.op == P.OP_LD)
         st_all = sum(c.bytes for _, cmds, _ in step for c in cmds if c.op == P.OP_ST)
         st_d, ld_d = bytes_of(step, drop, P.OP_ST), bytes_of(step, drop, P.OP_LD)
@@ -308,9 +376,9 @@ def main():
               f"of LD bytes)")
         print(f"   one list per dispatch (calibration form): {per_list / 1e6:.2f}M cycles")
         base = rows[0][1]
-        print(f"   {'scenario':24s} {'cycles':>9s} {'ms':>8s} {'vs joined':>9s} {'FENCEs':>7s}  {'LD busy':>8s} {'EX busy':>8s} {'VE busy':>8s}")
+        print(f"   {'scenario':30s} {'cycles':>9s} {'ms':>8s} {'vs joined':>9s} {'FENCEs':>7s}  {'LD busy':>8s} {'EX busy':>8s} {'VE busy':>8s}")
         for name, cy, fences, busy in rows:
-            print(f"   {name:24s} {cy / 1e6:8.2f}M {cy / arch.mhz / 1e3:8.1f} {100 * (cy / base - 1):+8.1f}% {fences:7d}  "
+            print(f"   {name:30s} {cy / 1e6:8.2f}M {cy / arch.mhz / 1e3:8.1f} {100 * (cy / base - 1):+8.1f}% {fences:7d}  "
                   f"{busy[0] / cy * 100:7.1f}% {busy[2] / cy * 100:7.1f}% {busy[3] / cy * 100:7.1f}%")
         by_pair(arch, step, drop, pairs, args.top)
         res[label] = dict(dispatches=nd_, ld=ld_all, st=st_all, st_inter=st_d, ld_inter=ld_d, per_list=per_list,
