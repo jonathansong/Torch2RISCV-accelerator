@@ -16,6 +16,13 @@
 > SmolLM2-135M 22.1 / 60.5, Gemma-3-270M 15.0 / 62.6, Qwen3-0.6B 7.0 / 20.8,
 > Llama-3.2-1B 4.0 / 15.1 (public W8A8 checkpoints, int8 KV cache; board
 > perplexity within 1-16% of fp32).
+> **Consolidated results (2026-10-17, tag `v2.2-kv260`,
+> [results_v2.2](docs/results_v2.2.md))**: all four models compiled for 2048
+> positions (Gemma 512), decode / prefill tok/s SmolLM2-135M 23.6 / 57.8,
+> Gemma-3-270M 16.5 / 68.5, Qwen3-0.6B 7.21 / 19.0, Llama-3.2-1B 4.42 / 15.4;
+> decode reads weights at 66–96% of the four-port peak; board teacher forcing
+> over two context-length windows within 3% of fp32 PPL for all four; the
+> RISC-V paths below on all four models (SmolLM2 added 2026-10-17).
 > Long context (2026-10-16): Qwen3-0.6B and Llama-3.2-1B compiled for 2048
 > positions, Gemma-3-270M for 512, prefill vs decode bit-exact on the board over
 > a 2032-token prompt; Qwen3 decode 7.2 tok/s at T = 64 and 3.2 at T = 2048,
@@ -211,6 +218,10 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 
 ## Documentation
 
+- [Results v2.2](docs/results_v2.2.md) - the consolidated board numbers
+  (tag `v2.2-kv260`): speed, quality, long context, decode bandwidth and the
+  RISC-V backend paths for SmolLM2, Gemma-3, Qwen3 and Llama-3.2, with the
+  bundle, commit and log behind each
 - [Hardware learning path](docs/hardware_learning_path.md) - a staged guide
   from digital design fundamentals to the accelerator RTL, verification,
   timing closure and board measurements, with labs on this repository
