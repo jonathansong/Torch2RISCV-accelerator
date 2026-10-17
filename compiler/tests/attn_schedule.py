@@ -368,7 +368,6 @@ def main():
     res = []
     for t in [int(x) for x in args.t.split(",")]:
         disp, bad = {}, []
-        alt_rows = {}
         for n in order:
             one, blob, ind = blobs[n]
             r, cmds = capture(a, one, blob, t, d)
