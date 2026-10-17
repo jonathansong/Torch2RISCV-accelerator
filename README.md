@@ -232,6 +232,9 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   intermediates of consecutive dispatches on chip would gain (the performance
   model's upper bound per model and per operator chain) and the design of the
   first step, the SwiGLU fusion
+- [Triton on the KV260 (proposal)](docs/triton_kv260_proposal.md) - a planned
+  follow-up project: LLM inference as hand-fused Triton kernels lowered to the
+  same `sahl` dialect, compared with this repository's IREE path
 - [Hardware learning path](docs/hardware_learning_path.md) - a staged guide
   from digital design fundamentals to the accelerator RTL, verification,
   timing closure and board measurements, with labs on this repository
