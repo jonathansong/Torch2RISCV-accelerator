@@ -503,35 +503,34 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   return true;
 }
 
-// Decode's gated FFN (FfnPlan, docs/fusion_design.md §4.3): per chunk of nc
-// output tiles both projections on the GEMV unit (x stays resident in it: no
+// Decode's gated FFN (FfnPlan, docs/fusion_design.md §4.3, §4.8): per chunk of
+// nc output tiles both projections on the GEMV unit (x stays resident in it: no
 // SPAD_A write in between), the accumulators side by side in the chunk's ACC
 // bank (alternating per chunk), the chunk's scale slices loaded beside them,
 // and the gating written straight into its slice of h (a local buffer: no
-// store). What follows h (the amax, the int8 output) is the generic lowering's.
-// The chunks are written out (no LOOP_END: h's slice moves on by a local offset).
+// store). The chunks overlap: chunk i's gating runs on the VE while chunk
+// i + 1's weights stream (its first projection issued before the gating, its
+// second after, so the in-order dispatch keeps the unit fed), about
+// `kFfnChunks` chunks whatever the capacity allows (3 to 8 model within 2% of
+// each other; 6 the best on the four models). Every buffer a chunk's VE work
+// touches is in its bank (the scoreboard tracks hazards per bank half):
+// h's slices (the even chunks' in bank 0, the odd ones' in bank 1, in the
+// chunk scratch), a copy of each scalar input, the temporaries. What follows h
+// (the amax, the int8 output) is the generic lowering's, in the chunks'
+// pieces: the amax's piece right after each chunk's gating (combined into its
+// result with sahl.accumulate), the int8 output's after the last chunk (it
+// needs the whole amax). The chunks are written out (no LOOP_END: h's slice
+// moves on by a local offset).
+static constexpr int64_t kFfnChunks = 6;
+
 bool expandFfn(sahl::KernelOp k, FfnPlan p, const ::sa::Layout &lay, int64_t d, int64_t gemvPorts) {
   if (!gemvPorts) return false;
   auto wt = cast<MemRefType>(p.w[0].getType());
-  const int64_t K = wt.getDimSize(1), nt = wt.getDimSize(0), cb = lay.cbank;
-  const int64_t nch_ = int64_t(p.chunked.size());
-  // a bank's scratch holds both accumulators and the chunked inputs: (2 + nch_) x nc words;
-  // the gating's temporaries (one of nc words per operation, the generic lowering)
-  // take at most half of a bank above the scratch, h and the amax's tree the rest
-  int64_t steps = 0;
-  for (Operation &o : p.epi.getRegion().front().without_terminator())
-    if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
-  int64_t nc = std::min<int64_t>({int64_t(lay.scr) / (2 + nch_),
-                                  (int64_t(lay.cbank) - int64_t(lay.scr)) / (2 * std::max<int64_t>(steps, 1)), nt});
-  while (nc > 1 && nt % nc) --nc;
-  if (nc < 1 || K % d) return false;
-  const int64_t nch = nt / nc, kBlock = std::min<int64_t>(K, 65535 / d / d * d);
-  int64_t ncg = std::min<int64_t>(nc, 8);
-  while (nc % ncg) --ncg;
+  const int64_t K = wt.getDimSize(1), nt = wt.getDimSize(0), cb = lay.cbank, scr = lay.scr;
+  const int64_t nch_ = int64_t(p.chunked.size()), nw = int64_t(p.whole.size());
+  if (K % d) return false;
   // what follows h: an amax (a max reduction of h into a scalar) and an
-  // element-wise op of h and scalars (the int8 output), both over N: done in
-  // the chunks' pieces too (their temporaries one chunk long), the amax
-  // combined over the pieces (sahl.accumulate) into its result reserved first
+  // element-wise op of h and scalars (the int8 output), both over N
   const int64_t N = nt * d;
   linalg::GenericOp red, ew;
   for (Operation *u : p.out.getUsers()) {
@@ -548,89 +547,138 @@ bool expandFfn(sahl::KernelOp k, FfnPlan p, const ::sa::Layout &lay, int64_t d, 
       ew = g;
   }
   if (ew && red && ew->isBeforeInBlock(red)) ew = {};
+  // h split over the banks when nothing else reads it, and the amax moved into
+  // the chunks when nothing between the kernel and it touches h or its result
+  bool split = red && ew && llvm::all_of(p.out.getUsers(), [&](Operation *u) {
+                 return u == p.epi.getOperation() || u == red.getOperation() || u == ew.getOperation() ||
+                        isa<memref::DeallocOp>(u);
+               });
+  for (Operation *o = k->getNextNode(); split && o && o != red.getOperation(); o = o->getNextNode())
+    for (Value v : o->getOperands())
+      if (v == p.out || v == red.getDpsInits()[0]) split = false;
+  // a bank's scratch holds both accumulators, the chunked inputs, its half of
+  // h's slices (split) and a copy of each scalar input; the gating's
+  // temporaries (one of nc words per operation, the generic lowering) take at
+  // most half of a bank above the scratch
+  int64_t steps = 0;
+  for (Operation &o : p.epi.getRegion().front().without_terminator())
+    if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
+  auto fits = [&](int64_t c) {
+    return (2 + nch_) * c + (split ? (nt / c + 1) / 2 * c : 0) + nw <= scr;
+  };
+  int64_t nc = std::min<int64_t>((cb - scr) / (2 * std::max<int64_t>(steps, 1)), std::max<int64_t>(nt / kFfnChunks, 1));
+  while (nc > 1 && (nt % nc || !fits(nc))) --nc;
+  if (nc < 1 || !fits(nc)) return false;
+  const int64_t nch = nt / nc, kBlock = std::min<int64_t>(K, 65535 / d / d * d), oH = (2 + nch_) * nc;
+  const int64_t oW = oH + (split ? (nch + 1) / 2 * nc : 0);
+  int64_t ncg = std::min<int64_t>(nc, 8);
+  while (nc % ncg) --ncg;
   Expander e{OpBuilder(k), k.getLoc(), d};
   MLIRContext *ctx = k.getContext();
-  Type f32 = Float32Type::get(ctx), i8 = IntegerType::get(ctx, 8), i32 = IntegerType::get(ctx, 32);
-  sahl::ReserveOp::create(e.b, e.loc, p.out, false);   // h: kept over the chunks' scopes
-  Value xl = e.alloc({K}, i8, "spad_a", "packed");
-  sahl::LoadOp::create(e.b, e.loc, p.x, xl);
-  llvm::DenseMap<int, Value> bc;
-  for (auto &[i, src] : p.whole) {
-    Value v = e.alloc({}, f32, "acc", "packed");
-    sahl::LoadOp::create(e.b, e.loc, src, v);
-    Value w = e.alloc({}, f32, "acc", "bcast");
-    sahl::BcastOp::create(e.b, e.loc, v, w);
-    bc[i] = w;
-  }
+  Type f32 = Float32Type::get(ctx), i32 = IntegerType::get(ctx, 32);
   auto placed = [&](ArrayRef<int64_t> shape, Type et, int64_t word) {
     Value v = e.alloc(shape, et, "acc", "packed");
     v.getDefiningOp()->setAttr("sa.word", e.b.getI64IntegerAttr(word));
     return v;
   };
-  Value acc[2][2];
+  if (!split) sahl::ReserveOp::create(e.b, e.loc, p.out, false);   // h: kept over the chunks' scopes
+  Value xl = e.alloc({K}, IntegerType::get(ctx, 8), "spad_a", "packed");
+  sahl::LoadOp::create(e.b, e.loc, p.x, xl);
+  // the scalar inputs: one copy per bank (each chunk broadcasts its own)
+  llvm::DenseMap<int, Value> sc[2];
+  for (int64_t q = 0; q < nw; ++q)
+    for (int bank = 0; bank < 2; ++bank) {
+      Value v = placed({}, f32, bank * cb + oW + q);
+      sahl::LoadOp::create(e.b, e.loc, p.whole[q].second, v);
+      sc[bank][p.whole[q].first] = v;
+    }
+  Value acc[2][2], hb[2];
   SmallVector<Value> cols[2];
   for (int bank = 0; bank < 2; ++bank) {
     for (int j = 0; j < 2; ++j) acc[bank][j] = placed({nc, d}, i32, bank * cb + j * nc);
     for (int64_t m = 0; m < nch_; ++m) cols[bank].push_back(placed({nc * d}, f32, bank * cb + (2 + m) * nc));
+    if (split) hb[bank] = placed({(nch + 1) / 2 * nc * d}, f32, bank * cb + oH);
   }
+  auto hSlice = [&](Expander &x, int64_t i) {
+    return split ? x.sub(hb[i & 1], {i / 2 * nc * d}, {nc * d}) : x.sub(p.out, {i * nc * d}, {nc * d});
+  };
+  auto gemvs = [&](int64_t i, int j) {
+    for (int64_t g = 0; g < nc; g += ncg)
+      for (int64_t k0 = 0; k0 < K; k0 += kBlock) {
+        const int64_t kb = std::min(kBlock, K - k0);
+        Value xs = kb == K ? xl : e.sub(xl, {k0}, {kb});
+        sahl::GemvOp::create(e.b, e.loc, xs, e.sub(p.w[j], {i * nc + g, k0, 0}, {ncg, kb, d}),
+                             e.sub(acc[i & 1][j], {g, 0}, {ncg, d}), k0 > 0);
+      }
+  };
+  auto scales = [&](int64_t i) {
+    for (int64_t m = 0; m < nch_; ++m)
+      sahl::LoadOp::create(e.b, e.loc, e.sub(p.chunked[m].second, {i * nc * d}, {nc * d}), cols[i & 1][m]);
+  };
+  // a piece of g (the amax or the int8 output) over chunk i's slice of h
+  auto piece = [&](OpBuilder &ib, linalg::GenericOp g, int64_t i, bool reduce) {
+    Expander pe{ib, g.getLoc(), d};
+    SmallVector<Value> ins;
+    for (Value v : g.getDpsInputs()) ins.push_back(v == p.out ? hSlice(pe, i) : v);
+    Value o = reduce ? g.getDpsInits()[0] : pe.sub(g.getDpsInits()[0], {i * nc * d}, {nc * d});
+    auto c = linalg::GenericOp::create(ib, g.getLoc(), TypeRange{}, ins, ValueRange{o}, g.getIndexingMapsArray(),
+                                       g.getIteratorTypesArray());
+    IRMapping map;
+    g.getRegion().cloneInto(&c.getRegion(), map);
+    if (reduce && i > 0) c->setAttr("sahl.accumulate", UnitAttr::get(ctx));
+    return c;
+  };
+  if (split) sahl::ReserveOp::create(e.b, e.loc, red.getDpsInits()[0], true);
+  gemvs(0, 0);
+  gemvs(0, 1);
+  scales(0);
   for (int64_t i = 0; i < nch; ++i) {
     const int bank = int(i & 1);
-    auto sc = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, /*spad_from=*/IntegerAttr());
-    OpBuilder::InsertionGuard guard(e.b);
-    e.b.setInsertionPointToEnd(&sc.getBody().emplaceBlock());
-    for (int j = 0; j < 2; ++j)
-      for (int64_t g = 0; g < nc; g += ncg)
-        for (int64_t k0 = 0; k0 < K; k0 += kBlock) {
-          const int64_t kb = std::min(kBlock, K - k0);
-          Value xs = kb == K ? xl : e.sub(xl, {k0}, {kb});
-          sahl::GemvOp::create(e.b, e.loc, xs, e.sub(p.w[j], {i * nc + g, k0, 0}, {ncg, kb, d}),
-                               e.sub(acc[bank][j], {g, 0}, {ncg, d}), k0 > 0);
+    if (i + 1 < nch) gemvs(i + 1, 0);
+    auto scope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, /*spad_from=*/IntegerAttr());
+    {
+      OpBuilder::InsertionGuard guard(e.b);
+      e.b.setInsertionPointToEnd(&scope.getBody().emplaceBlock());
+      SmallVector<Value> ins;
+      for (int in = 0; in < p.epi.getNumDpsInputs(); ++in) {
+        if (in == p.accIn[0] || in == p.accIn[1]) {
+          Value a = acc[bank][in == p.accIn[0] ? 0 : 1];
+          ins.push_back(memref::CollapseShapeOp::create(e.b, e.loc, a, ArrayRef<ReassociationIndices>{{0, 1}}));
+        } else if (sc[bank].count(in)) {
+          ins.push_back(sc[bank][in]);
+        } else {
+          auto it = llvm::find_if(p.chunked, [&](auto &c) { return c.first == in; });
+          if (it == p.chunked.end()) return false;
+          ins.push_back(cols[bank][it - p.chunked.begin()]);
         }
-    for (int64_t m = 0; m < nch_; ++m)
-      sahl::LoadOp::create(e.b, e.loc, e.sub(p.chunked[m].second, {i * nc * d}, {nc * d}), cols[bank][m]);
-    SmallVector<Value> ins;
-    for (int in = 0; in < p.epi.getNumDpsInputs(); ++in) {
-      if (in == p.accIn[0] || in == p.accIn[1]) {
-        Value a = acc[bank][in == p.accIn[0] ? 0 : 1];
-        ins.push_back(memref::CollapseShapeOp::create(e.b, e.loc, a, ArrayRef<ReassociationIndices>{{0, 1}}));
-      } else if (bc.count(in)) {
-        ins.push_back(bc[in]);
-      } else {
-        auto it = llvm::find_if(p.chunked, [&](auto &c) { return c.first == in; });
-        if (it == p.chunked.end()) return false;
-        ins.push_back(cols[bank][it - p.chunked.begin()]);
       }
+      auto g = linalg::GenericOp::create(e.b, e.loc, TypeRange{}, ins, ValueRange{hSlice(e, i)},
+                                         p.epi.getIndexingMapsArray(), p.epi.getIteratorTypesArray());
+      IRMapping map;
+      p.epi.getRegion().cloneInto(&g.getRegion(), map);
+      g->setAttr("sa.prefer_bank", e.b.getI64IntegerAttr(bank));
+      if (split) piece(e.b, red, i, true)->setAttr("sa.prefer_bank", e.b.getI64IntegerAttr(bank));
     }
-    Value hs = e.sub(p.out, {i * nc * d}, {nc * d});
-    auto g = linalg::GenericOp::create(e.b, e.loc, TypeRange{}, ins, ValueRange{hs}, p.epi.getIndexingMapsArray(),
-                                       p.epi.getIteratorTypesArray());
-    IRMapping map;
-    p.epi.getRegion().cloneInto(&g.getRegion(), map);
-    g->setAttr("sa.prefer_bank", e.b.getI64IntegerAttr(bank));
+    if (i + 1 < nch) {
+      gemvs(i + 1, 1);
+      scales(i + 1);
+    }
   }
-  // the amax and the int8 output in the chunks' pieces, after the kernel
+  // the pieces after the kernel: the int8 output (and the amax when not moved into the chunks)
   auto pieces = [&](linalg::GenericOp g, bool reduce) {
     OpBuilder pb(g);
-    if (reduce) sahl::ReserveOp::create(pb, g.getLoc(), g.getDpsInits()[0], true);
-    else sahl::ReserveOp::create(pb, g.getLoc(), g.getDpsInits()[0], false);
+    sahl::ReserveOp::create(pb, g.getLoc(), g.getDpsInits()[0], reduce);
     for (int64_t i = 0; i < nch; ++i) {
-      auto sc = sahl::ScopeOp::create(pb, g.getLoc(), /*keep=*/true, /*spad_from=*/IntegerAttr());
-      OpBuilder ib = OpBuilder::atBlockEnd(&sc.getBody().emplaceBlock());
-      Expander pe{ib, g.getLoc(), d};
-      SmallVector<Value> ins;
-      for (Value v : g.getDpsInputs()) ins.push_back(v == p.out ? pe.sub(p.out, {i * nc * d}, {nc * d}) : v);
-      Value o = reduce ? g.getDpsInits()[0] : pe.sub(g.getDpsInits()[0], {i * nc * d}, {nc * d});
-      auto c = linalg::GenericOp::create(ib, g.getLoc(), TypeRange{}, ins, ValueRange{o}, g.getIndexingMapsArray(),
-                                         g.getIteratorTypesArray());
-      IRMapping map;
-      g.getRegion().cloneInto(&c.getRegion(), map);
-      if (reduce && i > 0) c->setAttr("sahl.accumulate", UnitAttr::get(ctx));
+      auto s = sahl::ScopeOp::create(pb, g.getLoc(), /*keep=*/true, /*spad_from=*/IntegerAttr());
+      OpBuilder ib = OpBuilder::atBlockEnd(&s.getBody().emplaceBlock());
+      piece(ib, g, i, reduce);
     }
     g.erase();
   };
-  if (red && nch > 1) pieces(red, true);
-  if (ew && nch > 1) pieces(ew, false);
-  eraseKernel(k);
+  if (split) red.erase();
+  else if (red && nch > 1) pieces(red, true);
+  if (ew && (split || nch > 1)) pieces(ew, false);
+  eraseKernel(k);                                 // (split: h's buffer goes with it, unused)
   return true;
 }
 
