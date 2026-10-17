@@ -476,7 +476,8 @@ attention's share grows with the context.
 
 ## 6. The attention fusion (design)
 
-Status: design (2026-10-18), not implemented. The second fused chain after
+Status: design (2026-10-18), schedule prototyped in the performance model
+(§6.2.2), not implemented. The second fused chain after
 SwiGLU (§4, on by default since 2026-10-18). Bounds from
 `compiler/tests/fusion_whatif.py` on the `v2.2-kv260` traces (§6.2); the
 attention kernels it builds on are those of C6.5
@@ -491,14 +492,14 @@ output quantization into one dispatch per layer is worth up to −3.3% of
 decode and −5.6% of prefill on Qwen3. Up to −6.4% / −11% with every piece
 on SmolLM2. Prefill gains more because its attention runs row by row, each
 row as a decode step, so every boundary is paid 16 times per chunk. The
-gain at long contexts is larger still and not in these bounds: inside one
-dispatch the SFU-bound probabilities of one KV head can overlap the EX- and
-LD-bound scores and the GEMV-bound p · V of the next. The numerics need no
-change: the only fp32 reduction over T is a max, so the fused build is
-bit-exact with the unfused one. The hard part is not capacity (everything
-fits) but the per-bank scoreboard (§6.5): SPAD_A has two banks for three roles,
-so the schedule is to be prototyped in the performance model before the
-compiler work starts.
+numerics need no change: the only fp32 reduction over T is a max, so the
+fused build is bit-exact with the unfused one. A schedule prototype on the
+real commands (§6.2.2) gives Qwen3 −4.0% to −4.3% of decode from T = 48 to
+2048 with a schedule the compiler can emit, a little above the bound. It also
+finds the larger lever at long contexts. The VE is the busiest engine, and
+the q · Kᵀ loop's transposes wait for its EXs on a shared SPAD_B bank.
+Alternating that bank is worth −7.4% of decode at T = 2048 alone, and −11.6%
+together with the fusion (§6.5, §6.6).
 
 ### 6.1 The chain today (Qwen3-0.6B decode, one layer)
 
@@ -572,32 +573,77 @@ with the others; `build/perfmodel/attn_stages.sh`):
 The q path is where most of the gain is. It sits on the dependency path
 from q_proj to the scores, and its five dispatches are small.
 
-#### 6.2.2 Long contexts (beyond the bounds)
+#### 6.2.2 The schedule prototype (performance model, 2026-10-18)
 
-The bounds keep each dispatch's commands and order, and the traces are at a
-32-token prompt. At long T the attention dispatches dominate, and each is
-bound by a different engine. Qwen3 per layer at T = 2048 (cycle model, §8.22
-"Where decode attention's time goes"):
+`compiler/tests/attn_schedule.py` builds stage 1's fused command list from
+the real commands. Each unfused dispatch of the chain (Qwen3 2-layer build at
+`--max-len 2048`, `build/hfgen/qwen3_l2_t2048lc`) is compiled by the current
+compiler and run on the functional simulator at T through `dispatch_check.py`.
+So every dispatch is also checked against the oracle, with the executed
+commands captured. The list is then edited and timed by `perf_model.run_list`
+(`qwen3g_cal.json`):
 
-| Dispatch | Total | Bound by |
-|---|---:|---|
-| q · Kᵀ (T loop, steps a–c) | 276k | EX 172k, LD 140k, VE 88k |
-| masked max + exp | 100k | VE / SFU (≈ 90% busy) |
-| Σp | 24k | VE |
-| p · V (GEMV) | 74k | LD (72k) |
-| **sum, as today** | **474k** | |
-| per engine, if overlapped | | LD ≈ 212k, VE ≈ 200k, EX ≈ 172k |
+- the LDs and STs of intermediates are dropped: those on transient (`Indirect`)
+  bindings, except the chain's input (q_proj's output) and its outputs;
+- the GEMV reads p where the probabilities wrote it;
+- the commands are segmented by unit: the probabilities' row pieces, which
+  for Qwen3 are 4 query rows = 2 KV heads, so 4 units;
+- unit u's ACC work goes in bank u mod 2.
 
-In one dispatch, KV head h's probabilities (VE) can run while head h + 1's
-K blocks stream (LD) and its scores compute (EX). Head h's p · V (GEMV, on
-the LD engine) then fills the LD engine's gaps. The floor is the busiest
-engine, about 212k cycles against 474k. That would cut up to about
-−73 ms of the 310 ms Qwen3 decode step at 2048 (board, `qwen3_lc2048_pcpi`),
-about −24%, if the overlap were perfect. It will not be: LD and VE are both
-near the floor, and §6.5's false dependencies cost some of it. The schedule
-prototype (§6.6 step 1) gives the real figure. Gemma has a single KV head
-(Hk = 1), so it gets no head-level overlap. Its attention at T ≤ 512 is small
-anyway (38k cycles per layer).
+Then several orders are timed. Per layer, cycles of the attention chain
+(dispatches 8, 9, 13, 17–25):
+
+| T | Unfused | In order (the bound's form) | **Fused, implementable** | + alternating tiles | Alternating tiles alone (unfused) |
+|---|---:|---:|---:|---:|---:|
+| 48 | 84.2k | 69.3k | **65.7k** | 61.8k | 82.5k |
+| 512 | 191.7k | 172.1k | **165.5k** | 145.1k | 174.0k |
+| 2048 | 592.4k | 555.8k | **548.2k** | 464.3k | 510.8k |
+| Busiest engine (VE), unfused | 43.5k / 100.2k / 310.0k | | | | |
+
+Per token (× 28 layers), and against the board's decode device time
+(127.8 ms at T ≈ 40 with SwiGLU fused, `*f2`; 168.8 / 310.1 ms at
+T = 512 / 2048 from the `qwen3_lc2048_pcpi` sweep):
+
+| T | In order | Fused, implementable | + alternating tiles | Alternating tiles alone |
+|---|---:|---:|---:|---:|
+| 48 | −4.2 ms (−3.3%) | **−5.2 ms (−4.1%)** | −6.3 ms (−4.9%) | −0.5 ms (−0.4%) |
+| 512 | −5.5 ms (−3.3%) | **−7.3 ms (−4.3%)** | −13.0 ms (−7.7%) | −5.0 ms (−3.0%) |
+| 2048 | −10.2 ms (−3.3%) | **−12.4 ms (−4.0%)** | −35.9 ms (−11.6%) | −22.8 ms (−7.4%) |
+
+- **The prototype reproduces the bound.** "In order" (the intermediates
+  dropped, nothing moved) gives −3.3% of decode at T ≈ 40, exactly
+  `fusion_whatif.py`'s stage 1 (§6.2.1).
+- **The implementable schedule** puts unit u − 1's probabilities, Σp and
+  p · V between the two KV heads' T loops of unit u. The commands stay
+  whole, with no loop split by T, so the structure is valid for any T (a
+  `LOOP_END` count must not be 0). This gains another 1–2 ms per token
+  over "in order".
+- **Forms that are not implementable or not better.**
+  - Spreading the previous unit's commands one after each EX ("interleaved")
+    reaches −6.3 / −8.6 / −19.0 ms. But that needs the T loop unrolled,
+    which a dynamic T forbids.
+  - Cutting them into one piece per K block, a fixed share in the loop body
+    ("blocked"), pays each piece's fixed cost on the VE. That is worse than
+    "in order" up to T = 512, and better only at 2048 (−23.5 ms).
+- **p's bank does not matter.** Placing p in SPAD_A bank 0 (with the A tiles)
+  or bank 1 (with the raw K blocks) changes the cycles by at most 1% in every
+  form. The false dependencies feared in §6.5 are small.
+- **The VE is the busiest engine at every T**: 52% of the unfused chain at
+  T = 2048, against LD 39% and EX 29%.
+  - What keeps the fused list far above the VE floor is the q · Kᵀ loop
+    itself. A block's transpose into SPAD_B bank 0 waits for the previous
+    block's EX reading that bank, because EX and VE conflict on any common
+    bank. And the VE is held behind that block's copies, which wait for the
+    same EX.
+  - With the tiles alternating between SPAD_B banks 0 and 1, and the next
+    block's transpose issued ahead of the current block's copies, the VE
+    transposes while the EX runs. This is the double buffering that §8.22
+    step c left out.
+  - Alone it is worth −7.4% of decode at T = 2048. Together with the fusion
+    the two compound: −11.6% at 2048, −7.7% at 512.
+
+The other three models are not modelled yet (`--dispatches` takes their
+numbering; Gemma's Hk = 1 has a single unit).
 
 ### 6.3 Scope and stages
 
@@ -640,7 +686,7 @@ same phase (before dispatch creation, after weight packing and
   golden corpus identical with it off. Lit: a decode attention in linalg (one
   with QK-norm, one without) → one region; a near miss (scores not on a
   cache slice) left alone.
-- **Risk to check first** (§6.6 step 2): regions with dynamic dims this
+- **Risk to check first** (§6.6 step 3): regions with dynamic dims this
   early. IREE's own dispatch formation produces today's dynamic attention
   dispatches, but a region formed by hand must carry the workload ordinals
   for T. The FFN regions were static.
@@ -665,24 +711,26 @@ quantization). `SahlExpandKernels.cpp` gets `expandAttnLayer`, written as
 - the amax accumulated per head (`sahl.accumulate`, as the FFN's), the
   quantization after the last head, then the two STs.
 
-The schedule, per KV head h of Hk (G query rows each):
+The schedule (§6.2.2). A unit is one row piece of the probabilities: Qwen3
+has 4 query rows = 2 KV heads, and units alternate ACC banks.
 
 ```
 q path for all heads: dequantize, QK-norm, RoPE, amax per head, int8      (VE; small)
-A tiles of all KV heads                                                    (VE)
-for h in 0 … Hk − 1:
-    scores(h):  T loop over K blocks: LD, transpose, EX, copies            (LD, VE, EX)
-    probs(h−1): masked max, exp → p, Σp                                    (VE / SFU)
-    pv(h−1):    GEMV over the packed V cache, ÷ Σp, × s_v, amax piece      (LD mode 2, VE)
-probs(Hk−1), pv(Hk−1)
+A tiles of all KV heads, in SPAD_A                                         (VE)
+for unit u:
+    scores, first KV head of u:   T loop over K blocks                     (LD, VE, EX)
+    post(u − 1): masked max, exp → p, Σp; p · V (GEMV), ÷ Σp, × s_v, amax piece
+    scores, second KV head of u:  T loop over K blocks
+post(last unit)
 output: int8 by the amax; ST row, ST scale
 ```
 
-The skew by one head is the FFN's skew by one chunk: commands issue in order
-into queues of four, so head h + 1's LDs and EXs must be issued before head
-h's VE work, or the VE waits behind them. Whether probs(h − 1) sits before or
-after the T loop of h, or is interleaved with its blocks, is what the
-prototype (§6.6 step 1) decides.
+post(u − 1)'s commands are whole and sit between two T loops. No loop is
+split by T, so the list is valid for any T. The T loop itself, unfused or
+fused, should alternate its tiles between SPAD_B banks 0 and 1. That means a
+body unrolled by two, with the next block's transpose issued ahead of the
+current block's copies. In the prototype this matters as much as the fusion
+at long T (§6.2.2).
 
 #### 6.4.3 Local memory (D = 16; words: SPAD 16 B, ACC 64 B = 16 fp32)
 
@@ -714,7 +762,7 @@ with the unfused one, and prefill rows bit-exact with decode (they run the
 same fused executable). As in C6.5, no online softmax: block-local maxima
 would change p's int8 rounding.
 
-### 6.5 The hard part: banks
+### 6.5 Banks (measured in §6.2.2)
 
 The scoreboard tracks hazards per bank (SPAD_A ×2, SPAD_B ×2, ACC ×2): RAW,
 WAR and WAW against in-flight commands of *other* engines. EX and VE also
@@ -724,67 +772,50 @@ engine. It reads x from SPAD_A and writes ACC. The roles:
 
 | Role | Written by | Read by | Bank |
 |---|---|---|---|
-| q tiles (A operand) | VE | EX | SPAD_A ? |
-| raw K block | LD | VE (transpose) | SPAD_A ? |
-| p (GEMV x) | VE | LD (GEMV) | SPAD_A ? |
-| transposed tiles | VE | EX | SPAD_B 0 |
-| block scratch, scores(h) | EX, VE | VE | ACC h mod 2 |
-| p · V accumulators(h), output | LD (GEMV), VE | VE | ACC h mod 2 |
+| q tiles (A operand), all heads, before the loop | VE | EX | SPAD_A 0 |
+| raw K block | LD | VE (transpose) | SPAD_A 1 |
+| p (GEMV x) | VE | LD (GEMV) | SPAD_A 1 (0 measured the same) |
+| transposed tiles | VE | EX | SPAD_B 0 / 1 alternating |
+| block scratch, scores, p · V accumulators of unit u | EX, VE, GEMV | VE | ACC u mod 2 |
 
-ACC and SPAD_B work with the heads alternating ACC banks, as the FFN's
-chunks do. SPAD_A does not: three roles, two banks, and every pairing makes a
-false dependency.
-
-- p with the q tiles (bank 0): VE writing head h's p waits for every in-flight
-  EX (head h + 1's scores read their tile there), which is the overlap we
-  want gone.
-- p with the raw K (bank 1): VE writing p waits for the in-flight K block LDs
-  (WAW), and the next block's LD waits for p's writes (WAW). The two only
-  serialize where they meet, and LD and GEMV are one engine, in order.
-
-Options, to be measured in the prototype:
-
-- (a) p in bank 1 with the raw K blocks, and the q tiles of all heads built
-  once, before the head loop, in bank 0, which then has no writer inside the
-  loop. Issue p's writes between two K block LDs, so they meet an LD queue
-  that is drained there, not full.
-- (b) A finer hazard granularity in the scoreboard (LLM plan §11.3: bank
-  halves or address ranges). This is a bitstream change outside this design's
-  scope, to be weighed against the loss that (a) measures.
-
-EX's A operand and the GEMV's x must both be in SPAD_A, so moving a role to
-SPAD_B or ACC is not an option.
-
-The FFN's experience: the per-bank hazards decided the result, half the
-gain lost until every chunk's VE work sat in its own bank (§4.8–4.9).
-Here the cost is not known until (a) is modelled.
+The design feared SPAD_A, which has three roles in two banks. The prototype
+measured that cost as small: p's bank changes the cycles by at most 1%.
+SPAD_B is the costly bank. With the tiles in one bank, each block's transpose
+waits for the previous block's EX. Alternating the tiles is worth up to
+−7.4% of decode on its own at T = 2048. A finer scoreboard (LLM plan §11.3)
+is not needed for this design.
 
 ### 6.6 Plan
 
 | Step | Content | Estimate |
 |---|---|---|
-| 1 | **Schedule prototype in the performance model**: one layer's fused command list built from the unfused dispatches' commands (intermediates dropped, heads skewed, banks assigned as §6.5 (a)), run with `perf_model.run_list` at T = 32, 512, 2048. Gives stage 1's real gain at short and long T, and whether (a)'s false dependencies matter. Go / no-go | 2 days |
-| 2 | Region pass with dynamic T: the formed region through IREE's dispatch creation, `--compile-to=stream` and the backend unchanged (the region compiled as today's pieces would be, unfused inside) | 3–4 days |
-| 3 | `AttnLayerPlan` match and `expandAttnLayer`, decode at T within one bank first, then the T loop | 8–12 days |
-| 4 | Verification: lit; golden corpus with the flag off; `dispatch_check.py` per dispatch at T = 16, Tb ± D, 2·Tb, max T; end to end on the sim bit-exact with the unfused build (four models, 2 layers); prefill vs decode rows bit-exact; `test_long_context.py` at 2048 (512 Gemma); `host_copies.py` | 4–5 days |
-| 5 | Board: the four bundles (`run_board_tests.sh`: `llm`, `profile --batch`, long context and its sweep, plan A / plan B) | 2 days |
+| 1 | ~~Schedule prototype~~ **done 2026-10-18** (§6.2.2, `attn_schedule.py`): stage 1 −4.0% to −4.3% of decode (Qwen3, T = 48 to 2048) with an implementable schedule; with alternating tiles −4.9% to −11.6%. **Go.** | done |
+| 2 | **Alternating tiles in the existing q · Kᵀ T loop** (unfused; §8.22 step c's double buffering): the body unrolled by two, the next transpose ahead of the copies, an odd count's last block after the loop. Independent of the fusion and first, because it is small and helps long contexts on its own (−7.4% of decode at 2048 in the model). Golden: the tiled q · Kᵀ dispatches change | 2–3 days |
+| 3 | Region pass with dynamic T: the formed region through IREE's dispatch creation, `--compile-to=stream` and the backend unchanged (the region compiled as today's pieces would be, unfused inside) | 3–4 days |
+| 4 | `AttnLayerPlan` match and `expandAttnLayer` with §6.4.2's schedule, decode at T within one block first, then the T loop | 8–12 days |
+| 5 | Verification: lit; golden corpus with the flag off; `dispatch_check.py` per dispatch at T = 16, Tb ± D, 2·Tb, max T; end to end on the sim bit-exact with the unfused build (four models, 2 layers); prefill vs decode rows bit-exact; `test_long_context.py` at 2048 (512 Gemma); `host_copies.py` | 4–5 days |
+| 6 | Board: the four bundles (`run_board_tests.sh`: `llm`, `profile --batch`, long context and its sweep, plan A / plan B) | 2 days |
 
-About four weeks after a positive step 1. Expected: decode −1.4% to −6.4%,
-prefill −4.2% to −11% at short T (§6.2.1, stage 1 slightly less), more at long
-T (§6.2.2).
+About four weeks for steps 2–6. Expected on Qwen3 (model): decode −4%
+(fusion) and up to −12% at T = 2048 with step 2. Prefill gains more than
+decode, because its rows each pay the boundaries (§6.2.1). The other models
+remain to be modelled with `attn_schedule.py --dispatches`.
 
-**Risks.** (1) The false dependencies of §6.5 eating the overlap, the reason
-for step 1. (2) Dynamic-shape regions in IREE, the reason for step 2 before
+**Risks.** (1) The model's accuracy for a fused list. It was calibrated per
+dispatch, but SwiGLU's fused lists landed within 0.4 points of it on the board
+(§4.9). (2) Dynamic-shape regions in IREE, the reason for step 3 before
 the backend. (3) The per-layer generalization (`--iree-flow-enable-executable-generalization`)
 must still merge the fused executables across layers: the caches' offsets and
 scales as push constants, as today (checked by the decode working-set size,
-`rv_codesize.py`). (4) The T loop's guarantees (no read past T, the
-`sa.advance_final` epilogue) carried into a loop that now sits inside a
-head loop: the per-dispatch checks at block boundaries cover it.
+`rv_codesize.py`). (4) The T loop's guarantees, no read past T and the
+`sa.advance_final` epilogue, now hold inside a head loop and with a body
+unrolled by two. An odd block count must not prefetch past the cache. The
+per-dispatch checks at block boundaries cover it.
 
 ## Files
 
 - `compiler/tests/fusion_whatif.py`: the evaluation (`--only` for one chain by kind, `--chain` by role).
+- `compiler/tests/attn_schedule.py`: the attention schedule prototype (§6.2.2).
 - `compiler/tests/perf_model.py`: the command-level model (a FENCE now holds
   back later commands; it did not before 2026-10-17).
 - `build/perfmodel/<bundle>.trace`, `<bundle>_cal.json`,
