@@ -504,7 +504,8 @@ LogicalResult groupKernels(func::FuncOp f, const TargetConfig &cfg) {
   Block &blk = f.getBody().front();
   SmallVector<std::pair<Operation *, StringRef>> anchors;
   for (Operation &op : blk) {
-    if (km.linears.count(&op)) anchors.push_back({&op, "linear"});
+    if (km.ffns.count(&op)) anchors.push_back({&op, "ffn"});
+    else if (km.linears.count(&op)) anchors.push_back({&op, "linear"});
     else if (km.attns.count(&op)) anchors.push_back({&op, "attention"});
     else if (km.contracts.count(&op)) anchors.push_back({&op, "contraction"});
   }

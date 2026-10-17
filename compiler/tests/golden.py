@@ -55,6 +55,11 @@ CASES = [
     ("qwen3_t1024", "build/hfgen/qwen3_l2_t1024/sa_sources", ["--iree-sa-max-dynamic=1024"]),
     # C6.5b: row-mode pieces over dynamic-length rows (the attention probabilities at T = 2048)
     ("qwen3_t2048", "build/hfgen/qwen3_l2_t2048lc/sa_sources", ["--iree-sa-max-dynamic=2048"]),
+    # decode's gated FFN in one dispatch (--iree-sa-fuse-ffn, docs/fusion_design.md): 2-layer models, D = 16, 4 ports
+    ("ffn_smollm2", "build/fuse/smol_l2_ffn/sa_sources", []),
+    ("ffn_gemma", "build/fuse/gemma_l2_ffn/sa_sources", []),               # GeGLU
+    ("ffn_qwen3", "build/fuse/qwen3_l2_ffn/sa_sources", []),
+    ("ffn_llama", "build/fuse/llama_l2_ffn/sa_sources", []),               # N = 8192: amax / int8 output in pieces
 ]
 
 

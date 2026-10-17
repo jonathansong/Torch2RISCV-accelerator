@@ -26,6 +26,7 @@ iree_cc_library(
   SRCS
     "CloneCheapProducers.cpp"
     "DescList.cpp"
+    "FormFfnRegions.cpp"
     "LowerWorkgroupCount.cpp"
     "PackLinearWeights.cpp"
     "SATarget.cpp"
@@ -63,6 +64,9 @@ iree_cc_library(
     MLIRPass
     MLIRSupport
     MLIRTensorDialect
+    iree::compiler::DispatchCreation
+    iree::compiler::Dialect::Flow::IR
+    iree::compiler::Dialect::Flow::Transforms
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::Target
     iree::compiler::Dialect::LinalgExt::IR

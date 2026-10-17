@@ -20,7 +20,9 @@
 #include "../transforms/SahwPasses.h"
 #include "../transforms/SahlPasses.h"
 #include "SahlDialect.h"
+#include "iree/compiler/DispatchCreation/Passes.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "mlir/Transforms/Passes.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetBackend.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetDevice.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
@@ -73,6 +75,9 @@ struct SAOptions {
   // C7 plan A, S4 (§9.3): each export's code compiled in-process for the PicoRV32 (rv32imc)
   // and added to the sa-desc file as an optional code table (the descriptor templates unchanged).
   bool riscv = false;
+  // The gated FFN of decode in one dispatch (docs/fusion_design.md §4): the two
+  // projections, the gating, the amax and the int8 output (FormFfnRegions.cpp).
+  bool fuseFfn = false;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -105,6 +110,9 @@ struct SAOptions {
     binder.opt<bool>("iree-sa-riscv", riscv, llvm::cl::cat(category),
                      llvm::cl::desc("Also compile each export to rv32imc code for the PicoRV32 and embed it in the "
                                     "sa-desc file (C7 plan A, S4; needs iree-compile built with the RISCV target)."));
+    binder.opt<bool>("iree-sa-fuse-ffn", fuseFfn, llvm::cl::cat(category),
+                     llvm::cl::desc("Decode's gated FFN (two projections, gating, amax, int8 output) in one dispatch "
+                                    "(docs/fusion_design.md)."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -347,6 +355,7 @@ struct SASession final
   static void registerPasses() {
     sa::registerPackLinearWeightsPass();
     sa::registerCloneCheapProducersPass();
+    sa::registerFormFfnRegionsPass();
     sa::registerLowerWorkgroupCountPass();
     sa::registerSahwPasses();
   }
@@ -358,6 +367,13 @@ struct SASession final
   void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
     passManager.addPass(sa::createPackLinearWeightsPass(options.d));
     passManager.addPass(sa::createCloneCheapProducersPass());
+    if (options.fuseFfn) {
+      // unit dimensions folded first, as GlobalOptimization would (it skips ops
+      // already in a dispatch region): the region then holds the forms the backend knows
+      passManager.addPass(DispatchCreation::createFoldUnitExtentDimsPass());
+      passManager.addPass(createCanonicalizerPass());
+      passManager.addPass(sa::createFormFfnRegionsPass(true));
+    }
   }
   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) final {
     // #hal.device.target<"sa", ...

@@ -503,6 +503,137 @@ bool expandLinear(sahl::KernelOp k, LinearPlan p, const ::sa::Layout &lay, int64
   return true;
 }
 
+// Decode's gated FFN (FfnPlan, docs/fusion_design.md §4.3): per chunk of nc
+// output tiles both projections on the GEMV unit (x stays resident in it: no
+// SPAD_A write in between), the accumulators side by side in the chunk's ACC
+// bank (alternating per chunk), the chunk's scale slices loaded beside them,
+// and the gating written straight into its slice of h (a local buffer: no
+// store). What follows h (the amax, the int8 output) is the generic lowering's.
+// The chunks are written out (no LOOP_END: h's slice moves on by a local offset).
+bool expandFfn(sahl::KernelOp k, FfnPlan p, const ::sa::Layout &lay, int64_t d, int64_t gemvPorts) {
+  if (!gemvPorts) return false;
+  auto wt = cast<MemRefType>(p.w[0].getType());
+  const int64_t K = wt.getDimSize(1), nt = wt.getDimSize(0), cb = lay.cbank;
+  const int64_t nch_ = int64_t(p.chunked.size());
+  // a bank's scratch holds both accumulators and the chunked inputs: (2 + nch_) x nc words;
+  // the gating's temporaries (one of nc words per operation, the generic lowering)
+  // take at most half of a bank above the scratch, h and the amax's tree the rest
+  int64_t steps = 0;
+  for (Operation &o : p.epi.getRegion().front().without_terminator())
+    if (!isa<arith::TruncIOp, arith::SIToFPOp, arith::ExtSIOp>(o)) ++steps;
+  int64_t nc = std::min<int64_t>({int64_t(lay.scr) / (2 + nch_),
+                                  (int64_t(lay.cbank) - int64_t(lay.scr)) / (2 * std::max<int64_t>(steps, 1)), nt});
+  while (nc > 1 && nt % nc) --nc;
+  if (nc < 1 || K % d) return false;
+  const int64_t nch = nt / nc, kBlock = std::min<int64_t>(K, 65535 / d / d * d);
+  int64_t ncg = std::min<int64_t>(nc, 8);
+  while (nc % ncg) --ncg;
+  // what follows h: an amax (a max reduction of h into a scalar) and an
+  // element-wise op of h and scalars (the int8 output), both over N: done in
+  // the chunks' pieces too (their temporaries one chunk long), the amax
+  // combined over the pieces (sahl.accumulate) into its result reserved first
+  const int64_t N = nt * d;
+  linalg::GenericOp red, ew;
+  for (Operation *u : p.out.getUsers()) {
+    auto g = dyn_cast<linalg::GenericOp>(u);
+    if (!g || g == p.epi || g->getBlock() != k->getBlock() || g->isBeforeInBlock(k) || g.getNumDpsInits() != 1 ||
+        g.getNumLoops() != 1)
+      continue;
+    if (g.getNumReductionLoops() && g.getNumDpsInputs() == 1 && cast<MemRefType>(g.getDpsInits()[0].getType()).getRank() == 0)
+      red = g;
+    else if (!g.getNumReductionLoops() && cast<MemRefType>(g.getDpsInits()[0].getType()).getNumElements() == N &&
+             llvm::all_of(g.getDpsInputs(), [&](Value v) {
+               return v == p.out || cast<MemRefType>(v.getType()).getRank() == 0;
+             }))
+      ew = g;
+  }
+  if (ew && red && ew->isBeforeInBlock(red)) ew = {};
+  Expander e{OpBuilder(k), k.getLoc(), d};
+  MLIRContext *ctx = k.getContext();
+  Type f32 = Float32Type::get(ctx), i8 = IntegerType::get(ctx, 8), i32 = IntegerType::get(ctx, 32);
+  sahl::ReserveOp::create(e.b, e.loc, p.out, false);   // h: kept over the chunks' scopes
+  Value xl = e.alloc({K}, i8, "spad_a", "packed");
+  sahl::LoadOp::create(e.b, e.loc, p.x, xl);
+  llvm::DenseMap<int, Value> bc;
+  for (auto &[i, src] : p.whole) {
+    Value v = e.alloc({}, f32, "acc", "packed");
+    sahl::LoadOp::create(e.b, e.loc, src, v);
+    Value w = e.alloc({}, f32, "acc", "bcast");
+    sahl::BcastOp::create(e.b, e.loc, v, w);
+    bc[i] = w;
+  }
+  auto placed = [&](ArrayRef<int64_t> shape, Type et, int64_t word) {
+    Value v = e.alloc(shape, et, "acc", "packed");
+    v.getDefiningOp()->setAttr("sa.word", e.b.getI64IntegerAttr(word));
+    return v;
+  };
+  Value acc[2][2];
+  SmallVector<Value> cols[2];
+  for (int bank = 0; bank < 2; ++bank) {
+    for (int j = 0; j < 2; ++j) acc[bank][j] = placed({nc, d}, i32, bank * cb + j * nc);
+    for (int64_t m = 0; m < nch_; ++m) cols[bank].push_back(placed({nc * d}, f32, bank * cb + (2 + m) * nc));
+  }
+  for (int64_t i = 0; i < nch; ++i) {
+    const int bank = int(i & 1);
+    auto sc = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, /*spad_from=*/IntegerAttr());
+    OpBuilder::InsertionGuard guard(e.b);
+    e.b.setInsertionPointToEnd(&sc.getBody().emplaceBlock());
+    for (int j = 0; j < 2; ++j)
+      for (int64_t g = 0; g < nc; g += ncg)
+        for (int64_t k0 = 0; k0 < K; k0 += kBlock) {
+          const int64_t kb = std::min(kBlock, K - k0);
+          Value xs = kb == K ? xl : e.sub(xl, {k0}, {kb});
+          sahl::GemvOp::create(e.b, e.loc, xs, e.sub(p.w[j], {i * nc + g, k0, 0}, {ncg, kb, d}),
+                               e.sub(acc[bank][j], {g, 0}, {ncg, d}), k0 > 0);
+        }
+    for (int64_t m = 0; m < nch_; ++m)
+      sahl::LoadOp::create(e.b, e.loc, e.sub(p.chunked[m].second, {i * nc * d}, {nc * d}), cols[bank][m]);
+    SmallVector<Value> ins;
+    for (int in = 0; in < p.epi.getNumDpsInputs(); ++in) {
+      if (in == p.accIn[0] || in == p.accIn[1]) {
+        Value a = acc[bank][in == p.accIn[0] ? 0 : 1];
+        ins.push_back(memref::CollapseShapeOp::create(e.b, e.loc, a, ArrayRef<ReassociationIndices>{{0, 1}}));
+      } else if (bc.count(in)) {
+        ins.push_back(bc[in]);
+      } else {
+        auto it = llvm::find_if(p.chunked, [&](auto &c) { return c.first == in; });
+        if (it == p.chunked.end()) return false;
+        ins.push_back(cols[bank][it - p.chunked.begin()]);
+      }
+    }
+    Value hs = e.sub(p.out, {i * nc * d}, {nc * d});
+    auto g = linalg::GenericOp::create(e.b, e.loc, TypeRange{}, ins, ValueRange{hs}, p.epi.getIndexingMapsArray(),
+                                       p.epi.getIteratorTypesArray());
+    IRMapping map;
+    p.epi.getRegion().cloneInto(&g.getRegion(), map);
+    g->setAttr("sa.prefer_bank", e.b.getI64IntegerAttr(bank));
+  }
+  // the amax and the int8 output in the chunks' pieces, after the kernel
+  auto pieces = [&](linalg::GenericOp g, bool reduce) {
+    OpBuilder pb(g);
+    if (reduce) sahl::ReserveOp::create(pb, g.getLoc(), g.getDpsInits()[0], true);
+    else sahl::ReserveOp::create(pb, g.getLoc(), g.getDpsInits()[0], false);
+    for (int64_t i = 0; i < nch; ++i) {
+      auto sc = sahl::ScopeOp::create(pb, g.getLoc(), /*keep=*/true, /*spad_from=*/IntegerAttr());
+      OpBuilder ib = OpBuilder::atBlockEnd(&sc.getBody().emplaceBlock());
+      Expander pe{ib, g.getLoc(), d};
+      SmallVector<Value> ins;
+      for (Value v : g.getDpsInputs()) ins.push_back(v == p.out ? pe.sub(p.out, {i * nc * d}, {nc * d}) : v);
+      Value o = reduce ? g.getDpsInits()[0] : pe.sub(g.getDpsInits()[0], {i * nc * d}, {nc * d});
+      auto c = linalg::GenericOp::create(ib, g.getLoc(), TypeRange{}, ins, ValueRange{o}, g.getIndexingMapsArray(),
+                                         g.getIteratorTypesArray());
+      IRMapping map;
+      g.getRegion().cloneInto(&c.getRegion(), map);
+      if (reduce && i > 0) c->setAttr("sahl.accumulate", UnitAttr::get(ctx));
+    }
+    g.erase();
+  };
+  if (red && nch > 1) pieces(red, true);
+  if (ew && nch > 1) pieces(ew, false);
+  eraseKernel(k);
+  return true;
+}
+
 // A kernel left unexpanded: the check that refused it (this file's line) as
 // sa.unexpanded, which sahl-to-sahw's report prints (the fallback's reason).
 static bool notExpanded(sahl::KernelOp k, int line) {
@@ -1218,6 +1349,17 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
           if (!bm || !o.hasAttr("sahl.anchor")) continue;
           KernelMatcher km(cfg);
           if (km.matchAttention(bm)) expandAttention(k, km.attns[bm.getOperation()], lay, cfg.d, cfg.maxDynamic);
+          break;
+        }
+        continue;
+      }
+      if (k.getKind() == "ffn") {
+        for (Operation &o : k.getBody().front()) {
+          auto g = dyn_cast<linalg::GenericOp>(&o);
+          if (!g || !o.hasAttr("sahl.anchor")) continue;
+          KernelMatcher km(cfg);
+          if (!km.matchFfn(g) || !expandFfn(k, km.ffns[g.getOperation()], lay, cfg.d, cfg.gemvPorts))
+            notExpanded(k, __LINE__);
           break;
         }
         continue;

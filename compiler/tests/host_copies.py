@@ -30,9 +30,14 @@ def stream_ir(d):
              "--iree-dispatch-creation-enable-aggressive-fusion", "--iree-opt-strip-assertions",
              "--iree-sa-host-fallback", "--iree-hal-link-executables=false",
              f"--iree-sa-d={os.environ.get('SA_D', '16')}", f"--iree-sa-gemv-ports={os.environ.get('SA_GEMV_PORTS', '4')}"]
+    if os.environ.get("SA_GENERALIZE", "1") == "1":
+        flags.append("--iree-flow-enable-executable-generalization")
+    if os.environ.get("SA_FUSE_FFN", "0") == "1":
+        flags.append("--iree-sa-fuse-ffn")
     cf = os.path.join(d, "compile_flags.txt")
     if os.path.exists(cf):
         flags += open(cf).read().split()
+    flags += os.environ.get("SA_COMPILE_FLAGS", "").split()
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "s.mlir")
         r = subprocess.run([COMPILE, os.path.join(d, "qllama.mlir"), *flags, "--compile-to=stream",

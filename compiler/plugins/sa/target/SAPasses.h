@@ -19,6 +19,11 @@ void registerPackLinearWeightsPass();
 std::unique_ptr<Pass> createCloneCheapProducersPass();
 void registerCloneCheapProducersPass();
 
+// Preprocessing: decode's gated FFN wrapped in one flow.dispatch.region
+// (FormFfnRegions.cpp, docs/fusion_design.md §4.2).
+std::unique_ptr<Pass> createFormFfnRegionsPass(bool enabled);
+void registerFormFfnRegionsPass();
+
 // Translation: every export runs as one workgroup (a dispatch is one
 // descriptor template), so the workgroup count regions become (1, 1, 1)
 // (LowerWorkgroupCount.cpp).

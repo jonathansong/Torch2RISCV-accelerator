@@ -120,6 +120,25 @@ struct LinearPlan {
   SmallVector<std::pair<int, Value>> cols, rowv;
 };
 
+// ------------------------------------------------------------ decode's gated FFN (docs/fusion_design.md §4)
+// A dispatch formed by iree-sa-form-ffn-regions: two GEMV contractions of the
+// same x (i8 [K], one load), each accumulator [N / D, D] consumed through a
+// collapse to [N] by one element-wise gating generic (1-D: identity maps and
+// scalars) with fp32 [N] inputs (the scales) and scalars (s_x) from DDR; its
+// result h, a local buffer, is left to what follows (the amax, the int8
+// output: the generic lowering).
+struct FfnPlan {
+  linalg::GenericOp con[2];
+  linalg::GenericOp epi;
+  Value x;                                     // DDR
+  Value w[2];                                  // DDR, packed [N / D, K, D]
+  Value acc[2];                                // the accumulators (local)
+  int accIn[2] = {-1, -1};                     // the epilogue input of each (through its collapse)
+  SmallVector<std::pair<int, Value>> chunked;  // epilogue inputs fp32 [N]: (input, DDR)
+  SmallVector<std::pair<int, Value>> whole;    // scalar epilogue inputs: (input, DDR)
+  Value out;                                   // h: the epilogue's result (local, [N])
+};
+
 // The schedule of a linear micro-kernel (sahl-schedule): chunks of chunkTiles
 // output tiles (the weights of a chunk in one SPAD_B bank, the next chunk's
 // loaded into the other bank while this one computes); decode's form loops
@@ -152,6 +171,8 @@ class KernelMatcher {
            lay.acc0 + k / d + 2 <= lay.cbank;
   }
   bool matchAttention(linalg::BatchMatmulOp bmm);
+  // decode's gated FFN, anchored at the contraction that comes first (FfnPlan)
+  bool matchFfn(linalg::GenericOp con);
   bool matchContraction(linalg::LinalgOp op);
 
   std::optional<SmallVector<Range>> loopRanges(linalg::LinalgOp op);
@@ -161,6 +182,7 @@ class KernelMatcher {
   llvm::DenseMap<Operation *, LinearPlan> linears;
   llvm::DenseMap<Operation *, AttnPlan> attns;
   llvm::DenseMap<Operation *, ContractPlan> contracts;
+  llvm::DenseMap<Operation *, FfnPlan> ffns;
   llvm::DenseSet<Operation *> owned;
   llvm::DenseMap<Operation *, SmallVector<Operation *>> covers;   // anchor -> the operations of its match
 

@@ -358,6 +358,17 @@ class Interp:
         et = str(rt.element_type)
         self.set(op.results[0], T(np.zeros(shape, np.uint32 if et == "f32" else np.int64), et))
 
+    def _reshape(self, op):
+        # tensor.collapse_shape / expand_shape: the same elements in row-major order
+        t = self.val(op.operands[0])
+        shape = list(ir.RankedTensorType(op.results[0].type).shape)
+        if any(x < 0 for x in shape):
+            raise NotImplementedError("dynamic reshape")
+        self.set(op.results[0], T(np.asarray(t.arr).reshape(shape), t.et))
+
+    op_tensor_collapse_shape = _reshape
+    op_tensor_expand_shape = _reshape
+
     def op_linalg_fill(self, op):
         v, out = self.val(op.operands[0]), self.val(op.operands[1])
         self.set(op.results[0], T(np.full(out.arr.shape, v.arr, dtype=out.arr.dtype), out.et))

@@ -285,6 +285,15 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
     }
     return l;
   }
+  if (auto cs = v.getDefiningOp<memref::CollapseShapeOp>(); cs && !ddrRoot(v)) {
+    // a packed local buffer seen flat (an expanded kernel's step): the same words
+    auto base = bufOf(cs.getSrc());
+    if (!base) return std::nullopt;
+    if (base->bcast || base->rowStride || base->dyn || !mt.hasStaticShape()) return fail("collapsed local buffer"), std::nullopt;
+    LocalBuf l = *base;
+    l.n = mt.getNumElements();
+    return l;
+  }
   auto alloc = v.getDefiningOp<memref::AllocOp>();
   if (!alloc) return fail("operand is not a local buffer"), std::nullopt;
   auto vt = vtOf(mt.getElementType());

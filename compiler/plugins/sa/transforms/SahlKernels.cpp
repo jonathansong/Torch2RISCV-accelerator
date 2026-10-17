@@ -36,7 +36,12 @@ std::optional<Lin> dynLin(Value size) {
 }
 
 void KernelMatcher::matchAll(func::FuncOp f) {
-  // the micro-kernels (§8.8), as --iree-sa-ukernels allows
+  // the micro-kernels (§8.8), as --iree-sa-ukernels allows; a gated FFN before
+  // the linear layers (its contractions are not linear layers on their own)
+  if (cfg.ukernel("linear") && cfg.gemvPorts)
+    f.walk([&](linalg::GenericOp g) {
+      if (g->getParentOp() == f.getOperation() && !owned.contains(g.getOperation())) matchFfn(g);
+    });
   if (cfg.ukernel("linear"))
     f.walk([&](linalg::GenericOp g) {
       if (g->getParentOp() == f.getOperation()) matchLinear(g);
@@ -617,6 +622,151 @@ bool KernelMatcher::matchAttention(linalg::BatchMatmulOp bmm) {
   cover.push_back(p.store);
   record(bmm, cover);
   attns[bmm.getOperation()] = p;
+  return true;
+}
+
+// decode's GEMV contraction (t, j, k): x[k] Wp[t, k, j] -> acc[t, j], int8 x
+// and weights loaded from DDR, the accumulator zero-filled: (x load, w load, fill)
+// a copy generic out = in (identity maps), or null
+static linalg::GenericOp asCopy(Operation *op) {
+  auto g = dyn_cast<linalg::GenericOp>(op);
+  if (!g || g.getNumDpsInputs() != 1 || g.getNumDpsInits() != 1 || g.getNumReductionLoops() ||
+      !llvm::all_of(g.getIndexingMapsArray(), [](AffineMap m) { return m.isIdentity(); }))
+    return {};
+  auto y = cast<linalg::YieldOp>(g.getRegion().front().getTerminator());
+  return y.getOperand(0) == g.getRegion().front().getArgument(0) ? g : linalg::GenericOp();
+}
+
+// The zero initialization of an accumulator: a fill with 0, or a copy of a
+// zero-filled buffer (two accumulators from one fill: bufferization copies one)
+static Operation *zeroInit(Value acc) {
+  for (Operation *u : acc.getUsers()) {
+    if (auto f = dyn_cast<linalg::FillOp>(u); f && f.getDpsInits()[0] == acc)
+      return getConstantIntValue(f.getDpsInputs()[0]) == 0 ? u : nullptr;
+    if (auto c = asCopy(u); c && c.getDpsInits()[0] == acc) {
+      Value src = c.getDpsInputs()[0];
+      for (Operation *v : src.getUsers())
+        if (auto f = dyn_cast<linalg::FillOp>(v); f && f.getDpsInits()[0] == src && getConstantIntValue(f.getDpsInputs()[0]) == 0 &&
+                                                   f->isBeforeInBlock(c))
+          return u;
+      return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+static bool gemvContraction(linalg::GenericOp con, sahl::LoadOp &lx, sahl::LoadOp &lw, Operation *&fill) {
+  MLIRContext *ctx = con.getContext();
+  AffineExpr d0, d1, d2;
+  bindDims(ctx, d0, d1, d2);
+  auto maps = con.getIndexingMapsArray();
+  auto it = con.getIteratorTypesArray();
+  if (con.getNumDpsInputs() != 2 || con.getNumDpsInits() != 1 || it.size() != 3 ||
+      it[2] != utils::IteratorType::reduction || maps[0] != AffineMap::get(3, 0, {d2}, ctx) ||
+      maps[1] != AffineMap::get(3, 0, {d0, d2, d1}, ctx) || maps[2] != AffineMap::get(3, 0, {d0, d1}, ctx))
+    return false;
+  Block &b = con.getRegion().front();
+  auto y = cast<linalg::YieldOp>(b.getTerminator());
+  auto add = y.getOperand(0).getDefiningOp<arith::AddIOp>();
+  if (!add) return false;
+  Value prod = add.getLhs() == b.getArgument(2) ? add.getRhs() : add.getLhs();
+  auto mul = prod.getDefiningOp<arith::MulIOp>();
+  auto isExt = [&](Value v, int arg) {
+    auto e = v.getDefiningOp<arith::ExtSIOp>();
+    return e && e.getIn() == b.getArgument(arg);
+  };
+  if (!mul || (!(isExt(mul.getLhs(), 0) && isExt(mul.getRhs(), 1)) && !(isExt(mul.getLhs(), 1) && isExt(mul.getRhs(), 0))))
+    return false;
+  lx = loadInto(con.getDpsInputs()[0]);
+  lw = loadInto(con.getDpsInputs()[1]);
+  if (!lx || !lw) return false;
+  auto xt = cast<MemRefType>(lx.getSrc().getType()), wt = cast<MemRefType>(lw.getSrc().getType());
+  if (!xt.getElementType().isInteger(8) || xt.getRank() != 1 || !wt.getElementType().isInteger(8) || wt.getRank() != 3)
+    return false;
+  fill = zeroInit(con.getDpsInits()[0]);
+  return fill != nullptr;
+}
+
+bool KernelMatcher::matchFfn(linalg::GenericOp con) {
+  sahl::LoadOp lx, lw;
+  Operation *fill;
+  if (!gemvContraction(con, lx, lw, fill)) return false;
+  // the accumulator: the contraction, its zero initialization, one collapse to
+  // [N] (and the copy initializing the other accumulator from it)
+  auto collapseOf = [](Value acc, Operation *c, Operation *fl) -> memref::CollapseShapeOp {
+    memref::CollapseShapeOp cs;
+    for (Operation *u : acc.getUsers()) {
+      if (u == c || u == fl || isa<memref::DeallocOp>(u)) continue;
+      if (auto cp = asCopy(u); cp && cp.getDpsInputs()[0] == acc && cp->isBeforeInBlock(c)) continue;
+      auto x = dyn_cast<memref::CollapseShapeOp>(u);
+      if (!x || cs || cast<MemRefType>(x.getType()).getRank() != 1) return {};
+      cs = x;
+    }
+    return cs;
+  };
+  auto cs = collapseOf(con.getDpsInits()[0], con, fill);
+  if (!cs || !cs->hasOneUse()) return false;
+  auto epi = dyn_cast<linalg::GenericOp>(*cs->getUsers().begin());
+  if (!epi || epi.getNumDpsInits() != 1 || epi.getNumLoops() != 1 || epi.getNumReductionLoops() ||
+      !epi.getIndexingMapsArray().back().isIdentity())
+    return false;
+  auto ot = cast<MemRefType>(epi.getDpsInits()[0].getType());
+  const int64_t N = ot.getNumElements();
+  if (!ot.getElementType().isF32() || !ot.hasStaticShape()) return false;
+  FfnPlan p;
+  p.epi = epi;
+  p.out = epi.getDpsInits()[0];
+  p.x = lx.getSrc();
+  SmallVector<Operation *> cover = {epi, lx};
+  int nacc = 0;
+  for (int i = 0; i < epi.getNumDpsInputs(); ++i) {
+    Value in = epi.getDpsInputs()[i];
+    AffineMap m = epi.getIndexingMapsArray()[i];
+    if (auto c = in.getDefiningOp<memref::CollapseShapeOp>()) {
+      // an accumulator of one of the two contractions (this one, its partner)
+      linalg::GenericOp ci;
+      for (Operation *u : c.getSrc().getUsers())
+        if (auto g = dyn_cast<linalg::GenericOp>(u); g && g.getNumDpsInits() == 1 && g.getDpsInits()[0] == c.getSrc() &&
+                                                     g != epi && g.getNumReductionLoops() == 1)
+          ci = g;
+      sahl::LoadOp lxi, lwi;
+      Operation *fi;
+      if (!ci || nacc == 2 || !m.isIdentity() || !gemvContraction(ci, lxi, lwi, fi) || lxi != lx ||
+          collapseOf(c.getSrc(), ci, fi) != c || cast<MemRefType>(lwi.getSrc().getType()) != cast<MemRefType>(lw.getSrc().getType()))
+        return false;
+      p.con[nacc] = ci;
+      p.w[nacc] = lwi.getSrc();
+      p.acc[nacc] = c.getSrc();
+      p.accIn[nacc] = i;
+      cover.append({ci, fi, lwi});                 // (the collapse: a view, hoisted before the kernel)
+      ++nacc;
+      continue;
+    }
+    auto l = loadInto(in);
+    if (!l) return false;
+    for (Operation *u : in.getUsers())
+      if (u != epi.getOperation() && u != l.getOperation() && !isa<memref::DeallocOp>(u)) return false;
+    auto it = cast<MemRefType>(in.getType());
+    if (it.getRank() == 0 && m.getNumResults() == 0 && it.getElementType().isF32()) p.whole.push_back({i, l.getSrc()});
+    else if (it.getRank() == 1 && m.isIdentity() && it.getElementType().isF32() && it.getNumElements() == N)
+      p.chunked.push_back({i, l.getSrc()});
+    else return false;
+    cover.push_back(l);
+  }
+  if (nacc != 2 || (p.con[0] != con && p.con[1] != con)) return false;
+  // x used by the two contractions only; anchored at the one that comes first
+  for (Operation *u : con.getDpsInputs()[0].getUsers())
+    if (u != p.con[0].getOperation() && u != p.con[1].getOperation() && u != lx.getOperation() && !isa<memref::DeallocOp>(u))
+      return false;
+  auto wt = cast<MemRefType>(p.w[0].getType());
+  if (wt.getDimSize(2) != d || wt.getDimSize(0) * d != N || wt.getDimSize(1) % d) return false;
+  if (p.con[1]->isBeforeInBlock(p.con[0])) {
+    std::swap(p.con[0], p.con[1]), std::swap(p.w[0], p.w[1]), std::swap(p.acc[0], p.acc[1]);
+    std::swap(p.accIn[0], p.accIn[1]);
+  }
+  if (p.con[0] != con || owned.contains(p.con[1].getOperation())) return false;
+  record(con, cover);
+  ffns[con.getOperation()] = p;
   return true;
 }
 
