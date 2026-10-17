@@ -4,7 +4,8 @@ Status: **done 2026-10-16**. Everything below is accepted on the board for Gemma
 - plan B, the decode loop on the PicoRV32 (§7.1);
 - plan A, every dispatch as generated RISC-V code, from the `.ll` (S1–S3) and embedded in `sa.vmfb` by iree-compile (S4) (§9);
 - R5, an llvm-cpu kernel on the core (§5);
-- the code size against a TCM / I-cache (§8) and the performance-counter breakdown (§9.10).
+- the code size against a TCM / I-cache (§8) and the performance-counter breakdown (§9.10);
+- one executable per kernel instead of one per layer (§9.11, on by default in `compile_sa.sh` since 2026-10-17): a decode step's rv32 code is 20–41 KB instead of 65–288 KB.
 
 C7 is the optional stage of
 [`iree_compiler_plan.md`](iree_compiler_plan.md) §8.10. Its purpose here is to
@@ -109,11 +110,11 @@ GEMV is LD mode 2 with three fields only the descriptor path fills (`xword`, `cs
 
 The emitter needs the same register setup the serializer has (`SahwSerialize.cpp`) and the VE / EX field packing (`DescList.h`); writing it beside the serializer keeps the two encodings consistent.
 
-## 5. Plan (R1–R5; status 2026-10-16: R2, R3 and R5 done, R1 in part, R4 superseded by plan B)
+## 5. Plan (R1–R5; status 2026-10-16: R1, R2, R3 and R5 done, R4 superseded by plan B)
 
 | Step | Content | Needs | Estimate |
 |---|---|---|---|
-| R1 | (in part: the RVB cases on the board, §6, give PCPI against the list from BRAM and from DDR, and plan A's runs give it over whole models, §9.3; the performance-counter breakdown was not done) **Measure the issue cost**: a firmware loop issuing the commands of one recorded dispatch (from a funcsim trace) over PCPI from BRAM and from DDR, against the same list through `mat_submit`; on the board with the performance counters (scheduler starvation, all-idle) | the trace, firmware, the board | 1 day |
+| R1 | (done 2026-10-16: the RVB cases on the board, §6, give PCPI against the list from BRAM and from DDR, and plan A's runs give it over whole models, §9.3; the performance-counter breakdown is §9.10: about 27 cycles per instruction fetched from DDR, 9–11 instructions per command) **Measure the issue cost**: a firmware loop issuing the commands of one recorded dispatch (from a funcsim trace) over PCPI from BRAM and from DDR, against the same list through `mat_submit`; on the board with the performance counters (scheduler starvation, all-idle) | the trace, firmware, the board | 1 day |
 | R2 | (first form done 2026-10-15, §6: straight-line from the trace; the full form is plan A's `sahw` → LLVM IR → rv32 code generator, §9, used instead of a C emitter) **`sahw` → C emitter** (model A) with `sysarray_intrinsics.h`, compiled by the system clang to rv32imc: no LLVM rebuild. Functional check on the host: the same C compiled for x86 with the intrinsics redirected to the functional simulator (a C shim over `sa_funcsim`), compared with the descriptor path's results | compiler plugin, a host shim | 2–3 days |
 | R3 | (RTL part done 2026-10-15, §6: six dispatches bit-identical) **RTL co-simulation** of one small dispatch (a norm or the scalar index store) on `tb_system` (PicoRV32 + sa_unit), bit-identical to the descriptor path; then the board through a ring "call" entry in `rt_fw` | RTL sim, firmware | 2 days |
 | R4 | (superseded by plan B, §7.1: the core submits lists recorded per attention-length bucket and patches the words that differ, instead of computing the counts and offsets) **Model B**: a control program that computes the T loop's counts and offsets and submits the list (the dynamic fields no longer needed), as a prototype of a scalar core + command DMA | firmware, runtime | 2 days |
@@ -229,10 +230,10 @@ The core runs the whole step as RISC-V code issuing PCPI commands (§3 model A),
   | Qwen3-0.6B prefill (chunk of 16) | | 6376, 1056 | 562 KB | 67, 102.7 KB, 71% | |
 
   Most of a decode step's working set is per-layer copies of the attention kernels: QK `batch_matmul` (5.7 KB in Qwen3, 7.2 KB in Llama), PV `matmul_like` and the KV write. Each layer has its own export, and two copies of Qwen3's PV kernel differ in 19 halfwords. The layer's KV cache offset is compiled into immediates (the commands are specialized at compile time, §9.9), so the copies cannot share code; in Qwen3 they are 244 of the 288 KB. Consequences for an ASIC:
-  - **Today's code does not fit a small TCM**: no decode step fits 8–16 KB. The part called every layer (10–17 KB) does, and covers 85–88% of the calls. The per-layer copies are called once per step, so an I-cache of that size misses on them every step; they are about 12% of the calls.
+  - **The code before §9.11 does not fit a small TCM**: no decode step fits 8–16 KB. The part called every layer (10–17 KB) does, and covers 85–88% of the calls. The per-layer copies are called once per step, so an I-cache of that size misses on them every step; they are about 12% of the calls.
   - **Code shared between layers** (implemented 2026-10-16, §9.11: Qwen3's decode step 288 → 34 KB): with the per-layer offsets passed as runtime values (a push constant or a binding offset instead of an immediate; one export per kernel shape), a decode step needs 15–33 KB for all three models. A 32–64 KB TCM then holds the whole decode step, and the core never fetches code from DRAM. This is a compiler change (keep the KV layer offset dynamic for the attention dispatches); it costs a register add per address computation.
   - **Prefill is larger**: 562 KB per chunk, 103 KB of it called every layer. It needs DRAM with an I-cache, or the same de-specialization; a decode-only TCM is the realistic target.
-  - Not measured yet: the dynamic fetch traffic (instructions executed per call, the loop bodies' reuse). The next step is the performance counters per call (`rdinstret` / `rdcycle` on the core, the unit's STARVE / ALL_IDLE).
+  - The dynamic fetch traffic is measured in §9.10 (rt_fw v7's counters: the core's instructions retired and cycles, the unit's STARVE / ALL_IDLE, per call and per schedule): every instruction comes from DDR at about 27 cycles, and a command takes 9–11 instructions, so plan A's gap to the lists is the fetch, which a TCM holding the decode step removes.
 - **Core performance**: whether a simple in-order core issuing at the §2 rates is enough, or the command DMA must stay (model B).
 - **Scalar work on the core**: sampling, small reductions, KV cache bookkeeping, the per-token scales (today the VE's REDUCE and SFU).
 

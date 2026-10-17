@@ -382,7 +382,8 @@ directory about 10–15 GB. ccache is capped at 8 GB.
     the portable `.ll`, `--iree-sa-riscv` for the code embedded in `sa.vmfb`;
     runtime `SA_RV=<dir>|embedded`);
   - R5: an llvm-cpu kernel on the core (`SA_R5`);
-  - the code-size and performance-counter analysis.
+  - the code-size and performance-counter analysis;
+  - one executable per kernel instead of one per layer (on by default, see above).
 
   ```sh
   compiler/scripts/build_iree_compiler.sh                # with SA_WITH_RISCV=1: llvm-cpu + the RISC-V target (S4, R5)

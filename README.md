@@ -29,6 +29,9 @@
 >   (`sahw` → LLVM IR → rv32imc) and embeds in `sa.vmfb`, which issues the
 >   commands over PCPI with no descriptors, also inside plan B's loop.
 > - **R5**: a scalar kernel compiled by IREE's llvm-cpu for the core.
+> - **One executable per kernel, not per layer** (on by default): a decode
+>   step's rv32 code is 20–41 KB instead of 65–288 KB, small enough for a
+>   32–64 KB instruction memory.
 >
 > The counters put plan A's remaining gap to the lists (Qwen3 163 against 136
 > ms per step) entirely on instruction fetch from DDR: about 27 cycles per

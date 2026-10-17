@@ -854,7 +854,8 @@ Verification: compile the same model with different configurations (D = 8 / 16, 
 - **C7 RISC-V backend: done 2026-10-16.** Everything below is on the board for Gemma-3-270M, Qwen3-0.6B and Llama-3.2-1B, bit-exact, and is detailed in [`riscv_backend_design.md`](riscv_backend_design.md):
   - plan B: the decode loop on the PicoRV32 (§7.1);
   - plan A: every dispatch as generated RISC-V code (§9), from the `.ll` (S1–S3) and compiled in-process by iree-compile into `sa.vmfb` (S4, `--iree-sa-riscv`, `SA_RV=embedded`);
-  - R5: plan B's block argmax as a kernel compiled by llvm-cpu for riscv32 (§5).
+  - R5: plan B's block argmax as a kernel compiled by llvm-cpu for riscv32 (§5);
+  - one executable per kernel instead of one per layer (§9.11, IREE patch 0003, on by default in `compile_sa.sh` since 2026-10-17): a decode step's rv32 code 20–41 KB instead of 65–288 KB.
 
   The analysis is there too: §8 for the code size against a TCM / I-cache, §9.10 for the performance counters (plan A's gap to the lists is instruction fetch from DDR). The plan as written before:
 - **C7 RISC-V backend** (optional, any time after C5, not affecting the C5 / C6 main line; since 2026-10-15 pre-research for a future ASIC NPU, design and the KV260 facts in [`riscv_backend_design.md`](riscv_backend_design.md); there: real dispatches over PCPI bit-identical in RTL and on the board (R2 / R3, §6), and plan B, **the whole decode loop on the PicoRV32** (the driver records each attention-length bucket's lists, rt_fw v3 runs the steps, the argmax from an on-accelerator block-max), accepted on the board 2026-10-16 for Gemma-3-270M, Qwen3-0.6B and Llama-3.2-1B: tokens identical and logits bit-exact against the ARM's loop, Qwen3 145.7 ms per step against 148.3 (§7.1)):
