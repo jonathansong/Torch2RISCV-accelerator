@@ -6,7 +6,10 @@
 // loop rotated (block i's LD, block i - 1's EX and copies, block i's
 // transpose), the last block's EX and copies after the loop at the loop
 // PARAM's final value (sa.advance_final), the row buffers one block longer
-// in front (iteration 0's copies).
+// in front (iteration 0's copies). Each iteration's block of 128 rows as two
+// halves of 64 whose tiles alternate SPAD_B banks (docs/fusion_design.md
+// §6.2.2): per half its LD, the previous half's EX (the other bank), its
+// transpose, then the previous half's copies.
 // RUN: iree-opt --iree-sahl-expand-kernels="d=16 max-dynamic=512" %s | FileCheck %s
 // RUN: iree-opt --iree-sahl-expand-kernels="d=16 max-dynamic=512" --iree-sahl-to-sahw="d=16 max-dynamic=512" %s | FileCheck %s --check-prefix=LOW
 
@@ -24,12 +27,22 @@
 // CHECK: memref.alloc() {sa.accumulator, sa.layout = "packed", sa.mem = "acc"} : memref<2048xi64>
 // CHECK-COUNT-4: memref.alloc() {sa.accumulator, sa.layout = "packed", sa.mem = "acc"} : memref<768xi64>
 // CHECK: sahl.loop count(%{{.+}}) attributes {count = 5 : i64, strides = array<i64: 32768, 8>}
-// CHECK: sahl.load %{{.+}}, %{{.+}} {sa.advance = 0 : i64, sa.rows}
+// CHECK: sahl.load %{{.+}}, %{{.+}} {sa.advance = 0 : i64, sa.rows} : memref<64x256xi8
+// CHECK: memref.alloc() {sa.bank = 1 : i64, sa.mem = "spad_b"} : memref<4x256x16xi8>
 // CHECK: sahl.mma
-// CHECK-NOT: sahl.mma
-// CHECK-COUNT-4: memref.copy %{{.+}}, %{{.+}} {sa.advance = 1 : i64}
+// CHECK-NEXT: memref.alloc() {sa.bank = 0 : i64, sa.mem = "spad_b"} : memref<4x256x16xi8>
 // CHECK-NEXT: sahl.transpose
-// CHECK-NEXT: {{^ +}$}}
+// CHECK: memref.subview %{{.+}}[64] [64] [1] : memref<768xi64>
+// CHECK-NEXT: memref.copy %{{.+}}, %{{.+}} {sa.advance = 1 : i64}
+// CHECK: sahl.load %{{.+}}, %{{.+}} {sa.advance = 0 : i64, sa.rows} : memref<64x256xi8, strided<[256, 1], offset: 16384>
+// CHECK: memref.alloc() {sa.bank = 0 : i64, sa.mem = "spad_b"} : memref<4x256x16xi8>
+// CHECK: sahl.mma
+// CHECK-NEXT: memref.alloc() {sa.bank = 1 : i64, sa.mem = "spad_b"} : memref<4x256x16xi8>
+// CHECK-NEXT: sahl.transpose
+// CHECK: memref.subview %{{.+}}[128] [64] [1] : memref<768xi64>
+// CHECK-NEXT: memref.copy %{{.+}}, %{{.+}} {sa.advance = 1 : i64}
+// CHECK: {{^ +}$}}
+// CHECK-NEXT: memref.alloc() {sa.bank = 1 : i64, sa.mem = "spad_b"} : memref<4x256x16xi8>
 // CHECK: sahl.mma
 // CHECK-NOT: sahl.mma
 // CHECK-COUNT-4: memref.copy %{{.+}}, %{{.+}} {sa.advance_final = 1 : i64}
@@ -40,12 +53,16 @@
 // LOW-NEXT: sahw.transpose {dst = 268435456 : i64, {{.*}}stride = 1
 // LOW: sahw.setreg %[[P0:.+]], %[[P1:.+]] {values = array<i64: 0, 0>}
 // LOW-NEXT: sahw.loop 5, %[[P0]] step 32768, %[[P1]] step 8 dyn(
-// LOW-NEXT: sahw.ld %{{.+}} dyn(%[[P0]])
-// LOW-NEXT: sahw.ex
+// LOW-NEXT: sahw.ld %{{.+}} dyn(%[[P0]]) {ddr = 0 : i64
+// LOW-NEXT: sahw.ex {a = 0 : i64, b = 4096 : i64
+// LOW-NEXT: sahw.transpose {dst = 536870912 : i64
 // LOW-COUNT-4: sahw.ve dyn(%[[P1]]) {{.*}}dyn_add = array<i1: true>, dyn_fields = array<i32: 3>
-// LOW-NEXT: sahw.transpose
+// LOW-NEXT: sahw.ld %{{.+}} dyn(%[[P0]]) {ddr = 16384 : i64
+// LOW-NEXT: sahw.ex {a = 0 : i64, b = 0 : i64
+// LOW-NEXT: sahw.transpose {dst = 536875008 : i64
+// LOW-COUNT-4: sahw.ve dyn(%[[P1]]) {{.*}}dyn_add = array<i1: true>, dyn_fields = array<i32: 3>
 // LOW-NEXT: {{^ +}$}}
-// LOW-NEXT: sahw.ex
+// LOW-NEXT: sahw.ex {a = 0 : i64, b = 4096 : i64
 // LOW-COUNT-4: sahw.ve dyn(%[[P1]]) {{.*}}dyn_add = array<i1: true>, dyn_fields = array<i32: 3>
 func.func @scores_tiled() {
   %c32_i64 = arith.constant 32 : i64

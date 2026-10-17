@@ -70,7 +70,10 @@
 // (its destination moving on with the loop). Step c: the loop software-
 // pipelined (iteration i: block i's LD, block i - 1's EX and copies, block i's
 // transpose; the last block's EX and copies after the loop, iteration 0's
-// copies into a guard block in front of each row's buffer).
+// copies into a guard block in front of each row's buffer). With more than one
+// tile per block, each iteration's block is two halves whose tiles alternate
+// SPAD_B banks, a half's transpose issued before the previous half's copies:
+// the transposes run beside the EXs (docs/fusion_design.md §6.2.2).
 // Only integer accumulations are split, so the scores are those of the
 // untiled form, bit for bit. A dynamic K (p . V) with several chunks of
 // output tiles walks the rows of x again per chunk (the cursor repositioned).
@@ -1154,16 +1157,31 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       // (no block past T is read: the last block's EX and copies follow the
       // loop, the copies' destination at the loop PARAM's final value; iteration
       // 0's EX reads whatever SPAD_B holds, its copies go to the guard block)
-      Value tiles = placedDyn({nb, K, d}, ValueRange{}, "spad_b", 0);
-      auto exAndCopies = [&](StringRef adv) {
-        Value tl = placedDyn({nb, K, d}, ValueRange{}, "spad_b", 0);
+      // Each iteration covers Tb rows as two halves whose tiles alternate SPAD_B
+      // banks 0 / 1 (nb > 1): EX and VE conflict on any common bank, so with one
+      // bank a half's transpose waits for the previous half's EX; with two it
+      // runs beside it. Per half k the body issues k's LD, k - 1's EX, k's
+      // transpose, then k - 1's copies (which wait for that EX): the VE
+      // transposes while the EX runs. Only when a half's raw rows are at least
+      // 8 KB: smaller halves pay the transpose's fixed cost twice per block for
+      // less overlap (head_dim 64 at 128 rows a block: no gain at long T, a
+      // loss at short T in the cycle model; --iree-sa-attn-block 256 gives them
+      // halves of 128 rows, faster from T = 256, slower below). Otherwise one
+      // block per iteration, as before.
+      const int64_t nh = nb > 1 && (tb / 2) * K >= 8192 ? 2 : 1, hb = tb / nh, nbh = nb / nh;
+      auto ex = [&](int64_t bank) {
+        Value tl = placedDyn({nbh, K, d}, ValueRange{}, "spad_b", bank);
         if (oneEx)
-          sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tl, e.sub(scratch, {0}, {tb}), false);
+          sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tl, e.sub(scratch, {0}, {hb}), false);
         else
           for (int64_t g = 0; g < G; ++g)
-            sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, g * K), tl, e.sub(scratch, {g * tb}, {tb}), false);
+            sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, g * K), tl, e.sub(scratch, {g * hb}, {hb}), false);
+      };
+      // the copies of the half that starts at element `at` of the row buffers
+      // (as of iteration 0: the loop PARAM moves them on by Tb per iteration)
+      auto copies = [&](int64_t at, StringRef adv) {
         for (int64_t g = 0; g < G; ++g) {
-          auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch, {g * tb}, {tb}), e.sub(rowsAll[g], {0}, {tb}));
+          auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch, {g * hb}, {hb}), e.sub(rowsAll[g], {at}, {hb}));
           c->setAttr(adv, e.b.getI64IntegerAttr(1));
         }
       };
@@ -1171,18 +1189,25 @@ bool expandContraction(sahl::KernelOp k, ContractPlan p, KernelMatcher &km, cons
       {
         OpBuilder::InsertionGuard guard(e.b);
         e.b.setInsertionPointToEnd(&lp.getBody().emplaceBlock());
-        Value raw = placedA({tb, K}, sb);
-        llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
-        if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
-        at[p.kLoop] = {0, K};
-        at[p.nLoop] = {0, tb};
-        auto l = sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}), raw);
-        l->setAttr("sa.rows", e.b.getUnitAttr());
-        l->setAttr("sa.advance", e.b.getI64IntegerAttr(0));
-        exAndCopies("sa.advance");
-        sahl::TransposeOp::create(e.b, e.loc, raw, tiles);
+        Value raw = placedA({hb, K}, sb);
+        for (int64_t h = 0; h < nh; ++h) {
+          llvm::DenseMap<int, std::pair<int64_t, int64_t>> at;
+          if (p.bLoop >= 0) at[p.bLoop] = {b, 1};
+          at[p.kLoop] = {0, K};
+          at[p.nLoop] = {h * hb, hb};
+          auto l = sahl::LoadOp::create(e.b, e.loc, e.view(p.m.view, mMap, at, {p.bLoop}), raw);
+          l->setAttr("sa.rows", e.b.getUnitAttr());
+          l->setAttr("sa.advance", e.b.getI64IntegerAttr(0));
+          // the previous half: the last of the previous iteration, or this one's first
+          const int64_t prev = (h + nh - 1) % nh;
+          ex(prev);
+          if (nh == 1) copies(0, "sa.advance");      // (one bank: the copies first, as before)
+          sahl::TransposeOp::create(e.b, e.loc, raw, placedDyn({nbh, K, d}, ValueRange{}, "spad_b", h));
+          if (nh > 1) copies(h == 0 ? tb - hb : tb, "sa.advance");
+        }
       }
-      exAndCopies("sa.advance_final");
+      ex(nh - 1);
+      copies(tb - hb, "sa.advance_final");
       for (int64_t g = 0; g < G; ++g) {
         auto scope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
         OpBuilder::InsertionGuard guard(e.b);

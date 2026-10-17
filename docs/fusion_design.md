@@ -498,8 +498,10 @@ real commands (§6.2.2) gives Qwen3 −4.0% to −4.3% of decode from T = 48 to
 2048 with a schedule the compiler can emit, a little above the bound. It also
 finds the larger lever at long contexts. The VE is the busiest engine, and
 the q · Kᵀ loop's transposes wait for its EXs on a shared SPAD_B bank.
-Alternating that bank is worth −7.4% of decode at T = 2048 alone, and −11.6%
-together with the fusion (§6.5, §6.6).
+Alternating that bank (implemented, §6.2.2) is worth −1.8% of decode at
+T = 2048 by default. With 256 rows per loop iteration it is worth −7.4%,
+which costs short contexts +3%, and −11.6% together with the fusion (§6.5,
+§6.6).
 
 ### 6.1 The chain today (Qwen3-0.6B decode, one layer)
 
@@ -645,6 +647,50 @@ T = 512 / 2048 from the `qwen3_lc2048_pcpi` sweep):
 The other three models are not modelled yet (`--dispatches` takes their
 numbering; Gemma's Hk = 1 has a single unit).
 
+**The alternating tiles, implemented (2026-10-18, §6.6 step 2).** Correction
+to the table above: its "alternating tiles" columns tile blocks of 128 rows
+in alternating banks at even block counts. That is 256 rows per loop
+iteration. At T ≤ 128 such a loop computes a second block, which the
+prototype did not count.
+
+The compiler (`SahlExpandKernels.cpp`, the q · Kᵀ T loop):
+- Each iteration covers its block of Tb rows (`--iree-sa-attn-block`,
+  default 128) as two halves whose tiles alternate SPAD_B banks.
+- Per half: its LD, the previous half's EX, its transpose, then the previous
+  half's copies.
+- Only where a half's raw rows are at least 8 KB (Tb / 2 · head_dim). At the
+  default that is Qwen3 (128) and Gemma (256). SmolLM2 and Llama (64) get
+  halves only with `--iree-sa-attn-block 256`; otherwise their code is
+  byte-identical.
+- The block count, the rows read (never past ⌈T / Tb⌉ · Tb) and the guard
+  block are unchanged.
+
+The q · Kᵀ dispatch per layer, compiled, timed by the cycle model, and
+checked against the oracle at every T from 16 to the compiled maximum around
+the block boundaries:
+
+| T | Qwen3 default | Qwen3, 256 | Gemma default | Gemma, 256 | Llama, 256 | SmolLM2, 256 |
+|---|---:|---:|---:|---:|---:|---:|
+| 48 | −9.0% | +29.5% | −12.1% | +30.2% | +25.7% | +23.7% |
+| 256 | −7.6% | −10.0% | −12.1% | −8.7% | −10.3% | −11.3% |
+| 512 | −6.5% | −15.6% | −12.3% | −14.4% | −16.2% | −17.9% |
+| 2048 | −5.3% | −21.7% | | | −22.9% | −25.6% |
+
+Per token on Qwen3:
+- The default saves 1.2 ms at T = 48 (−0.9% of decode) and 5.6 ms at 2048
+  (−1.8%).
+- 256 rows per iteration costs 3.9 ms at T ≤ 128 (+3.1%) and saves 22.9 ms
+  at 2048 (−7.4%), the figure above; 294.0k cycles, exactly the prototype's.
+
+So the default helps every T a little, and 256 is the choice for a bundle
+meant for long contexts.
+
+Checks:
+- lit: `sahl_expand_tiled_t.mlir` updated.
+- Golden: exactly the three tiled q · Kᵀ dispatches changed, re-recorded.
+- The 2-layer Qwen3 at 2048, end to end on the sim: logits bit-exact with the
+  single-bank form (`--iree-sa-attn-block 16`).
+
 ### 6.3 Scope and stages
 
 1. **Stage 1 (this design): q path + core + output quantization**,
@@ -781,16 +827,16 @@ engine. It reads x from SPAD_A and writes ACC. The roles:
 The design feared SPAD_A, which has three roles in two banks. The prototype
 measured that cost as small: p's bank changes the cycles by at most 1%.
 SPAD_B is the costly bank. With the tiles in one bank, each block's transpose
-waits for the previous block's EX. Alternating the tiles is worth up to
-−7.4% of decode on its own at T = 2048. A finer scoreboard (LLM plan §11.3)
-is not needed for this design.
+waits for the previous block's EX. Alternating the tiles is now done (§6.2.2):
+−1.8% of decode at T = 2048 by default, −7.4% with 256 rows per iteration.
+A finer scoreboard (LLM plan §11.3) is not needed for this design.
 
 ### 6.6 Plan
 
 | Step | Content | Estimate |
 |---|---|---|
 | 1 | ~~Schedule prototype~~ **done 2026-10-18** (§6.2.2, `attn_schedule.py`): stage 1 −4.0% to −4.3% of decode (Qwen3, T = 48 to 2048) with an implementable schedule; with alternating tiles −4.9% to −11.6%. **Go.** | done |
-| 2 | **Alternating tiles in the existing q · Kᵀ T loop** (unfused; §8.22 step c's double buffering): the body unrolled by two, the next transpose ahead of the copies, an odd count's last block after the loop. Independent of the fusion and first, because it is small and helps long contexts on its own (−7.4% of decode at 2048 in the model). Golden: the tiled q · Kᵀ dispatches change | 2–3 days |
+| 2 | ~~Alternating tiles in the existing q · Kᵀ T loop~~ **done 2026-10-18** (§6.2.2): each block as two halves in alternating SPAD_B banks, where a half is at least 8 KB. Qwen3 −0.9% to −1.8% of decode by default, −7.4% at 2048 with `--iree-sa-attn-block 256`. Bit-exact; golden: the three tiled q · Kᵀ dispatches changed | done |
 | 3 | Region pass with dynamic T: the formed region through IREE's dispatch creation, `--compile-to=stream` and the backend unchanged (the region compiled as today's pieces would be, unfused inside) | 3–4 days |
 | 4 | `AttnLayerPlan` match and `expandAttnLayer` with §6.4.2's schedule, decode at T within one block first, then the T loop | 8–12 days |
 | 5 | Verification: lit; golden corpus with the flag off; `dispatch_check.py` per dispatch at T = 16, Tb ± D, 2·Tb, max T; end to end on the sim bit-exact with the unfused build (four models, 2 layers); prefill vs decode rows bit-exact; `test_long_context.py` at 2048 (512 Gemma); `host_copies.py` | 4–5 days |
