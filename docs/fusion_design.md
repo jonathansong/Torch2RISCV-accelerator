@@ -434,6 +434,9 @@ computed the same way also understates what fused, re-scheduled code can reach.
    before `o_proj`; table below): the largest chain left, −1.4% to −6.4%
    of decode and −4.2% to −11% of prefill; needs the region pass to take a
    dynamic-T chain and the T-block loop of §8.22 inside the fused template.
+   Designed in [`attention_fusion_design.md`](attention_fusion_design.md)
+   (2026-10-18): stage 1 (the q path + the core + the output quantization)
+   is most of it, −3.3% / −5.6% on Qwen3; more at long T.
 3. **Residual + RMSNorm into the projections** (table below): −0.9% to
    −4.0% of decode, −2.5% to −4.8% of prefill; structurally the closest to
    SwiGLU (a reduction and an elementwise pass between GEMVs).
