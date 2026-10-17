@@ -16,9 +16,8 @@
 #   (board_rvperf.py; then compiler/tests/rv_perf.py on the rvperf_*.csv)
 #   (rvsched: the decode loop on the RISC-V core, after compiler/scripts/deploy_rvsched.sh; without
 #   REDO only the tests not passed yet run)
-# LC_SUFFIX=_v21: the bundles of that build_board_bundles.sh suffix (gemma qwen3 llama smollm2;
-# the release set, logs in ~/board_tests_v21)
-#   sudo LC_SUFFIX=_v21 bash ~/run_board_tests.sh gemma qwen3 llama smollm2
+# LC_SUFFIX: the model bundles of another build_board_bundles.sh suffix (default _pcpi; logs in
+# ~/board_tests<suffix>). smollm2: SmolLM2-135M at 2048, every test of the release set.
 # Logs: ~/board_tests<LC_SUFFIX, default _pcpi>/<bundle>.<mode>.log, markers .done / .failed, summary.txt.
 set -u
 H=${BUNDLE_HOME:-/home/ubuntu}
@@ -44,23 +43,17 @@ declare -A DIR=(
   [llamag]=deploy_hfgen_llamag_pcpi
 )
 tests_of() {
-  if [ "$SUF" != _pcpi ]; then          # a release set: the main table's profiles, the long context, the RISC-V paths
-    case $1 in
-      gemma) sw=64,128,256,512 ;;
-      qwen3|llama|smollm2) sw=64,256,512,1024,2048 ;;
-      *) return ;;
-    esac
-    printf '%s\n' "llm" "teacher" "profile 40 --prompt 32" "profile 40 --prompt 32 --batch" "longctx" "longctx --sweep $sw" \
-      "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf"
-    return
-  fi
   case $1 in
     rvb|rvbc|rvbe) echo "rvb" ;;
     gemma) printf '%s\n' "llm" "longctx" "longctx --sweep 64,128,256,512" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
     qwen3) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
     llama) printf '%s\n' "llm" "longctx" "longctx --sweep 64,256,512,1024,2048" "teacher" "rvsched" "rvcode" "rvsched --rv" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
-    gemmag) printf '%s\n' "llm" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvperf" "longctx" "longctx --sweep 64,128,256,512" ;;
-    qwen3g|llamag) printf '%s\n' "llm" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvperf" "longctx" "longctx --sweep 64,256,512,1024,2048" ;;
+    gemmag) printf '%s\n' "llm" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvperf" "longctx" "longctx --sweep 64,128,256,512" \
+      "teacher" "profile 40 --prompt 32" "profile 40 --prompt 32 --batch" "rvsched --r5" ;;
+    qwen3g|llamag) printf '%s\n' "llm" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvperf" "longctx" "longctx --sweep 64,256,512,1024,2048" \
+      "teacher" "profile 40 --prompt 32" "profile 40 --prompt 32 --batch" "rvsched --r5" ;;
+    smollm2) printf '%s\n' "llm" "teacher" "profile 40 --prompt 32" "profile 40 --prompt 32 --batch" "longctx" "longctx --sweep 64,256,512,1024,2048" \
+      "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
   esac
 }
 
