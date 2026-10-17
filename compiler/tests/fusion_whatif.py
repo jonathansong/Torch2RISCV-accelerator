@@ -26,7 +26,8 @@ Every scenario keeps the dispatches' commands and engine timing otherwise, so
 the gaps are upper bounds (no capacity limit, no extra local copies). --only
 REGEX fuses one chain: only intermediates whose producer and consumer kinds
 both match (e.g. the FFN's gate / up projections, the reduction and the
-quantization of h).
+quantization of h). --chain ROLES [--with-proj] selects a chain by the
+dispatches' roles in the layer instead (roles()), where kinds collide.
 
     compiler/scripts/perf_trace.sh                      (DEPLOY / MODEL / OUT: the trace)
     compiler/tests/fusion_whatif.py --trace build/perfmodel/qwen3g.trace \\
@@ -286,6 +287,43 @@ def kind(name):
     return re.sub(r"_(i8|i32|i64|f32)(x(i8|i32|i64|f32))*$", "", k)
 
 
+PROJ = re.compile(r"^(matvec_like_|matmul_like_16x\d+x16x\d+$)")   # a linear layer (decode / prefill), not p . V
+
+
+def roles(step):
+    """each dispatch's role in its layer, by position: 'proj' (a linear layer); the runs of other
+    dispatches between them are 'attn' (a run with a dynamic-T kind: decode's v preparation,
+    the attention core and the quantization before o_proj; prefill's whole row attention),
+    then after it, one per run: 'norm' (residual + RMSNorm + quantization, after o_proj),
+    'swiglu', 'norm' (after the down projection), and 'prep' (q / k preparation) up to the
+    next 'attn'. The runs before the first projection are 'norm'."""
+    kinds = [kind(n) for n, _, _ in step]
+    out, run, since, seen_proj = [None] * len(step), [], None, False
+
+    def close():
+        nonlocal since
+        if not run:
+            return
+        if any("xD" in kinds[i] for i in run):
+            r, since = "attn", 0
+        elif since is None:
+            r = "prep" if seen_proj else "norm"
+        else:
+            r = ("norm", "swiglu", "norm")[since] if since < 3 else "prep"
+            since += 1
+        for i in run:
+            out[i] = r
+        run.clear()
+    for i, k in enumerate(kinds):
+        if PROJ.search(k):
+            close()
+            out[i], seen_proj = "proj", True
+        else:
+            run.append(i)
+    close()
+    return out
+
+
 def by_pair(arch, step, drop, pairs, top):
     """the dropped commands' standalone cycles per (producer kind -> consumer kind)"""
     agg = {}
@@ -317,6 +355,11 @@ def main():
     ap.add_argument("--logits", default=r"matvec_like_\d{4,}x", help="the vocabulary projection (left out of the prefill chunk)")
     ap.add_argument("--top", type=int, default=12, help="producer -> consumer pairs shown")
     ap.add_argument("--only", help="regex of dispatch kinds: fuse only the chains among them (e.g. one FFN)")
+    ap.add_argument("--chain", help="roles fused (roles(): norm, prep, attn, swiglu; comma-separated), e.g. prep,attn; "
+                    "an intermediate is kept on chip when both its producer and consumer have one of them")
+    ap.add_argument("--with-proj", action="store_true",
+                    help="with --chain: also the intermediates between the chain and the projections before / after it, "
+                         "and between two projections when the run after the consumer is in the chain")
     ap.add_argument("--merge-consts", action="store_true",
                     help="also: no fusion, the constant tail inputs (per-channel scales) of each dispatch in one LD")
     ap.add_argument("--json")
@@ -350,6 +393,23 @@ def main():
         if args.only:                                  # one chain: producer and consumer both of these kinds
             rx = re.compile(args.only)
             drop = {t for t in drop if rx.search(kind(step[pairs[t][0]][0])) and rx.search(kind(step[pairs[t][1]][0]))}
+        if args.chain:                                 # one chain by role (kinds alone collide: e.g. two quantizations)
+            want = set(args.chain.split(","))
+            rl = roles(step)
+            after = [None] * len(rl)                   # a projection: the role of the run after it
+            for d in range(len(rl) - 1, -1, -1):
+                after[d] = (after[d + 1] if d + 1 < len(rl) else None) if rl[d] == "proj" else rl[d]
+
+            def fused(p, q):
+                if rl[p] == rl[q] == "proj":           # gate -> up (swiglu); the residual stream across a block (norm)
+                    return args.with_proj and after[q] in want
+                ok = lambda d: rl[d] in want or (args.with_proj and rl[d] == "proj")
+                return ok(p) and ok(q)
+            drop = {t for t in drop if fused(*pairs[t])}
+            cnt = {}
+            for r in rl:
+                cnt[r] = cnt.get(r, 0) + 1
+            print(f"   roles ({label}): " + ", ".join(f"{r} {n}" for r, n in sorted(cnt.items())))
         per_list = sum(P.run_list(arch, cmds, gemv=False)[0] for _, cmds, _ in step)
         rows = []
         for name, dr, bar in (("joined", frozenset(), True), ("no barriers", frozenset(), False),

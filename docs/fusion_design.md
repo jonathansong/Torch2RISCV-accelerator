@@ -431,17 +431,50 @@ computed the same way also understates what fused, re-scheduled code can reach.
    changes the time by +0.1% to +0.7% (decode) and −0.4% to −0.7% (prefill),
    within the model's error: these loads are off the critical path.
 2. **Attention with its preparation** (q / k norm, RoPE, the quantization
-   before `o_proj`): −3.7% decode, −6.1% prefill on Qwen3; needs the region
-   pass to take a dynamic-T chain and the T-block loop of §8.22 inside the
-   fused template.
-3. **Residual + RMSNorm into the projections**: −1.6% / −3.7%.
+   before `o_proj`; table below): the largest chain left, −1.4% to −6.4%
+   of decode and −4.2% to −11% of prefill; needs the region pass to take a
+   dynamic-T chain and the T-block loop of §8.22 inside the fused template.
+3. **Residual + RMSNorm into the projections** (table below): −0.9% to
+   −4.0% of decode, −2.5% to −4.8% of prefill; structurally the closest to
+   SwiGLU (a reduction and an elementwise pass between GEMVs).
+
+**The remaining chains on all four models** (2026-10-18, `fusion_whatif.py
+--chain`, on the same v2.2 traces and calibrations as §2; upper bounds, "on
+chip, no barriers"). Kinds alone cannot separate these chains (SmolLM2's and
+Llama's attention output has the hidden size, so its quantization has the
+same kind as the RMSNorm's), so `--chain` selects by role: the dispatches
+between two projections form a run, a run with a dynamic-T kind is the
+attention (in decode also v's preparation and the quantization before
+`o_proj`; in prefill the whole row attention), and the runs after it are,
+in order, residual + RMSNorm, SwiGLU, residual + RMSNorm, then q / k
+preparation up to the next attention. `--with-proj` adds the intermediates
+between the chain and its projections, and between two projections when the
+run after the consumer belongs to the chain (gate → up for SwiGLU, the
+residual stream across a block for the norm).
+
+| Chain fused alone (prefill / decode) | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| Attention + q / k preparation + quantization before `o_proj` | −9.0 / −5.6% | −7.2 / −2.0% | −7.6 / −3.5% | −3.5 / −1.2% |
+| … with the q / k / v and `o_proj` projections | **−11.0 / −6.4%** | **−8.7 / −2.4%** | **−9.3 / −3.9%** | **−4.2 / −1.4%** |
+| Residual + RMSNorm + quantization of x | −1.2 / −2.2% | −2.7 / −1.5% | −0.7 / −0.7% | −0.9 / −0.4% |
+| … with the projections before and after it | **−4.4 / −4.0%** | **−4.8 / −2.1%** | **−2.7 / −1.5%** | **−2.5 / −0.9%** |
+| SwiGLU with its projections (check against §2.3) | −4.1 / −4.7% | −4.7 / −2.7% | −2.7 / −2.5% | −3.7 / −2.4% |
+
+The SwiGLU row is within 0.5 points of §2.3's (selected there by kind);
+the role selection also keeps h_q's load into the down projection. The Qwen3
+rows differ from §2.3's (−6.1 / −3.7% and −3.7 / −1.6%) because the earlier
+regexes, by kind, also caught pairs of other chains. As SwiGLU showed
+(§4.9), re-scheduled fused code can beat these bounds, which keep the
+unfused code's order. The decode figures are at a 32-token prompt: the
+attention's share grows with the context.
+
 4. **Prefill**: the chains above with capacity-aware chunking (h per N chunk,
    the amax as a second pass over local memory), where the bound is largest
    (−10% to −20%).
 
 ## Files
 
-- `compiler/tests/fusion_whatif.py`: the evaluation (`--only` for one chain).
+- `compiler/tests/fusion_whatif.py`: the evaluation (`--only` for one chain by kind, `--chain` by role).
 - `compiler/tests/perf_model.py`: the command-level model (a FENCE now holds
   back later commands; it did not before 2026-10-17).
 - `build/perfmodel/<bundle>.trace`, `<bundle>_cal.json`,
