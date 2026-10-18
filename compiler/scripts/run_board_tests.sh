@@ -22,6 +22,8 @@
 # (SA_FUSE_FFN=1, docs/fusion_design.md; build/fuse/bundles.sh), against the g bundles' speed.
 # smollm2f2 / gemmaf2 / qwen3f2 / llamaf2: the same with each chunk's gating overlapping the next
 # chunk's weight streaming (fusion_design.md §4.9).
+# smollm2a / gemmaa / qwen3a / llamaa: the f2 builds with decode's attention in one dispatch
+# per layer too (SA_FUSE_ATTN=1, fusion_design.md §6.4; build/fuse/bundles_attn.sh).
 # Logs: ~/board_tests<LC_SUFFIX, default _pcpi>/<bundle>.<mode>.log, markers .done / .failed, summary.txt.
 set -u
 H=${BUNDLE_HOME:-/home/ubuntu}
@@ -53,6 +55,10 @@ declare -A DIR=(
   [gemmaf2]=deploy_hfgen_gemmaf2_pcpi
   [qwen3f2]=deploy_hfgen_qwen3f2_pcpi
   [llamaf2]=deploy_hfgen_llamaf2_pcpi
+  [smollm2a]=deploy_hfgen_smollm2a_pcpi
+  [gemmaa]=deploy_hfgen_gemmaa_pcpi
+  [qwen3a]=deploy_hfgen_qwen3a_pcpi
+  [llamaa]=deploy_hfgen_llamaa_pcpi
 )
 tests_of() {
   case $1 in
@@ -67,9 +73,9 @@ tests_of() {
     smollm2) printf '%s\n' "llm" "teacher" "profile 40 --prompt 32" "profile 40 --prompt 32 --batch" "longctx" "longctx --sweep 64,256,512,1024,2048" \
       "rvsched" "rvcode --embedded" "rvsched --rv --embedded" "rvsched --r5" "rvperf" ;;
     # the SwiGLU fusion (SA_FUSE_FFN=1, docs/fusion_design.md): bit-exact checks, decode speed, the RISC-V paths
-    gemmaf|gemmaf2) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" "longctx --sweep 64,128,256,512" \
+    gemmaf|gemmaf2|gemmaa) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" "longctx --sweep 64,128,256,512" \
       "rvsched" "rvcode --embedded" "rvsched --rv --embedded" ;;
-    smollm2f|qwen3f|llamaf|smollm2f2|qwen3f2|llamaf2) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" \
+    smollm2f|qwen3f|llamaf|smollm2f2|qwen3f2|llamaf2|smollm2a|qwen3a|llamaa) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" \
       "longctx --sweep 64,256,512,1024,2048" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" ;;
   esac
 }
@@ -78,7 +84,7 @@ SEL=("$@")
 [ ${#SEL[@]} -eq 0 ] && SEL=(rvb gemma qwen3 llama)
 for b in "${SEL[@]}"; do
   d=$H/${DIR[$b]:-}
-  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama smollm2 qwen3g gemmag llamag smollm2f gemmaf qwen3f llamaf smollm2f2 gemmaf2 qwen3f2 llamaf2)"; continue; }
+  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama smollm2 qwen3g gemmag llamag smollm2f gemmaf qwen3f llamaf smollm2f2 gemmaf2 qwen3f2 llamaf2 smollm2a gemmaa qwen3a llamaa)"; continue; }
   [ -d "$d" ] || { echo "[$b] $d not on the board: skipped"; continue; }
   while IFS= read -r t; do
     [ -n "$t" ] || continue

@@ -997,8 +997,33 @@ The untiled form now follows §6.4.2's schedule and §6.5's banks:
 
   Qwen3 passes the prototype's −4.0% to −4.3% for this schedule (§6.2.2).
   Left: per-row pieces still pay the VE's fixed cost per row, the tiled form
-  (long contexts) is still in order, prefill rows not modelled, and none of
-  it on the board yet.
+  (long contexts) is still in order, and none of it is on the board yet.
+
+#### 6.4.7 Decode only, for now (2026-10-18)
+
+- **Prefill rows are no longer fused.** The model (2-layer builds, a chunk of
+  16 rows) gave prefill slower with every row fused: Qwen3 4423K → 5158K
+  cycles (+17%), Llama +4%. Each fused row is a decode step's kernel: it loads
+  and transposes the cache of every KV head once per row, 16 times a chunk.
+  `iree-sa-form-attn-regions` therefore leaves a prefill chunk's rows alone
+  (option `rows=true` merges them as before). It recognizes them by their
+  q: rows of one producer read by nothing but attention chains (the chunk's
+  q, sliced per row), where a decode layer's chain has its own q. Values
+  shared with the k path, such as the RoPE tables, are read outside the
+  chains and do not count. The K cache cannot tell them apart: all layers
+  share one global, and decode's two layers read it the same way.
+- **A kernel for a whole chunk** is the real prefill fusion: the chunk's 16
+  query rows of a head as one A tile, the head's cache loaded and transposed
+  once, one EX for all 16 rows, each row with its own causal position. Not
+  started; prefill's bound is −10% to −20% (§5).
+- **Long context (max_dynamic 2048) checked**, the tiled form: on the 2-layer
+  Qwen3 compiled for 2048 positions, logits bit-identical to the unfused
+  build, `dispatch_check` OK at T = 16 to 2048 and at `--pos 0`. It also
+  showed that `sa.release_temps` (§6.4.6) had never applied to generics
+  whose result is a view of a local buffer: the check looked the result up
+  only among cached buffers. With the tiled form's larger buffers, every
+  fused dispatch ran out of ACC. The result is now recomputed through its
+  buffer.
 
 ### 6.5 Banks (measured in §6.2.2)
 
@@ -1030,7 +1055,7 @@ A finer scoreboard (LLM plan §11.3) is not needed for this design.
 | 1 | ~~Schedule prototype~~ **done 2026-10-18** (§6.2.2, `attn_schedule.py`): stage 1 −4.0% to −4.3% of decode (Qwen3, T = 48 to 2048) with an implementable schedule; with alternating tiles −4.9% to −11.6%. **Go.** | done |
 | 2 | ~~Alternating tiles in the existing q · Kᵀ T loop~~ **done 2026-10-18** (§6.2.2): each block as two halves in alternating SPAD_B banks, where a half is at least 8 KB. Qwen3 −0.9% to −1.8% of decode by default, −7.4% at 2048 with `--iree-sa-attn-block 256`. Bit-exact; golden: the three tiled q · Kᵀ dispatches changed | done |
 | 3 | ~~Region pass with dynamic T~~ **done 2026-10-18** (§6.4.1): the regions IREE formed merged after formation (plugin hook, IREE patch 0004), `--iree-sa-fuse-attn` / `SA_FUSE_ATTN=1`. 66 chains per 2-layer model (decode layers and prefill rows), workload over T from IREE. The backend is unchanged, so they run on the host. Gemma / Qwen3 / Llama end to end with the same tokens; the logit difference is the VMVX exp, shown on Llama | done |
-| 4 | ~~4a: `AttnLayerPlan` and `expandAttnLayer`, in order~~ **done 2026-10-18** (§6.4.5): the fused dispatch on the accelerator, decode and prefill rows, untiled and tiled forms; bit-exact end to end on Gemma / Qwen3 / Llama; model decode −3.5% / −1.1% / −1.4%. ~~4b: the interleaved schedule~~ **done 2026-10-18** (§6.4.6): A tiles shared across heads, one EX a head, post(b − 1) after head b's EX, ACC banks by parity, Gemma untiled; model decode Qwen3 −5.0%, Gemma −2.6%, Llama −2.1%. Left: row pieces per head, the tiled form's schedule | done (the rest optional) |
+| 4 | (decode only since §6.4.7: prefill rows unfused) ~~4a: `AttnLayerPlan` and `expandAttnLayer`, in order~~ **done 2026-10-18** (§6.4.5): the fused dispatch on the accelerator, decode and prefill rows, untiled and tiled forms; bit-exact end to end on Gemma / Qwen3 / Llama; model decode −3.5% / −1.1% / −1.4%. ~~4b: the interleaved schedule~~ **done 2026-10-18** (§6.4.6): A tiles shared across heads, one EX a head, post(b − 1) after head b's EX, ACC banks by parity, Gemma untiled; model decode Qwen3 −5.0%, Gemma −2.6%, Llama −2.1%. Left: row pieces per head, the tiled form's schedule | done (the rest optional) |
 | 5 | Verification: lit; golden corpus with the flag off; `dispatch_check.py` per dispatch at T = 16, Tb ± D, 2·Tb, max T; end to end on the sim bit-exact with the unfused build (four models, 2 layers); prefill vs decode rows bit-exact; `test_long_context.py` at 2048 (512 Gemma); `host_copies.py` | 4–5 days |
 | 6 | Board: the four bundles (`run_board_tests.sh`: `llm`, `profile --batch`, long context and its sweep, plan A / plan B) | 2 days |
 

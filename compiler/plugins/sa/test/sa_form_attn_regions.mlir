@@ -4,6 +4,7 @@
 // one flow.dispatch.region; q_proj and o_proj (static contractions) and a value
 // the q path shares with the outside stay outside.
 // RUN: iree-opt --split-input-file --iree-sa-form-attn-regions="force=true max-dynamic=8" %s | FileCheck %s
+// RUN: iree-opt --split-input-file --iree-sa-form-attn-regions="force=true rows=true" %s | FileCheck %s --check-prefix=ROWS
 
 #v1 = affine_map<(d0, d1) -> (d1)>
 #m2 = affine_map<(d0, d1) -> (d0, d1)>
@@ -266,4 +267,116 @@ func.func @no_pv(%q8: tensor<2x4xi32>, %kc: tensor<2x8x4xi8>, %T: index) -> tens
     flow.return %0 : tensor<2xi32>
   }
   return %m : tensor<2xi32>
+}
+
+// -----
+
+// Two rows of a prefill chunk: two attentions whose q are rows of one producer read by
+// nothing else (the chunk's q). Left alone (rows=false): fused, each row would load and
+// transpose the cache once a row.
+#qa = affine_map<(d0, d1, d2) -> (d0, d2)>
+#ka = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#va = affine_map<(d0, d1, d2) -> (d0, d2, d1)>
+#o3 = affine_map<(d0, d1, d2) -> (d0, d1)>
+#m2 = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK-LABEL: func.func @rows
+// CHECK-COUNT-5: flow.dispatch.region
+// CHECK-NOT:     flow.dispatch.region
+// rows=true: each row's chain in one region
+// ROWS-LABEL: func.func @rows
+// ROWS:         flow.dispatch.region -> (tensor<2x2x4xi32>)
+// ROWS-COUNT-2: flow.dispatch.region -> (tensor<2x4xi32>)
+// ROWS-NOT:     flow.dispatch.region
+func.func @rows(%qin: tensor<2x2x4xi32>, %kc: tensor<2x8x4xi8>, %vc: tensor<2x8x4xi8>, %T: index)
+    -> (tensor<2x4xi32>, tensor<2x4xi32>) {
+  %qq = flow.dispatch.region -> (tensor<2x2x4xi32>) {
+    %e = tensor.empty() : tensor<2x2x4xi32>
+    %0 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1, d2)>],
+                         iterator_types = ["parallel", "parallel", "parallel"]}
+        ins(%qin : tensor<2x2x4xi32>) outs(%e : tensor<2x2x4xi32>) {
+    ^bb0(%i: i32, %o: i32):
+      %1 = arith.addi %i, %i : i32
+      linalg.yield %1 : i32
+    } -> tensor<2x2x4xi32>
+    flow.return %0 : tensor<2x2x4xi32>
+  }
+  %q0 = tensor.extract_slice %qq[0, 0, 0] [1, 2, 4] [1, 1, 1] : tensor<2x2x4xi32> to tensor<2x4xi32>
+  %q1 = tensor.extract_slice %qq[1, 0, 0] [1, 2, 4] [1, 1, 1] : tensor<2x2x4xi32> to tensor<2x4xi32>
+  %s0 = flow.dispatch.region -> (tensor<2x?xi8>{%T}) {
+    %c0 = arith.constant 0 : i32
+    %k = tensor.extract_slice %kc[0, 0, 0] [2, %T, 4] [1, 1, 1] : tensor<2x8x4xi8> to tensor<2x?x4xi8>
+    %e = tensor.empty(%T) : tensor<2x?xi32>
+    %z = linalg.fill ins(%c0 : i32) outs(%e : tensor<2x?xi32>) -> tensor<2x?xi32>
+    %0 = linalg.generic {indexing_maps = [#qa, #ka, #o3], iterator_types = ["parallel", "parallel", "reduction"]}
+        ins(%q0, %k : tensor<2x4xi32>, tensor<2x?x4xi8>) outs(%z : tensor<2x?xi32>) {
+    ^bb0(%i: i32, %j: i8, %acc: i32):
+      %1 = arith.extsi %j : i8 to i32
+      %2 = arith.muli %i, %1 : i32
+      %3 = arith.addi %2, %acc : i32
+      linalg.yield %3 : i32
+    } -> tensor<2x?xi32>
+    %f = tensor.empty(%T) : tensor<2x?xi8>
+    %1 = linalg.generic {indexing_maps = [#m2, #m2], iterator_types = ["parallel", "parallel"]}
+        ins(%0 : tensor<2x?xi32>) outs(%f : tensor<2x?xi8>) {
+    ^bb0(%i: i32, %o: i8):
+      %2 = arith.trunci %i : i32 to i8
+      linalg.yield %2 : i8
+    } -> tensor<2x?xi8>
+    flow.return %1 : tensor<2x?xi8>
+  }
+  %o0 = flow.dispatch.region -> (tensor<2x4xi32>) {
+    %c0 = arith.constant 0 : i32
+    %v = tensor.extract_slice %vc[0, 0, 0] [2, %T, 4] [1, 1, 1] : tensor<2x8x4xi8> to tensor<2x?x4xi8>
+    %e = tensor.empty() : tensor<2x4xi32>
+    %z = linalg.fill ins(%c0 : i32) outs(%e : tensor<2x4xi32>) -> tensor<2x4xi32>
+    %0 = linalg.generic {indexing_maps = [#qa, #va, #o3], iterator_types = ["parallel", "parallel", "reduction"]}
+        ins(%s0, %v : tensor<2x?xi8>, tensor<2x?x4xi8>) outs(%z : tensor<2x4xi32>) {
+    ^bb0(%i: i8, %j: i8, %acc: i32):
+      %1 = arith.extsi %i : i8 to i32
+      %2 = arith.extsi %j : i8 to i32
+      %3 = arith.muli %1, %2 : i32
+      %4 = arith.addi %3, %acc : i32
+      linalg.yield %4 : i32
+    } -> tensor<2x4xi32>
+    flow.return %0 : tensor<2x4xi32>
+  }
+  %s1 = flow.dispatch.region -> (tensor<2x?xi8>{%T}) {
+    %c0 = arith.constant 0 : i32
+    %k = tensor.extract_slice %kc[0, 0, 0] [2, %T, 4] [1, 1, 1] : tensor<2x8x4xi8> to tensor<2x?x4xi8>
+    %e = tensor.empty(%T) : tensor<2x?xi32>
+    %z = linalg.fill ins(%c0 : i32) outs(%e : tensor<2x?xi32>) -> tensor<2x?xi32>
+    %0 = linalg.generic {indexing_maps = [#qa, #ka, #o3], iterator_types = ["parallel", "parallel", "reduction"]}
+        ins(%q1, %k : tensor<2x4xi32>, tensor<2x?x4xi8>) outs(%z : tensor<2x?xi32>) {
+    ^bb0(%i: i32, %j: i8, %acc: i32):
+      %1 = arith.extsi %j : i8 to i32
+      %2 = arith.muli %i, %1 : i32
+      %3 = arith.addi %2, %acc : i32
+      linalg.yield %3 : i32
+    } -> tensor<2x?xi32>
+    %f = tensor.empty(%T) : tensor<2x?xi8>
+    %1 = linalg.generic {indexing_maps = [#m2, #m2], iterator_types = ["parallel", "parallel"]}
+        ins(%0 : tensor<2x?xi32>) outs(%f : tensor<2x?xi8>) {
+    ^bb0(%i: i32, %o: i8):
+      %2 = arith.trunci %i : i32 to i8
+      linalg.yield %2 : i8
+    } -> tensor<2x?xi8>
+    flow.return %1 : tensor<2x?xi8>
+  }
+  %o1 = flow.dispatch.region -> (tensor<2x4xi32>) {
+    %c0 = arith.constant 0 : i32
+    %v = tensor.extract_slice %vc[0, 0, 0] [2, %T, 4] [1, 1, 1] : tensor<2x8x4xi8> to tensor<2x?x4xi8>
+    %e = tensor.empty() : tensor<2x4xi32>
+    %z = linalg.fill ins(%c0 : i32) outs(%e : tensor<2x4xi32>) -> tensor<2x4xi32>
+    %0 = linalg.generic {indexing_maps = [#qa, #va, #o3], iterator_types = ["parallel", "parallel", "reduction"]}
+        ins(%s1, %v : tensor<2x?xi8>, tensor<2x?x4xi8>) outs(%z : tensor<2x4xi32>) {
+    ^bb0(%i: i8, %j: i8, %acc: i32):
+      %1 = arith.extsi %i : i8 to i32
+      %2 = arith.extsi %j : i8 to i32
+      %3 = arith.muli %1, %2 : i32
+      %4 = arith.addi %3, %acc : i32
+      linalg.yield %4 : i32
+    } -> tensor<2x4xi32>
+    flow.return %0 : tensor<2x4xi32>
+  }
+  return %o0, %o1 : tensor<2x4xi32>, tensor<2x4xi32>
 }

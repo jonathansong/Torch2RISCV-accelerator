@@ -194,13 +194,16 @@ bool Lowerer::lowerBlock(Block &block) {
       bool ok = generic(g);
       mem.preferBank = -1;
       if (!ok) return false;
+      // (a result may be a view of a local buffer: its words recomputed from the buffer)
+      const bool isRed = g.getNumReductionLoops() > 0;
       if (scoped && llvm::all_of(outs, [&](auto &o) {
-            auto it = locals.find(o.first);
-            return it != locals.end() && it->second.la == o.second;
+            auto l = bufOf(o.first, isRed);
+            return l && l->la == o.second;
           })) {
         mem.release(mark);
         decltype(locals) kept = std::move(savedLocals);
-        for (auto &o : outs) kept[o.first] = locals[o.first];
+        for (auto &o : outs)
+          if (auto it = locals.find(o.first); it != locals.end()) kept[o.first] = it->second;
         locals = std::move(kept);
         bcastOf = std::move(savedBcast);
       }
@@ -272,6 +275,8 @@ LocalBuf Lowerer::newLocal(VType vt, int64_t n, bool bcast) {
     l.la = ::sa::laddr(::sa::MEM_SPAD_A, w.value_or(0));
   } else {
     auto w = mem.allocAcc(words);
+    if (!w && getenv("SA_ATTN_DEBUG"))
+      llvm::errs() << "ACC full: " << words << " words, banks at " << mem.mark().acc[0] << " / " << mem.mark().acc[1] << "\n";
     if (!w) fail("ACC full");
     l.la = ::sa::acc(w.value_or(0));
   }

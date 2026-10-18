@@ -33,12 +33,15 @@
 // Runs only when the module targets the sa device and --iree-sa-fuse-attn is set.
 #include "SAPasses.h"
 
+#include <functional>
 #include <map>
 
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -292,6 +295,7 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
     if (!force && !targetsSA(module)) return;
     SmallVector<SmallVector<Operation *>> chains;
     llvm::DenseSet<Operation *> taken;
+    SmallVector<SmallVector<Operation *>> blockChains;
     module.walk([&](Block *blk) {
       for (Operation &op : *blk) {
         auto r = dyn_cast<DispatchRegionOp>(&op);
@@ -299,8 +303,55 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
         SmallVector<Operation *> ops = chainOf(blk, r);
         if (ops.empty() || llvm::any_of(ops, [&](Operation *o) { return taken.contains(o); })) continue;
         for (Operation *o : ops) taken.insert(o);
-        chains.push_back(std::move(ops));
+        blockChains.push_back(std::move(ops));
       }
+      // a prefill chunk's rows (rows=false: left unfused, fusion_design.md §6.6): chains that
+      // read one producer read by nothing else (the chunk's q, computed for its rows). Fused,
+      // each row would load and transpose the cache once a row; a decode layer's chain has
+      // its own q (values shared with the k path, e.g. RoPE tables, are read outside too)
+      llvm::DenseMap<Operation *, int> chainOf_;
+      for (auto [i, ch] : llvm::enumerate(blockChains))
+        for (Operation *o : ch) chainOf_[o] = int(i);
+      llvm::DenseSet<int> rowChains;
+      llvm::DenseSet<Operation *> seen;
+      // (through reshapes and slices: a row's part of the chunk's q is a slice of it)
+      auto isView = [](Operation *op) { return isReshape(op) || isa_and_nonnull<tensor::ExtractSliceOp>(op); };
+      auto srcRegion = [&](Value v) -> DispatchRegionOp {
+        Operation *d = v.getDefiningOp();
+        while (isView(d)) d = d->getOperand(0).getDefiningOp();
+        return dyn_cast_or_null<DispatchRegionOp>(d);
+      };
+      std::function<void(Value, SmallVectorImpl<Operation *> &)> viewReaders = [&](Value v, SmallVectorImpl<Operation *> &out) {
+        for (Operation *u : v.getUsers()) {
+          Operation *a = blk->findAncestorOpInBlock(*u);
+          if (!a) continue;
+          if (isView(a) && a == u) viewReaders(a->getResult(0), out);
+          else out.push_back(a);
+        }
+      };
+      for (auto &ch : blockChains)
+        for (Operation *o : ch) {
+          auto reg = dyn_cast<DispatchRegionOp>(o);
+          if (!reg) continue;
+          for (Value v : captured(reg)) {
+            DispatchRegionOp p = srcRegion(v);
+            if (!p || chainOf_.count(p) || !seen.insert(p).second) continue;
+            SmallVector<Operation *> rd;
+            for (Value res : p->getResults()) viewReaders(res, rd);
+            llvm::DenseSet<int> by;
+            bool onlyChains = !rd.empty();
+            for (Operation *u : rd) {
+              auto it = chainOf_.find(u);
+              if (it == chainOf_.end()) onlyChains = false;
+              else by.insert(it->second);
+            }
+            if (onlyChains && by.size() > 1) rowChains.insert(by.begin(), by.end());
+          }
+        }
+      if (dbg && !rowChains.empty()) llvm::errs() << "attn: " << rowChains.size() << " chains are a prefill chunk's rows\n";
+      for (auto [i, ch] : llvm::enumerate(blockChains))
+        if (rows || !rowChains.contains(int(i))) chains.push_back(std::move(ch));
+      blockChains.clear();
     });
     std::map<int, int> sizes;   // regions merged -> chains
     for (auto &ops : chains) {
@@ -314,6 +365,8 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
     }
   }
 
+  Option<bool> rows{*this, "rows", llvm::cl::desc("Also merge the attention of each row of a prefill chunk"),
+                    llvm::cl::init(false)};
   Option<bool> force{*this, "force", llvm::cl::desc("Run without an sa device target (tests)"), llvm::cl::init(false)};
   Option<int64_t> maxDynamic{*this, "max-dynamic",
                              llvm::cl::desc("Bound of the dynamic sizes inside a merged region (0: none)"),
