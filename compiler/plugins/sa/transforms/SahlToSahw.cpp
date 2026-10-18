@@ -73,9 +73,13 @@ bool Lowerer::lowerBlock(Block &block) {
       if (cs->hasAttr("sa.relative")) {
         // (a fused dispatch's kernel, in a scope: its placed words after the buffers
         // already in SPAD_A, which it may read; the words it claims after them)
+        // (words of SPAD_A bank 0 after the base; the claim's words beyond bank 0 are
+        // placed absolutely in bank 1)
         spadBase = mem.spadTop();
-        if (spadBase + uint32_t(cs.getWords()) > 2 * lay.sbank) return fail("a relative SPAD_A claim beyond SPAD_A");
-        mem.takeSpad(spadBase + uint32_t(cs.getWords()));
+        const uint32_t words = uint32_t(cs.getWords());
+        if (words > lay.sbank ? spadBase >= lay.sbank || words > 2 * lay.sbank : spadBase + words > 2 * lay.sbank)
+          return fail("a relative SPAD_A claim beyond SPAD_A");
+        mem.takeSpad(words > lay.sbank ? words : spadBase + words);
         continue;
       }
       if (mem.spadUsed()) return fail("a kernel claiming SPAD_A after other SPAD_A buffers");
@@ -132,7 +136,11 @@ bool Lowerer::lowerBlock(Block &block) {
       continue;
     }
     if (auto rs = dyn_cast<sahl::ReserveOp>(op)) {  // a buffer shared by the pieces: allocated now
+      // (sa.prefer_bank: in that ACC bank if it has room, as an epilogue's temps)
+      auto pb = rs->getAttrOfType<IntegerAttr>("sa.prefer_bank");
+      if (pb) mem.preferBank = int(pb.getInt());
       auto l = bufOf(rs.getBuffer(), rs.getBcast());
+      mem.preferBank = -1;
       if (!l) return false;
       reserved[rs.getBuffer()] = *l;
       continue;
@@ -165,10 +173,37 @@ bool Lowerer::lowerBlock(Block &block) {
     if (auto g = dyn_cast<linalg::GenericOp>(op)) {
       // an expanded kernel's epilogue: its temps next to its accumulator (that ACC bank first)
       auto pb = g->getAttrOfType<IntegerAttr>("sa.prefer_bank");
+      // sa.release_temps (a fused dispatch's generics before its kernel): the results
+      // allocated first, the temps released after it (unless a result ended up among them)
+      const bool scoped = g->hasAttr("sa.release_temps");
+      LocalMemory::Mark mark{};
+      SmallVector<std::pair<Value, uint32_t>> outs;
+      decltype(locals) savedLocals;
+      decltype(bcastOf) savedBcast;
+      if (scoped) {
+        for (Value init : g.getDpsInits()) {
+          auto l = bufOf(init, /*bcast=*/g.getNumReductionLoops() > 0);
+          if (!l) return false;
+          outs.push_back({init, l->la});
+        }
+        mark = mem.mark();
+        savedLocals = locals;
+        savedBcast = bcastOf;
+      }
       if (pb) mem.preferBank = int(pb.getInt());
       bool ok = generic(g);
       mem.preferBank = -1;
       if (!ok) return false;
+      if (scoped && llvm::all_of(outs, [&](auto &o) {
+            auto it = locals.find(o.first);
+            return it != locals.end() && it->second.la == o.second;
+          })) {
+        mem.release(mark);
+        decltype(locals) kept = std::move(savedLocals);
+        for (auto &o : outs) kept[o.first] = locals[o.first];
+        locals = std::move(kept);
+        bcastOf = std::move(savedBcast);
+      }
       continue;
     }
     if (auto sc = dyn_cast<sahl::ScatterOp>(op)) {
@@ -327,7 +362,13 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
       LocalBuf l;
       l.vt = ::sa::VT_I8;
       l.n = placedElems(alloc, l);
-      l.la = ::sa::laddr(::sa::MEM_SPAD_A, uint32_t(w.getInt()) + spadBase);
+      // (a relative claim: bank 0 words after the base, bank 1 words as they are)
+      uint32_t at = uint32_t(w.getInt());
+      if (spadBase && at < lay.sbank) {
+        at += spadBase;
+        if (at + uint32_t((l.n + d - 1) / d) > lay.sbank) return fail("a placed SPAD_A buffer past bank 0"), std::nullopt;
+      }
+      l.la = ::sa::laddr(::sa::MEM_SPAD_A, at);
       locals[v] = l;
       return l;
     }

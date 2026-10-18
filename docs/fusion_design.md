@@ -945,8 +945,60 @@ schedule is step 4b.
   untiled form removed that.
   - VE busy time is still above the unfused path's: per-row pieces pay the
     VE's fixed cost once per row.
-  - Next (step 4b): pieces over the G rows of a head at once, post(u − 1)
-    between the T loops (§6.4.2), the untiled form for Gemma.
+
+#### 6.4.6 Step 4b: the interleaved schedule (2026-10-18)
+
+The untiled form now follows §6.4.2's schedule and §6.5's banks:
+
+- **A tiles before the loop.** Each tile holds D query rows of all heads in
+  order: staging rows in SPAD_A bank 1, two transposes, the A form in bank
+  0. Qwen3's 16 rows are one tile, Llama's 32 two. One EX a head reads its
+  rows' tile. Its output rows from the head's first row on are the head's
+  scores; the other rows are garbage nobody reads. Before, each row was a
+  strip and an EX of its own; a tile per head cost two transposes each,
+  almost 470 VE cycles of fixed cost apiece.
+- **Order per head b**: the LD of its K rows (SPAD_A bank 1), the transpose
+  into SPAD_B bank b mod 2, its EX, then head b − 1's per-row post (VE, GEMV).
+  The VE works on head b − 1 while the EX runs head b and the LD fetches
+  head b + 1.
+- **ACC**: the EX output [D, max_dynamic] by the head's parity in ACC bank 0
+  or 1 (`sahl.reserve` with `sa.prefer_bank`), the post's buffers and temps
+  in the same bank as its rows. EX and VE conflict on any shared ACC bank.
+- **SPAD_A**: p's row in bank 1 after the K rows, or in bank 0 after the A
+  tiles when bank 1 is full. Gemma (head_dim 256) is now untiled too. The
+  relative claim offsets only bank-0 placements: q's int8 sits at the start
+  of bank 0.
+- **Two defects the interleaving exposed, fixed:**
+  - *The EX writes all D rows of its output*, row i at `c + i · crow`, here
+    crow = max_dynamic / D words. The accumulator had room for one row, so
+    the 15 garbage rows overwrote the next buffers. That was harmless while
+    each row's post came right after its EX; with the interleaving they
+    clobbered head b − 1's post buffers. The accumulator is now [D, T].
+    `expandContraction`'s untiled form allocates the same way, harmlessly
+    so far, since nothing live follows its accumulator.
+  - *The q path's generics never released their temporaries.* The RoPE
+    gather's per-element broadcasts alone take about 2048 ACC words, so the
+    kernel's buffers no longer fit. The generics before the kernel are now
+    marked `sa.release_temps`: results allocated first, temps released after
+    each. Only fused dispatches are marked, so golden is unchanged without
+    the flag.
+- **Verified** as §6.4.5 (2-layer Gemma / Qwen3 / Llama): no host dispatch,
+  logits end to end bit-identical to the unfused build's, `dispatch_check` OK
+  at T = 16 / 128 / 144 / 256 with `--dirty`, at the default position and at
+  `--pos 0`. Golden: the unfused cases identical, `attn_*` re-recorded.
+- **Model** (decode, last step; Qwen3's fused dispatch per layer, unfused /
+  4a / 4b: 62.8K / 46.4K / 39.2K cycles; VE busy 29.0K, the busiest engine):
+
+  | Model | Saved per layer, 4a → 4b | Decode, whole model, 4a → 4b |
+  |---|---:|---:|
+  | Qwen3 | 15.9K → 23.0K | −3.5% → **−5.0%** |
+  | Gemma | 4.3K → 7.8K | −1.4% → **−2.6%** |
+  | Llama | 14.8K → 27.7K | −1.1% → **−2.1%** |
+
+  Qwen3 passes the prototype's −4.0% to −4.3% for this schedule (§6.2.2).
+  Left: per-row pieces still pay the VE's fixed cost per row, the tiled form
+  (long contexts) is still in order, prefill rows not modelled, and none of
+  it on the board yet.
 
 ### 6.5 Banks (measured in §6.2.2)
 
@@ -978,7 +1030,7 @@ A finer scoreboard (LLM plan §11.3) is not needed for this design.
 | 1 | ~~Schedule prototype~~ **done 2026-10-18** (§6.2.2, `attn_schedule.py`): stage 1 −4.0% to −4.3% of decode (Qwen3, T = 48 to 2048) with an implementable schedule; with alternating tiles −4.9% to −11.6%. **Go.** | done |
 | 2 | ~~Alternating tiles in the existing q · Kᵀ T loop~~ **done 2026-10-18** (§6.2.2): each block as two halves in alternating SPAD_B banks, where a half is at least 8 KB. Qwen3 −0.9% to −1.8% of decode by default, −7.4% at 2048 with `--iree-sa-attn-block 256`. Bit-exact; golden: the three tiled q · Kᵀ dispatches changed | done |
 | 3 | ~~Region pass with dynamic T~~ **done 2026-10-18** (§6.4.1): the regions IREE formed merged after formation (plugin hook, IREE patch 0004), `--iree-sa-fuse-attn` / `SA_FUSE_ATTN=1`. 66 chains per 2-layer model (decode layers and prefill rows), workload over T from IREE. The backend is unchanged, so they run on the host. Gemma / Qwen3 / Llama end to end with the same tokens; the logit difference is the VMVX exp, shown on Llama | done |
-| 4 | ~~4a: `AttnLayerPlan` and `expandAttnLayer`, in order~~ **done 2026-10-18** (§6.4.5): the fused dispatch on the accelerator, decode and prefill rows, untiled and tiled forms; bit-exact end to end on Gemma / Qwen3 / Llama; model decode −3.5% / −1.1% / −1.4%. 4b: §6.4.2's interleaved schedule, row pieces per head, Gemma untiled | 4a done; 4b 4–6 days |
+| 4 | ~~4a: `AttnLayerPlan` and `expandAttnLayer`, in order~~ **done 2026-10-18** (§6.4.5): the fused dispatch on the accelerator, decode and prefill rows, untiled and tiled forms; bit-exact end to end on Gemma / Qwen3 / Llama; model decode −3.5% / −1.1% / −1.4%. ~~4b: the interleaved schedule~~ **done 2026-10-18** (§6.4.6): A tiles shared across heads, one EX a head, post(b − 1) after head b's EX, ACC banks by parity, Gemma untiled; model decode Qwen3 −5.0%, Gemma −2.6%, Llama −2.1%. Left: row pieces per head, the tiled form's schedule | done (the rest optional) |
 | 5 | Verification: lit; golden corpus with the flag off; `dispatch_check.py` per dispatch at T = 16, Tb ± D, 2·Tb, max T; end to end on the sim bit-exact with the unfused build (four models, 2 layers); prefill vs decode rows bit-exact; `test_long_context.py` at 2048 (512 Gemma); `host_copies.py` | 4–5 days |
 | 6 | Board: the four bundles (`run_board_tests.sh`: `llm`, `profile --batch`, long context and its sweep, plan A / plan B) | 2 days |
 
