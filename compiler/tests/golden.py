@@ -60,6 +60,10 @@ CASES = [
     ("ffn_gemma", "build/fuse/gemma_l2_ffn/sa_sources", []),               # GeGLU
     ("ffn_qwen3", "build/fuse/qwen3_l2_ffn/sa_sources", []),
     ("ffn_llama", "build/fuse/llama_l2_ffn/sa_sources", []),               # N = 8192: amax / int8 output in pieces
+    # decode's attention in one dispatch (--iree-sa-fuse-attn, fusion_design.md §6.4): decode layers and prefill rows
+    ("attn_gemma", "build/fuse/gemma_l2_attn/sa_sources", []),             # one KV head (rank-reducing slices)
+    ("attn_qwen3", "build/fuse/qwen3_l2_attn/sa_sources", []),             # QK-norm, halves in alternating banks
+    ("attn_llama", "build/fuse/llama_l2_attn/sa_sources", []),             # G = 4, head_dim 64
 ]
 
 

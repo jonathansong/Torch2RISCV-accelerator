@@ -1379,6 +1379,251 @@ bool expandAttention(sahl::KernelOp k, AttnPlan p, const ::sa::Layout &lay, int6
   return true;
 }
 
+// The fused decode attention's core (AttnLayerPlan, docs/fusion_design.md §6.4.2).
+// Per KV head: the A tile of its G query rows from q (local), the scores by the
+// T loop of expandContraction (§8.22: blocks of Tb rows, software-pipelined,
+// halves in alternating SPAD_B banks), then per query row, each a 1-D piece of
+// the matched generic over the row's T (the generic lowering): the scores'
+// epilogue, the masked max, p (int8, SPAD_A), its sum, p . V on the GEMV unit
+// (p the GEMV's x), and p . V's epilogue into the row's slice of the output.
+// The intermediates stay in local memory; only the caches are read from DDR.
+// All of it in one scope (its SPAD_A claim ends with it; the output reserved before).
+bool expandAttnLayer(sahl::KernelOp k, AttnLayerPlan p, const ::sa::Layout &lay, int64_t d, int64_t attnBlock,
+                     int64_t maxDyn) {
+  const int64_t H = p.H, G = p.G, K = p.hd, sb = lay.sbank, nt = K / d;
+  if (K % d || G > d || 2 * K > sb) return notExpanded(k, __LINE__);
+  // blocks of Tb rows (expandContraction's: nb tiles a power of two, 128 rows by default)
+  int64_t nb = int64_t(llvm::bit_floor(uint64_t(sb / K)));
+  const int64_t blk = attnBlock > 0 ? attnBlock : 128;
+  nb = std::min(nb, std::max<int64_t>(int64_t(llvm::bit_floor(uint64_t(std::max<int64_t>(blk / d, 1)))), 1));
+  SmallVector<int64_t> kst;
+  int64_t koff;
+  if (nb < 1 || failed(cast<MemRefType>(p.kCache.getType()).getStridesAndOffset(kst, koff)) ||
+      ShapedType::isDynamic(kst[0]))
+    return notExpanded(k, __LINE__);
+  const int64_t rowPitch = kst[0];                 // (int8: bytes between the cache's rows of T)
+  // the whole cache in one SPAD_B bank (max_dynamic x head_dim): no T loop, as
+  // expandContraction's untiled form (one LD and transpose a head, an EX a row)
+  // (q's int8, H G hd bytes, may be in SPAD_A before the kernel's words)
+  const bool whole = maxDyn * K / d + (H * G * K + d - 1) / d <= sb;
+  const int64_t tb = nb * d, blocks = maxDyn / tb + 1, rowElems = whole ? maxDyn : blocks * tb;
+  // p's row in SPAD_A bank 0 after the A tile(s) (K words each; one a row in the untiled form)
+  const int64_t pAt = (whole ? G : 1) * K;
+  if (pAt + (rowElems + d - 1) / d > sb) return notExpanded(k, __LINE__);
+
+  Expander e{OpBuilder(k), k.getLoc(), d};
+  MLIRContext *ctx = k.getContext();
+  Type f32 = Float32Type::get(ctx), i8 = IntegerType::get(ctx, 8), i32 = IntegerType::get(ctx, 32);
+  Type accT = cast<MemRefType>(p.bmm.getDpsInits()[0].getType()).getElementType();
+  sahl::ReserveOp::create(e.b, e.loc, p.out, false);
+  auto top = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
+  OpBuilder::InsertionGuard topGuard(e.b);
+  e.b.setInsertionPointToEnd(&top.getBody().emplaceBlock());
+  // SPAD_A after the buffers already there (q, int8, may be one): the A tile and p's
+  // row in the first bank, the staging rows and a block's raw rows from word sb on
+  {
+    const int64_t hbMax = whole ? maxDyn : nb > 1 && (tb / 2) * K >= 8192 ? tb / 2 : tb;
+    auto c = sahl::ClaimSpadOp::create(e.b, e.loc, sb + std::max<int64_t>(2 * K, hbMax * K / d));
+    c->setAttr("sa.relative", e.b.getUnitAttr());
+  }
+  auto placedA = [&](ArrayRef<int64_t> shape, int64_t word) {
+    Value v = e.alloc(shape, i8, "spad_a", "");
+    v.getDefiningOp()->setAttr("sa.word", e.b.getI64IntegerAttr(word));
+    return v;
+  };
+  auto placedDyn = [&](ArrayRef<int64_t> shape, StringRef mem, int64_t at) -> Value {
+    auto a = memref::AllocOp::create(e.b, e.loc, MemRefType::get(shape, i8), ValueRange{});
+    a->setAttr("sa.mem", e.b.getStringAttr(mem));
+    a->setAttr(mem == "spad_b" ? "sa.bank" : "sa.word", e.b.getI64IntegerAttr(at));
+    return Value(a);
+  };
+  // a rank-reduced static view
+  auto view = [&](Value v, ArrayRef<int64_t> offs, ArrayRef<OpFoldResult> sizes, ArrayRef<int64_t> shape) {
+    SmallVector<OpFoldResult> o, st;
+    for (int64_t x : offs) o.push_back(e.b.getIndexAttr(x)), st.push_back(e.b.getIndexAttr(1));
+    auto rt = memref::SubViewOp::inferRankReducedResultType(shape, cast<MemRefType>(v.getType()), o, sizes, st);
+    return Value(memref::SubViewOp::create(e.b, e.loc, cast<MemRefType>(rt), v, o, sizes, st));
+  };
+  auto ix = [&](int64_t x) -> OpFoldResult { return e.b.getIndexAttr(x); };
+  // s_q, one word per (head, row)
+  auto sqt = cast<MemRefType>(p.sq.getType());
+  Value sqw = e.alloc(sqt.getShape(), f32, "acc", "bcast");
+  sahl::BcastOp::create(e.b, e.loc, p.sq, sqw);
+  auto sqOf = [&](int64_t b, int64_t g) {
+    int64_t w = b * G + g;
+    SmallVector<int64_t> offs;
+    SmallVector<OpFoldResult> one;
+    for (int64_t r = sqt.getRank() - 1; r >= 0; --r) offs.insert(offs.begin(), w % sqt.getDimSize(r)), w /= sqt.getDimSize(r);
+    for (int64_t r = 0; r < sqt.getRank(); ++r) one.push_back(ix(1));
+    return view(sqw, offs, one, {});
+  };
+  // the block count (expandContraction's): ceil(T / Tb) through a power of two M, else (T >> log2 Tb) + 1
+  const int64_t lgTb = int64_t(llvm::Log2_64(uint64_t(tb)));
+  const int64_t Mp = int64_t(llvm::bit_ceil(uint64_t(std::max<int64_t>(maxDyn / d, 2))));
+  Value tv = p.tK;
+  int64_t sh = lgTb;
+  if (lgTb + int64_t(llvm::Log2_64(uint64_t(Mp))) <= 15) {
+    auto mul = arith::MulIOp::create(e.b, e.loc, p.tK, arith::ConstantIndexOp::create(e.b, e.loc, Mp - 1));
+    mul->setAttr("sa.index", e.b.getUnitAttr());
+    tv = mul;
+    sh += int64_t(llvm::Log2_64(uint64_t(Mp)));
+  }
+  Value shv = arith::ShRUIOp::create(e.b, e.loc, tv, arith::ConstantIndexOp::create(e.b, e.loc, sh));
+  auto cnt = arith::AddIOp::create(e.b, e.loc, shv, arith::ConstantIndexOp::create(e.b, e.loc, 1));
+  cnt->setAttr("sa.index", e.b.getUnitAttr());
+  // a 1-D piece of a matched generic: its body over the given operands (loop index 1, T, becomes 0)
+  AffineMap id1 = AffineMap::getMultiDimIdentityMap(1, ctx), none = AffineMap::get(1, 0, ctx);
+  auto piece = [&](linalg::GenericOp g, ArrayRef<Value> ins, ArrayRef<AffineMap> inMaps, Value out, bool reduce) {
+    SmallVector<AffineMap> maps(inMaps);
+    maps.push_back(reduce ? none : id1);
+    auto g1 = linalg::GenericOp::create(
+        e.b, e.loc, TypeRange{}, ins, ValueRange{out}, maps,
+        SmallVector<utils::IteratorType>{reduce ? utils::IteratorType::reduction : utils::IteratorType::parallel});
+    IRMapping map;
+    g.getRegion().cloneInto(&g1.getRegion(), map);
+    bool ok = true;
+    g1.walk([&](linalg::IndexOp io) {
+      if (io.getDim() != 1) {
+        ok = false;
+        return;
+      }
+      OpBuilder ib(io);
+      io.replaceAllUsesWith(linalg::IndexOp::create(ib, io.getLoc(), 0).getResult());
+      io.erase();
+    });
+    return ok;
+  };
+  auto scalar = [&](Value init) {
+    auto a = memref::AllocOp::create(e.b, e.loc, MemRefType::get({}, f32));
+    linalg::FillOp::create(e.b, e.loc, init, a.getResult());
+    return Value(a);
+  };
+  Value outFlat = memref::CollapseShapeOp::create(
+      e.b, e.loc, p.out, SmallVector<ReassociationIndices>{llvm::to_vector(llvm::seq<int64_t>(0, cast<MemRefType>(p.out.getType()).getRank()))});
+
+  // (T: the K slice's length for every piece; p's and the V slice's are equal to it, as
+  // the IR's shapes require, and one length lets sahw-fuse-ve merge across the pieces)
+  p.tP = p.tV = p.tK;
+  // per query row (b, g), its scores' accumulator: scores, max, p, sum, p . V, its epilogue
+  auto post = [&](int64_t b, int64_t g, Value rowAcc) -> bool {
+    auto scope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
+    OpBuilder::InsertionGuard guard(e.b);
+    e.b.setInsertionPointToEnd(&scope.getBody().emplaceBlock());
+    Value srow = e.alloc({rowElems}, f32, "acc", "packed");
+    sahl::ReserveOp::create(e.b, e.loc, srow, false);
+    if (!piece(p.scoresEpi, {e.prefix(rowAcc, p.tK), sqOf(b, g)}, {id1, none}, e.prefix(srow, p.tK), false))
+      return false;
+    Value mx = scalar(p.maxInit);
+    if (!piece(p.maxR, {p.pos, e.prefix(srow, p.tP)}, {none, id1}, mx, true)) return false;
+    Value prow = placedA({rowElems}, pAt);
+    if (!piece(p.probs, {p.pos, e.prefix(srow, p.tP), mx}, {none, id1, none}, e.prefix(prow, p.tP), false)) return false;
+    Value sum = scalar(p.sumInit);
+    if (!piece(p.sumR, {e.prefix(prow, p.tP)}, {id1}, sum, true)) return false;
+    Value acc2 = e.alloc({K}, i32, "acc", "packed");
+    for (int64_t c0 = 0; c0 < nt; c0 += 8) {
+      const int64_t ncg = std::min<int64_t>(8, nt - c0);
+      Value vv = cast<MemRefType>(p.vCache.getType()).getRank() == 4
+                     ? view(p.vCache, {b, c0, 0, 0}, {ix(1), ix(ncg), OpFoldResult(p.tV), ix(d)},
+                            {ncg, ShapedType::kDynamic, d})
+                     : view(p.vCache, {c0, 0, 0}, {ix(ncg), OpFoldResult(p.tV), ix(d)}, {ncg, ShapedType::kDynamic, d});
+      sahl::GemvOp::create(e.b, e.loc, prow, vv, nt > 8 ? e.sub(acc2, {c0 * d}, {ncg * d}) : acc2, false);
+    }
+    return piece(p.pvEpi, {acc2, sum}, {id1, none}, e.sub(outFlat, {(b * G + g) * K}, {K}), false);
+  };
+
+  const bool oneEx = G > 1;
+  for (int64_t b = 0; b < H; ++b) {
+    auto bscope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
+    OpBuilder::InsertionGuard bguard(e.b);
+    e.b.setInsertionPointToEnd(&bscope.getBody().emplaceBlock());
+    if (whole) {
+      // the head's T rows of K into SPAD_A bank 1, transposed into SPAD_B; per row its strip, its EX
+      Value tK = p.tK;
+      Value nTiles = arith::ShRUIOp::create(e.b, e.loc, tK,
+                                            arith::ConstantIndexOp::create(e.b, e.loc, int64_t(llvm::Log2_64(uint64_t(d)))));
+      Value kv = cast<MemRefType>(p.kCache.getType()).getRank() == 3
+                     ? view(p.kCache, {0, b, 0}, {OpFoldResult(tK), ix(1), ix(K)}, {ShapedType::kDynamic, K})
+                     : view(p.kCache, {0, 0}, {OpFoldResult(tK), ix(K)}, {ShapedType::kDynamic, K});
+      auto raw = memref::AllocOp::create(e.b, e.loc, MemRefType::get({ShapedType::kDynamic, K}, i8), ValueRange{tK});
+      raw->setAttr("sa.mem", e.b.getStringAttr("spad_a"));
+      raw->setAttr("sa.word", e.b.getI64IntegerAttr(sb));
+      sahl::LoadOp::create(e.b, e.loc, kv, raw)->setAttr("sa.rows", e.b.getUnitAttr());
+      auto tiles = memref::AllocOp::create(e.b, e.loc, MemRefType::get({ShapedType::kDynamic, K, d}, i8), ValueRange{nTiles});
+      tiles->setAttr("sa.mem", e.b.getStringAttr("spad_b"));
+      tiles->setAttr("sa.bank", e.b.getI64IntegerAttr(b & 1));
+      sahl::TransposeOp::create(e.b, e.loc, raw, tiles);
+      for (int64_t g = 0; g < G; ++g) {
+        sahl::StripOp::create(e.b, e.loc, view(p.q, {b, g, 0}, {ix(1), ix(1), ix(K)}, {K}), placedA({d, K}, g * K));
+        Value acc = e.alloc({rowElems}, accT, "acc", "packed");
+        if (accT.isInteger(64)) acc.getDefiningOp()->setAttr("sa.accumulator", e.b.getUnitAttr());
+        sahl::ReserveOp::create(e.b, e.loc, acc, false);
+        sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, g * K), tiles, acc, false);
+        if (!post(b, g, acc)) return notExpanded(k, __LINE__);
+      }
+      continue;
+    }
+    // the A tile of the head's G rows of q (int32 in ACC: one VE copy to int8)
+    if (oneEx) {
+      Value xv = view(p.q, {b, 0, 0}, {ix(1), ix(G), ix(K)}, {G, K});
+      sahl::StripOp::create(e.b, e.loc, xv, placedA({G, K}, sb))->setAttr("sa.packed", e.b.getUnitAttr());
+      Value cols = placedA({K, d}, sb + K);
+      sahl::TransposeOp::create(e.b, e.loc, placedA({d, K}, sb), cols);
+      sahl::TransposeOp::create(e.b, e.loc, cols, placedA({d, K}, 0));
+    } else {
+      sahl::StripOp::create(e.b, e.loc, view(p.q, {b, 0, 0}, {ix(1), ix(1), ix(K)}, {K}), placedA({d, K}, 0));
+    }
+    auto accBuf = [&](int64_t n) {
+      Value a = e.alloc({n}, accT, "acc", "packed");
+      if (accT.isInteger(64)) a.getDefiningOp()->setAttr("sa.accumulator", e.b.getUnitAttr());
+      sahl::ReserveOp::create(e.b, e.loc, a, false);
+      return a;
+    };
+    Value scratch = accBuf(((oneEx ? 0 : G - 1) + d) * tb);
+    SmallVector<Value> rowsAll, rowsAcc;
+    for (int64_t g = 0; g < G; ++g) {
+      rowsAll.push_back(accBuf(tb + rowElems));
+      rowsAcc.push_back(e.sub(rowsAll.back(), {tb}, {rowElems}));
+    }
+    // the T loop (expandContraction's, §8.22 steps a-c and c')
+    const int64_t nh = nb > 1 && (tb / 2) * K >= 8192 ? 2 : 1, hb = tb / nh, nbh = nb / nh;
+    auto ex = [&](int64_t bank) {
+      Value tl = placedDyn({nbh, K, d}, "spad_b", bank);
+      if (oneEx) sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tl, e.sub(scratch, {0}, {hb}), false);
+      else sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tl, e.sub(scratch, {0}, {hb}), false);
+    };
+    auto copies = [&](int64_t at, StringRef adv) {
+      for (int64_t g = 0; g < G; ++g) {
+        auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch, {g * hb}, {hb}), e.sub(rowsAll[g], {at}, {hb}));
+        c->setAttr(adv, e.b.getI64IntegerAttr(1));
+      }
+    };
+    auto lp = sahl::LoopOp::create(e.b, e.loc, blocks, ArrayRef<int64_t>{tb * rowPitch, nb}, cnt);
+    {
+      OpBuilder::InsertionGuard guard(e.b);
+      e.b.setInsertionPointToEnd(&lp.getBody().emplaceBlock());
+      Value raw = placedA({hb, K}, sb);
+      for (int64_t h = 0; h < nh; ++h) {
+        Value kv = cast<MemRefType>(p.kCache.getType()).getRank() == 3
+                       ? view(p.kCache, {h * hb, b, 0}, {ix(hb), ix(1), ix(K)}, {hb, K})
+                       : view(p.kCache, {h * hb, 0}, {ix(hb), ix(K)}, {hb, K});
+        auto l = sahl::LoadOp::create(e.b, e.loc, kv, raw);
+        l->setAttr("sa.rows", e.b.getUnitAttr());
+        l->setAttr("sa.advance", e.b.getI64IntegerAttr(0));
+        ex((h + nh - 1) % nh);
+        if (nh == 1) copies(0, "sa.advance");
+        sahl::TransposeOp::create(e.b, e.loc, raw, placedDyn({nbh, K, d}, "spad_b", h));
+        if (nh > 1) copies(h == 0 ? tb - hb : tb, "sa.advance");
+      }
+    }
+    ex(nh - 1);
+    copies(tb - hb, "sa.advance_final");
+    for (int64_t g = 0; g < G; ++g)
+      if (!post(b, g, rowsAcc[g])) return notExpanded(k, __LINE__);
+  }
+  eraseKernel(k);
+  return true;
+}
+
 struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SahlExpandKernelsPass)
   SahlExpandKernelsPass() = default;
@@ -1422,6 +1667,18 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
           if (!bm || !o.hasAttr("sahl.anchor")) continue;
           KernelMatcher km(cfg);
           if (km.matchAttention(bm)) expandAttention(k, km.attns[bm.getOperation()], lay, cfg.d, cfg.maxDynamic);
+          break;
+        }
+        continue;
+      }
+      if (k.getKind() == "attn_layer") {
+        for (Operation &o : k.getBody().front()) {
+          auto bm = dyn_cast<linalg::BatchMatmulOp>(&o);
+          if (!bm || !o.hasAttr("sahl.anchor")) continue;
+          KernelMatcher km(cfg);
+          if (!km.matchAttnLayer(bm) ||
+              !expandAttnLayer(k, km.attnLayers[bm.getOperation()], lay, cfg.d, cfg.attnBlock, cfg.maxDynamic))
+            notExpanded(k, __LINE__);
           break;
         }
         continue;

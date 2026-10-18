@@ -477,9 +477,10 @@ attention's share grows with the context.
 ## 6. The attention fusion (design)
 
 Status: design (2026-10-18), schedule prototyped in the performance model
-(§6.2.2). The region pass is implemented (§6.4.1, step 3 of §6.6); the
-backend (`expandAttnLayer`, step 4) is not, so the fused dispatch runs on
-the host. The second fused chain after
+(§6.2.2). The region pass (§6.4.1) and the backend's kernel in its in-order
+form (§6.4.5) are implemented, steps 3 and 4a of §6.6: the fused dispatch runs
+on the accelerator, bit-exact with the unfused build, not yet on the board.
+The second fused chain after
 SwiGLU (§4, on by default since 2026-10-18). Bounds from
 `compiler/tests/fusion_whatif.py` on the `v2.2-kv260` traces (§6.2); the
 attention kernels it builds on are those of C6.5
@@ -869,6 +870,84 @@ with the unfused one, and prefill rows bit-exact with decode (they run the
 same fused executable). As in C6.5, no online softmax: block-local maxima
 would change p's int8 rounding.
 
+#### 6.4.5 Implemented: the in-order kernel (step 4a, 2026-10-18)
+
+What the backend does with the fused dispatch today. It differs from §6.4.2
+in where the cut lies and in the schedule, which is in order. The interleaved
+schedule is step 4b.
+
+- **What the generic lowering keeps**: the q path before the core, and the
+  amax and int8 output after it. They are generics on local buffers, so
+  sa-to-sahl normalizes what bufferization leaves for them:
+  - `expandLocalViews`: a static local buffer seen through an `expand_shape`
+    is allocated in the expanded shape, its other uses through a collapse of
+    it. sahl-to-sahw also takes a static `expand_shape` of a contiguous local
+    buffer as the same words.
+  - `freshReductionInits`: bufferization merges equal fills, so reductions
+    share one filled buffer. An identity copy of a filled buffer becomes a
+    fill, and a reduction whose filled init was used in between gets a fresh
+    filled buffer.
+- **The core, an `AttnLayerPlan`** (`SahlKernels.cpp`, kernel kind
+  `attn_layer`), anchored at the scores' batch matmul with a local q. It runs
+  from the scores through p · V's epilogue: the extension of the K cache
+  slice, the scores' epilogue (s_q local), the masked max and p (the
+  position), Σp, p's and the V cache's extensions (V's local copy: its DDR
+  source), p · V and its epilogue. Each intermediate is the core's own. Its
+  readers are checked over the value's lifetime (to the buffer's next write),
+  because bufferization reuses buffers.
+- **`expandAttnLayer`**, all in one keep-scope:
+  - Per KV head, the scores of its G rows:
+    - *untiled*, when max_dynamic × head_dim, plus q's int8, fits one SPAD_B
+      bank (Qwen3, Llama at 256): one LD of the head's T rows, one transpose,
+      then per row its strip and its EX straight into the row's accumulator;
+    - *tiled* otherwise (Gemma's head_dim 256; long contexts): the T loop of
+      §8.22, copied from `expandContraction`.
+  - Then per query row, each a 1-D piece of the matched generic over the
+    row's T for the generic lowering: the scores' epilogue, the masked max, p
+    (int8, SPAD_A), Σp, p · V on the GEMV unit (p as its x), and the epilogue
+    into the row's slice of the output.
+  - T is the K slice's length for every piece. The IR's shapes require p's
+    and V's lengths to equal it, and one length parameter lets
+    `sahw-fuse-ve` merge across the pieces.
+- **SPAD_A**: q's int8 may already be in SPAD_A when the kernel starts. The
+  kernel's claim is therefore relative (`sahl.claim_spad` "sa.relative"): its
+  placed words follow the buffers already there.
+- **A defect found and fixed**: the lowering writes `select(mask, x, -inf)` as
+  a copy carrying VALID, whose masked lanes are 0, and relies on
+  `sahw-fuse-ve` merging that copy into the max REDUCE. The kernel's rows
+  reuse buffers, so the merge was refused, and rows with one to three keys
+  unmasked gave NaN.
+  - Now, for such a mask only, the merge counts readers only of the words no
+    later VE of the same length has overwritten. An EX reads ACC only when it
+    accumulates.
+  - A mask left unmerged fails the compile (`sa.neginf`) instead of computing
+    the wrong value.
+  - `dispatch_check.py --pos 0` tests rows with one key unmasked; the default
+    position, T − 3, had missed it.
+- **Verified** (2-layer Gemma / Qwen3 / Llama, D = 16, 4 ports, max_dynamic
+  256): no dispatch on the host; logits end to end on the sim bit-identical to
+  the unfused build's.
+  - `dispatch_check` passes every fused dispatch (decode and the 64 prefill
+    rows) at T = 16, 128, 144, 256, with `--dirty`, each at the default
+    position and at `--pos 0`.
+  - Golden: the corpus without the flag unchanged; three new cases,
+    `attn_gemma`, `attn_qwen3`, `attn_llama` (8932 dispatches).
+- **Model** (decode, last step, cycles saved against the default build):
+
+  | Model | Saved per layer | Decode, whole model |
+  |---|---:|---:|
+  | Qwen3 | 15.9K | ≈ −3.5% |
+  | Llama | 14.8K | ≈ −1.1% |
+  | Gemma (tiled form) | 4.3K | ≈ −1.4% |
+
+  Qwen3 lands at the in-order bound of §6.2.2 (−3.3%). At first the kernel
+  always ran the T loop, with integer copies, and saved nothing on Qwen3. The
+  untiled form removed that.
+  - VE busy time is still above the unfused path's: per-row pieces pay the
+    VE's fixed cost once per row.
+  - Next (step 4b): pieces over the G rows of a head at once, post(u − 1)
+    between the T loops (§6.4.2), the untiled form for Gemma.
+
 ### 6.5 Banks (measured in §6.2.2)
 
 The scoreboard tracks hazards per bank (SPAD_A ×2, SPAD_B ×2, ACC ×2): RAW,
@@ -899,7 +978,7 @@ A finer scoreboard (LLM plan §11.3) is not needed for this design.
 | 1 | ~~Schedule prototype~~ **done 2026-10-18** (§6.2.2, `attn_schedule.py`): stage 1 −4.0% to −4.3% of decode (Qwen3, T = 48 to 2048) with an implementable schedule; with alternating tiles −4.9% to −11.6%. **Go.** | done |
 | 2 | ~~Alternating tiles in the existing q · Kᵀ T loop~~ **done 2026-10-18** (§6.2.2): each block as two halves in alternating SPAD_B banks, where a half is at least 8 KB. Qwen3 −0.9% to −1.8% of decode by default, −7.4% at 2048 with `--iree-sa-attn-block 256`. Bit-exact; golden: the three tiled q · Kᵀ dispatches changed | done |
 | 3 | ~~Region pass with dynamic T~~ **done 2026-10-18** (§6.4.1): the regions IREE formed merged after formation (plugin hook, IREE patch 0004), `--iree-sa-fuse-attn` / `SA_FUSE_ATTN=1`. 66 chains per 2-layer model (decode layers and prefill rows), workload over T from IREE. The backend is unchanged, so they run on the host. Gemma / Qwen3 / Llama end to end with the same tokens; the logit difference is the VMVX exp, shown on Llama | done |
-| 4 | `AttnLayerPlan` match and `expandAttnLayer` with §6.4.2's schedule, decode at T within one block first, then the T loop | 8–12 days |
+| 4 | ~~4a: `AttnLayerPlan` and `expandAttnLayer`, in order~~ **done 2026-10-18** (§6.4.5): the fused dispatch on the accelerator, decode and prefill rows, untiled and tiled forms; bit-exact end to end on Gemma / Qwen3 / Llama; model decode −3.5% / −1.1% / −1.4%. 4b: §6.4.2's interleaved schedule, row pieces per head, Gemma untiled | 4a done; 4b 4–6 days |
 | 5 | Verification: lit; golden corpus with the flag off; `dispatch_check.py` per dispatch at T = 16, Tb ± D, 2·Tb, max T; end to end on the sim bit-exact with the unfused build (four models, 2 layers); prefill vs decode rows bit-exact; `test_long_context.py` at 2048 (512 Gemma); `host_copies.py` | 4–5 days |
 | 6 | Board: the four bundles (`run_board_tests.sh`: `llm`, `profile --batch`, long context and its sweep, plan A / plan B) | 2 days |
 

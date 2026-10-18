@@ -44,6 +44,7 @@ class LocalMemory {
     return w;
   }
   bool spadUsed() const { return spad != 0; }
+  uint32_t spadTop() const { return spad; }
   // a kernel's own SPAD_A layout: the first `words` words are its
   void takeSpad(uint32_t words) { spad = words; }
 

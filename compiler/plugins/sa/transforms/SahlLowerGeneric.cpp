@@ -600,6 +600,9 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
       v.o = {t.la, ::sa::VT_F32, ::sa::IDX_LIN, 0};
       v.producer = lastVe;
       v.negInf = negInf;
+      // (correct only merged into the max reduction that reads it: masked lanes are 0
+      // here; sahw-fuse-ve merges it and fails the compile on one left unmerged)
+      if (negInf && lastVe) lastVe->setAttr("sa.neginf", UnitAttr::get(lastVe->getContext()));
       vals[res] = v;
       continue;
     }

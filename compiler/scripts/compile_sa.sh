@@ -21,7 +21,7 @@
 # --iree-sa-fuse-ffn, docs/fusion_design.md §4.9).
 # SA_FUSE_ATTN=1: decode's attention (q path, scores, probabilities, p . V, int8
 # output) in one dispatch per layer and prefill row (--iree-sa-fuse-attn, default 0;
-# docs/fusion_design.md §6.4.1; the backend does not compile it yet: on the host).
+# docs/fusion_design.md §6.4.1, §6.4.5; on the accelerator, bit-exact, not yet on the board).
 # SA_HOST_FALLBACK=0: no host fallback (default 1: every dispatch also gets a
 # VMVX variant; one the sa backend cannot compile runs on the ARM host, plan
 # §8.15; IREE's executable linking is off, it would merge the VMVX variants of

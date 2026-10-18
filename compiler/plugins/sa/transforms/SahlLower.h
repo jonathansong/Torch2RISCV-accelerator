@@ -112,6 +112,8 @@ private:
   ::sa::Layout lay;
   OpBuilder regB, bb;
   Location loc;
+  // a kernel's placed SPAD_A words are relative to this (sahl.claim_spad "sa.relative")
+  uint32_t spadBase = 0;
   std::map<std::pair<int, Lin>, Value> bases;
   llvm::DenseMap<Value, LocalBuf> locals;
   llvm::DenseMap<Value, LocalBuf> bcastOf;

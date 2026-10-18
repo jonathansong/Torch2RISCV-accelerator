@@ -292,6 +292,94 @@ static std::optional<std::tuple<Value, int64_t, int64_t>> stridedRows(Value idx,
   return std::make_tuple(src, stride, add);
 }
 
+// A fused dispatch (docs/fusion_design.md §6.4) keeps its intermediates in
+// local buffers, and bufferization gives a consumer of another shape an
+// expand_shape view of the producer's buffer. A static local buffer seen
+// through such a view is allocated in the expanded shape instead, its other
+// uses through a collapse of it (a contiguous local buffer seen flat, a form
+// the lowering knows); a second view of the same shape is the buffer itself.
+// A fused dispatch's reductions may share one filled buffer (bufferization of
+// two equal fills): a reduction then starts from a buffer something else read
+// or wrote since the fill, and an identity copy of a filled buffer stands for
+// another fill. Each such copy becomes a fill of its destination, and each
+// reduction whose init is filled earlier with other uses in between gets a
+// buffer of its own, filled just before it (later uses read that one).
+void freshReductionInits(func::FuncOp f) {
+  Block &blk = f.getBody().front();
+  auto local = [](Value v) {                       // a local buffer, or a reshaped view of one
+    while (auto c = v.getDefiningOp<memref::CollapseShapeOp>()) v = c.getSrc();
+    return bool(v.getDefiningOp<memref::AllocOp>());
+  };
+  auto fillOf = [&](Value v, Operation *before) -> linalg::FillOp {
+    linalg::FillOp last;
+    for (Operation *u : v.getUsers())
+      if (auto fl = dyn_cast<linalg::FillOp>(u); fl && fl->getBlock() == &blk && fl->isBeforeInBlock(before) &&
+                                                 (!last || last->isBeforeInBlock(fl)))
+        last = fl;
+    return last;
+  };
+  auto between = [&](Value v, Operation *a, Operation *b, Operation *except) {
+    return llvm::any_of(v.getUsers(), [&](Operation *u) {
+      Operation *t = blk.findAncestorOpInBlock(*u);
+      return t && t != except && a->isBeforeInBlock(t) && t->isBeforeInBlock(b);
+    });
+  };
+  SmallVector<linalg::GenericOp> gs;
+  for (Operation &op : blk)
+    if (auto g = dyn_cast<linalg::GenericOp>(&op)) gs.push_back(g);
+  for (linalg::GenericOp g : gs) {
+    if (isIdentityCopy(g)) {
+      Value src = g.getDpsInputs()[0];
+      if (!local(src) || !local(g.getDpsInits()[0])) continue;
+      auto fl = fillOf(src, g);
+      if (!fl || between(src, fl, g, nullptr)) continue;
+      OpBuilder b(g);
+      linalg::FillOp::create(b, g.getLoc(), fl.getDpsInputs()[0], g.getDpsInits()[0]);
+      g.erase();
+      continue;
+    }
+    if (!g.getNumReductionLoops() || g.getNumDpsInits() != 1) continue;
+    Value init = g.getDpsInits()[0];
+    auto it = dyn_cast<MemRefType>(init.getType());
+    if (!local(init) || !it || !it.hasStaticShape() || !it.getLayout().isIdentity()) continue;
+    auto fl = fillOf(init, g);
+    if (!fl || !between(init, fl, g, nullptr)) continue;
+    OpBuilder b(g);
+    auto na = memref::AllocOp::create(b, g.getLoc(), it);
+    linalg::FillOp::create(b, g.getLoc(), fl.getDpsInputs()[0], na.getResult());
+    init.replaceUsesWithIf(na.getResult(), [&](OpOperand &use) {
+      Operation *t = blk.findAncestorOpInBlock(*use.getOwner());
+      return t && (t == g.getOperation() || g->isBeforeInBlock(t));
+    });
+  }
+}
+
+void expandLocalViews(func::FuncOp f) {
+  SmallVector<memref::ExpandShapeOp> exps;
+  f.walk([&](memref::ExpandShapeOp e) { exps.push_back(e); });
+  for (memref::ExpandShapeOp e : exps) {
+    MemRefType et = e.getResultType();
+    if (!et.hasStaticShape() || !et.getLayout().isIdentity()) continue;
+    if (auto c = e.getSrc().getDefiningOp<memref::CollapseShapeOp>();
+        c && c.getSrcType() == et && c.getReassociationIndices() == e.getReassociationIndices()) {
+      e.replaceAllUsesWith(c.getSrc());
+      e.erase();
+      continue;
+    }
+    auto a = e.getSrc().getDefiningOp<memref::AllocOp>();
+    if (!a || !a.getType().hasStaticShape() || !a.getType().getLayout().isIdentity() ||
+        !a->getDiscardableAttrDictionary().empty())
+      continue;
+    OpBuilder b(a);
+    auto na = memref::AllocOp::create(b, a.getLoc(), MemRefType::get(et.getShape(), et.getElementType()));
+    auto c = memref::CollapseShapeOp::create(b, a.getLoc(), na, e.getReassociationIndices());
+    a.replaceAllUsesWith(c.getResult());
+    a.erase();
+    e.replaceAllUsesWith(na.getResult());
+    e.erase();
+  }
+}
+
 void replaceScatters(func::FuncOp f) {
   SmallVector<IREE::LinalgExt::ScatterOp> scs;
   f.walk([&](IREE::LinalgExt::ScatterOp sc) { scs.push_back(sc); });
@@ -505,6 +593,7 @@ LogicalResult groupKernels(func::FuncOp f, const TargetConfig &cfg) {
   SmallVector<std::pair<Operation *, StringRef>> anchors;
   for (Operation &op : blk) {
     if (km.ffns.count(&op)) anchors.push_back({&op, "ffn"});
+    else if (km.attnLayers.count(&op)) anchors.push_back({&op, "attn_layer"});
     else if (km.linears.count(&op)) anchors.push_back({&op, "linear"});
     else if (km.attns.count(&op)) anchors.push_back({&op, "attention"});
     else if (km.contracts.count(&op)) anchors.push_back({&op, "contraction"});
@@ -566,6 +655,8 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
   void runOnOperation() override {
     func::FuncOp f = getOperation();
     unrollOuterRows(f);
+    expandLocalViews(f);
+    freshReductionInits(f);
     llvm::DenseMap<Value, Value> loaded;          // DDR view -> its local copy
     auto localFor = [&](OpBuilder &b, Location loc, Value ddr) -> Value {
       auto mt = cast<MemRefType>(ddr.getType());

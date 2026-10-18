@@ -139,6 +139,30 @@ struct FfnPlan {
   Value out;                                   // h: the epilogue's result (local, [N])
 };
 
+// ------------------------------------------------------------ decode's attention, fused (docs/fusion_design.md §6.4.2)
+// A dispatch formed by iree-sa-form-attn-regions, its core from the scores to
+// p . V (the q path before it and the amax / int8 output after it are the
+// generic lowering's, on local buffers):
+//   scores: bmm(q [H, G, hd] i32 local, ext(K cache [T, H, hd] i8 DDR)) -> i64
+//           [H, G, T], epilogue (s_q [H, G] local) -> S f32 [H, G, T] (through a
+//           collapse [H G, T] for the next two);
+//   max:    masked max over T of S (the position, i64 DDR) -> [H G];
+//   p:      p = i8(f(S, max)) -> [H G, T] (masked, exp, x 127);
+//   sum:    sum over T of p -> [H G];
+//   p . V:  contraction(ext(p) [H, G, T], ext(V cache [H, nb, T, D] i8, its
+//           local copy's DDR source)) -> i32 [H, G, nb, D], epilogue (the sum
+//           [H, G], scalars) -> out f32 [H, G, nb, D] (local, left to what follows).
+struct AttnLayerPlan {
+  linalg::BatchMatmulOp bmm;
+  Value q, sq;                                 // local
+  Value kCache, vCache, pos;                   // DDR
+  Value tK, tP, tV;                            // the dynamic lengths (of the K slice, p, the V slice)
+  linalg::GenericOp scoresEpi, maxR, probs, sumR, pv, pvEpi;
+  Value out;                                   // pvEpi's result (local)
+  Value maxInit, sumInit;                      // the reductions' fill values
+  int64_t H = 0, G = 0, hd = 0;
+};
+
 // The schedule of a linear micro-kernel (sahl-schedule): chunks of chunkTiles
 // output tiles (the weights of a chunk in one SPAD_B bank, the next chunk's
 // loaded into the other bank while this one computes); decode's form loops
@@ -171,6 +195,8 @@ class KernelMatcher {
            lay.acc0 + k / d + 2 <= lay.cbank;
   }
   bool matchAttention(linalg::BatchMatmulOp bmm);
+  // a fused dispatch's attention core, anchored at the scores' batch matmul (AttnLayerPlan)
+  bool matchAttnLayer(linalg::BatchMatmulOp bmm);
   // decode's gated FFN, anchored at the contraction that comes first (FfnPlan)
   bool matchFfn(linalg::GenericOp con);
   bool matchContraction(linalg::LinalgOp op);
@@ -183,6 +209,7 @@ class KernelMatcher {
   llvm::DenseMap<Operation *, AttnPlan> attns;
   llvm::DenseMap<Operation *, ContractPlan> contracts;
   llvm::DenseMap<Operation *, FfnPlan> ffns;
+  llvm::DenseMap<Operation *, AttnLayerPlan> attnLayers;
   llvm::DenseSet<Operation *> owned;
   llvm::DenseMap<Operation *, SmallVector<Operation *>> covers;   // anchor -> the operations of its match
 

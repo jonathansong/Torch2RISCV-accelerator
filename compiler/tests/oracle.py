@@ -351,6 +351,24 @@ class Interp:
             full.arr = np.asarray(value.arr)
         write_tensor(self.buffers[binding], offset, full, et)
 
+    def op_tensor_extract_slice(self, op):
+        # a slice of a tensor value (a fused dispatch's rank-reducing slice, form-attn-regions):
+        # the elements, the unit dimensions the result type drops removed
+        t = self.val(op.operands[0])
+        offs, sizes, strides = self._slice_args(op, 1)
+        arr = np.asarray(t.arr)[tuple(slice(o, o + s * st, st) for o, s, st in zip(offs, sizes, strides))]
+        rank = ir.RankedTensorType(op.results[0].type).rank
+        shape = list(sizes)
+        i = 0
+        while len(shape) > rank and i < len(shape):
+            if shape[i] == 1:
+                shape.pop(i)
+            else:
+                i += 1
+        if len(shape) != rank:
+            raise NotImplementedError("oracle: extract_slice rank reduction")
+        self.set(op.results[0], T(arr.reshape(shape), t.et))
+
     def op_tensor_empty(self, op):
         rt = ir.RankedTensorType(op.results[0].type)
         dyn = [int(np.asarray(self.val(o).arr)) for o in op.operands]
@@ -363,7 +381,16 @@ class Interp:
         t = self.val(op.operands[0])
         shape = list(ir.RankedTensorType(op.results[0].type).shape)
         if any(x < 0 for x in shape):
-            raise NotImplementedError("dynamic reshape")
+            # (a fused dispatch: [16, T] <-> [8, 2, T]) the dynamic sizes: expand_shape's
+            # output_shape operands, or the one left by the element count
+            dyn = [int(np.asarray(self.val(o).arr)) for o in list(op.operands)[1:]]
+            if len(dyn) == sum(x < 0 for x in shape):
+                shape = [dyn.pop(0) if x < 0 else x for x in shape]
+            elif sum(x < 0 for x in shape) == 1:
+                known = int(np.prod([x for x in shape if x >= 0]))
+                shape = [int(np.asarray(t.arr).size) // known if x < 0 else x for x in shape]
+            else:
+                raise NotImplementedError("dynamic reshape")
         self.set(op.results[0], T(np.asarray(t.arr).reshape(shape), t.et))
 
     op_tensor_collapse_shape = _reshape

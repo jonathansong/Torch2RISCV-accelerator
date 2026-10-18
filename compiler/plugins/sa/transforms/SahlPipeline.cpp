@@ -7,6 +7,7 @@
 // (the C3 folding rules): x * c -> A, x + c -> B, exp / rsqrt / 1/x / abs ->
 // FUNC, a reduction -> REDUCE, to_i8 -> int8 output. The intermediate buffer
 // must have no other reader.
+#include "../target/DescList.h"
 #include "SahlPasses.h"
 #include "SahwPasses.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
@@ -35,7 +36,8 @@ int64_t srcWords(int64_t words, int64_t mode, int64_t period) {
   return words;
 }
 
-void readsOf(Operation *op, int64_t d, SmallVectorImpl<Range> &out) {
+// (exact: an EX reads ACC only when it accumulates; otherwise treated as reading everything)
+void readsOf(Operation *op, int64_t d, SmallVectorImpl<Range> &out, bool exact = false) {
   if (auto v = dyn_cast<sahw::VeOp>(op)) {
     int64_t words = (v.getLength() + d - 1) / d;
     out.push_back(rangeOf(v.getSrc1(), srcWords(words, v.getM1(), v.getP1())));
@@ -46,8 +48,14 @@ void readsOf(Operation *op, int64_t d, SmallVectorImpl<Range> &out) {
     // words of D elements: 4 * D bytes in ACC, D bytes in SPAD
     int64_t wordBytes = ((uint64_t(s.getLaddr()) >> 28) & 0xF) == 3 ? 4 * d : d;
     out.push_back(rangeOf(s.getLaddr(), (s.getRows() * s.getRowBytes() + wordBytes - 1) / wordBytes));
-  } else if (isa<sahw::ExOp>(op)) {
-    out.push_back({0xFFFFFFFFu, 0, 0xFFFFFFFFu});          // treated as reading everything
+  } else if (auto ex = dyn_cast<sahw::ExOp>(op)) {
+    if (exact) {                                              // A and B in the SPADs, C if accumulating
+      out.push_back({uint32_t(::sa::MEM_SPAD_A), 0, 0xFFFFFFFFu});
+      out.push_back({uint32_t(::sa::MEM_SPAD_B), 0, 0xFFFFFFFFu});
+      if (ex.getAccumulate()) out.push_back({uint32_t(::sa::MEM_ACC), 0, 0xFFFFFFFFu});
+    } else {
+      out.push_back({0xFFFFFFFFu, 0, 0xFFFFFFFFu});          // treated as reading everything
+    }
   }
 }
 
@@ -117,15 +125,36 @@ struct SahwFuseVePass : public PassWrapper<SahwFuseVePass, OperationPass<>> {
       // the intermediate has no other reader; nothing between touches v2's destination
       bool ok = true;
       Range dst2 = rangeOf(v2.getDst(), (v2.getLength() + d - 1) / d);
-      // (readers after the producer: earlier commands cannot see the change)
-      for (size_t k = i + 1; k < ops.size() && ok; ++k)
+      // (readers after the producer: earlier commands cannot see the change; for a
+      // -inf mask, which must merge, only of the words no later VE has overwritten
+      // since v2: e.g. a fused kernel's next row reusing the buffer)
+      Range live = t;                         // the intermediate's words a later command could still read
+      for (size_t k = i + 1; k < ops.size() && ok; ++k) {
         ops[k]->walk([&](Operation *op) {
           if (op == v2.getOperation() || !ok) return;
           SmallVector<Range> rs;
-          readsOf(op, d, rs);
+          readsOf(op, d, rs, v1->hasAttr("sa.neginf"));
           for (const Range &r : rs)
-            if (r.overlaps(t)) ok = false;
+            if (r.overlaps(live)) ok = false;
         });
+        // (only for a -inf mask, which must merge; an overwrite of a static length, or
+        // of the same dynamic length as the mask's: one that may write less does not count)
+        // (VALID only selects the value or 0 per lane: all lanes up to the length written)
+        auto sameLen = [&](sahw::VeOp v) {
+          if (v.getDynFields().empty()) return true;
+          Value l, vl;
+          return dynOf(v, l, vl) && l && l == len1;
+        };
+        if (auto v = dyn_cast<sahw::VeOp>(ops[k]);
+            v && k > j && v1->hasAttr("sa.neginf") && v.getReduce() == 0 && sameLen(v)) {
+          // the words it writes are dead from here: the live part of the intermediate shrinks
+          // (from either end; a write inside it keeps it whole), nothing left: stop
+          Range w = rangeOf(v.getDst(), (v.getLength() + d - 1) / d);
+          if (w.mem == live.mem && w.lo <= live.lo && live.lo < w.hi) live.lo = std::min(w.hi, live.hi);
+          else if (w.mem == live.mem && w.lo < live.hi && live.hi <= w.hi) live.hi = std::max(w.lo, live.lo);
+          if (live.lo >= live.hi) break;
+        }
+      }
       for (size_t k = i + 1; k < j && ok; ++k) {
         SmallVector<Range> rs;
         readsOf(ops[k], d, rs);
@@ -140,6 +169,7 @@ struct SahwFuseVePass : public PassWrapper<SahwFuseVePass, OperationPass<>> {
       if (usesR) {
         v1.setReduce(v2.getReduce());
         v1.setRowlen(v2.getRowlen());
+        v1->removeAttr("sa.neginf");
       }
       if (usesV) {
         SmallVector<int32_t> f(v1.getDynFields());
@@ -164,6 +194,13 @@ struct SahwFuseVePass : public PassWrapper<SahwFuseVePass, OperationPass<>> {
       if (auto a = t->getAttrOfType<IntegerAttr>("sa.d")) d = a.getInt();
       t.walk([&](Block *blk) {
         while (fuseOnce(*blk, d)) {
+        }
+      });
+      // a -inf mask not merged into its max reduction: its masked lanes are 0, not -inf
+      t.walk([&](sahw::VeOp v) {
+        if (v->hasAttr("sa.neginf")) {
+          v.emitError("sahw-fuse-ve: a -inf mask not merged into its max reduction");
+          signalPassFailure();
         }
       });
     });

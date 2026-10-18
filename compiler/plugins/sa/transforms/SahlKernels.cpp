@@ -46,7 +46,15 @@ void KernelMatcher::matchAll(func::FuncOp f) {
     f.walk([&](linalg::GenericOp g) {
       if (g->getParentOp() == f.getOperation()) matchLinear(g);
     });
-  if (cfg.ukernel("attention")) f.walk([&](linalg::BatchMatmulOp m) { matchAttention(m); });
+  // a fused dispatch's attention (on the GEMV unit's p . V)
+  if (cfg.ukernel("attention") && cfg.gemvPorts)
+    f.walk([&](linalg::BatchMatmulOp m) {
+      if (m->getParentOp() == f.getOperation()) matchAttnLayer(m);
+    });
+  if (cfg.ukernel("attention"))
+    f.walk([&](linalg::BatchMatmulOp m) {
+      if (!owned.contains(m.getOperation())) matchAttention(m);
+    });
   // the other contractions: the generic lowering
   f.walk([&](linalg::LinalgOp op) {
     if (op->getParentOp() == f.getOperation() && !owned.contains(op.getOperation()) &&
@@ -537,6 +545,201 @@ bool KernelMatcher::matchContraction(linalg::LinalgOp op) {
   }
   record(op, cover);
   contracts[op.getOperation()] = p;
+  return true;
+}
+
+// A view of a local buffer as a whole: a reshape, or a subview dropping unit
+// dimensions (form-attn-regions' rank-reducing slice).
+static bool wholeView(Operation *o) {
+  if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp>(o)) return true;
+  auto sv = dyn_cast<memref::SubViewOp>(o);
+  return sv && !ddrRoot(sv.getSource()) && llvm::all_of(sv.getStaticOffsets(), [](int64_t x) { return x == 0; }) &&
+         sv.getSourceType().getNumDynamicDims() == sv.getType().getNumDynamicDims() &&
+         (!sv.getSourceType().hasStaticShape() || sv.getSourceType().getNumElements() == sv.getType().getNumElements());
+}
+
+// A local buffer under its whole views.
+static Value localRoot(Value v) {
+  while (Operation *o = v.getDefiningOp()) {
+    if (!wholeView(o)) break;
+    v = o->getOperand(0);
+  }
+  return v;
+}
+
+// The users of a local buffer and of its whole views (not the views themselves).
+static void usersOf(Value v, SmallVectorImpl<Operation *> &out) {
+  for (Operation *u : v.getUsers()) {
+    if (wholeView(u) && u->getOperand(0) == v) usersOf(u->getResult(0), out);
+    else out.push_back(u);
+  }
+}
+
+bool KernelMatcher::matchAttnLayer(linalg::BatchMatmulOp bmm) {
+  static const bool dbg = getenv("SA_ATTN_DEBUG") != nullptr;
+  auto no = [&](const char *why) {
+    if (dbg) llvm::errs() << "attn-layer: " << why << "\n";
+    return false;
+  };
+  AttnLayerPlan p;
+  p.bmm = bmm;
+  SmallVector<Operation *> cover = {bmm};
+  // the readers of the value `self` writes into the local v (or a view of it):
+  // the uses after `self` in its block up to the buffer's next write (bufferization
+  // reuses buffers; inside the core's sahl.kernel, at the expansion, its uses there)
+  auto readers = [&](Value v, Operation *self) {
+    SmallVector<Operation *> us, rs;
+    usersOf(localRoot(v), us);
+    Block *blk = self->getBlock();
+    SmallVector<std::pair<Operation *, Operation *>> at;   // (use, its op in self's block)
+    for (Operation *u : us)
+      if (Operation *a = blk->findAncestorOpInBlock(*u); a && a != self && !isa<memref::DeallocOp>(u)) at.push_back({u, a});
+    llvm::sort(at, [](auto &x, auto &y) { return x.second->isBeforeInBlock(y.second); });
+    for (auto [u, a] : at) {
+      if (a->isBeforeInBlock(self)) continue;
+      auto lo = dyn_cast<linalg::LinalgOp>(u);
+      bool writes = isa<linalg::FillOp>(u) ||
+                    (lo && llvm::any_of(lo.getDpsInits(), [&](Value i) { return localRoot(i) == localRoot(v); }));
+      bool reads = lo && llvm::any_of(lo.getDpsInputs(), [&](Value i) { return localRoot(i) == localRoot(v); });
+      if (reads) rs.push_back(u);
+      if (writes) break;
+    }
+    return rs;
+  };
+  // a before b (ops of the function: compared in the innermost block holding both)
+  auto before = [&](Operation *a, Operation *b) {
+    for (Block *blk = b->getBlock(); blk; blk = blk->getParentOp() ? blk->getParentOp()->getBlock() : nullptr)
+      if (Operation *x = blk->findAncestorOpInBlock(*a)) {
+        Operation *y = blk->findAncestorOpInBlock(*b);
+        return x != y && x->isBeforeInBlock(y);
+      }
+    return false;
+  };
+  // the last fill of the local v (or a view) before the reduction r: its value (the fill joins the core)
+  auto fillOf = [&](Value v, Operation *r) -> Value {
+    SmallVector<Operation *> us;
+    usersOf(localRoot(v), us);
+    linalg::FillOp last;
+    for (Operation *u : us)
+      if (auto f = dyn_cast<linalg::FillOp>(u); f && before(f, r) && (!last || before(last, f))) last = f;
+    if (!last) return {};
+    cover.push_back(last);
+    return last.getDpsInputs()[0];
+  };
+  auto local = [&](Value v) { return !ddrRoot(v) && !loadInto(localRoot(v)) && localRoot(v).getDefiningOp<memref::AllocOp>(); };
+  auto onlyGeneric = [&](ArrayRef<Operation *> rs, int n) {
+    return int(rs.size()) == n && llvm::all_of(rs, [](Operation *o) { return isa<linalg::GenericOp>(o); });
+  };
+  // q [H, G, hd] i32, local; K: an extension of the cache [T, H, hd] i8 in DDR
+  Value q = bmm.getDpsInputs()[0];
+  auto qt = cast<MemRefType>(q.getType());
+  if (!local(q) || qt.getRank() != 3 || !qt.hasStaticShape() || !qt.getElementType().isInteger(32)) return no("q");
+  p.q = q, p.H = qt.getDimSize(0), p.G = qt.getDimSize(1), p.hd = qt.getDimSize(2);
+  auto k = operandOf(bmm, 1);
+  if (!k || !ddrRoot(k->view)) return no("K");
+  auto kt = cast<MemRefType>(k->view.getType());
+  auto ksv = k->view.getDefiningOp<memref::SubViewOp>();
+  // [T, H, hd], or [T, hd] for one KV head
+  if (!(kt.getRank() == 3 || (kt.getRank() == 2 && p.H == 1)) || !kt.isDynamicDim(0) ||
+      (kt.getRank() == 3 && kt.getDimSize(1) != p.H) || kt.getDimSize(kt.getRank() - 1) != p.hd ||
+      !kt.getElementType().isInteger(8) || !ksv || ksv.getSizes().size() != 1)
+    return no("K view");
+  p.kCache = k->view, p.tK = ksv.getSizes()[0];
+  cover.append(k->cover.begin(), k->cover.end());
+  // the accumulator: filled, the scores' epilogue
+  Value acc = bmm.getDpsInits()[0];
+  for (Operation *u : acc.getUsers()) {
+    if (u == bmm.getOperation() || isa<memref::DeallocOp>(u)) continue;
+    if (isa<linalg::FillOp>(u)) cover.push_back(u);
+    else if (auto g = dyn_cast<linalg::GenericOp>(u); g && !p.scoresEpi) p.scoresEpi = g;
+    else return no("scores accumulator");
+  }
+  auto &e1 = p.scoresEpi;
+  if (!e1 || e1.getNumDpsInputs() != 2 || e1.getNumDpsInits() != 1 || e1.getNumReductionLoops() ||
+      e1.getDpsInputs()[0] != acc || !e1.getRegion().front().getOps<linalg::IndexOp>().empty())
+    return no("scores epilogue");
+  p.sq = e1.getDpsInputs()[1];
+  auto sqt = cast<MemRefType>(p.sq.getType());
+  if (!local(p.sq) || !sqt.hasStaticShape() || sqt.getNumElements() != p.H * p.G) return no("s_q");
+  Value S = e1.getDpsInits()[0];
+  cover.push_back(e1);
+  // the masked max and p, reading the scores; the sum, reading p
+  auto rs = readers(S, e1);
+  if (!onlyGeneric(rs, 2)) return no("scores readers");
+  for (Operation *o : rs) {
+    auto g = cast<linalg::GenericOp>(o);
+    if (g.getNumReductionLoops()) p.maxR = g;
+    else p.probs = g;
+  }
+  if (!p.maxR || !p.probs || p.maxR.getNumDpsInputs() != 2 || p.probs.getNumDpsInputs() != 3) return no("max / p");
+  p.pos = p.maxR.getDpsInputs()[0];
+  auto post = cast<MemRefType>(p.pos.getType());
+  if (!ddrRoot(p.pos) || post.getRank() != 0 || !post.getElementType().isInteger(64) ||
+      p.probs.getDpsInputs()[0] != p.pos || localRoot(p.probs.getDpsInputs()[2]) != localRoot(p.maxR.getDpsInits()[0]))
+    return no("position / max");
+  Value M = p.maxR.getDpsInits()[0];
+  if (!onlyGeneric(readers(M, p.maxR), 1)) return no("max readers");
+  p.maxInit = fillOf(M, p.maxR);
+  Value P = p.probs.getDpsInits()[0];
+  auto pt = cast<MemRefType>(P.getType());
+  auto pa = localRoot(P).getDefiningOp<memref::AllocOp>();
+  if (!pt.getElementType().isInteger(8) || !pa || pa.getDynamicSizes().size() != 1) return no("p");
+  p.tP = pa.getDynamicSizes()[0];
+  cover.append({p.maxR, p.probs});
+  rs = readers(P, p.probs);
+  linalg::GenericOp pExt;
+  if (!onlyGeneric(rs, 2)) return no("p readers");
+  for (Operation *o : rs) {
+    auto g = cast<linalg::GenericOp>(o);
+    if (g.getNumReductionLoops()) p.sumR = g;
+    else pExt = g;
+  }
+  if (!p.sumR || !pExt || p.sumR.getNumDpsInputs() != 1 || pExt.getNumDpsInputs() != 1) return no("sum / p extension");
+  Value Sum = p.sumR.getDpsInits()[0];
+  p.sumInit = fillOf(Sum, p.sumR);
+  if (!p.maxInit || !p.sumInit) return no("reduction fills");
+  cover.append({p.sumR, pExt});
+  // p . V: the contraction of p's extension with the V cache's
+  rs = readers(pExt.getDpsInits()[0], pExt);
+  if (!onlyGeneric(rs, 1)) return no("p . V");
+  p.pv = cast<linalg::GenericOp>(rs[0]);
+  if (p.pv.getNumDpsInputs() != 2 || p.pv.getNumReductionLoops() != 1 || p.pv.getDpsInputs()[0] != pExt.getDpsInits()[0])
+    return no("p . V form");
+  auto v = operandOf(p.pv, 1);
+  if (!v || !ddrRoot(v->view)) return no("V");
+  auto vt = cast<MemRefType>(v->view.getType());
+  auto vsv = v->view.getDefiningOp<memref::SubViewOp>();
+  // [H, hd / D, T, D], or [hd / D, T, D] for one KV head
+  const int64_t vr = vt.getRank();
+  if (!(vr == 4 || (vr == 3 && p.H == 1)) || (vr == 4 && vt.getDimSize(0) != p.H) || !vt.isDynamicDim(vr - 2) ||
+      vt.getDimSize(vr - 1) != d || vt.getDimSize(vr - 3) * d != p.hd || !vt.getElementType().isInteger(8) || !vsv ||
+      vsv.getSizes().size() != 1)
+    return no("V view");
+  p.vCache = v->view, p.tV = vsv.getSizes()[0];
+  cover.append(v->cover.begin(), v->cover.end());
+  cover.push_back(p.pv);
+  Value acc2 = p.pv.getDpsInits()[0];
+  for (Operation *u : acc2.getUsers()) {
+    if (u == p.pv.getOperation() || isa<memref::DeallocOp>(u)) continue;
+    if (isa<linalg::FillOp>(u)) cover.push_back(u);
+    else if (auto g = dyn_cast<linalg::GenericOp>(u); g && !p.pvEpi) p.pvEpi = g;
+    else return no("p . V accumulator");
+  }
+  auto &e2 = p.pvEpi;
+  if (!e2 || e2.getNumDpsInputs() != 2 || e2.getNumDpsInits() != 1 || e2.getNumReductionLoops() ||
+      e2.getDpsInputs()[0] != acc2 || localRoot(e2.getDpsInputs()[1]) != localRoot(Sum) ||
+      !e2.getRegion().front().getOps<linalg::IndexOp>().empty())
+    return no("p . V epilogue");
+  p.out = e2.getDpsInits()[0];
+  auto ot = cast<MemRefType>(p.out.getType());
+  if (!p.out.getDefiningOp<memref::AllocOp>() || !ot.hasStaticShape() || ot.getNumElements() != p.H * p.G * p.hd ||
+      !ot.getElementType().isF32())
+    return no("output");
+  cover.push_back(e2);
+  // the sum read only by p . V's epilogue (the other intermediates' readers checked above)
+  if (readers(Sum, p.sumR).size() != 1) return no("sum readers");
+  record(bmm, cover);
+  attnLayers[bmm.getOperation()] = p;
   return true;
 }
 

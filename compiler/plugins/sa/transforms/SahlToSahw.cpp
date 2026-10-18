@@ -42,10 +42,12 @@ bool Lowerer::lowerBlock(Block &block) {
         if (auto sf = sc.getSpadFrom()) mem.takeSpad(uint32_t(*sf));
         auto savedLocals = locals;
         auto savedBcast = bcastOf;
+        uint32_t savedBase = spadBase;
         if (!lowerBlock(sc.getBody().front())) return false;
         mem.release(mark);
         locals = std::move(savedLocals);
         bcastOf = std::move(savedBcast);
+        spadBase = savedBase;
         continue;
       }
       locals = reserved;
@@ -68,6 +70,14 @@ bool Lowerer::lowerBlock(Block &block) {
       continue;
     }
     if (auto cs = dyn_cast<sahl::ClaimSpadOp>(op)) {
+      if (cs->hasAttr("sa.relative")) {
+        // (a fused dispatch's kernel, in a scope: its placed words after the buffers
+        // already in SPAD_A, which it may read; the words it claims after them)
+        spadBase = mem.spadTop();
+        if (spadBase + uint32_t(cs.getWords()) > 2 * lay.sbank) return fail("a relative SPAD_A claim beyond SPAD_A");
+        mem.takeSpad(spadBase + uint32_t(cs.getWords()));
+        continue;
+      }
       if (mem.spadUsed()) return fail("a kernel claiming SPAD_A after other SPAD_A buffers");
       mem.takeSpad(uint32_t(cs.getWords()));
       continue;
@@ -128,7 +138,7 @@ bool Lowerer::lowerBlock(Block &block) {
       continue;
     }
     if (isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CastOp,
-            memref::DimOp, memref::CollapseShapeOp, IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp,
+            memref::DimOp, memref::CollapseShapeOp, memref::ExpandShapeOp, IREE::HAL::InterfaceBindingSubspanOp, IREE::HAL::InterfaceConstantLoadOp,
             IREE::TensorExt::DispatchWorkloadOrdinalOp, func::ReturnOp>(op))
       continue;
     if (op->getDialect() && op->getDialect()->getNamespace() == "util") continue;
@@ -285,6 +295,16 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
     }
     return l;
   }
+  if (auto es = v.getDefiningOp<memref::ExpandShapeOp>(); es && !ddrRoot(v)) {
+    // a packed local buffer seen in another static shape (a fused dispatch's
+    // intermediate, after sa-to-sahl's expandLocalViews): the same words
+    auto base = bufOf(es.getSrc());
+    if (!base) return std::nullopt;
+    if (base->bcast || base->rowStride || base->dyn || !mt.hasStaticShape()) return fail("expanded local buffer"), std::nullopt;
+    LocalBuf l = *base;
+    l.n = mt.getNumElements();
+    return l;
+  }
   if (auto cs = v.getDefiningOp<memref::CollapseShapeOp>(); cs && !ddrRoot(v)) {
     // a packed local buffer seen flat (an expanded kernel's step): the same words
     auto base = bufOf(cs.getSrc());
@@ -295,7 +315,10 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
     return l;
   }
   auto alloc = v.getDefiningOp<memref::AllocOp>();
-  if (!alloc) return fail("operand is not a local buffer"), std::nullopt;
+  if (!alloc) {
+    if (getenv("SA_ATTN_DEBUG")) llvm::errs() << "sahl-to-sahw: not a local buffer: " << v << "\n";
+    return fail("operand is not a local buffer"), std::nullopt;
+  }
   auto vt = vtOf(mt.getElementType());
   if (auto w = alloc->getAttrOfType<IntegerAttr>("sa.word")) {
     auto pm = alloc->getAttrOfType<StringAttr>("sa.mem");
@@ -304,7 +327,7 @@ std::optional<LocalBuf> Lowerer::bufOf(Value v, bool bcast) {
       LocalBuf l;
       l.vt = ::sa::VT_I8;
       l.n = placedElems(alloc, l);
-      l.la = ::sa::laddr(::sa::MEM_SPAD_A, uint32_t(w.getInt()));
+      l.la = ::sa::laddr(::sa::MEM_SPAD_A, uint32_t(w.getInt()) + spadBase);
       locals[v] = l;
       return l;
     }

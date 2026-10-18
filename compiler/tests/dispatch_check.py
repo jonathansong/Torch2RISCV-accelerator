@@ -112,6 +112,7 @@ def binding_regions(func, interp):
 
 
 FULL_I8 = False
+POS = None                                  # --pos
 
 
 def fill(rng, et, n, t):
@@ -124,7 +125,8 @@ def fill(rng, et, n, t):
     if et == "i64":
         # pos + 1 < T: partly masked rows; a vector (prefill's positions of a
         # chunk) distinct, ending at t - 3 (equal values hide per-row indexing)
-        return np.maximum(0, t - 3 - np.arange(n)[::-1]).astype(np.int64).tobytes()
+        last = t - 3 if POS is None else POS
+        return np.maximum(0, last - np.arange(n)[::-1]).astype(np.int64).tobytes()
     return bytes(n)
 
 
@@ -234,13 +236,16 @@ def main():
     ap.add_argument("binaries")
     ap.add_argument("--d", type=int, help="default: the D the dispatches were compiled for")
     ap.add_argument("--t", type=int, default=16)
+    ap.add_argument("--pos", type=int, help="the i64 scalars (the position) and the last element of i64 vectors "
+                    "(default --t - 3; 0: rows with one key unmasked)")
     ap.add_argument("--skew", type=int, default=0, help="binding k's base at a page + skew * (k + 1) bytes")
     ap.add_argument("--dirty", action="store_true", help="local memories start with garbage, not zeros")
     ap.add_argument("--full-i8", action="store_true", help="int8 data over [-128, 127] (default [-127, 127], "
                     "the range of the frontend's own quantization)")
     ap.add_argument("numbers", nargs="*")
     args = ap.parse_args()
-    global FULL_I8
+    global FULL_I8, POS
+    POS = args.pos
     FULL_I8 = args.full_i8
     global SKEW, DIRTY
     SKEW, DIRTY = args.skew, args.dirty
