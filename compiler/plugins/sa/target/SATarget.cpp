@@ -78,6 +78,9 @@ struct SAOptions {
   // The gated FFN of decode in one dispatch (docs/fusion_design.md §4): the two
   // projections, the gating, the amax and the int8 output (FormFfnRegions.cpp).
   bool fuseFfn = false;
+  // Decode's attention in one dispatch (docs/fusion_design.md §6): the q path, the
+  // scores, the probabilities, p . V and the int8 output (FormAttnRegions.cpp).
+  bool fuseAttn = false;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -113,6 +116,9 @@ struct SAOptions {
     binder.opt<bool>("iree-sa-fuse-ffn", fuseFfn, llvm::cl::cat(category),
                      llvm::cl::desc("Decode's gated FFN (two projections, gating, amax, int8 output) in one dispatch "
                                     "(docs/fusion_design.md)."));
+    binder.opt<bool>("iree-sa-fuse-attn", fuseAttn, llvm::cl::cat(category),
+                     llvm::cl::desc("Decode's attention (q path, scores, probabilities, p . V, int8 output) in one "
+                                    "dispatch (docs/fusion_design.md §6)."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -356,6 +362,7 @@ struct SASession final
     sa::registerPackLinearWeightsPass();
     sa::registerCloneCheapProducersPass();
     sa::registerFormFfnRegionsPass();
+    sa::registerFormAttnRegionsPass();
     sa::registerLowerWorkgroupCountPass();
     sa::registerSahwPasses();
   }
@@ -374,6 +381,11 @@ struct SASession final
       passManager.addPass(createCanonicalizerPass());
       passManager.addPass(sa::createFormFfnRegionsPass(true));
     }
+  }
+  // After IREE forms the dispatch regions (IREE patch 0004): the pieces keep the
+  // forms of today's dispatches.
+  void extendDispatchRegionFormationPassPipeline(OpPassManager &passManager) override {
+    if (options.fuseAttn) passManager.addPass(sa::createFormAttnRegionsPass(options.codegenReport, options.maxDynamic));
   }
   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) final {
     // #hal.device.target<"sa", ...

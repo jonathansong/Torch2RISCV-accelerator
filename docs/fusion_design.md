@@ -477,7 +477,9 @@ attention's share grows with the context.
 ## 6. The attention fusion (design)
 
 Status: design (2026-10-18), schedule prototyped in the performance model
-(§6.2.2), not implemented. The second fused chain after
+(§6.2.2). The region pass is implemented (§6.4.1, step 3 of §6.6); the
+backend (`expandAttnLayer`, step 4) is not, so the fused dispatch runs on
+the host. The second fused chain after
 SwiGLU (§4, on by default since 2026-10-18). Bounds from
 `compiler/tests/fusion_whatif.py` on the `v2.2-kv260` traces (§6.2); the
 attention kernels it builds on are those of C6.5
@@ -712,30 +714,89 @@ Checks:
 
 ### 6.4 Design (stage 1)
 
-#### 6.4.1 Frontend / preprocessing: `iree-sa-form-attn-regions`
+#### 6.4.1 Dispatch creation: `iree-sa-form-attn-regions` (implemented 2026-10-18)
 
-Next to `iree-sa-form-ffn-regions` (`compiler/plugins/sa/target/FormFfnRegions.cpp`),
-same phase (before dispatch creation, after weight packing and
-`clone-cheap-producers`):
+The pass (`compiler/plugins/sa/target/FormAttnRegions.cpp`, flag
+`--iree-sa-fuse-attn`, default off) does not wrap linalg ops before dispatch
+creation, as `iree-sa-form-ffn-regions` does. It **merges the
+`flow.dispatch.region` ops that IREE has formed**, right after region
+formation and before they become `flow.dispatch.workgroups`. The first plan
+was the FFN's: wrap the ops in the preprocessing phase. The IR at that point
+showed why not. The attention is still raw: an i32 × i32 → i64
+`batch_matmul`, `linalg.transpose`, the RoPE halves as `tensor.concat`, some
+40 unfused generics. GlobalOptimization and dispatch creation's fusion turn
+these into the forms the backend knows today. A region formed before them
+keeps them out of both, because GlobalOptimization skips ops already in a
+region. Merged after formation, every piece keeps exactly the body of
+today's dispatch. `expandAttnLayer` (step 4) can then reuse the existing
+piece matchers, and T stays a dynamic dimension of each piece as IREE
+formed it. `ConvertDispatchRegionsToWorkgroups` derives the merged
+dispatch's workload (three ordinals for T: T, min(T, rows of the K cache),
+min(T, rows of the V cache)).
 
-- **Match** structurally, anchored on the scores contraction (a batched
-  contraction i32 × i8 → … whose B operand is a slice `[:, :T]` of a KV cache
-  global, T dynamic). Walk back along the q operand through elementwise and
-  per-head reduction generics to the q_proj contraction (stopping there).
-  Walk forward through the masked max / exp generic (the one reading the
-  position), the Σp reduction, the p · V contraction over the V cache slice
-  and its epilogue, the amax and the quantization.
-- **Wrap** them in one `flow.dispatch.region` yielding the int8 row and the
-  scale. The region captures T (the cache slice's size) and the position
-  value; its result shapes are static.
-- Flag `--iree-sa-fuse-attn` (default off; `compile_sa.sh` `SA_FUSE_ATTN`),
-  golden corpus identical with it off. Lit: a decode attention in linalg (one
-  with QK-norm, one without) → one region; a near miss (scores not on a
-  cache slice) left alone.
-- **Risk to check first** (§6.6 step 3): regions with dynamic dims this
-  early. IREE's own dispatch formation produces today's dynamic attention
-  dispatches, but a region formed by hand must carry the workload ordinals
-  for T. The FFN regions were static.
+IREE has no plugin hook in dispatch creation, so
+`compiler/patches/iree/0004-pluginapi-dispatch-region-formation-hook.patch`
+adds one: `PipelineExtensions::extendDispatchRegionFormationPassPipeline`,
+run after `addDispatchRegionCreationPasses`. DispatchCreation takes it as an
+optional callback, so it does not depend on the plugin API. The default is a
+no-op.
+
+- **Match**, structurally, over the regions of a block:
+  - *Anchor*: a region with a contraction whose result has a dynamic dim
+    (the scores). A contraction is a linalg op with a reduction loop and two
+    operands of rank ≥ 1.
+  - *Backward*: producer regions without a contraction, all of whose results
+    are read only by the set (the q path). q_proj, the K / V paths and values
+    shared with them, such as RoPE tables, stay outside.
+  - *Forward*: consumer regions without a static contraction whose other
+    operands do not depend on the set (probabilities, Σp, p · V, amax,
+    int8). o_proj stops it.
+  - *Accept* when a second contraction runs over a dynamic dim (p · V) and
+    every value used outside is static.
+- **Merge**:
+  - The bodies are cloned in block order into one region at the set's last
+    op, together with the reshapes between the regions.
+  - The cache writes stay outside, before it: no DDR RAW inside a dispatch.
+  - The dynamic sizes inside get `util.assume.int` with umax
+    `--iree-sa-max-dynamic`. A piece's dynamic intermediate is now a tensor
+    inside the dispatch, not a result stored to DDR, and IREE's range
+    analysis leaves T unbounded. Without the bound the host fallback's
+    (VMVX) allocas are 2⁵³ elements and the run fails with
+    `RESOURCE_EXHAUSTED`.
+  - A collapse that only drops unit dims of a dynamic tensor (Gemma's
+    scores `1x4x?` → `4x?`) becomes a rank-reducing `extract_slice`.
+    Inside the dispatch that tensor is a subview of a bounded allocation,
+    and VMVX fails to legalize its `collapse_shape` ("unresolved
+    materialization ... `memref<4x?xf32, strided<[256, 1]>>`").
+- **Lit**: `sa_form_attn_regions.mlir`. A decode attention at region level
+  becomes one region, with q_proj, o_proj and a value shared with the
+  outside left out. A near miss without p · V is left alone.
+- **Result** (2-layer builds, D = 16, 4 ports): Qwen3 merges 12 regions per
+  decode layer (§6.1: dispatches 8, 9, 13, 17–25) and 9 per prefill row: 66
+  chains, 2 in decode and 2 layers × 16 rows in each of the two prefill
+  functions. A prefill row's fused dispatch reads q already dequantized and
+  QK-normed for the whole chunk (`1x16x16x128xf32`). Those pieces are shared
+  by the 16 rows, so they stay outside. The
+  backend is unchanged, so each fused dispatch runs on the host (VMVX).
+  Gemma merges 8 per decode layer and 6 per prefill row, Llama 9 and 6, 66
+  chains each.
+
+  End to end on the sim (40-token prompt in chunks of 16, 8 decode steps),
+  every model's tokens equal the unfused build's:
+
+  | Model | Logits, fused vs unfused |
+  |---|---|
+  | Gemma | bit-exact |
+  | Qwen3 | within 1.9·10⁻⁶ (one row) |
+  | Llama | within 0.62 (correlation 0.998) |
+
+  The fused dispatch computes exp and 1 / x in IEEE fp32 on VMVX, not with
+  the device's SFU (`qhf.device_sfu`). An int8 probability that flips
+  grows through the layers. For Llama this accounts for the whole
+  difference: the unfused build with only its probabilities dispatch on the
+  host (`--iree-sa-host-dispatches=reduction_32xD_i64xf32xf32`) gives
+  logits bit-identical to the fused build's. With the flag off the golden
+  corpus is unchanged (patch 0004 adds nothing then).
 
 #### 6.4.2 Backend: one `sahl.kernel "attn_layer"`
 
@@ -837,7 +898,7 @@ A finer scoreboard (LLM plan §11.3) is not needed for this design.
 |---|---|---|
 | 1 | ~~Schedule prototype~~ **done 2026-10-18** (§6.2.2, `attn_schedule.py`): stage 1 −4.0% to −4.3% of decode (Qwen3, T = 48 to 2048) with an implementable schedule; with alternating tiles −4.9% to −11.6%. **Go.** | done |
 | 2 | ~~Alternating tiles in the existing q · Kᵀ T loop~~ **done 2026-10-18** (§6.2.2): each block as two halves in alternating SPAD_B banks, where a half is at least 8 KB. Qwen3 −0.9% to −1.8% of decode by default, −7.4% at 2048 with `--iree-sa-attn-block 256`. Bit-exact; golden: the three tiled q · Kᵀ dispatches changed | done |
-| 3 | Region pass with dynamic T: the formed region through IREE's dispatch creation, `--compile-to=stream` and the backend unchanged (the region compiled as today's pieces would be, unfused inside) | 3–4 days |
+| 3 | ~~Region pass with dynamic T~~ **done 2026-10-18** (§6.4.1): the regions IREE formed merged after formation (plugin hook, IREE patch 0004), `--iree-sa-fuse-attn` / `SA_FUSE_ATTN=1`. 66 chains per 2-layer model (decode layers and prefill rows), workload over T from IREE. The backend is unchanged, so they run on the host. Gemma / Qwen3 / Llama end to end with the same tokens; the logit difference is the VMVX exp, shown on Llama | done |
 | 4 | `AttnLayerPlan` match and `expandAttnLayer` with §6.4.2's schedule, decode at T within one block first, then the T loop | 8–12 days |
 | 5 | Verification: lit; golden corpus with the flag off; `dispatch_check.py` per dispatch at T = 16, Tb ± D, 2·Tb, max T; end to end on the sim bit-exact with the unfused build (four models, 2 layers); prefill vs decode rows bit-exact; `test_long_context.py` at 2048 (512 Gemma); `host_copies.py` | 4–5 days |
 | 6 | Board: the four bundles (`run_board_tests.sh`: `llm`, `profile --batch`, long context and its sweep, plan A / plan B) | 2 days |
@@ -862,6 +923,9 @@ per-dispatch checks at block boundaries cover it.
 
 - `compiler/tests/fusion_whatif.py`: the evaluation (`--only` for one chain by kind, `--chain` by role).
 - `compiler/tests/attn_schedule.py`: the attention schedule prototype (§6.2.2).
+- `compiler/plugins/sa/target/FormAttnRegions.cpp`, `test/sa_form_attn_regions.mlir`:
+  the attention region pass (§6.4.1); `compiler/patches/iree/0004-pluginapi-dispatch-region-formation-hook.patch`:
+  its hook.
 - `compiler/tests/perf_model.py`: the command-level model (a FENCE now holds
   back later commands; it did not before 2026-10-17).
 - `build/perfmodel/<bundle>.trace`, `<bundle>_cal.json`,

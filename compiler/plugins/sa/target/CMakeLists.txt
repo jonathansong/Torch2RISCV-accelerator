@@ -26,6 +26,7 @@ iree_cc_library(
   SRCS
     "CloneCheapProducers.cpp"
     "DescList.cpp"
+    "FormAttnRegions.cpp"
     "FormFfnRegions.cpp"
     "LowerWorkgroupCount.cpp"
     "PackLinearWeights.cpp"

@@ -39,7 +39,6 @@
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler::sa {
-namespace {
 
 bool targetsSA(ModuleOp module) {
   bool found = false;
@@ -52,6 +51,8 @@ bool targetsSA(ModuleOp module) {
   });
   return found;
 }
+
+namespace {
 
 // int8 x int8 -> int32 with one reduction loop: x[.., k] . W[.., k, ..]
 bool isInt8Contraction(linalg::GenericOp g) {

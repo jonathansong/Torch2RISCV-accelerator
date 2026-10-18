@@ -19,6 +19,9 @@
 # SA_FUSE_FFN=0: decode's gated FFN in separate dispatches as before (default 1:
 # the two projections, gating, amax and int8 output in one dispatch,
 # --iree-sa-fuse-ffn, docs/fusion_design.md §4.9).
+# SA_FUSE_ATTN=1: decode's attention (q path, scores, probabilities, p . V, int8
+# output) in one dispatch per layer and prefill row (--iree-sa-fuse-attn, default 0;
+# docs/fusion_design.md §6.4.1; the backend does not compile it yet: on the host).
 # SA_HOST_FALLBACK=0: no host fallback (default 1: every dispatch also gets a
 # VMVX variant; one the sa backend cannot compile runs on the ARM host, plan
 # §8.15; IREE's executable linking is off, it would merge the VMVX variants of
@@ -36,6 +39,7 @@ rm -f "$dir"/sa_sources/*.mlir      # (a source left from an earlier compile has
   --iree-opt-strip-assertions \
   $( [ "${SA_GENERALIZE:-1}" = 1 ] && echo --iree-flow-enable-executable-generalization ) \
   $( [ "${SA_FUSE_FFN:-1}" = 1 ] && echo --iree-sa-fuse-ffn ) \
+  $( [ "${SA_FUSE_ATTN:-0}" = 1 ] && echo --iree-sa-fuse-attn ) \
   $( [ "${SA_HOST_FALLBACK:-1}" = 1 ] && echo --iree-sa-host-fallback --iree-hal-link-executables=false ) \
   $( [ -n "${SA_D:-}" ] && [ "$SA_D" != 8 ] && echo --iree-sa-d="$SA_D" ) \
   $( [ "${SA_GEMV_PORTS:-0}" != 0 ] && echo --iree-sa-gemv-ports="$SA_GEMV_PORTS" ) \

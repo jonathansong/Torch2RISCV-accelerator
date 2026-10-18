@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler::sa {
@@ -23,6 +24,15 @@ void registerCloneCheapProducersPass();
 // (FormFfnRegions.cpp, docs/fusion_design.md §4.2).
 std::unique_ptr<Pass> createFormFfnRegionsPass(bool enabled);
 void registerFormFfnRegionsPass();
+
+// Dispatch creation, after the regions are formed: decode's attention (q path,
+// scores, probabilities, p . V, int8 output) merged into one flow.dispatch.region
+// (FormAttnRegions.cpp, docs/fusion_design.md §6.4.1).
+std::unique_ptr<Pass> createFormAttnRegionsPass(bool report = false, int64_t maxDynamic = 0);
+void registerFormAttnRegionsPass();
+
+// The module targets the sa device (the preprocessing passes act only then).
+bool targetsSA(ModuleOp module);
 
 // Translation: every export runs as one workgroup (a dispatch is one
 // descriptor template), so the workgroup count regions become (1, 1, 1)

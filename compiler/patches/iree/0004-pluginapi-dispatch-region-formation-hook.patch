@@ -1,0 +1,108 @@
+From: jonathansong <7958352+jonathansong@users.noreply.github.com>
+Subject: [PATCH] [PluginAPI] Add a plugin hook after dispatch region formation
+
+PipelineExtensions::extendDispatchRegionFormationPassPipeline: passes run in
+the dispatch creation pipeline once the flow.dispatch.region ops are formed
+(producers cloned in), before ConvertDispatchRegionsToWorkgroups. The sa
+plugin merges decode's attention regions there (FormAttnRegions.cpp,
+docs/fusion_design.md §6.4.1); the default is a no-op, so the compiler is
+unchanged without such a plugin. DispatchCreation takes the hook as an
+optional callback and does not depend on the plugin API.
+
+diff --git a/compiler/src/iree/compiler/DispatchCreation/Passes.cpp b/compiler/src/iree/compiler/DispatchCreation/Passes.cpp
+index d5c8395..a4d7d8c 100644
+--- a/compiler/src/iree/compiler/DispatchCreation/Passes.cpp
++++ b/compiler/src/iree/compiler/DispatchCreation/Passes.cpp
+@@ -304,7 +304,8 @@ static void addDispatchRegionCreationPasses(OpPassManager &passManager,
+ 
+ // Apply preprocessing and form dispatch regions
+ void buildDispatchCreationPassPipeline(
+-    OpPassManager &passManager, const TransformOptions &transformOptions) {
++    OpPassManager &passManager, const TransformOptions &transformOptions,
++    std::function<void(OpPassManager &)> extendRegionFormation) {
+ 
+   // Inject tensor tracing early as we need to have the tracers in the IR
+   // prior to dispatch region formation where we may lose access to them.
+@@ -346,6 +347,9 @@ void buildDispatchCreationPassPipeline(
+ 
+   addDispatchRegionCreationPreprocessingPasses(passManager, transformOptions);
+   addDispatchRegionCreationPasses(passManager, transformOptions);
++  if (extendRegionFormation) {
++    extendRegionFormation(passManager);
++  }
+ 
+   FunctionLikeNest(passManager)
+       .addPass(DispatchCreation::createConvertDispatchRegionsToWorkgroupsPass)
+diff --git a/compiler/src/iree/compiler/DispatchCreation/Passes.h b/compiler/src/iree/compiler/DispatchCreation/Passes.h
+index cc1f2b3..3ddd7b9 100644
+--- a/compiler/src/iree/compiler/DispatchCreation/Passes.h
++++ b/compiler/src/iree/compiler/DispatchCreation/Passes.h
+@@ -83,8 +83,11 @@ struct TransformOptions : PassPipelineOptions<TransformOptions> {
+   };
+ };
+ 
++// |extendRegionFormation|, when set, adds passes after the dispatch regions
++// are formed and before they are converted to workgroups (plugin extensions).
+ void buildDispatchCreationPassPipeline(
+-    OpPassManager &passManager, const TransformOptions &transformOptions);
++    OpPassManager &passManager, const TransformOptions &transformOptions,
++    std::function<void(OpPassManager &)> extendRegionFormation = nullptr);
+ 
+ //===----------------------------------------------------------------------===//
+ // Register all Passes
+diff --git a/compiler/src/iree/compiler/Pipelines/Pipelines.cpp b/compiler/src/iree/compiler/Pipelines/Pipelines.cpp
+index 8278678..46c0292 100644
+--- a/compiler/src/iree/compiler/Pipelines/Pipelines.cpp
++++ b/compiler/src/iree/compiler/Pipelines/Pipelines.cpp
+@@ -374,8 +374,15 @@ void buildIREEVMTransformPassPipeline(
+       if (hooks.beforePhase) {
+         hooks.beforePhase(IREEVMPipelinePhase::DispatchCreation, passManager);
+       }
++      std::function<void(OpPassManager &)> extendRegionFormation;
++      if (hooks.pipelineExtensions) {
++        extendRegionFormation = [&hooks](OpPassManager &pm) {
++          hooks.pipelineExtensions->extendDispatchRegionFormationPassPipeline(
++              pm);
++        };
++      }
+       DispatchCreation::buildDispatchCreationPassPipeline(
+-          passManager, dispatchTransformOptions);
++          passManager, dispatchTransformOptions, extendRegionFormation);
+       if (hooks.afterPhase) {
+         hooks.afterPhase(IREEVMPipelinePhase::DispatchCreation, passManager);
+       }
+diff --git a/compiler/src/iree/compiler/PluginAPI/Client.h b/compiler/src/iree/compiler/PluginAPI/Client.h
+index 3c7ade9..0df9abb 100644
+--- a/compiler/src/iree/compiler/PluginAPI/Client.h
++++ b/compiler/src/iree/compiler/PluginAPI/Client.h
+@@ -81,6 +81,12 @@ public:
+ 
+   // Adds passes to the |buildPreprocessingPassPipeline| pipeline at the end.
+   virtual void extendPreprocessingPassPipeline(OpPassManager &passManager) {}
++
++  // Adds passes to the dispatch creation pipeline once dispatch regions are
++  // formed (`flow.dispatch.region` ops with their producers cloned in), before
++  // they are converted to `flow.dispatch.workgroups`.
++  virtual void
++  extendDispatchRegionFormationPassPipeline(OpPassManager &passManager) {}
+ };
+ 
+ // Policy for how to activate the plugin.
+diff --git a/compiler/src/iree/compiler/PluginAPI/PluginManager.h b/compiler/src/iree/compiler/PluginAPI/PluginManager.h
+index ef19499..2661c02 100644
+--- a/compiler/src/iree/compiler/PluginAPI/PluginManager.h
++++ b/compiler/src/iree/compiler/PluginAPI/PluginManager.h
+@@ -134,6 +134,13 @@ public:
+     }
+   }
+ 
++  void extendDispatchRegionFormationPassPipeline(
++      OpPassManager &passManager) override {
++    for (auto *s : initializedSessions) {
++      s->extendDispatchRegionFormationPassPipeline(passManager);
++    }
++  }
++
+   // Populates the given list of HAL target devices for all initialized
+   // plugins.
+   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &list);
