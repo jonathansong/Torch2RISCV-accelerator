@@ -480,7 +480,8 @@ Status: design (2026-10-18), schedule prototyped in the performance model
 (§6.2.2). The region pass (§6.4.1) and the backend's kernel in its in-order
 form (§6.4.5) are implemented, steps 3 and 4a of §6.6: the fused dispatch runs
 on the accelerator, bit-exact with the unfused build; decode only (§6.4.7), on
-the board since 2026-10-19 (§6.4.8: decode −0.9% to −4.3% against f2).
+the board since 2026-10-19 (§6.4.8: decode −1.1% to −4.8% against f2), on by
+default in `compile_sa.sh`.
 The second fused chain after
 SwiGLU (§4, on by default since 2026-10-18). Bounds from
 `compiler/tests/fusion_whatif.py` on the `v2.2-kv260` traces (§6.2); the
@@ -1073,6 +1074,30 @@ Reading:
 - **Next**: the interleaved schedule for the tiled form (post(b − 1) between
   head b's T loop blocks, accumulators by parity) is what the board's
   configurations use; a chunk kernel for prefill (§6.4.7).
+
+**Second run (2026-10-19, `d391e13`): the tiled form interleaved.** The
+same bundles rebuilt, with the tiled form on §6.4.6's schedule (A tiles
+shared, head b − 1's post after head b's T loop). Llama falls back to the
+in-order form (SaCodegen's ACC-full retry: G = 4 rows' buffers twice do not
+fit). All tests bit-exact again. Decode device time, run 1 → run 2:
+
+| | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| short context (`profile --batch`, ms) | 33.09 → **32.87** | 53.49 → 53.49 | 122.33 → **121.64** | 213.41 → 213.12 |
+| against f2 | −3.4% | −1.2% | −4.8% | −1.1% |
+| T = 2048 (Gemma 512, ms) | 87.3 → 87.0 | 59.7 → 59.7 | 286.6 → 288.8 | 301.4 → 301.1 |
+
+The interleaving gains about 0.6% at short context on SmolLM2 and Qwen3,
+nothing on Gemma. Qwen3 at T = 2048 is 0.8% slower. That is far below the
+model (Qwen3 at 2048 positions −1.2% of a 2-layer step, §6.4.6 ×28 ≈ −4.6%
+in all, about 1 point over run 1). Not yet explained: the tiled loop's own
+VE work (transposes, integer copies) sits on the same VE queue as the
+previous head's post, so the overlap the untiled form gets is mostly absent,
+and the extra buffers move the post's temps.
+
+**On by default since 2026-10-19**: `compile_sa.sh` passes
+`--iree-sa-fuse-attn` unless `SA_FUSE_ATTN=0` (`host_copies.py` the same);
+`iree-compile`'s flag itself stays off, like the SwiGLU fusion's.
 
 ### 6.5 Banks (measured in §6.2.2)
 

@@ -34,7 +34,7 @@ def stream_ir(d):
         flags.append("--iree-flow-enable-executable-generalization")
     if os.environ.get("SA_FUSE_FFN", "1") == "1":
         flags.append("--iree-sa-fuse-ffn")
-    if os.environ.get("SA_FUSE_ATTN", "0") == "1":
+    if os.environ.get("SA_FUSE_ATTN", "1") == "1":
         flags.append("--iree-sa-fuse-attn")
     cf = os.path.join(d, "compile_flags.txt")
     if os.path.exists(cf):
