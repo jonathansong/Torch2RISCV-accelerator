@@ -479,7 +479,8 @@ attention's share grows with the context.
 Status: design (2026-10-18), schedule prototyped in the performance model
 (§6.2.2). The region pass (§6.4.1) and the backend's kernel in its in-order
 form (§6.4.5) are implemented, steps 3 and 4a of §6.6: the fused dispatch runs
-on the accelerator, bit-exact with the unfused build, not yet on the board.
+on the accelerator, bit-exact with the unfused build; decode only (§6.4.7), on
+the board since 2026-10-19 (§6.4.8: decode −0.9% to −4.3% against f2).
 The second fused chain after
 SwiGLU (§4, on by default since 2026-10-18). Bounds from
 `compiler/tests/fusion_whatif.py` on the `v2.2-kv260` traces (§6.2); the
@@ -1024,6 +1025,54 @@ The untiled form now follows §6.4.2's schedule and §6.5's banks:
   only among cached buffers. With the tiled form's larger buffers, every
   fused dispatch ran out of ACC. The result is now recomputed through its
   buffer.
+
+#### 6.4.8 Board results (2026-10-19, bundles `*a`, `673a82e`)
+
+The four models compiled as for the board, with the defaults plus
+`SA_FUSE_ATTN=1`: 2048 positions (Gemma 512), decode attention fused (30 / 18
+/ 28 / 16 chains, one per layer), prefill rows unfused. Bundles
+`deploy_hfgen_{smollm2,gemma,qwen3,llama}a_pcpi`, `run_board_tests.sh
+smollm2a gemmaa qwen3a llamaa`. All tests pass on all four:
+- logits bit-exact with the sim (17/17 steps);
+- long context at 2048 (Gemma 512), prefill against decode-only rows
+  bit-exact;
+- the length sweep;
+- plan B and plan A (`rvsched`, `rvcode --embedded`, `rvsched --rv
+  --embedded`): tokens identical, last logits bit-exact.
+
+Decode device time per step (`profile --batch`, 32-token prompt), against the
+f2 bundles (§4.9, SwiGLU fused):
+
+| | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| f2 (ms) | 34.04 | 54.15 | 127.77 | 215.42 |
+| f2 + attention (ms) | **33.09** | **53.49** | **122.33** | **213.41** |
+| Against f2 | **−2.8%** | **−1.2%** | **−4.3%** | **−0.9%** |
+| Against v2.2 | −8.7% | −4.9% | −7.4% | −4.3% |
+| Decode end to end, ms per step (f2) | 37.5 (39.7) | 57.0 (58.3) | 126.8 (133.9) | 216.0 (218.7) |
+| tokens / s | 26.7 | 17.5 | 7.89 | 4.63 |
+
+Decode device time at long context (sweep), f2 → f2 + attention: SmolLM2
+90.6 → 87.3 ms at T = 2048 (−3.6%), Qwen3 306.4 → 286.6 (−6.5%), Llama
+310.0 → 301.4 (−2.8%), Gemma 60.7 → 59.7 at 512 (−1.6%).
+
+Reading:
+- **The f2 bundles predate the tile alternation (§6.2.2, `21888b0`).** It is on
+  by default for head_dim ≥ 128, so Qwen3's and Gemma's differences include
+  it. Their prefill is the alternation alone: Qwen3 843.3 → 811.0 ms a chunk
+  at T = 64 (−3.8%), Gemma 233.7 → 229.5 (−1.8%). SmolLM2's and Llama's
+  prefill are unchanged (hd 64: no alternation by default; prefill rows
+  unfused).
+- **For SmolLM2 and Llama the difference is the fusion alone**: −2.8% and
+  −0.9% at short context, −3.6% and −2.8% at 2048.
+- **Below §6.4.6's model** (Qwen3 −5.0%, Gemma −2.6%, Llama −2.1%). The model
+  ran at max_dynamic 256, where the kernel takes the untiled form with the
+  interleaved schedule. At 2048 (Gemma 512) every model takes the tiled form,
+  which still runs in order (§6.4.5). The gain grows with T: the boundaries
+  removed are per layer, the in-order T loop is per block.
+- **Next**: the interleaved schedule for the tiled form (post(b − 1) between
+  head b's T loop blocks, accumulators by parity) is what the board's
+  configurations use; a chunk kernel for prefill (§6.4.7).
 
 ### 6.5 Banks (measured in §6.2.2)
 
