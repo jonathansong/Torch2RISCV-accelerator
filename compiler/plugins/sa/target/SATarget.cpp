@@ -68,6 +68,8 @@ struct SAOptions {
   bool gemvKSplit = true;
   // C6.5: rows of T per block of the tiled decode q . K^T (0: 128, at most what one SPAD_B bank holds).
   int attnBlock = 0;
+  // Keys per block of a prefill chunk's attention kernel (0: 64; docs/fusion_design.md §6.7).
+  int chunkBlock = 0;
   // C7 plan A (docs/riscv_backend_design.md §9): also write each export as LLVM IR of a
   // RISC-V function issuing its commands over PCPI, <dir>/<export>.ll (empty: off; the
   // binary is the same either way).
@@ -81,6 +83,9 @@ struct SAOptions {
   // Decode's attention in one dispatch (docs/fusion_design.md §6): the q path, the
   // scores, the probabilities, p . V and the int8 output (FormAttnRegions.cpp).
   bool fuseAttn = false;
+  // With fuseAttn: also a prefill chunk's rows in one dispatch per layer (the chunk kernel,
+  // docs/fusion_design.md §6.7).
+  bool fuseAttnChunk = false;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("sa HAL target (PYNQ-Z1 accelerator)");
@@ -107,6 +112,8 @@ struct SAOptions {
                      llvm::cl::desc("Decode's GEMV over a K beyond 4080 in K blocks (WP6; false: such layers on EX)."));
     binder.opt<int>("iree-sa-attn-block", attnBlock, llvm::cl::cat(category),
                     llvm::cl::desc("Rows of T per block of the tiled decode attention (C6.5; 0: 128, at most one SPAD_B bank)."));
+    binder.opt<int>("iree-sa-attn-chunk-block", chunkBlock, llvm::cl::cat(category),
+                    llvm::cl::desc("Keys per block of a prefill chunk's attention kernel (0: 64; docs/fusion_design.md §6.7)."));
     binder.opt<std::string>("iree-sa-emit-riscv", emitRiscv, llvm::cl::cat(category),
                             llvm::cl::desc("Also write each export as LLVM IR of a RISC-V function issuing its "
                                            "commands over PCPI, into this directory (C7 plan A)."));
@@ -119,6 +126,9 @@ struct SAOptions {
     binder.opt<bool>("iree-sa-fuse-attn", fuseAttn, llvm::cl::cat(category),
                      llvm::cl::desc("Decode's attention (q path, scores, probabilities, p . V, int8 output) in one "
                                     "dispatch (docs/fusion_design.md §6)."));
+    binder.opt<bool>("iree-sa-fuse-attn-chunk", fuseAttnChunk, llvm::cl::cat(category),
+                     llvm::cl::desc("With --iree-sa-fuse-attn: also a prefill chunk's attention rows in one dispatch "
+                                    "(docs/fusion_design.md §6.7)."));
     binder.opt<bool>("iree-sa-codegen-report", codegenReport, llvm::cl::cat(category),
                      llvm::cl::desc("Print, per dispatch, whether it compiled (and why not)."));
   }
@@ -136,6 +146,7 @@ getSAExecutableTarget(MLIRContext *context, const SAOptions &options) {
   tc.gemvPorts = options.gemvPorts;
   tc.gemvKSplit = options.gemvKSplit;
   tc.attnBlock = options.attnBlock;
+  tc.chunkBlock = options.chunkBlock;
   tc.addTo(b, config);
   return b.getAttr<IREE::HAL::ExecutableTargetAttr>(
       b.getStringAttr("sa"), b.getStringAttr("sa-desc-v1"),
@@ -385,7 +396,8 @@ struct SASession final
   // After IREE forms the dispatch regions (IREE patch 0004): the pieces keep the
   // forms of today's dispatches.
   void extendDispatchRegionFormationPassPipeline(OpPassManager &passManager) override {
-    if (options.fuseAttn) passManager.addPass(sa::createFormAttnRegionsPass(options.codegenReport, options.maxDynamic));
+    if (options.fuseAttn) passManager.addPass(sa::createFormAttnRegionsPass(options.codegenReport, options.maxDynamic,
+                                                                            options.fuseAttnChunk));
   }
   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) final {
     // #hal.device.target<"sa", ...

@@ -3,6 +3,7 @@
 #include "SahlPasses.h"
 
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "llvm/ADT/MapVector.h"
 #include "mlir/IR/Builders.h"
 
 namespace mlir::iree_compiler::sa {
@@ -24,6 +25,7 @@ TargetConfig TargetConfig::fromAttr(DictionaryAttr config) {
   get("gemv_ports", c.gemvPorts);
   get("gemv_ksplit", c.gemvKSplit);
   get("attn_block", c.attnBlock);
+  get("chunk_block", c.chunkBlock);
   return c;
 }
 
@@ -50,6 +52,7 @@ void TargetConfig::addTo(Builder &b, SmallVectorImpl<NamedAttribute> &attrs) con
   if (gemvPorts) add("gemv_ports", gemvPorts);
   if (!gemvKSplit) add("gemv_ksplit", 0);
   if (attnBlock) add("attn_block", attnBlock);
+  if (chunkBlock) add("chunk_block", chunkBlock);
 }
 
 bool TargetConfig::ukernel(StringRef name) const {
@@ -122,6 +125,81 @@ struct SahwAssignRegistersPass : public PassWrapper<SahwAssignRegistersPass, Ope
   void runOnOperation() override {
     getOperation()->walk([&](sahw::TemplateOp t) {
       Builder b(t.getContext());
+      // More private PARAMs than registers (a prefill chunk's attention: positions and
+      // RoPE rows of 16 rows): one written by an LDPARAM before any read is free after
+      // its last use, so its register is reused; the others keep theirs (read as 0
+      // first: cursors, loop strides). Otherwise the numbering of before.
+      Block &tb = t.getRegion().front();
+      int nParams = 0, nPrivate = 0;
+      for (Operation &op : tb) nParams += isa<sahw::ParamOp>(op), nPrivate += isa<sahw::PrivateOp>(op);
+      if (nParams + nPrivate > 8) {
+        llvm::DenseMap<Operation *, int> pos;
+        int i = 0;
+        tb.walk([&](Operation *o) { pos[o] = i++; });   // (pre-order: the program's order)
+        struct Live { int first = INT_MAX, last = -1; bool defFirst = false; };
+        llvm::MapVector<Operation *, Live> live;
+        for (Operation &op : tb)
+          if (auto o = dyn_cast<sahw::PrivateOp>(op)) {
+            Live l;
+            for (OpOperand &u : o.getResult().getUses()) {
+              int at = pos[u.getOwner()];
+              if (at < l.first) {
+                l.first = at;
+                auto ld = dyn_cast<sahw::LdParamOp>(u.getOwner());
+                l.defFirst = ld && ld.getTarget() == o.getResult();
+              }
+              l.last = std::max(l.last, at);
+            }
+            live[o] = l;
+          }
+        // (loops: a use inside a loop body lives to the loop's end)
+        tb.walk([&](Operation *o) {
+          if (o->getNumRegions() == 0 || o->getParentOp() != t.getOperation()) return;
+          int end = pos[o];
+          o->walk([&](Operation *x) { end = std::max(end, pos[x]); });
+          for (auto &[po, l] : live)
+            if (l.first > pos[o] && l.first <= end) l.last = std::max(l.last, end);
+            else if (l.last > pos[o] && l.last <= end) l.last = end;
+        });
+        int next = nParams;
+        SmallVector<int> freeRegs;
+        SmallVector<std::pair<int, int>> busy;   // (last use, register)
+        SmallVector<std::pair<int, Operation *>> order;
+        for (auto &[po, l] : live) order.push_back({l.first, po});
+        llvm::sort(order, [](auto &a, auto &b) { return a.first < b.first; });
+        for (auto [first, po] : order) {
+          Live &l = live[po];
+          for (size_t j = 0; j < busy.size();)
+            if (busy[j].first < first) freeRegs.push_back(busy[j].second), busy.erase(busy.begin() + j);
+            else ++j;
+          int reg;
+          if (l.defFirst && !freeRegs.empty()) reg = freeRegs.pop_back_val();
+          else reg = next++;
+          if (reg > 7) {
+            if (getenv("SA_PARAM_DEBUG"))
+              for (auto &[q, lq] : live)
+                llvm::errs() << "private " << lq.first << ".." << lq.last << (lq.defFirst ? " ldparam" : " read first")
+                             << " " << *(*q->getUsers().begin()) << "\n";
+            po->emitError("more than 8 PARAM registers");
+            return signalPassFailure();
+          }
+          cast<sahw::PrivateOp>(po).setRegAttr(b.getI64IntegerAttr(reg));
+          if (l.defFirst) busy.push_back({l.last, reg});
+        }
+        int pi = 0;
+        for (Operation &op : tb)
+          if (auto o = dyn_cast<sahw::ParamOp>(op)) o.setRegAttr(b.getI64IntegerAttr(pi++));
+        int nb = 0;
+        for (Operation &op : tb)
+          if (auto o = dyn_cast<sahw::BaseOp>(op)) {
+            if (nb >= 15) {
+              o.emitError("more than 15 BASE registers (BASE15 is the prefixes')");
+              return signalPassFailure();
+            }
+            o.setRegAttr(b.getI64IntegerAttr(nb++));
+          }
+        return;
+      }
       int nextBase = 0, nextParam = 0, nextPrivate = 7;
       for (Operation &op : t.getRegion().front()) {
         if (auto o = dyn_cast<sahw::BaseOp>(op)) {

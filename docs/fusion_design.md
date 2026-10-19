@@ -13,9 +13,12 @@ fusion (§6) is implemented for decode (2026-10-18/19: a region pass after IREE'
 region formation, IREE patch 0004, and a kernel `attn_layer`). It was accepted
 on the board on all four models (§6.4.8): bit-exact, decode device time
 −1.1% to −4.8% against the SwiGLU-fused builds. It has been on by default in
-`compile_sa.sh` since 2026-10-19 (`SA_FUSE_ATTN=0` turns it off). Prefill rows
-stay unfused (§6.4.7). Together against v2.2: decode device time −4.4% to
-−9.3%. Measured against tag `v2.2-kv260`.
+`compile_sa.sh` since 2026-10-19 (`SA_FUSE_ATTN=0` turns it off). Together
+against v2.2: decode device time −4.4% to −9.3%. Measured against tag
+`v2.2-kv260`. Prefill: a chunk kernel (§6.7, 2026-10-19/20) runs a chunk's 16
+attention rows in one dispatch per layer, bit-exact on the sim on Gemma, Qwen3
+and Llama up to 2048 positions; in the model a layer's prefill attention costs
+−51% to −64%; opt-in (`SA_FUSE_ATTN_CHUNK=1`), not on the board yet.
 
 **In one paragraph.** Every IREE dispatch on the sa device stores its outputs
 to DDR and the next dispatch loads them back. Keeping those intermediates in
@@ -1022,8 +1025,8 @@ The untiled form now follows §6.4.2's schedule and §6.5's banks:
   share one global, and decode's two layers read it the same way.
 - **A kernel for a whole chunk** is the real prefill fusion: the chunk's 16
   query rows of a head as one A tile, the head's cache loaded and transposed
-  once, one EX for all 16 rows, each row with its own causal position. Not
-  started; prefill's bound is −10% to −20% (§5).
+  once, one EX for all 16 rows, each row with its own causal position.
+  Implemented 2026-10-19/20 (§6.7).
 - **Long context (max_dynamic 2048) checked**, the tiled form: on the 2-layer
   Qwen3 compiled for 2048 positions, logits bit-identical to the unfused
   build, `dispatch_check` OK at T = 16 to 2048 and at `--pos 0`. It also
@@ -1155,10 +1158,126 @@ scales as push constants, as today (checked by the decode working-set size,
 unrolled by two. An odd block count must not prefetch past the cache. The
 per-dispatch checks at block boundaries cover it.
 
+### 6.7 Prefill: the chunk kernel (2026-10-19/20)
+
+A prefill chunk ran its attention row by row, each row a decode step's
+dispatches (§6.1): about 12 dispatches a row, 16 rows a chunk, and every row
+loading and transposing the K cache of every head again. Now the chunk's
+rows are one dispatch per layer and one kernel, `attn_chunk`.
+
+**Frontend** (`hf_generic._attention_rows`). The rows' K / V cache writes all
+come first (each row's module forward, its query recorded, `sa_collect`),
+then the attention of the M rows over the cache after the writes
+(`sa_attention` with `query_rows`), every row's q quantized before the
+first row's scores. Each row's mask is its own position, so the later rows'
+keys never reach it: the max is over the same keys and p is 0 elsewhere.
+Eager logits are bit-identical to the row-by-row export (prefill and
+decode), and so is the unfused build on the sim.
+
+**Region pass** (`--iree-sa-fuse-attn-chunk`, `FormAttnRegions.cpp`, option
+`chunks`). The chains of a chunk's rows (found by their shared q producer,
+§6.4.7) are merged into one region:
+- each row's small inputs computed outside are copied in for it: its slice
+  of the chunk's q, the RoPE rows at its position (small regions without a
+  contraction, also read by the k path). The region then reads the chunk's
+  q, the positions and the tables once: 16 rows' own inputs were 48 bindings
+  and base registers, beyond the 16 / 15 there are;
+- the rows' results, put together by an `insert_slice` chain into a
+  `tensor.empty` (the `torch.cat`), are stacked as they are, `[rows, ...]`,
+  and reshaped after the region: one result, and no collapse in front of each
+  row's store (IREE's VMVX codegen mis-typed the binding of Gemma's rows,
+  `[1, 4, 16, 16]` collapsed to `[4, 256]`).
+- **An IREE miscompile found and fixed**: `FoldInsertSliceWithTensorStoreOp`
+  rewrote `store(insert_slice(src into dest))` as a store of `src` alone,
+  dropping `dest`. Correct only for an undefined `dest`; a chain kept only its
+  last row, the other 15 rows' work then dead code. `dest` is now stored first
+  unless it is a `tensor.empty`
+  (`compiler/patches/iree/0005-tensorext-fold-insert-slice-store-keep-dest.patch`).
+  The golden corpus is unchanged by it.
+
+**Backend.** `KernelMatcher::matchAttnChunk` matches the dispatch as rows:
+an `AttnLayerPlan` each (decode's matcher), all reading the same K / V cache
+views, plus each row's q path (the last writers of its q and s_q, back to
+DDR) and the store of its output. `expandAttnChunkBlocked`
+(`SahlExpandKernels.cpp`), for M = D = 16 rows:
+- *q paths*: each row's in a scope of its own (its buffers released after
+  it: a dispatch's buffers are otherwise allocated for the whole dispatch,
+  and 16 rows' RoPE and norm temps do not fit ACC); its int8 q into row m of
+  a staging matrix `[16, H G hd]`, its s_q into row m of `[16, U]`
+  (U = H G units, a unit = a KV head b and query head g).
+- *A tiles*: the staging matrix transposed once into columns, then one
+  transpose per unit: unit u's tile holds the 16 rows' q of that head.
+  s_q per unit by an fp32 transpose of `[16, U]` (`sahl.transpose` now
+  also ACC → ACC).
+- *per KV head, two passes over the cache in blocks of Tb keys* (`sahl.loop`,
+  the count ⌈T / Tb⌉ from T; the loads advance with the loop):
+  - pass 1: the block's K rows loaded and transposed once for the head's G
+    units; per unit one EX `[16, Tb]`, the scores' epilogue, the mask, the
+    block's maximum per row folded into the running maximum (the reduction
+    with `sahl.accumulate`, now over several rows);
+  - pass 2: K again and V's block (its packed groups are the B tiles of
+    p · V as they are), followed by a tile of ones; per unit the scores again,
+    p = i8(exp(s − max) · 127) for the 16 rows, p into the A form (two
+    transposes), then p · V and Σp as one EX each, accumulated over the
+    blocks (the ones tile gives every lane the row's sum: no VE reduction);
+  - after: p · V's epilogue by the sums, the 16 rows' outputs stored.
+  Every VE operation covers the 16 rows `[16, Tb]`; the bodies are the
+  matched generics' (scores' epilogue, max, p, p · V's epilogue), so the
+  arithmetic is the IR's.
+- *The mask is arithmetic*, each row at its own position:
+  s' = min(s, (pos − key + ½) · 10³⁰). A key past the row's position gets
+  about −10³⁰: the max is over the earlier keys as before, exp gives 0, p is
+  0 as the IR's select gives. No VALID, so blocks partly or wholly past T and
+  any positions (the last chunk of a prompt starts anywhere) need nothing
+  special, and the loop body is the same for every block. The key indices
+  are `sahl.iota` (lanes from VALID prefixes, then + D per word), the
+  positions `sahl.scalar_f32` (an i64 scalar as an fp32 word), new sahl ops,
+  as is `sahl.splat` (an accumulator zeroed, the ones tile).
+- No online softmax: two passes keep the max global, so p's int8 rounding is
+  the unfused build's.
+
+Infrastructure on the way: the private PARAMs are numbered by liveness when a
+template has more than 8 (16 rows' positions and RoPE rows; LDPARAM-written
+ones reused, the others kept), and a `sa.fresh_params` scope forgets the VALID
+counts it loaded; a DDR view through `expand_shape`; `sahl.loop` takes two
+strides always. None changes a template that compiled before (golden
+identical).
+
+**Verification** (2-layer builds, D = 16, 4 ports): `dispatch_check` of the
+chunk dispatch OK at T = 16, 64, 128, 144, 256 (`--dirty`, and `--pos 0`)
+on Gemma, Qwen3 and Llama at 256 positions, and on Qwen3 at 2048 positions
+at T = 16 to 2048; logits end to end on the sim bit-identical to the unfused
+builds (all four builds). `dispatch_check` now gives fp32 push constants a
+scale's value (it gave t's bits, a denormal: every output 0) and can save the
+executed commands (`SA_DC_TRACE`) for the cycle model.
+
+**Model** (Qwen3, one layer's prefill attention for a chunk of 16 rows, cycles;
+rows unfused: each row's scores, probabilities, sum and p · V dispatches at
+T, × 16, plus the q paths, without the dispatch boundaries):
+
+| T | rows unfused | chunk, Tb = 32 | **Tb = 64 (default)** | Tb = 128 |
+|---|---:|---:|---:|---:|
+| 64 | ≈ 1.16M | 0.45M | **0.42M (−64%)** | 0.52M |
+| 512 | ≈ 2.81M | 1.58M | **1.32M (−53%)** | 1.19M |
+| 2048 | ≈ 9.0M | 5.45M | **4.38M (−51%)** | 3.85M |
+
+`--iree-sa-attn-chunk-block` sets Tb. The VE is the busy engine (≈ 75%):
+at T = 64 half of it is the 16 rows' q paths (RMSNorm, RoPE, quantization:
+the unfused build's work, ≈ 11K cycles a row), the rest the units' blocks;
+exp is the largest single operation. A 2-layer prefill chunk (the model,
+T = 32): 503 → 217 dispatches.
+
+Left: the board (bundles with `SA_FUSE_ATTN_CHUNK=1`, an export from this
+frontend); SmolLM2 (its G = 3 is fine for the kernel, not run yet); the two
+passes' K loads and transposes are paid twice and pass 1 / pass 2 of different
+units could overlap more; the q paths batched over the rows.
+
 ## Files
 
 - `compiler/tests/fusion_whatif.py`: the evaluation (`--only` for one chain by kind, `--chain` by role).
 - `compiler/tests/attn_schedule.py`: the attention schedule prototype (§6.2.2).
+- `SahlKernels.cpp` (`matchAttnChunk`), `SahlExpandKernels.cpp` (`expandAttnChunkBlocked`):
+  the prefill chunk kernel (§6.7); `compiler/patches/iree/0005-tensorext-fold-insert-slice-store-keep-dest.patch`.
 - `compiler/plugins/sa/target/FormAttnRegions.cpp`, `test/sa_form_attn_regions.mlir`:
   the attention region pass (§6.4.1); `compiler/patches/iree/0004-pluginapi-dispatch-region-formation-hook.patch`:
   its hook.

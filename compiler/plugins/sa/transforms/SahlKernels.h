@@ -163,6 +163,19 @@ struct AttnLayerPlan {
   int64_t H = 0, G = 0, hd = 0;
 };
 
+// ------------------------------------------------------------ a prefill chunk's attention, fused (docs/fusion_design.md §6.7)
+// A dispatch formed by iree-sa-form-attn-regions from a chunk's rows: an
+// AttnLayerPlan per row, all reading the same K / V cache views; each row's q
+// path (the operations of the dispatch that compute its q and s_q, block
+// order; the kernel emits them row by row, each row's buffers released after
+// it) and the store of its output (a local [H, G, hd] into its row of the
+// dispatch's result).
+struct AttnChunkPlan {
+  SmallVector<AttnLayerPlan> rows;
+  SmallVector<SmallVector<Operation *>> qpath;
+  SmallVector<Value> outDdr;                   // per row: the store's destination
+};
+
 // The schedule of a linear micro-kernel (sahl-schedule): chunks of chunkTiles
 // output tiles (the weights of a chunk in one SPAD_B bank, the next chunk's
 // loaded into the other bank while this one computes); decode's form loops
@@ -196,7 +209,11 @@ class KernelMatcher {
   }
   bool matchAttention(linalg::BatchMatmulOp bmm);
   // a fused dispatch's attention core, anchored at the scores' batch matmul (AttnLayerPlan)
-  bool matchAttnLayer(linalg::BatchMatmulOp bmm);
+  // (plan / cover given: the plan only, not recorded)
+  bool matchAttnLayer(linalg::BatchMatmulOp bmm, AttnLayerPlan *plan = nullptr,
+                      SmallVector<Operation *> *coverOut = nullptr);
+  // a prefill chunk's rows (AttnChunkPlan), anchored at the first row's scores
+  bool matchAttnChunk(Block &blk);
   // decode's gated FFN, anchored at the contraction that comes first (FfnPlan)
   bool matchFfn(linalg::GenericOp con);
   bool matchContraction(linalg::LinalgOp op);
@@ -210,6 +227,7 @@ class KernelMatcher {
   llvm::DenseMap<Operation *, ContractPlan> contracts;
   llvm::DenseMap<Operation *, FfnPlan> ffns;
   llvm::DenseMap<Operation *, AttnLayerPlan> attnLayers;
+  llvm::DenseMap<Operation *, AttnChunkPlan> attnChunks;
   llvm::DenseSet<Operation *> owned;
   llvm::DenseMap<Operation *, SmallVector<Operation *>> covers;   // anchor -> the operations of its match
 

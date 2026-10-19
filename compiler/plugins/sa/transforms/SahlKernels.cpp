@@ -46,9 +46,11 @@ void KernelMatcher::matchAll(func::FuncOp f) {
     f.walk([&](linalg::GenericOp g) {
       if (g->getParentOp() == f.getOperation()) matchLinear(g);
     });
-  // a fused dispatch's attention (on the GEMV unit's p . V)
+  // a fused dispatch's attention (on the GEMV unit's p . V): a prefill chunk's rows, or one
+  if (cfg.ukernel("attention") && cfg.gemvPorts) matchAttnChunk(f.getBody().front());
   if (cfg.ukernel("attention") && cfg.gemvPorts)
     f.walk([&](linalg::BatchMatmulOp m) {
+      if (owned.contains(m.getOperation())) return;
       if (m->getParentOp() == f.getOperation()) matchAttnLayer(m);
     });
   if (cfg.ukernel("attention"))
@@ -575,7 +577,8 @@ static void usersOf(Value v, SmallVectorImpl<Operation *> &out) {
   }
 }
 
-bool KernelMatcher::matchAttnLayer(linalg::BatchMatmulOp bmm) {
+bool KernelMatcher::matchAttnLayer(linalg::BatchMatmulOp bmm, AttnLayerPlan *planOut,
+                                   SmallVector<Operation *> *coverOut) {
   static const bool dbg = getenv("SA_ATTN_DEBUG") != nullptr;
   auto no = [&](const char *why) {
     if (dbg) llvm::errs() << "attn-layer: " << why << "\n";
@@ -738,8 +741,150 @@ bool KernelMatcher::matchAttnLayer(linalg::BatchMatmulOp bmm) {
   cover.push_back(e2);
   // the sum read only by p . V's epilogue (the other intermediates' readers checked above)
   if (readers(Sum, p.sumR).size() != 1) return no("sum readers");
+  if (planOut) {
+    *planOut = p;
+    *coverOut = cover;
+    return true;
+  }
   record(bmm, cover);
   attnLayers[bmm.getOperation()] = p;
+  return true;
+}
+
+// The ops of blk that write the local buffer under v (through any view of it).
+static void writersOf(Block &blk, Value v, SmallVectorImpl<Operation *> &out) {
+  Value r = v;
+  while (Operation *o = r.getDefiningOp()) {
+    if (!isa<memref::SubViewOp, memref::CollapseShapeOp, memref::ExpandShapeOp>(o)) break;
+    r = o->getOperand(0);
+  }
+  if (!r.getDefiningOp<memref::AllocOp>()) return;
+  std::function<void(Value)> walk = [&](Value x) {
+    for (OpOperand &use : x.getUses()) {
+      Operation *u = use.getOwner();
+      if (isa<memref::SubViewOp, memref::CollapseShapeOp, memref::ExpandShapeOp>(u)) {
+        walk(u->getResult(0));
+        continue;
+      }
+      Operation *a = blk.findAncestorOpInBlock(*u);
+      if (!a) continue;
+      bool w = false;
+      if (auto l = dyn_cast<linalg::LinalgOp>(u)) w = l.isDpsInit(&use);
+      else if (auto ld = dyn_cast<sahl::LoadOp>(u)) w = ld.getDst() == x;
+      else if (auto c = dyn_cast<memref::CopyOp>(u)) w = c.getTarget() == x;
+      if (w) out.push_back(a);
+    }
+  };
+  walk(r);
+}
+
+// The local buffers an op reads (its inputs; a linalg op's inits its body reads).
+static void readsOf(Operation *op, SmallVectorImpl<Value> &out) {
+  if (auto l = dyn_cast<linalg::LinalgOp>(op)) {
+    for (OpOperand *in : l.getDpsInputOperands()) out.push_back(in->get());
+    for (OpOperand &init : l.getDpsInitsMutable())
+      if (l.payloadUsesValueFromOperand(&init)) out.push_back(init.get());
+    // (values a body reads directly: a gather's source)
+    op->walk([&](sahl::GatherOp g) { out.push_back(g.getSource()); });
+    op->walk([&](memref::LoadOp g) { out.push_back(g.getMemRef()); });
+    return;
+  }
+  if (auto c = dyn_cast<memref::CopyOp>(op)) out.push_back(c.getSource());
+}
+
+bool KernelMatcher::matchAttnChunk(Block &blk) {
+  static const bool dbg = getenv("SA_ATTN_DEBUG") != nullptr;
+  auto no = [&](const char *why) {
+    if (dbg) llvm::errs() << "attn-chunk: " << why << "\n";
+    return false;
+  };
+  SmallVector<linalg::BatchMatmulOp> bmms;
+  for (Operation &op : blk)
+    if (auto b = dyn_cast<linalg::BatchMatmulOp>(&op)) bmms.push_back(b);
+  if (bmms.size() < 2) return false;
+  AttnChunkPlan c;
+  llvm::DenseSet<Operation *> cores;
+  SmallVector<Operation *> cover;
+  auto same = [](Value a, Value b) {
+    if (a == b) return true;
+    Operation *x = a.getDefiningOp(), *y = b.getDefiningOp();
+    return x && y && OperationEquivalence::isEquivalentTo(x, y, OperationEquivalence::IgnoreLocations);
+  };
+  for (linalg::BatchMatmulOp bm : bmms) {
+    AttnLayerPlan p;
+    SmallVector<Operation *> cv;
+    if (!matchAttnLayer(bm, &p, &cv)) return no("a row's core");
+    if (!c.rows.empty()) {
+      const AttnLayerPlan &p0 = c.rows.front();
+      if (p.H != p0.H || p.G != p0.G || p.hd != p0.hd || !same(p.kCache, p0.kCache) || !same(p.vCache, p0.vCache) ||
+          p.tK != p0.tK)
+        return no("rows of different shapes or caches");
+    }
+    // the output's store into the dispatch's result
+    sahl::StoreOp st;
+    SmallVector<Operation *> us;
+    usersOf(p.out, us);
+    for (Operation *u : us)
+      if (auto s = dyn_cast<sahl::StoreOp>(u); s && localRoot(s.getSrc()) == p.out) {
+        if (st) return no("two stores of a row's output");
+        st = s;
+      }
+    if (!st || !ddrRoot(st.getDst())) return no("a row's output store");
+    cv.push_back(st);
+    c.outDdr.push_back(st.getDst());
+    for (Operation *o : cv) cores.insert(o);
+    cover.append(cv.begin(), cv.end());
+    c.rows.push_back(p);
+  }
+  // each row's q path: the last writers of q and s_q before its scores, back to DDR
+  for (auto [i, p] : llvm::enumerate(c.rows)) {
+    llvm::SetVector<Operation *> s;
+    SmallVector<std::pair<Value, Operation *>> work = {{p.q, p.bmm}, {p.sq, p.scoresEpi}};
+    while (!work.empty()) {
+      auto [v, at] = work.pop_back_val();
+      if (ddrRoot(v)) continue;
+      SmallVector<Operation *> ws;
+      writersOf(blk, v, ws);
+      llvm::sort(ws, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+      // the writers before `at` back to the last one writing the whole buffer
+      for (Operation *w : llvm::reverse(ws)) {
+        if (!w->isBeforeInBlock(at)) continue;
+        if (cores.contains(w)) return no("a q path reaching a core");
+        if (!s.insert(w)) break;
+        SmallVector<Value> rs;
+        readsOf(w, rs);
+        for (Value r : rs) work.push_back({r, w});
+        bool whole = isa<linalg::FillOp, sahl::LoadOp>(w);
+        if (auto g = dyn_cast<linalg::GenericOp>(w))
+          whole = !g.getNumReductionLoops() && llvm::all_of(g.getDpsInitsMutable(), [&](OpOperand &o) {
+            return !g.payloadUsesValueFromOperand(&o);
+          });
+        if (whole) break;
+      }
+    }
+    SmallVector<Operation *> q(s.begin(), s.end());
+    llvm::sort(q, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+    if (dbg) llvm::errs() << "attn-chunk: row " << i << ": q path of " << q.size() << " ops\n";
+    c.qpath.push_back(q);
+    for (Operation *o : q)
+      if (!llvm::is_contained(cover, o)) cover.push_back(o);
+  }
+  // nothing else of the block between the first q path op and the last core op but
+  // views, allocations and constants (the kernel takes them all)
+  llvm::DenseSet<Operation *> in(cover.begin(), cover.end());
+  Operation *first = *llvm::min_element(cover, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  Operation *last = *llvm::max_element(cover, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  for (Operation *o = first; o != last; o = o->getNextNode())
+    if (!in.contains(o) && !isa<memref::AllocOp, memref::DeallocOp, memref::SubViewOp, memref::CollapseShapeOp,
+                                memref::ExpandShapeOp, memref::DimOp, memref::CastOp, arith::ConstantOp>(o) &&
+        !o->hasTrait<OpTrait::ConstantLike>() && !isa<arith::ArithDialect>(o->getDialect())) {
+      if (dbg) llvm::errs() << "attn-chunk: an operation of neither a q path nor a core: " << *o << "\n";
+      return false;
+    }
+  if (dbg) llvm::errs() << "attn-chunk: " << c.rows.size() << " rows\n";
+  for (Operation *o : cover) owned.insert(o);
+  covers[bmms.front().getOperation()].assign(cover.begin(), cover.end());
+  attnChunks[bmms.front().getOperation()] = std::move(c);
   return true;
 }
 

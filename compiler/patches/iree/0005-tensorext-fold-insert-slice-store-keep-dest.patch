@@ -1,0 +1,33 @@
+From: jonathansong <7958352+jonathansong@users.noreply.github.com>
+Subject: [PATCH] [TensorExt] Keep the insert's destination when folding insert_slice into dispatch.tensor.store
+
+FoldInsertSliceWithTensorStoreOp rewrote store(insert_slice(src into dest))
+as a store of src at the slice only, dropping dest: correct only when dest
+is undefined (tensor.empty). A chain of insert_slices (a dispatch putting
+its rows together into one result) kept only its last row, the earlier
+rows' computations then dead code. dest is now stored first unless it is a
+tensor.empty, so a chain folds into one store per slice. Found by the sa
+plugin's prefill attention chunks (docs/fusion_design.md §6.7).
+
+diff --git a/compiler/src/iree/compiler/Dialect/TensorExt/Transforms/Folders.cpp b/compiler/src/iree/compiler/Dialect/TensorExt/Transforms/Folders.cpp
+index 591fc68..8525e71 100644
+--- a/compiler/src/iree/compiler/Dialect/TensorExt/Transforms/Folders.cpp
++++ b/compiler/src/iree/compiler/Dialect/TensorExt/Transforms/Folders.cpp
+@@ -71,6 +71,17 @@ struct FoldInsertSliceWithTensorStoreOp
+       return failure();
+     }
+ 
++    // The rest of the stored value is the insert's destination: unless it is
++    // undefined (tensor.empty), it is stored first, as the original store did.
++    if (!insertSliceOp.getDest().getDefiningOp<tensor::EmptyOp>()) {
++      IREE::TensorExt::DispatchTensorStoreOp::create(
++          rewriter, dispatchTensorStoreOp.getLoc(), insertSliceOp.getDest(),
++          dispatchTensorStoreOp.getTarget(),
++          dispatchTensorStoreOp.getTargetDims(),
++          dispatchTensorStoreOp.getMixedOffsets(),
++          dispatchTensorStoreOp.getMixedSizes(),
++          dispatchTensorStoreOp.getMixedStrides());
++    }
+     rewriter.replaceOpWithNewOp<IREE::TensorExt::DispatchTensorStoreOp>(
+         dispatchTensorStoreOp, insertSliceOp.getSource(),
+         dispatchTensorStoreOp.getTarget(),

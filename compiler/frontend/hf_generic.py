@@ -240,6 +240,9 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
     (* 127 / sum(eq): the weights sum to 1 exactly; plan §12.4)."""
     cache = module.sa_cache
     l = module.layer_idx
+    if getattr(module, "sa_collect", None) is not None:      # (a prefill row: _attention_rows)
+        module.sa_collect.append((query, key, value, scaling))
+        return query.new_zeros(1, query.shape[2], query.shape[1], query.shape[3]), None
     if SA_FP32 & {"kv", "q", "probs"}:
         return _sa_attention_fp32(module, query, key, value, scaling)
     H, M, hd = query.shape[1], query.shape[2], query.shape[3]
@@ -251,14 +254,20 @@ def sa_attention(module, query, key, value, attention_mask, scaling=None, dropou
         vh = value.to(torch.int32).unflatten(0, (Hk, hd // VP_LANES))          # (T not reshaped: no export guard)
     else:
         vh = value.to(torch.int32).reshape(T, Hk, hd).permute(1, 0, 2)            # (Hk, T, hd)
-    # the query rows as [M, H, hd] (HF's transpose undone: each row contiguous)
-    qr = query[0].transpose(0, 1)
-    outs = []
+    # the query rows as [M, H, hd] (HF's transpose undone: each row contiguous;
+    # a prefill chunk's rows as they were given, no transpose of the chunk)
+    qr = kwargs.get("query_rows") or query[0].transpose(0, 1)
+    # every row's query quantized first, then the rows' attention (a prefill
+    # chunk's: its q paths before the attention it shares the cache reads of)
+    qs = []
     for m in range(M):
         q = qr[m].reshape(Hk, G, hd)
         if cache.k_ch[l]:                                                        # (K per channel)
             q = q * cache.sk[l]
-        qq, s_q = _quant_act(q)                                                  # (Hk, G, hd), (Hk, G, 1)
+        qs.append(_quant_act(q))                                                 # (Hk, G, hd), (Hk, G, 1)
+    outs = []
+    for m in range(M):
+        qq, s_q = qs[m]
         sc = torch.matmul(qq.to(torch.int32), kh)                                # (Hk, G, T) int32
         a_k = cache.a_k[l]
         if scaling is not None and abs(scaling * np.sqrt(cache.hd) - 1.0) > 1e-9:
@@ -300,8 +309,10 @@ def _attention_rows(forward):
     the M rows computed together first (the linear layers are what gain from
     the rows), then the module's forward on each row with those projections
     given and the row's cos / sin looked up at its scalar position in the RoPE
-    table (sa_rope, as a decode step does: QK-norm, RoPE, the KV row, the sa
-    attention at the row's position), and o_proj on the M rows together. In one
+    table (sa_rope, as a decode step does: QK-norm, RoPE, the KV row; the
+    query recorded, sa_collect), then the sa attention of the M rows, each at
+    its position, after all their KV rows are written (the rows read one cache
+    slice: a chunk kernel's), and o_proj on the M rows together. In one
     piece the chunk's QK-norm / RoPE / attention inputs are M x heads x head_dim
     tensors that do not fit ACC (left to the host: not bit-exact with decode),
     and their row slices strided views. With the chunk's RoPE rows sliced
@@ -320,10 +331,11 @@ def _attention_rows(forward):
         cache = self.sa_cache
         positions = cache.positions
         cos, sin = position_embeddings
-        outs = []
+        got = []                                 # (each row's query, the cache read, the scaling)
         try:
             setattr(self, "o_proj", _Given(None))
             self.o_proj.forward = lambda x: x
+            self.sa_collect = got
             for m in range(M):
                 for n in names[:3]:
                     setattr(self, n, _Given(proj[n][:, m:m + 1]))
@@ -335,13 +347,19 @@ def _attention_rows(forward):
                                *([ty] if ty is not None and rope.types != [None] else []))
                 else:
                     emb = (cos[:, m:m + 1], sin[:, m:m + 1])
-                o, _ = forward(self, hidden_states[:, m:m + 1], emb, None, past_key_values, **kw)
-                outs.append(o)
+                forward(self, hidden_states[:, m:m + 1], emb, None, past_key_values, **kw)
         finally:
+            self.sa_collect = None
             for n, v in saved.items():
                 setattr(self, n, v)
             cache.positions = positions
-        return saved["o_proj"](torch.cat(outs, dim=1)), None
+        # the attention of the M rows after all their cache writes: each row's
+        # mask (its position) leaves the later rows' K / V out exactly as before
+        # (max over the unmasked scores, p = 0 elsewhere), and the rows read one
+        # cache slice (a chunk kernel's: fusion_design.md §6.7)
+        o, _ = sa_attention(self, torch.cat([r[0] for r in got], dim=2), got[-1][1], got[-1][2], None,
+                            scaling=got[-1][3], query_rows=[r[0][0, :, 0] for r in got])
+        return saved["o_proj"](o.reshape(1, M, -1)), None
     return rows
 
 

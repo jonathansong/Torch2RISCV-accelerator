@@ -141,6 +141,29 @@ def Sahl_BcastOp : Sahl_Op<"bcast"> {
   let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
 }
 
+def Sahl_IotaOp : Sahl_Op<"iota"> {
+  let summary = "dst[i] = i, fp32 (a local vector, D elements a word)";
+  let description = [{
+    The element indices as values, for a mask computed arithmetically (a
+    prefill chunk's attention: each row's own causal position, compared with
+    the key's index in VE operations; docs/fusion_design.md §6.7).
+  }];
+  let arguments = (ins Arg<AnyMemRef, "the indices", [MemWrite]>:$dst);
+  let assemblyFormat = "$dst attr-dict `:` type($dst)";
+}
+
+def Sahl_SplatOp : Sahl_Op<"splat"> {
+  let summary = "Every element of a local buffer (ACC or SPAD) set to `value` (one VE copy)";
+  let arguments = (ins Arg<AnyMemRef, "the buffer", [MemWrite]>:$dst, F32Attr:$value);
+  let assemblyFormat = "$dst attr-dict `:` type($dst)";
+}
+
+def Sahl_ScalarF32Op : Sahl_Op<"scalar_f32"> {
+  let summary = "An i64 scalar in DDR as fp32 into one word of a local buffer (every lane)";
+  let arguments = (ins Arg<AnyMemRef, "the scalar (DDR)", [MemRead]>:$src, Arg<AnyMemRef, "the word", [MemWrite]>:$dst);
+  let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
+}
+
 def Sahl_LoopOp : Sahl_Op<"loop", [SingleBlock, NoTerminator]> {
   let summary = "A hardware loop (LOOP_END): the body `count` times, its DDR views advancing each time";
   let description = [{

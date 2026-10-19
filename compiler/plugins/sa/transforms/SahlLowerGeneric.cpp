@@ -302,6 +302,7 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
       while (Operation *d = r.getDefiningOp()) {
         if (auto sv = dyn_cast<memref::SubViewOp>(d)) r = sv.getSource();
         else if (auto cs = dyn_cast<memref::CollapseShapeOp>(d)) r = cs.getSrc();
+        else if (auto es = dyn_cast<memref::ExpandShapeOp>(d)) r = es.getSrc();
         else break;
       }
       auto a = r.getDefiningOp<memref::AllocOp>();
@@ -740,16 +741,18 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
     auto out = bufOf(init, /*bcast=*/true);
     if (!out) return false;
     if (!out->bcast) return fail("reduction result used before");
-    // a later piece (sahl-tile: sahl.accumulate): its maximum into a temp word, then into the result
+    // a later piece (sahl-tile: sahl.accumulate): its maximum into temp words (one a row),
+    // then into the result (a chunk kernel's running maximum over the blocks: [D] rows)
     uint32_t dst = out->la;
+    const int64_t outWords = std::max<int64_t>(out->n, 1);
     if (g->hasAttr("sahl.accumulate")) {
       if (rk != ::sa::RED_MAX) return fail("a sum over pieces");
-      dst = newLocal(::sa::VT_F32, 1, /*bcast=*/true).la;
+      dst = newLocal(::sa::VT_F32, outWords, /*bcast=*/true).la;
     }
     auto combine = [&]() {
       if (dst != out->la)
         ve(Opd{out->la, ::sa::VT_F32, ::sa::IDX_LIN, 0}, Opd{dst, ::sa::VT_F32, ::sa::IDX_LIN, 0}, out->la,
-           ::sa::VT_F32, d, ::sa::VOP_MAX);
+           ::sa::VT_F32, outWords * d, ::sa::VOP_MAX);
       return err.empty();
     };
     int64_t groups = n / d;

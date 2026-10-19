@@ -37,6 +37,7 @@ struct TargetConfig {
   int64_t gemvPorts = 0;             // K2b streaming GEMV unit (LD mode GEMV) and its read ports; 0: none
   int64_t gemvKSplit = 1;            // decode's GEMV over a K beyond 4080 in K blocks (WP6; 0: such layers on EX)
   int64_t attnBlock = 0;             // C6.5: rows of T per block of the tiled q . K^T (0: 128; at most one SPAD_B bank)
+  int64_t chunkBlock = 0;            // keys per block of a prefill chunk's attention kernel (0: 64; docs/fusion_design.md §6.7)
   static TargetConfig fromAttr(DictionaryAttr config);
   // What the command encoding allows (empty if valid): D 8 or 16, the local
   // memories powers of two of at most 2^16 words (16-bit local addresses).

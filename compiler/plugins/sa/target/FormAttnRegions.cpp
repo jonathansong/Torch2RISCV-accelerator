@@ -88,9 +88,10 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FormAttnRegionsPass)
 
   FormAttnRegionsPass() = default;
-  FormAttnRegionsPass(bool report, int64_t maxDynamic) {
+  FormAttnRegionsPass(bool report, int64_t maxDynamic, bool chunks) {
     this->report = report;
     this->maxDynamic = maxDynamic;
+    this->chunks = chunks;
   }
   FormAttnRegionsPass(const FormAttnRegionsPass &other) : PassWrapper(other) {}
 
@@ -294,6 +295,7 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
     ModuleOp module = getOperation();
     if (!force && !targetsSA(module)) return;
     SmallVector<SmallVector<Operation *>> chains;
+    int nChunks = 0;                                 // (of them: prefill chunks)
     llvm::DenseSet<Operation *> taken;
     SmallVector<SmallVector<Operation *>> blockChains;
     module.walk([&](Block *blk) {
@@ -313,6 +315,10 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
       for (auto [i, ch] : llvm::enumerate(blockChains))
         for (Operation *o : ch) chainOf_[o] = int(i);
       llvm::DenseSet<int> rowChains;
+      // (the chunks: the rows that share such a producer, union-find over the chains)
+      SmallVector<int> chunkOf(blockChains.size());
+      for (auto [i, c] : llvm::enumerate(chunkOf)) c = int(i);
+      std::function<int(int)> root = [&](int i) { return chunkOf[i] == i ? i : chunkOf[i] = root(chunkOf[i]); };
       llvm::DenseSet<Operation *> seen;
       // (through reshapes and slices: a row's part of the chunk's q is a slice of it)
       auto isView = [](Operation *op) { return isReshape(op) || isa_and_nonnull<tensor::ExtractSliceOp>(op); };
@@ -345,12 +351,229 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
               if (it == chainOf_.end()) onlyChains = false;
               else by.insert(it->second);
             }
-            if (onlyChains && by.size() > 1) rowChains.insert(by.begin(), by.end());
+            if (onlyChains && by.size() > 1) {
+              rowChains.insert(by.begin(), by.end());
+              for (int c : by) chunkOf[root(c)] = root(*by.begin());
+            }
           }
         }
       if (dbg && !rowChains.empty()) llvm::errs() << "attn: " << rowChains.size() << " chains are a prefill chunk's rows\n";
-      for (auto [i, ch] : llvm::enumerate(blockChains))
-        if (rows || !rowChains.contains(int(i))) chains.push_back(std::move(ch));
+      // chunks=true: a chunk's rows in one region (each row's chain whole, in block order:
+      // a chunk kernel's, fusion_design.md §6.7); rows=true: each row in its own
+      std::map<int, SmallVector<Operation *>> chunks;
+      for (auto [i, ch] : llvm::enumerate(blockChains)) {
+        if (!rowChains.contains(int(i))) chains.push_back(std::move(ch));
+        else if (this->chunks) chunks[root(int(i))].append(ch.begin(), ch.end());
+        else if (rows) chains.push_back(std::move(ch));
+      }
+      for (auto &[r, ops] : chunks) {
+        llvm::sort(ops, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+        // the rows' small inputs computed outside (a row's slice of the chunk's q, the RoPE
+        // rows at its position) copied in, each copy for one region: the chunk reads the
+        // chunk's q, the positions and the tables once, not one input a row (a dispatch
+        // has at most 16 bindings and 15 base registers)
+        {
+          llvm::DenseSet<Operation *> inSet(ops.begin(), ops.end());
+          auto cheapRegion = [&](DispatchRegionOp p) {
+            if (kindOf(p).contraction) return false;
+            for (Type t : p->getResultTypes())
+              if (auto rt = dyn_cast<RankedTensorType>(t); !rt || !rt.hasStaticShape() || rt.getNumElements() > 4096)
+                return false;
+            return true;
+          };
+          SmallVector<Operation *> added;
+          for (Operation *o : ops) {
+            auto reg = dyn_cast<DispatchRegionOp>(o);
+            if (!reg) continue;
+            for (Value v : captured(reg)) {
+              // (a chain of views of an outside value, or a cheap region's result)
+              SmallVector<Operation *> chain;
+              Value x = v;
+              while (Operation *d = x.getDefiningOp()) {
+                if (inSet.contains(d)) break;
+                if (isReshape(d) || isa<tensor::ExtractSliceOp>(d)) {
+                  chain.push_back(d);
+                  x = d->getOperand(0);
+                  continue;
+                }
+                if (auto pr = dyn_cast<DispatchRegionOp>(d); pr && cheapRegion(pr)) chain.push_back(d);
+                break;
+              }
+              // (a reshape alone stays outside: a cache's view of its global)
+              if (llvm::all_of(chain, [](Operation *d) { return isReshape(d); })) continue;
+              // the copies just before the region, innermost first
+              OpBuilder cb(reg);
+              IRMapping m;
+              Operation *outer = nullptr;
+              for (Operation *d : llvm::reverse(chain)) {
+                outer = cb.clone(*d, m);
+                for (auto [a, b] : llvm::zip(d->getResults(), outer->getResults())) m.map(a, b);
+                added.push_back(outer);
+              }
+              Value nv = m.lookup(v);
+              v.replaceUsesWithIf(nv, [&](OpOperand &use) { return reg->isAncestor(use.getOwner()); });
+            }
+          }
+          for (Operation *a : added) ops.push_back(a), inSet.insert(a);
+          llvm::sort(ops, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+        }
+        // every use outside after the chunk's last op (each row's were after its own): the
+        // reshapes of a row's result before the end (side-effect free, read by nothing of the
+        // chunk) moved after it
+        Operation *last = ops.back();
+        llvm::DenseSet<Operation *> in(ops.begin(), ops.end());
+        {
+          llvm::DenseSet<Operation *> dep(ops.begin(), ops.end());
+          SmallVector<Operation *> sink;
+          for (Operation *op = ops.front(); op != last; op = op->getNextNode()) {
+            if (in.contains(op)) continue;
+            bool d = false;
+            op->walk([&](Operation *x) {
+              for (Value v : x->getOperands())
+                if (Operation *a = v.getDefiningOp() ? blk->findAncestorOpInBlock(*v.getDefiningOp()) : nullptr;
+                    a && dep.contains(a))
+                  d = true;
+            });
+            if (!d) continue;
+            dep.insert(op);
+            sink.push_back(op);
+          }
+          bool movable = llvm::all_of(sink, [&](Operation *op) {
+            return isReshape(op) && llvm::all_of(op->getUsers(), [&](Operation *u) {
+                     Operation *a = blk->findAncestorOpInBlock(*u);
+                     return !a || !in.contains(a);
+                   });
+          });
+          if (movable)
+            for (Operation *op : llvm::reverse(sink)) op->moveAfter(last);
+        }
+        // a chain of insert_slices of the rows' collapsed results into a tensor.empty
+        // (torch.cat of the rows): the rows' results stacked as they are, [rows, ...],
+        // the stack reshaped after (a collapse into each row's store of the dispatch's
+        // result trips IREE's codegen when the row has unit dimensions: Gemma's [1, 4, 16, 16])
+        for (Operation *op = ops.front(); op; op = op->getNextNode()) {
+          auto first = dyn_cast<tensor::InsertSliceOp>(op);
+          if (!first || !first.getDest().getDefiningOp<tensor::EmptyOp>()) continue;
+          SmallVector<tensor::InsertSliceOp> chain;
+          for (tensor::InsertSliceOp is = first; is;) {
+            chain.push_back(is);
+            tensor::InsertSliceOp nx;
+            if (is->hasOneUse()) nx = dyn_cast<tensor::InsertSliceOp>(*is->getUsers().begin());
+            is = nx && nx.getDest() == chain.back().getResult() ? nx : tensor::InsertSliceOp();
+          }
+          auto rowOf = [&](tensor::InsertSliceOp is) -> Value {
+            auto c = is.getSource().getDefiningOp<tensor::CollapseShapeOp>();
+            return c && c.getSrc().getDefiningOp() && in.contains(c.getSrc().getDefiningOp()) ? c.getSrc() : Value();
+          };
+          auto dt = first.getDestType();
+          if (chain.size() < 2 || dt.getRank() < 2 || !dt.hasStaticShape() || !llvm::all_of(chain, rowOf)) continue;
+          // rows along one dimension r, one each, in order, the rest of each row whole
+          int r = -1;
+          bool ok = true;
+          auto rt = cast<RankedTensorType>(rowOf(first).getType());
+          for (auto [i, is] : llvm::enumerate(chain)) {
+            auto offs = is.getStaticOffsets();
+            if (cast<RankedTensorType>(rowOf(is).getType()) != rt || ShapedType::isDynamicShape(offs)) ok = false;
+            for (auto [k, o] : llvm::enumerate(offs))
+              if (o != 0) {
+                if (r < 0) r = int(k);
+                if (int(k) != r) ok = false;
+              }
+            if (ok && r >= 0 && offs[r] != int64_t(i)) ok = false;
+          }
+          if (!ok || r < 0 || dt.getDimSize(r) != int64_t(chain.size()) ||
+              dt.getNumElements() != int64_t(chain.size()) * rt.getNumElements())
+            continue;
+          Operation *empty0 = first.getDest().getDefiningOp();
+          OpBuilder sb(chain.back());
+          sb.setInsertionPointAfter(chain.back());
+          Location loc = first.getLoc();
+          SmallVector<int64_t> st = {int64_t(chain.size())};
+          st.append(rt.getShape().begin(), rt.getShape().end());
+          Value acc = tensor::EmptyOp::create(sb, loc, st, rt.getElementType());
+          ops.push_back(acc.getDefiningOp()), in.insert(acc.getDefiningOp());
+          for (auto [i, is] : llvm::enumerate(chain)) {
+            SmallVector<OpFoldResult> o(st.size(), sb.getIndexAttr(0)), sz, one(st.size(), sb.getIndexAttr(1));
+            o[0] = sb.getIndexAttr(int64_t(i));
+            sz.push_back(sb.getIndexAttr(1));
+            for (int64_t x : rt.getShape()) sz.push_back(sb.getIndexAttr(x));
+            auto ni = tensor::InsertSliceOp::create(sb, loc, rowOf(is), acc, o, sz, one);
+            acc = ni.getResult();
+            ops.push_back(ni), in.insert(ni);
+          }
+          // [rows, ...] -> [rows, row elements] -> the chain's shape
+          Value flat = tensor::CollapseShapeOp::create(
+              sb, loc, acc, SmallVector<ReassociationIndices>{{0}, llvm::to_vector(llvm::seq<int64_t>(1, st.size()))});
+          SmallVector<ReassociationIndices> re;
+          for (int64_t k = 0; k < dt.getRank(); ++k) {
+            if (k <= r) {
+              if (re.empty()) re.push_back({});
+              re[0].push_back(k);
+            } else {
+              if (re.size() < 2) re.push_back({});
+              re[1].push_back(k);
+            }
+          }
+          Value out = tensor::ExpandShapeOp::create(sb, loc, dt, flat, re);
+          chain.back().getResult().replaceAllUsesWith(out);
+          for (tensor::InsertSliceOp is : llvm::reverse(chain)) {
+            Operation *c = is.getSource().getDefiningOp();
+            SmallVector<Operation *> &opl = ops;
+            auto drop = [&in, &opl](Operation *o) {
+              in.erase(o);
+              if (auto it = llvm::find(opl, o); it != opl.end()) opl.erase(it);
+            };
+            drop(is);
+            is.erase();
+            if (c && c->use_empty()) {
+              drop(c);
+              c->erase();
+            }
+          }
+          if (empty0->use_empty()) empty0->erase();
+          break;
+        }
+        // the rows' results put together after it (reshapes, insert_slice chains into a
+        // tensor.empty: one result, one binding, instead of one a row)
+        for (bool grown = true; grown;) {
+          grown = false;
+          for (Operation *op = ops.front(); op; op = op->getNextNode()) {
+            if (in.contains(op)) continue;
+            auto inSet = [&](Value v) { return v.getDefiningOp() && in.contains(v.getDefiningOp()); };
+            bool take = false;
+            // (a reshape of a row's result, not of the result put together)
+            if (isReshape(op) && inSet(op->getOperand(0)) &&
+                !isa<tensor::InsertSliceOp, tensor::EmptyOp>(op->getOperand(0).getDefiningOp()))
+              take = true;
+            if (auto is = dyn_cast<tensor::InsertSliceOp>(op); is && inSet(is.getSource())) {
+              if (auto e = is.getDest().getDefiningOp<tensor::EmptyOp>(); e && !in.contains(e)) {
+                // (its own copy: an empty tensor may be shared)
+                OpBuilder eb(is);
+                Operation *ec = eb.clone(*e);
+                is.getDestMutable().assign(ec->getResult(0));
+                in.insert(ec), ops.push_back(ec);
+                take = true;
+              } else if (inSet(is.getDest())) {
+                take = true;
+              }
+            }
+            if (!take) continue;
+            in.insert(op), ops.push_back(op), grown = true;
+          }
+        }
+        llvm::sort(ops, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+        last = ops.back();
+        bool ok = true;
+        for (Operation *o : ops)
+          for (Value v : o->getResults())
+            for (Operation *u : v.getUsers())
+              if (Operation *a = blk->findAncestorOpInBlock(*u); a && !in.contains(a) && !last->isBeforeInBlock(a)) {
+                if (dbg && ok) llvm::errs() << "attn: chunk use before its end: " << *a << "\n";
+                ok = false;
+              }
+        if (dbg) llvm::errs() << "attn: a chunk of " << ops.size() << " ops" << (ok ? "" : ": a use before its end") << "\n";
+        if (ok) chains.push_back(std::move(ops)), ++nChunks;
+      }
       blockChains.clear();
     });
     std::map<int, int> sizes;   // regions merged -> chains
@@ -359,7 +582,8 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
       merge(ops, maxDynamic);
     }
     if (report) {
-      llvm::errs() << "sa form-attn-regions: " << chains.size() << " attention chains in one dispatch each (regions x chains:";
+      llvm::errs() << "sa form-attn-regions: " << chains.size() << " attention chains in one dispatch each, "
+                   << nChunks << " of them a prefill chunk's rows (regions x chains:";
       for (auto [n, c] : sizes) llvm::errs() << " " << n << "x" << c;
       llvm::errs() << ")\n";
     }
@@ -367,6 +591,8 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
 
   Option<bool> rows{*this, "rows", llvm::cl::desc("Also merge the attention of each row of a prefill chunk"),
                     llvm::cl::init(false)};
+  Option<bool> chunks{*this, "chunks", llvm::cl::desc("Merge the attention of a prefill chunk's rows into one"),
+                      llvm::cl::init(false)};
   Option<bool> force{*this, "force", llvm::cl::desc("Run without an sa device target (tests)"), llvm::cl::init(false)};
   Option<int64_t> maxDynamic{*this, "max-dynamic",
                              llvm::cl::desc("Bound of the dynamic sizes inside a merged region (0: none)"),
@@ -376,8 +602,8 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
 
 }  // namespace
 
-std::unique_ptr<Pass> createFormAttnRegionsPass(bool report, int64_t maxDynamic) {
-  return std::make_unique<FormAttnRegionsPass>(report, maxDynamic);
+std::unique_ptr<Pass> createFormAttnRegionsPass(bool report, int64_t maxDynamic, bool chunks) {
+  return std::make_unique<FormAttnRegionsPass>(report, maxDynamic, chunks);
 }
 
 void registerFormAttnRegionsPass() { PassRegistration<FormAttnRegionsPass>(); }

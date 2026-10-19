@@ -66,6 +66,11 @@ def push_constants(func, t, site=0):
             src = op.operands[0].owner
             if src.name == "arith.extui" and src.operands[0] in loads:
                 vals[loads[src.operands[0]]] = 0
+    # an fp32 push constant (a generalized executable's scale): a scale's size, not t's bits (a
+    # denormal: every product 0, the results' signs all that is compared)
+    for op in ops_of(func):
+        if op.name == "arith.bitcast" and op.operands[0] in loads and str(op.results[0].type) == "f32":
+            vals[loads[op.operands[0]]] = int(np.float32(0.0123).view(np.uint32))
     # values fixed by util.assume.int (first call site)
     for op in ops_of(func):
         if op.name != "util.assume.int":
@@ -185,10 +190,18 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
     lst = sadesc.dispatch_list(base, phys, consts, setup, ext)
     lst_addr = base + size - 0x10000
     sim.ddr_write(lst_addr, lst.array().tobytes())
+    if os.environ.get("SA_DC_TRACE"):                 # (the executed commands, for perf_model: a trace file)
+        sim.trace = []
     try:
         sim.run_list(lst_addr)
     except SaError as e:
         return f"device error: {e}"
+    if os.environ.get("SA_DC_TRACE"):
+        tp = os.environ["SA_DC_TRACE"]
+        np.asarray(sim.trace, np.uint64).reshape(-1, 10).tofile(tp)
+        with open(tp + ".idx", "w") as f:
+            f.write(f"0 {len(sim.trace)} {name}\n")
+        sim.trace = None
     bad = []
     for b, regs in regions.items():
         got = sim.ddr_read(phys[b], len(bufs[b])).tobytes()
@@ -197,7 +210,9 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
             if g != x:
                 if et == "f32":
                     gv, xv = np.frombuffer(g, np.float32), np.frombuffer(x, np.float32)
-                    k = int(np.argmax(gv != xv))
+                    if os.environ.get("SA_DC_DUMP"):          # (the two results, to look at the differences)
+                        np.savez(os.environ["SA_DC_DUMP"], got=gv, want=xv)
+                    k = int(np.argmax(gv.view(np.uint32) != xv.view(np.uint32)))
                     bad.append(f"b{b}@{o} f32[{n // 4}]: {int(np.sum(gv.view(np.uint32) != xv.view(np.uint32)))} "
                                f"differ, first [{k}] {gv[k]!r} vs {xv[k]!r}")
                 else:

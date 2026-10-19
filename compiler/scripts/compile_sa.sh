@@ -22,6 +22,10 @@
 # SA_FUSE_ATTN=0: decode's attention in separate dispatches as before (default 1: the q
 # path, scores, probabilities, p . V and int8 output in one dispatch per layer, prefill
 # rows unfused; --iree-sa-fuse-attn, docs/fusion_design.md §6.4, board results §6.4.8).
+# SA_FUSE_ATTN_CHUNK=1: with it, a prefill chunk's attention rows in one dispatch per
+# layer too (the chunk kernel, --iree-sa-fuse-attn-chunk, docs/fusion_design.md §6.7;
+# default 0 until accepted on the board; needs an export with hf_generic's rows after
+# their cache writes, 2026-10-19 on).
 # SA_HOST_FALLBACK=0: no host fallback (default 1: every dispatch also gets a
 # VMVX variant; one the sa backend cannot compile runs on the ARM host, plan
 # §8.15; IREE's executable linking is off, it would merge the VMVX variants of
@@ -40,6 +44,7 @@ rm -f "$dir"/sa_sources/*.mlir      # (a source left from an earlier compile has
   $( [ "${SA_GENERALIZE:-1}" = 1 ] && echo --iree-flow-enable-executable-generalization ) \
   $( [ "${SA_FUSE_FFN:-1}" = 1 ] && echo --iree-sa-fuse-ffn ) \
   $( [ "${SA_FUSE_ATTN:-1}" = 1 ] && echo --iree-sa-fuse-attn ) \
+  $( [ "${SA_FUSE_ATTN:-1}" = 1 ] && [ "${SA_FUSE_ATTN_CHUNK:-0}" = 1 ] && echo --iree-sa-fuse-attn-chunk ) \
   $( [ "${SA_HOST_FALLBACK:-1}" = 1 ] && echo --iree-sa-host-fallback --iree-hal-link-executables=false ) \
   $( [ -n "${SA_D:-}" ] && [ "$SA_D" != 8 ] && echo --iree-sa-d="$SA_D" ) \
   $( [ "${SA_GEMV_PORTS:-0}" != 0 ] && echo --iree-sa-gemv-ports="$SA_GEMV_PORTS" ) \

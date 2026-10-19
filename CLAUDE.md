@@ -46,7 +46,7 @@ PicoRV32 control core). Start with `README.md`, then
 - The board's configuration: `SA_D=16 SA_GEMV_PORTS=4` (test scripts default to
   D = 8 otherwise).
 - IREE sources `build/iree/src` (pinned `e4a3b0405d` plus
-  `compiler/patches/iree/0001`–`0004`, applied by
+  `compiler/patches/iree/0001`–`0005`, applied by
   `compiler/scripts/fetch_iree_sources.sh`), build `build/iree/build-compiler`.
   Incremental build of the compiler after a plugin change:
   `cmake --build $IREE_BUILD -j 4 --target iree-compile iree-opt` (under systemd-run).
@@ -80,6 +80,10 @@ PicoRV32 control core). Start with `README.md`, then
   decode attention (§6, kernel `attn_layer`, region pass
   `FormAttnRegions.cpp` after IREE's region formation via patch 0004), both on by
   default and accepted on the board (§4.9, §6.4.8).
-- Open, in the order discussed: a chunk kernel for prefill attention (§6.4.7);
-  residual + RMSNorm + projection fusion (§5); why the tiled attention form's
-  interleaving gains less than the model (§6.4.8).
+- Prefill chunk kernel (§6.7, 2026-10-19/20): `--iree-sa-fuse-attn-chunk` /
+  `SA_FUSE_ATTN_CHUNK=1` (opt-in), kernel `attn_chunk`, IREE patch 0005; needs an
+  export from the current `hf_generic` (rows after their cache writes). Bit-exact on
+  the sim (Gemma, Qwen3, Llama, up to 2048); not on the board yet.
+- Open: the chunk kernel on the board, then on by default; residual + RMSNorm +
+  projection fusion (§5); why the tiled attention form's interleaving gains less than
+  the model (§6.4.8).

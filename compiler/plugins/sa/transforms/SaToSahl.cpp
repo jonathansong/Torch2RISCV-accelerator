@@ -593,6 +593,7 @@ LogicalResult groupKernels(func::FuncOp f, const TargetConfig &cfg) {
   SmallVector<std::pair<Operation *, StringRef>> anchors;
   for (Operation &op : blk) {
     if (km.ffns.count(&op)) anchors.push_back({&op, "ffn"});
+    else if (km.attnChunks.count(&op)) anchors.push_back({&op, "attn_chunk"});
     else if (km.attnLayers.count(&op)) anchors.push_back({&op, "attn_layer"});
     else if (km.linears.count(&op)) anchors.push_back({&op, "linear"});
     else if (km.attns.count(&op)) anchors.push_back({&op, "attention"});

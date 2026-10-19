@@ -28,7 +28,7 @@ void registerFormFfnRegionsPass();
 // Dispatch creation, after the regions are formed: decode's attention (q path,
 // scores, probabilities, p . V, int8 output) merged into one flow.dispatch.region
 // (FormAttnRegions.cpp, docs/fusion_design.md §6.4.1).
-std::unique_ptr<Pass> createFormAttnRegionsPass(bool report = false, int64_t maxDynamic = 0);
+std::unique_ptr<Pass> createFormAttnRegionsPass(bool report = false, int64_t maxDynamic = 0, bool chunks = false);
 void registerFormAttnRegionsPass();
 
 // The module targets the sa device (the preprocessing passes act only then).

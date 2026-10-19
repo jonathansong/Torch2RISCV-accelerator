@@ -43,7 +43,12 @@ bool Lowerer::lowerBlock(Block &block) {
         auto savedLocals = locals;
         auto savedBcast = bcastOf;
         uint32_t savedBase = spadBase;
+        // (sa.fresh_params: the VALID counts it loads are its own, their PARAMs free after
+        // it: a chunk kernel's rows, each at its position)
+        const bool fresh = sc->hasAttr("sa.fresh_params");
+        auto savedValid = validParams;
         if (!lowerBlock(sc.getBody().front())) return false;
+        if (fresh) validParams = std::move(savedValid);
         mem.release(mark);
         locals = std::move(savedLocals);
         bcastOf = std::move(savedBcast);
@@ -86,10 +91,56 @@ bool Lowerer::lowerBlock(Block &block) {
       mem.takeSpad(uint32_t(cs.getWords()));
       continue;
     }
+    if (auto io = dyn_cast<sahl::IotaOp>(op)) {
+      // lane l's index: 15 - (the lanes < k, k = 1..15, counted: prefixes by VALID), then + D g in word g
+      auto dst = bufOf(io.getDst());
+      if (!dst || dst->vt != ::sa::VT_F32 || dst->bcast || dst->n % d) return fail("iota: a packed fp32 vector");
+      StaticLen fixed(*this);
+      LocalBuf ones = newLocal(::sa::VT_F32, d), cnt = newLocal(::sa::VT_F32, d), pre = newLocal(::sa::VT_F32, d);
+      ve({ones.la, ::sa::VT_I32}, std::nullopt, ones.la, ::sa::VT_F32, d, ::sa::VOP_COPY, 0.0f, 1.0f);
+      ve({ones.la}, std::nullopt, cnt.la, ::sa::VT_F32, d, ::sa::VOP_COPY, 0.0f, 0.0f);
+      for (int64_t k = 1; k < d; ++k) {
+        ve({ones.la}, std::nullopt, pre.la, ::sa::VT_F32, d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
+           ::sa::RED_NONE, 0, uint32_t(k));
+        ve({cnt.la}, Opd{pre.la}, cnt.la, ::sa::VT_F32, d, ::sa::VOP_ADD);
+      }
+      for (int64_t g = 0; g < dst->n / d; ++g)
+        ve({cnt.la}, std::nullopt, dst->la + uint32_t(g), ::sa::VT_F32, d, ::sa::VOP_COPY, -1.0f,
+           float(d - 1 + d * g));
+      continue;
+    }
+    if (auto sp = dyn_cast<sahl::SplatOp>(op)) {
+      // (x * 0 + value over its own words, read as int32: finite whatever they hold)
+      auto dst = bufOf(sp.getDst());
+      if (!dst || dst->dyn) return fail("splat of a static buffer");
+      StaticLen fixed(*this);
+      const uint32_t memc = (dst->la >> 28) & 0xF;
+      const bool spad = memc != uint32_t(::sa::MEM_ACC);
+      ve({dst->la, spad ? ::sa::VT_I8 : ::sa::VT_I32}, std::nullopt, dst->la, dst->vt, dst->bcast ? dst->n * d : dst->n,
+         ::sa::VOP_COPY, 0.0f, sp.getValue().convertToFloat());
+      continue;
+    }
+    if (auto sf = dyn_cast<sahl::ScalarF32Op>(op)) {
+      // (decode's i64 scalars: an LD of its 8 bytes, lane 0 through a REDUCE with VALID = 1)
+      auto src = scalarI64(sf.getSrc());
+      auto dst = bufOf(sf.getDst());
+      if (!src || !dst || dst->vt != ::sa::VT_F32) return fail("scalar_f32 form");
+      StaticLen fixed(*this);
+      ve({src->la, ::sa::VT_I32}, std::nullopt, dst->la, ::sa::VT_F32, d, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE,
+         ::sa::RED_MAX, 0, 1);
+      locals.erase(sf.getSrc());                     // (the next use loads it again: its word is a temp)
+      continue;
+    }
     if (auto tr = dyn_cast<sahl::TransposeOp>(op)) {
       auto a = bufOf(tr.getSrc()), b = bufOf(tr.getDst());
       if (!a || !b) return false;
       auto st = cast<MemRefType>(tr.getSrc().getType());
+      if (st.getElementType().isF32()) {             // ACC -> ACC (a chunk kernel's per-unit s_q)
+        if (st.getRank() != 2 || st.getDimSize(1) % d || !st.hasStaticShape()) return fail("fp32 transpose [R, C]");
+        sahw::TransposeOp::create(bb, loc, int64_t(a->la), int64_t(b->la), st.getNumElements(),
+                                  int64_t(::sa::vtypes(::sa::VT_F32, ::sa::VT_F32)), st.getDimSize(1) / d, ValueRange{});
+        continue;
+      }
       if (st.getRank() != 2 || st.getDimSize(1) % d) return fail("transpose source [R, C]");
       // a dynamic row count (the cache's T): the length at the bound, T x C dynamic
       int64_t rows = st.isDynamicDim(0) ? cfg.maxDynamic : st.getDimSize(0);
@@ -564,6 +615,10 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
     }
     if (auto c = dyn_cast<memref::CollapseShapeOp>(op)) {   // (a contiguous view flattened: sahl-tile's pieces)
       cur = c.getSrc();
+      continue;
+    }
+    if (auto x = dyn_cast<memref::ExpandShapeOp>(op)) {     // (the same elements: a chunk's q as rows of heads)
+      cur = x.getSrc();
       continue;
     }
     auto sub = dyn_cast<IREE::HAL::InterfaceBindingSubspanOp>(op);
