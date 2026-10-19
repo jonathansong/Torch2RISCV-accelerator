@@ -64,6 +64,7 @@ CASES = [
     ("attn_gemma", "build/fuse/gemma_l2_attn/sa_sources", []),             # one KV head (rank-reducing slices)
     ("attn_qwen3", "build/fuse/qwen3_l2_attn/sa_sources", []),             # QK-norm, halves in alternating banks
     ("attn_llama", "build/fuse/llama_l2_attn/sa_sources", []),             # G = 4, head_dim 64
+    ("attn_qwen3_t2048", "build/fuse/q3lc_attn/sa_sources", ["--iree-sa-max-dynamic=2048"]),   # the tiled form
 ]
 
 

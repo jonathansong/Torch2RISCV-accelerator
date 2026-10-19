@@ -1388,8 +1388,11 @@ bool expandAttention(sahl::KernelOp k, AttnPlan p, const ::sa::Layout &lay, int6
 // (p the GEMV's x), and p . V's epilogue into the row's slice of the output.
 // The intermediates stay in local memory; only the caches are read from DDR.
 // All of it in one scope (its SPAD_A claim ends with it; the output reserved before).
+// interleave false (SaCodegen's retry after ACC full, tile_shrink > 0): one set of the
+// heads' buffers, each head's post right after its scores (in order, less ACC).
 bool expandAttnLayer(sahl::KernelOp k, AttnLayerPlan p, const ::sa::Layout &lay, int64_t d, int64_t attnBlock,
-                     int64_t maxDyn) {
+                     int64_t maxDyn, bool interleave) {
+  const int64_t npar = interleave ? 2 : 1;
   const int64_t H = p.H, G = p.G, K = p.hd, sb = lay.sbank, nt = K / d;
   if (K % d || G > d || 2 * K > sb) return notExpanded(k, __LINE__);
   // blocks of Tb rows (expandContraction's: nb tiles a power of two, 128 rows by default)
@@ -1418,9 +1421,9 @@ bool expandAttnLayer(sahl::KernelOp k, AttnLayerPlan p, const ::sa::Layout &lay,
   const int64_t nA = shared ? (H * G + d - 1) / d : H, aRows = shared ? std::min<int64_t>(d, H * G) : G;
   const bool whole = qWords + nA * K + (pInBank1 ? 0 : rowWordsU) <= sb && rawWords <= sb && (aRows + d) * K / d <= sb;
   const int64_t tb = nb * d, blocks = maxDyn / tb + 1, rowElems = whole ? maxDyn : blocks * tb;
-  // p's row: the untiled form as above; the tiled form in bank 0 after the A tile (K words)
-  const int64_t pAt = whole ? (pInBank1 ? sb + rawWords : nA * K) : K;
-  if (!whole && pAt + (rowElems + d - 1) / d > sb) return notExpanded(k, __LINE__);
+  // p's row: the untiled form as above; the tiled form in bank 0 after the A tiles (K words each)
+  const int64_t pAt = whole ? (pInBank1 ? sb + rawWords : nA * K) : nA * K;
+  if (!whole && qWords + pAt + (rowElems + d - 1) / d > sb) return notExpanded(k, __LINE__);
 
   Expander e{OpBuilder(k), k.getLoc(), d};
   MLIRContext *ctx = k.getContext();
@@ -1557,29 +1560,29 @@ bool expandAttnLayer(sahl::KernelOp k, AttnLayerPlan p, const ::sa::Layout &lay,
     return ok;
   };
 
+  // the A tiles (§8.22 step b): D query rows of q each (int32 in ACC: one VE copy to int8)
+  // as rows of staging in bank 1, transposed into the [K, D] form after them, each D x D
+  // block transposed into the A form (bank 0, K words a tile). One EX a head with its
+  // rows' tile: its output rows (the head's first row's place in the tile on) are its
+  // rows' scores, the others whatever (two transposes a tile, not a head: Qwen3's 16
+  // rows are one tile)
+  Value qRows = memref::CollapseShapeOp::create(e.b, e.loc, p.q, SmallVector<ReassociationIndices>{{0, 1}, {2}});
+  auto aTile = [&](int64_t t) { return placedA({d, K}, t * K); };
+  for (int64_t t = 0; t < nA; ++t) {
+    const int64_t r0 = shared ? t * d : t * G, nr = shared ? std::min<int64_t>(d, H * G - r0) : G;
+    sahl::StripOp::create(e.b, e.loc, view(qRows, {r0, 0}, {ix(nr), ix(K)}, {nr, K}), placedA({nr, K}, sb))
+        ->setAttr("sa.packed", e.b.getUnitAttr());
+    Value cols = placedA({K, d}, sb + K);
+    sahl::TransposeOp::create(e.b, e.loc, placedA({d, K}, sb), cols);
+    sahl::TransposeOp::create(e.b, e.loc, cols, aTile(t));
+  }
+  // head b's tile and the row of its first query row in it
+  auto tileOf = [&](int64_t b) { return shared ? b * G / d : b; };
+  auto rowIn = [&](int64_t b) { return shared ? b * G % d : 0; };
   if (whole) {
-    // the A tiles (§8.22 step b): D query rows of q each (int32 in ACC: one VE copy to int8)
-    // as rows of staging in bank 1, transposed into the [K, D] form after them, each D x D
-    // block transposed into the A form (bank 0, K words a tile). One EX a head with its
-    // rows' tile: its output rows (the head's first row's place in the tile on) are its
-    // rows' scores, the others whatever (two transposes a tile, not a head: Qwen3's 16
-    // rows are one tile)
-    Value qRows = memref::CollapseShapeOp::create(e.b, e.loc, p.q, SmallVector<ReassociationIndices>{{0, 1}, {2}});
-    auto aTile = [&](int64_t t) { return placedA({d, K}, t * K); };
-    for (int64_t t = 0; t < nA; ++t) {
-      const int64_t r0 = shared ? t * d : t * G, nr = shared ? std::min<int64_t>(d, H * G - r0) : G;
-      sahl::StripOp::create(e.b, e.loc, view(qRows, {r0, 0}, {ix(nr), ix(K)}, {nr, K}), placedA({nr, K}, sb))
-          ->setAttr("sa.packed", e.b.getUnitAttr());
-      Value cols = placedA({K, d}, sb + K);
-      sahl::TransposeOp::create(e.b, e.loc, placedA({d, K}, sb), cols);
-      sahl::TransposeOp::create(e.b, e.loc, cols, aTile(t));
-    }
-    // head b's tile and the row of its first query row in it
-    auto tileOf = [&](int64_t b) { return shared ? b * G / d : b; };
-    auto rowIn = [&](int64_t b) { return shared ? b * G % d : 0; };
     // the EX output [D, max_dynamic] (it writes all D rows), by the head's parity in ACC bank 0 / 1
     Value rowAcc[2];
-    for (int64_t par = 0; par < 2; ++par) {
+    for (int64_t par = 0; par < npar; ++par) {
       rowAcc[par] = e.alloc({d * rowElems}, accT, "acc", "packed");
       if (accT.isInteger(64)) rowAcc[par].getDefiningOp()->setAttr("sa.accumulator", e.b.getUnitAttr());
       sahl::ReserveOp::create(e.b, e.loc, rowAcc[par], false)->setAttr("sa.prefer_bank", e.b.getI64IntegerAttr(par));
@@ -1602,78 +1605,79 @@ bool expandAttnLayer(sahl::KernelOp k, AttnLayerPlan p, const ::sa::Layout &lay,
         tiles->setAttr("sa.mem", e.b.getStringAttr("spad_b"));
         tiles->setAttr("sa.bank", e.b.getI64IntegerAttr(b & 1));
         sahl::TransposeOp::create(e.b, e.loc, raw, tiles);
-        sahl::MmaOp::create(e.b, e.loc, aTile(tileOf(b)), tiles, rowAcc[b & 1], false);
+        sahl::MmaOp::create(e.b, e.loc, aTile(tileOf(b)), tiles, rowAcc[b % npar], false);
       }
-      if (b > 0)
+      const int64_t pb = interleave ? b - 1 : b;
+      if (pb >= 0 && pb < H)
         for (int64_t g = 0; g < G; ++g)
-          if (!post(b - 1, g, e.sub(rowAcc[(b - 1) & 1], {(rowIn(b - 1) + g) * rowElems}, {rowElems}), (b - 1) & 1))
+          if (!post(pb, g, e.sub(rowAcc[pb % npar], {(rowIn(pb) + g) * rowElems}, {rowElems}), interleave ? pb & 1 : -1))
             return notExpanded(k, __LINE__);
     }
     eraseKernel(k);
     return true;
   }
-  const bool oneEx = G > 1;
-  for (int64_t b = 0; b < H; ++b) {
-    auto bscope = sahl::ScopeOp::create(e.b, e.loc, /*keep=*/true, IntegerAttr());
-    OpBuilder::InsertionGuard bguard(e.b);
-    e.b.setInsertionPointToEnd(&bscope.getBody().emplaceBlock());
-    // the A tile of the head's G rows of q (int32 in ACC: one VE copy to int8)
-    if (oneEx) {
-      Value xv = view(p.q, {b, 0, 0}, {ix(1), ix(G), ix(K)}, {G, K});
-      sahl::StripOp::create(e.b, e.loc, xv, placedA({G, K}, sb))->setAttr("sa.packed", e.b.getUnitAttr());
-      Value cols = placedA({K, d}, sb + K);
-      sahl::TransposeOp::create(e.b, e.loc, placedA({d, K}, sb), cols);
-      sahl::TransposeOp::create(e.b, e.loc, cols, placedA({d, K}, 0));
-    } else {
-      sahl::StripOp::create(e.b, e.loc, view(p.q, {b, 0, 0}, {ix(1), ix(1), ix(K)}, {K}), placedA({d, K}, 0));
-    }
+  // The tiled form (the cache of a head beyond one SPAD_B bank: long contexts), with the
+  // same schedule: per head b its T loop (§8.22 steps a-c and c': blocks of Tb rows,
+  // software-pipelined, halves in alternating SPAD_B banks; one EX a block with the
+  // head's rows' tile), then head b - 1's rows' post while the next loop's commands run.
+  // The EX output (scratch, all D rows) and the rows' buffers (one block longer in front:
+  // §8.22 step c's guard block) by the head's parity in ACC bank 0 / 1.
+  const int64_t nh = nb > 1 && (tb / 2) * K >= 8192 ? 2 : 1, hb = tb / nh, nbh = nb / nh;
+  Value scratch[2];
+  SmallVector<Value> rowsAll[2];
+  for (int64_t par = 0; par < npar; ++par) {
     auto accBuf = [&](int64_t n) {
       Value a = e.alloc({n}, accT, "acc", "packed");
       if (accT.isInteger(64)) a.getDefiningOp()->setAttr("sa.accumulator", e.b.getUnitAttr());
-      sahl::ReserveOp::create(e.b, e.loc, a, false);
+      auto r = sahl::ReserveOp::create(e.b, e.loc, a, false);
+      if (interleave) r->setAttr("sa.prefer_bank", e.b.getI64IntegerAttr(par));
       return a;
     };
-    Value scratch = accBuf(((oneEx ? 0 : G - 1) + d) * tb);
-    SmallVector<Value> rowsAll, rowsAcc;
-    for (int64_t g = 0; g < G; ++g) {
-      rowsAll.push_back(accBuf(tb + rowElems));
-      rowsAcc.push_back(e.sub(rowsAll.back(), {tb}, {rowElems}));
-    }
-    // the T loop (expandContraction's, §8.22 steps a-c and c')
-    const int64_t nh = nb > 1 && (tb / 2) * K >= 8192 ? 2 : 1, hb = tb / nh, nbh = nb / nh;
-    auto ex = [&](int64_t bank) {
-      Value tl = placedDyn({nbh, K, d}, "spad_b", bank);
-      if (oneEx) sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tl, e.sub(scratch, {0}, {hb}), false);
-      else sahl::MmaOp::create(e.b, e.loc, placedA({d, K}, 0), tl, e.sub(scratch, {0}, {hb}), false);
-    };
-    auto copies = [&](int64_t at, StringRef adv) {
-      for (int64_t g = 0; g < G; ++g) {
-        auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch, {g * hb}, {hb}), e.sub(rowsAll[g], {at}, {hb}));
-        c->setAttr(adv, e.b.getI64IntegerAttr(1));
+    scratch[par] = accBuf(d * tb);
+    for (int64_t g = 0; g < G; ++g) rowsAll[par].push_back(accBuf(tb + rowElems));
+  }
+  for (int64_t b = 0; b <= H; ++b) {
+    if (b < H) {
+      const int64_t par = b % npar, r0 = rowIn(b);
+      Value aT = aTile(tileOf(b));
+      auto ex = [&](int64_t bank) {
+        Value tl = placedDyn({nbh, K, d}, "spad_b", bank);
+        sahl::MmaOp::create(e.b, e.loc, aT, tl, e.sub(scratch[par], {0}, {hb}), false);
+      };
+      // (row r of the EX output at r hb: the head's rows from r0 on)
+      auto copies = [&](int64_t at, StringRef adv) {
+        for (int64_t g = 0; g < G; ++g) {
+          auto c = memref::CopyOp::create(e.b, e.loc, e.sub(scratch[par], {(r0 + g) * hb}, {hb}),
+                                          e.sub(rowsAll[par][g], {at}, {hb}));
+          c->setAttr(adv, e.b.getI64IntegerAttr(1));
+        }
+      };
+      auto lp = sahl::LoopOp::create(e.b, e.loc, blocks, ArrayRef<int64_t>{tb * rowPitch, nb}, cnt);
+      {
+        OpBuilder::InsertionGuard guard(e.b);
+        e.b.setInsertionPointToEnd(&lp.getBody().emplaceBlock());
+        Value raw = placedA({hb, K}, sb);
+        for (int64_t h = 0; h < nh; ++h) {
+          Value kv = cast<MemRefType>(p.kCache.getType()).getRank() == 3
+                         ? view(p.kCache, {h * hb, b, 0}, {ix(hb), ix(1), ix(K)}, {hb, K})
+                         : view(p.kCache, {h * hb, 0}, {ix(hb), ix(K)}, {hb, K});
+          auto l = sahl::LoadOp::create(e.b, e.loc, kv, raw);
+          l->setAttr("sa.rows", e.b.getUnitAttr());
+          l->setAttr("sa.advance", e.b.getI64IntegerAttr(0));
+          ex((h + nh - 1) % nh);
+          if (nh == 1) copies(0, "sa.advance");
+          sahl::TransposeOp::create(e.b, e.loc, raw, placedDyn({nbh, K, d}, "spad_b", h));
+          if (nh > 1) copies(h == 0 ? tb - hb : tb, "sa.advance");
+        }
       }
-    };
-    auto lp = sahl::LoopOp::create(e.b, e.loc, blocks, ArrayRef<int64_t>{tb * rowPitch, nb}, cnt);
-    {
-      OpBuilder::InsertionGuard guard(e.b);
-      e.b.setInsertionPointToEnd(&lp.getBody().emplaceBlock());
-      Value raw = placedA({hb, K}, sb);
-      for (int64_t h = 0; h < nh; ++h) {
-        Value kv = cast<MemRefType>(p.kCache.getType()).getRank() == 3
-                       ? view(p.kCache, {h * hb, b, 0}, {ix(hb), ix(1), ix(K)}, {hb, K})
-                       : view(p.kCache, {h * hb, 0}, {ix(hb), ix(K)}, {hb, K});
-        auto l = sahl::LoadOp::create(e.b, e.loc, kv, raw);
-        l->setAttr("sa.rows", e.b.getUnitAttr());
-        l->setAttr("sa.advance", e.b.getI64IntegerAttr(0));
-        ex((h + nh - 1) % nh);
-        if (nh == 1) copies(0, "sa.advance");
-        sahl::TransposeOp::create(e.b, e.loc, raw, placedDyn({nbh, K, d}, "spad_b", h));
-        if (nh > 1) copies(h == 0 ? tb - hb : tb, "sa.advance");
-      }
+      ex(nh - 1);
+      copies(tb - hb, "sa.advance_final");
     }
-    ex(nh - 1);
-    copies(tb - hb, "sa.advance_final");
-    for (int64_t g = 0; g < G; ++g)
-      if (!post(b, g, rowsAcc[g])) return notExpanded(k, __LINE__);
+    const int64_t pb = interleave ? b - 1 : b;
+    if (pb >= 0 && pb < H)
+      for (int64_t g = 0; g < G; ++g)
+        if (!post(pb, g, e.sub(rowsAll[pb % npar][g], {tb}, {rowElems}), interleave ? pb & 1 : -1))
+          return notExpanded(k, __LINE__);
   }
   eraseKernel(k);
   return true;
@@ -1732,7 +1736,8 @@ struct SahlExpandKernelsPass : public PassWrapper<SahlExpandKernelsPass, Operati
           if (!bm || !o.hasAttr("sahl.anchor")) continue;
           KernelMatcher km(cfg);
           if (!km.matchAttnLayer(bm) ||
-              !expandAttnLayer(k, km.attnLayers[bm.getOperation()], lay, cfg.d, cfg.attnBlock, cfg.maxDynamic))
+              !expandAttnLayer(k, km.attnLayers[bm.getOperation()], lay, cfg.d, cfg.attnBlock, cfg.maxDynamic,
+                               /*interleave=*/cfg.tileShrink == 0))
             notExpanded(k, __LINE__);
           break;
         }
