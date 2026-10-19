@@ -8,8 +8,14 @@ decode −1.1% to −2.7% of device time, about half of the model's −2.3% to
 −4.4%, for a reason found in §4.8 (the fused gating is not chunked enough to
 overlap the weight streaming). The schedule is fixed in `ea7ca80` (§4.9)
 and accepted on the board (2026-10-18): bit-exact, decode −3.3% to −6.1% of
-device time, within 0.4 points of the model's −3.4% to −6.3%. The attention fusion is designed in §6 (2026-10-18, not implemented).
-Measured against tag `v2.2-kv260`.
+device time, within 0.4 points of the model's −3.4% to −6.3%. The attention
+fusion (§6) is implemented for decode (2026-10-18/19: a region pass after IREE's
+region formation, IREE patch 0004, and a kernel `attn_layer`). It was accepted
+on the board on all four models (§6.4.8): bit-exact, decode device time
+−1.1% to −4.8% against the SwiGLU-fused builds. It has been on by default in
+`compile_sa.sh` since 2026-10-19 (`SA_FUSE_ATTN=0` turns it off). Prefill rows
+stay unfused (§6.4.7). Together against v2.2: decode device time −4.4% to
+−9.3%. Measured against tag `v2.2-kv260`.
 
 **In one paragraph.** Every IREE dispatch on the sa device stores its outputs
 to DDR and the next dispatch loads them back. Keeping those intermediates in

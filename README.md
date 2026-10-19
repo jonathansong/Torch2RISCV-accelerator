@@ -27,6 +27,13 @@
 > positions, Gemma-3-270M for 512, prefill vs decode bit-exact on the board over
 > a 2032-token prompt; Qwen3 decode 7.2 tok/s at T = 64 and 3.2 at T = 2048,
 > Qwen3 teacher-forcing PPL over two 2048-token windows 18.58 (fp32 18.77).
+> **Since v2.2: cross-operator fusion (2026-10-17..19,
+> [fusion_design](docs/fusion_design.md))**, both on by default and
+> bit-exact on the board. Decode's SwiGLU (two GEMVs, gating, amax, int8 in one
+> dispatch) and decode's attention (q path, scores, probabilities, p · V, int8 in
+> one dispatch per layer) together cut decode device time by 9.3% / 4.9% / 7.9% /
+> 4.4% against v2.2 (SmolLM2 / Gemma / Qwen3 / Llama: 32.9 / 53.5 / 121.6 /
+> 213.1 ms a step; Qwen3 at T = 2048 −6% for the attention alone).
 > RISC-V backend pre-research (C7, [design](docs/riscv_backend_design.md)), all
 > on the board for Gemma-3, Qwen3 and Llama-3.2, bit-exact:
 > - **Plan B**: the decode loop runs on the PicoRV32 control core instead of the
@@ -230,11 +237,12 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
   the RISC-V backend and upstreaming to IREE
 - [Cross-operator fusion](docs/fusion_design.md) - what keeping the
   intermediates of consecutive dispatches on chip would gain (the performance
-  model's upper bound per model and per operator chain) and the design of the
-  first step, the SwiGLU fusion
-- [Triton on the KV260 (proposal)](docs/triton_kv260_proposal.md) - a planned
+  model's upper bound per model and per operator chain), and the two fusions
+  done, SwiGLU and decode attention: design, schedules and board results
+- [Triton on the KV260 (proposal)](docs/triton_kv260_proposal.md) - the
   follow-up project: LLM inference as hand-fused Triton kernels lowered to the
-  same `sahl` dialect, compared with this repository's IREE path
+  same `sahl` dialect, compared with this repository's IREE path (in its own
+  repository; SmolLM2 decode on the board since 2026-10-18)
 - [Hardware learning path](docs/hardware_learning_path.md) - a staged guide
   from digital design fundamentals to the accelerator RTL, verification,
   timing closure and board measurements, with labs on this repository
