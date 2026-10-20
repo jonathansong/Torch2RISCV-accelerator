@@ -91,3 +91,5 @@ PicoRV32 control core). Start with `README.md`, then
   worth a few percent at most and deferred; decode is bound by the GEMV's weight
   streaming. Next levers: W4A8 (weights), the hardware side (LD / GEMV width,
   command issue), the results for the talk (2026-11-15).
+- Lifetime-based local memory planning (3a / 3b): designed, deferred
+  (`docs/local_memory_planning.md`).
