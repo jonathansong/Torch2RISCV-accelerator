@@ -21,8 +21,9 @@ stage_model_json.py}), the tokenizer (tokenizer.json + hf_tokenizer.py, or
 tokenizer.bin + tokenizer.py), optional board.txt (window MB, last field) and
 sa_args.txt (extra sa-llm-run arguments).
 
-    sudo bash -c 'source /etc/profile.d/pynq_venv.sh && source /etc/profile.d/xrt_setup.sh && \\
-        cd /home/xilinx/c55 && python3 board_generate.py [--max-new 64] [--prompt "Once upon a time"]'
+    sudo bash -c 'source /etc/profile.d/pynq_venv.sh && \\
+        cd /home/ubuntu/<bundle> && python3 board_generate.py [--chat] [--max-new 64] [--prompt "Once upon a time"]'
+(the KV260 has no xrt_setup.sh; under sudo bash -c, ~ is root's home: an absolute path)
 """
 import argparse
 import json

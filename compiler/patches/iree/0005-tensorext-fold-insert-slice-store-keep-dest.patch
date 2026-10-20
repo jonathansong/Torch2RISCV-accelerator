@@ -9,6 +9,10 @@ rows' computations then dead code. dest is now stored first unless it is a
 tensor.empty, so a chain folds into one store per slice. Found by the sa
 plugin's prefill attention chunks (docs/fusion_design.md §6.7).
 
+Upstream fixed it independently before this was found (iree-org/iree#24266
+and #24276, 2026-04-27, after the pinned e4a3b04): drop this patch when the
+pin moves past 349078834 (compiler/patches/iree/README.md).
+
 diff --git a/compiler/src/iree/compiler/Dialect/TensorExt/Transforms/Folders.cpp b/compiler/src/iree/compiler/Dialect/TensorExt/Transforms/Folders.cpp
 index 591fc68..8525e71 100644
 --- a/compiler/src/iree/compiler/Dialect/TensorExt/Transforms/Folders.cpp
