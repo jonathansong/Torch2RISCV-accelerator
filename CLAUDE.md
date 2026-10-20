@@ -51,8 +51,10 @@ PicoRV32 control core). Start with `README.md`, then
   Incremental build of the compiler after a plugin change:
   `cmake --build $IREE_BUILD -j 4 --target iree-compile iree-opt` (under systemd-run).
 - Compile a model: `compiler/scripts/compile_sa.sh <dir>` (defaults: executable
-  generalization, SwiGLU and decode-attention fusion on; `SA_FUSE_FFN=0`,
-  `SA_FUSE_ATTN=0`, `SA_GENERALIZE=0` turn them off).
+  generalization, SwiGLU, decode-attention and prefill-chunk fusion on;
+  `SA_FUSE_FFN=0`, `SA_FUSE_ATTN=0`, `SA_FUSE_ATTN_CHUNK=0`, `SA_GENERALIZE=0` turn
+  them off). The chunk kernel needs an export from `hf_generic` of 2026-10-19 on
+  (an earlier export's prefill rows stay unfused).
 
 ## Verification (before every commit that touches the compiler)
 
@@ -80,11 +82,12 @@ PicoRV32 control core). Start with `README.md`, then
   decode attention (§6, kernel `attn_layer`, region pass
   `FormAttnRegions.cpp` after IREE's region formation via patch 0004), both on by
   default and accepted on the board (§4.9, §6.4.8).
-- Prefill chunk kernel (§6.7, 2026-10-19/20): `--iree-sa-fuse-attn-chunk` /
-  `SA_FUSE_ATTN_CHUNK=1` (opt-in), kernel `attn_chunk`, IREE patch 0005; needs an
-  export from the current `hf_generic` (rows after their cache writes). Bit-exact on
-  the sim; accepted on the board on all four models (bundles `*c`, §6.7.1, 2026-10-20):
-  prefill −9% to −25% (40 tokens), −20% to −45% (2032 tokens), decode unchanged.
-- Open: the chunk kernel on by default; residual + RMSNorm +
-  projection fusion (§5); why the tiled attention form's interleaving gains less than
-  the model (§6.4.8).
+- Prefill chunk kernel (§6.7, 2026-10-19/20): `--iree-sa-fuse-attn-chunk`, kernel
+  `attn_chunk`, IREE patch 0005; accepted on the board on all four models (bundles
+  `*c`, §6.7.1): prefill −9% to −25% (40 tokens), −20% to −45% (2032 tokens),
+  decode unchanged. On by default since 2026-10-20 (`SA_FUSE_ATTN_CHUNK=0` off).
+- Fusion closed (2026-10-20, fusion_design.md §7): the chains left (residual +
+  RMSNorm + projection, prefill SwiGLU, the k / v path, q_proj / o_proj) are each
+  worth a few percent at most and deferred; decode is bound by the GEMV's weight
+  streaming. Next levers: W4A8 (weights), the hardware side (LD / GEMV width,
+  command issue), the results for the talk (2026-11-15).

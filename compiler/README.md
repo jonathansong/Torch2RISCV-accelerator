@@ -291,6 +291,15 @@ directory about 10–15 GB. ccache is capped at 8 GB.
   step's rv32 code 288 → 34 KB, outputs bit-exact. `SA_GENERALIZE=0` compiles
   one executable per layer as before.
 
+- **Cross-operator fusion on by default** (docs/fusion_design.md, 2026-10-17..20,
+  all accepted on the board, bit-exact): decode's SwiGLU (`--iree-sa-fuse-ffn`,
+  kernel `ffn`), decode's attention (`--iree-sa-fuse-attn`, region pass
+  `FormAttnRegions.cpp` after IREE's region formation, kernel `attn_layer`) and a
+  prefill chunk's attention (`--iree-sa-fuse-attn-chunk`, kernel `attn_chunk`:
+  16 rows a dispatch, the cache in blocks of 64 keys, two passes, an arithmetic
+  causal mask). `compile_sa.sh` passes all three; `SA_FUSE_FFN=0`,
+  `SA_FUSE_ATTN=0`, `SA_FUSE_ATTN_CHUNK=0` turn them off.
+
 - **C8 done** (docs/iree_compiler_plan.md §8.14): the code generator's
   decisions are passes with lit tests, visible in the IR: `iree-sa-to-sahl`
   groups each micro-kernel / generic contraction into a `sahl.kernel` and

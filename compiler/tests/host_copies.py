@@ -36,7 +36,7 @@ def stream_ir(d):
         flags.append("--iree-sa-fuse-ffn")
     if os.environ.get("SA_FUSE_ATTN", "1") == "1":
         flags.append("--iree-sa-fuse-attn")
-        if os.environ.get("SA_FUSE_ATTN_CHUNK", "0") == "1":     # (compile_sa.sh's: the prefill chunk kernel)
+        if os.environ.get("SA_FUSE_ATTN_CHUNK", "1") == "1":     # (compile_sa.sh's: the prefill chunk kernel)
             flags.append("--iree-sa-fuse-attn-chunk")
     cf = os.path.join(d, "compile_flags.txt")
     if os.path.exists(cf):

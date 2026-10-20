@@ -366,6 +366,60 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
         else if (this->chunks) chunks[root(int(i))].append(ch.begin(), ch.end());
         else if (rows) chains.push_back(std::move(ch));
       }
+      // a chunk only when its rows read the same caches (the int8 tensors the rows' regions
+      // read from outside, through views: hf_generic's rows after all their cache writes,
+      // 2026-10-19 on);
+      // an earlier export's rows each read the cache after its own write: left unfused
+      for (auto it = chunks.begin(); it != chunks.end();) {
+        std::map<int, llvm::SetVector<Value>> byRow;
+        for (auto [i, ch] : llvm::enumerate(blockChains)) {
+          if (!rowChains.contains(int(i)) || root(int(i)) != it->first) continue;
+          llvm::DenseSet<Operation *> own(ch.begin(), ch.end());
+          // (from outside the row's chain: its own reshapes between its regions do not count;
+          // through views, to the value they look at)
+          auto source = [&](Value v) {
+            while (Operation *d = v.getDefiningOp()) {
+              if (own.contains(d) || !(isReshape(d) || isa<tensor::ExtractSliceOp>(d))) break;
+              v = d->getOperand(0);
+            }
+            return v;
+          };
+          for (Operation *o : ch)
+            if (auto reg = dyn_cast<DispatchRegionOp>(o))
+              for (Value v : captured(reg)) {
+                auto t = dyn_cast<ShapedType>(v.getType());
+                Operation *d = v.getDefiningOp();
+                if (!t || !t.getElementType().isInteger(8) || t.getRank() < 2 ||
+                    (d && own.contains(blk->findAncestorOpInBlock(*d))))
+                  continue;
+                byRow[int(i)].insert(source(v));
+              }
+        }
+        bool same = llvm::all_of(byRow, [&](auto &kv) { return kv.second == byRow.begin()->second; });
+        if (dbg)
+          for (auto &[r, vs] : byRow) {
+            llvm::errs() << "attn: chunk row " << r << " reads:";
+            for (Value v : vs) {
+              llvm::errs() << " " << v.getType();
+              if (Operation *d = v.getDefiningOp()) llvm::errs() << "(" << d->getName() << ")";
+              llvm::errs() << "@" << v.getAsOpaquePointer();
+            }
+            llvm::errs() << "\n";
+          }
+        if (!same) {
+          if (dbg) {
+            llvm::errs() << "attn: a chunk's rows read different caches: left unfused\n";
+            for (auto &[r, vs] : byRow) {
+              llvm::errs() << "  row chain " << r << ":";
+              for (Value v : vs) llvm::errs() << " " << v.getType() << "@" << v.getAsOpaquePointer();
+              llvm::errs() << "\n";
+            }
+          }
+          it = chunks.erase(it);
+        } else {
+          ++it;
+        }
+      }
       for (auto &[r, ops] : chunks) {
         llvm::sort(ops, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
         // the rows' small inputs computed outside (a row's slice of the chunk's q, the RoPE

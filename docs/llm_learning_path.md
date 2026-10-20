@@ -373,8 +373,10 @@ them agree bit for bit.
 1. `iree_compiler_plan.md` §8.13 (C6.P): prefill in chunks of M = 16 rows
    (one array height), a separate `prefill` export, the KV cache shared.
 2. `iree_compiler_plan.md` §8.19 and `hf_generic.py` `_attention_rows`:
-   prefill attention row by row, so each row computes exactly what decode
-   computes at that position.
+   prefill attention per row, so each row computes exactly what decode
+   computes at that position; since 2026-10-19 the rows' K / V written first and
+   the 16 rows' attention one kernel (`fusion_design.md` §6.7: each head's cache
+   read once a chunk, the same numbers).
 3. `sa_llm_run.c` `--prefill`, `--prefill_all_out`: chunks at 0, M, 2M, …;
    `prefill_all` returns every position's logits (teacher forcing on the
    device, stage 10).

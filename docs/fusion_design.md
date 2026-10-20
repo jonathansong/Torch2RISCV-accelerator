@@ -20,7 +20,9 @@ attention rows in one dispatch per layer, bit-exact on the sim on Gemma, Qwen3
 and Llama up to 2048 positions; in the model a layer's prefill attention costs
 −51% to −64%. Accepted on the board on all four models (2026-10-20, §6.7.1):
 bit-exact, prefill −9% to −25% at a 40-token prompt and −20% to −45% at a
-2032-token one (Gemma 496), decode unchanged; opt-in (`SA_FUSE_ATTN_CHUNK=1`).
+2032-token one (Gemma 496), decode unchanged; on by default since 2026-10-20
+(`SA_FUSE_ATTN_CHUNK=0` turns it off). The fusion work is closed there (§7):
+the chains left are worth a few percent each and are deferred.
 
 **In one paragraph.** Every IREE dispatch on the sa device stores its outputs
 to DDR and the next dispatch loads them back. Keeping those intermediates in
@@ -1014,7 +1016,7 @@ The untiled form now follows §6.4.2's schedule and §6.5's banks:
 
 #### 6.4.7 Decode only, for now (2026-10-18)
 
-- **Prefill rows are no longer fused.** The model (2-layer builds, a chunk of
+- **Prefill rows are no longer fused** (superseded by the chunk kernel, §6.7). The model (2-layer builds, a chunk of
   16 rows) gave prefill slower with every row fused: Qwen3 4423K → 5158K
   cycles (+17%), Llama +4%. Each fused row is a decode step's kernel: it loads
   and transposes the cache of every KV head once per row, 16 times a chunk.
@@ -1309,9 +1311,47 @@ vectors, not the chunk's tensors) are copied too, and the chunk reads the k
 projection once. Gemma's chunk region: 448 regions with a 4096-element bound
 (it copied each row's dequantized k chunk too: ACC full), 256 with 1024.
 
-Left: the chunk kernel on by default; the two passes' K loads and transposes are
-paid twice and pass 1 / pass 2 of different units could overlap more; the q
-paths batched over the rows.
+**On by default since 2026-10-20**: `compile_sa.sh` passes
+`--iree-sa-fuse-attn-chunk` with `--iree-sa-fuse-attn` unless
+`SA_FUSE_ATTN_CHUNK=0` (`host_copies.py` the same); `iree-compile`'s flag stays
+off. An export from before the frontend change (each row reading the cache after
+its own write) keeps its rows unfused: the region pass merges a chunk only when
+its rows read the same int8 tensors from outside (the caches, through views);
+checked on such an export (no chunk formed, logits bit-identical to before) and on
+this frontend's 2-layer Qwen3 and Gemma with the defaults (chunks formed, logits
+bit-identical to the unfused builds).
+
+Not done (§7): pass 1 recomputes what pass 2 needs (K's loads and transposes, the
+EX, the scores' epilogue and mask; a single pass with the scores kept in ACC for T
+up to a few hundred would save an estimated 30–40% of the units' blocks there);
+the q paths batched over the rows (they are bound by the VE's throughput, not its
+fixed cost: about 5–10% of them).
+
+## 7. Where it stands (2026-10-20): closed
+
+| Fusion | Status | Board, against the build before it |
+|---|---|---|
+| SwiGLU, decode (§4) | on by default | decode −3.3% to −6.1% |
+| Decode attention, stage 1 (§6.4) | on by default | decode −1.1% to −4.8% (−2.8% to −6.5% at T = 2048) |
+| Prefill chunk kernel (§6.7) | on by default | prefill −9% to −25% (40 tokens), −20% to −45% (2032) |
+| The tiled form's interleaving (§6.4.8) | done | about +0.6%, below the model; not explained |
+| Decode attention stage 2, k / v path (§6.3) | deferred | bound −0.5% decode / −1.0% prefill (Qwen3) |
+| q_proj / o_proj in the region (§6.3) | deferred | bound −0.1% to −0.9% |
+| Residual + RMSNorm + projection (§5) | deferred | bound −0.9% to −4.0% decode, −2.5% to −4.8% prefill |
+| SwiGLU for prefill | deferred | bound −2.4% to −4.2% prefill |
+
+Against v2.2: decode device time −4.4% to −9.3% (the upper bound of §2.2 was
+−4.5% to −14%); prefill well past §2.2's −10% to −20%, because the chunk kernel
+also removed work (every row reading and transposing every head's cache), not
+only the round trips.
+
+**Why stop here.** Each chain left is a few percent at most in the model, and the
+board has given about half of the model before (§4.8, §6.4.8); each costs a
+region pattern, a kernel and a round of 2-layer, golden, bundle and board checks.
+Decode is bound by the GEMV's weight streaming (about 80% of a step), prefill now
+by the linear layers. The larger levers are elsewhere: fewer weight bytes (W4A8,
+the performance model's answer to the next step, `perf_model.py --whatif`), the
+hardware side (LD / GEMV width, command issue), and the results for the talk.
 
 ## Files
 
