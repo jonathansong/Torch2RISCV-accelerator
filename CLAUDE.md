@@ -30,8 +30,8 @@ PicoRV32 control core). Start with `README.md`, then
   `jonathansong/iree`, clone `/home/jon/Projects/iree-pr-work`): the DCO
   `Signed-off-by` is the user's own (`! git commit --amend -s`); you push after.
 - **Docs**: `docs/*.md` in English are canonical and committed; the `*.zh.md`
-  copies are local and not updated. `docs/results_v2.2.md` is a frozen release
-  record.
+  copies are local and not updated. `docs/results_v2.2.md` and
+  `docs/results_v2.3.md` are frozen release records.
 - **Leave alone**: `.vscode/`, the untracked `compiler/patches/iree-pr1/2/3`,
   `Hummingbird.pdf`; the sibling repo `../triton-kv260` (another session's project).
 - **Before deleting or overwriting** anything under `build/`, check that no build
@@ -74,10 +74,12 @@ PicoRV32 control core). Start with `README.md`, then
   `compiler/scripts/run_board_tests.sh` there when it changed); rerunning a bundle
   name that passed before needs `sudo REDO=1 bash run_board_tests.sh ...`.
 
-## Where the work stands (2026-10-19)
+## Where the work stands (2026-10-20)
 
 - Release `v2.2.1-kv260` (`docs/results_v2.2.md`): four models (SmolLM2-135M,
   Gemma-3-270M, Qwen3-0.6B, Llama-3.2-1B) on the board, bit-exact.
+- Release `v2.3-kv260` (`docs/results_v2.3.md`, branch `kv260-v2.3`): the same with
+  the three fusions on by default; bundles `build/deploy_hfgen_*c_pcpi`.
 - Since then, cross-operator fusion (`docs/fusion_design.md`): SwiGLU (§4) and
   decode attention (§6, kernel `attn_layer`, region pass
   `FormAttnRegions.cpp` after IREE's region formation via patch 0004), both on by

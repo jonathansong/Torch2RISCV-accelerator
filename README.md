@@ -16,6 +16,12 @@
 > SmolLM2-135M 22.1 / 60.5, Gemma-3-270M 15.0 / 62.6, Qwen3-0.6B 7.0 / 20.8,
 > Llama-3.2-1B 4.0 / 15.1 (public W8A8 checkpoints, int8 KV cache; board
 > perplexity within 1-16% of fp32).
+> **Results v2.3 (2026-10-20, tag `v2.3-kv260`,
+> [results_v2.3](docs/results_v2.3.md))**: with the three fusions below, decode /
+> prefill tok/s SmolLM2-135M 27.0 / 73.6, Gemma-3-270M 17.6 / 78.9, Qwen3-0.6B
+> 7.94 / 25.9, Llama-3.2-1B 4.64 / 16.8 (1.05-1.14x decode, 1.09-1.37x prefill
+> against v2.2; a 2032-token prompt: Qwen3 13.4 tok/s against 7.0), same
+> overlay, runtime and quality, bit-exact.
 > **Consolidated results (2026-10-17, tag `v2.2-kv260`,
 > [results_v2.2](docs/results_v2.2.md))**: all four models compiled for 2048
 > positions (Gemma 512), decode / prefill tok/s SmolLM2-135M 23.6 / 57.8,
@@ -229,6 +235,8 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 
 ## Documentation
 
+- [Results v2.3](docs/results_v2.3.md) - the board numbers with the fusions
+  (tag `v2.3-kv260`): speed, long context, the RISC-V paths, against v2.2
 - [Results v2.2](docs/results_v2.2.md) - the consolidated board numbers
   (tag `v2.2-kv260`): speed, quality, long context, decode bandwidth and the
   RISC-V backend paths for SmolLM2, Gemma-3, Qwen3 and Llama-3.2, with the
