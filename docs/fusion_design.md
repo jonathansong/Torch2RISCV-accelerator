@@ -18,7 +18,9 @@ against v2.2: decode device time −4.4% to −9.3%. Measured against tag
 `v2.2-kv260`. Prefill: a chunk kernel (§6.7, 2026-10-19/20) runs a chunk's 16
 attention rows in one dispatch per layer, bit-exact on the sim on Gemma, Qwen3
 and Llama up to 2048 positions; in the model a layer's prefill attention costs
-−51% to −64%; opt-in (`SA_FUSE_ATTN_CHUNK=1`), not on the board yet.
+−51% to −64%. Accepted on the board on all four models (2026-10-20, §6.7.1):
+bit-exact, prefill −9% to −25% at a 40-token prompt and −20% to −45% at a
+2032-token one (Gemma 496), decode unchanged; opt-in (`SA_FUSE_ATTN_CHUNK=1`).
 
 **In one paragraph.** Every IREE dispatch on the sa device stores its outputs
 to DDR and the next dispatch loads them back. Keeping those intermediates in
@@ -1267,10 +1269,49 @@ the unfused build's work, ≈ 11K cycles a row), the rest the units' blocks;
 exp is the largest single operation. A 2-layer prefill chunk (the model,
 T = 32): 503 → 217 dispatches.
 
-Left: the board (bundles with `SA_FUSE_ATTN_CHUNK=1`, an export from this
-frontend); SmolLM2 (its G = 3 is fine for the kernel, not run yet); the two
-passes' K loads and transposes are paid twice and pass 1 / pass 2 of different
-units could overlap more; the q paths batched over the rows.
+#### 6.7.1 Board results (2026-10-20, bundles `*c`)
+
+The four models exported again by this frontend (`qllama.irpa` byte-identical
+to the earlier exports: the sim's references of the bundles stay valid),
+compiled with the defaults and `SA_FUSE_ATTN_CHUNK=1` (+ `--iree-sa-riscv`) at
+2048 positions (Gemma 512), bundles `deploy_hfgen_{smollm2,gemma,qwen3,llama}c_pcpi`
+(`build/chunk/bundles_chunk.sh`), `run_board_tests.sh smollm2c gemmac qwen3c llamac`.
+On the host first: no dispatch on the host, `host_copies.py` PASS, the chunk
+dispatch's `dispatch_check` OK at T = 16, 144 and the maximum, each with `--pos 0`.
+All eight tests pass on all four: logits bit-exact with the sim (17/17 steps);
+long context, prefill against decode-only rows bit-exact (17/17), the generated
+tokens identical; the length sweep; plan B and plan A (`rvsched`, `rvcode
+--embedded`, `rvsched --rv --embedded`).
+
+Prefill time against the `*a` bundles (§6.4.8: the same build without the
+chunk kernel), board, ms:
+
+| | SmolLM2 | Gemma | Qwen3 | Llama |
+|---|---:|---:|---:|---:|
+| 40-token prompt, 3 chunks (`llm`) | 924.9 → **703.9 (−24%)** | 764.8 → **658.2 (−14%)** | 2547.5 → **1914.5 (−25%)** | 3181.5 → **2898.0 (−9%)** |
+| 32-token prompt, 2 chunks (`profile --batch`) | 620.0 → **472.5 (−24%)** | 522.6 → **452.0 (−14%)** | 1705.8 → **1288.0 (−24%)** | 2132.4 → **1948.6 (−9%)** |
+| 2032-token prompt, 127 chunks (Gemma 496, 31) | 95.8 s → **62.9 s (−34%)** | 9.06 s → **7.19 s (−21%)** | 277.3 s → **151.2 s (−45%)** | 227.7 s → **182.9 s (−20%)** |
+| prefill tokens / s at 2032 (Gemma 496) | 21.2 → **32.3** | 54.8 → **69.0** | 7.33 → **13.44** | 8.92 → **11.11** |
+
+Decode is unchanged (37.3 / 57.0 / 126.1 / 215.7 ms a step). The gain grows
+with the context: a row by row chunk loaded and transposed every head's cache
+16 times. Llama gains least: its prefill is mostly the linear layers (hidden
+2048, 8192 in the MLP), the attention a smaller share.
+
+**A fix the whole Gemma needed** (the 2-layer build passed): its RoPE rows are
+computed in small regions together with each row's k norm, so the copies of
+§6.7's region pass captured those norms, 32 inputs a chunk. In the 2-layer
+build their offsets were constants (one base register for the binding); with
+the per-layer generalization (§9.11 of the RISC-V design) each became a push
+constant and a base register of its own, past 15. The copying now goes on in
+rounds: a copied region's own small inputs (at most 1024 elements: a row's
+vectors, not the chunk's tensors) are copied too, and the chunk reads the k
+projection once. Gemma's chunk region: 448 regions with a 4096-element bound
+(it copied each row's dequantized k chunk too: ACC full), 256 with 1024.
+
+Left: the chunk kernel on by default; the two passes' K loads and transposes are
+paid twice and pass 1 / pass 2 of different units could overlap more; the q
+paths batched over the rows.
 
 ## Files
 

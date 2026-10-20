@@ -374,15 +374,23 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
         // has at most 16 bindings and 15 base registers)
         {
           llvm::DenseSet<Operation *> inSet(ops.begin(), ops.end());
+          // (a row's: at most 4096 elements; a copied region's own inputs at most 1024, a
+          // row's vectors, not the chunk's tensors)
+          int round = 0;
           auto cheapRegion = [&](DispatchRegionOp p) {
             if (kindOf(p).contraction) return false;
             for (Type t : p->getResultTypes())
-              if (auto rt = dyn_cast<RankedTensorType>(t); !rt || !rt.hasStaticShape() || rt.getNumElements() > 4096)
+              if (auto rt = dyn_cast<RankedTensorType>(t);
+                  !rt || !rt.hasStaticShape() || rt.getNumElements() > (round ? 1024 : 4096))
                 return false;
             return true;
           };
+          // (in rounds: a copied region's own small inputs copied too, e.g. Gemma's RoPE rows
+          // read with the k path's norm of each row)
+          SmallVector<Operation *> todo(ops.begin(), ops.end());
+          for (; round < 4 && !todo.empty(); ++round) {
           SmallVector<Operation *> added;
-          for (Operation *o : ops) {
+          for (Operation *o : todo) {
             auto reg = dyn_cast<DispatchRegionOp>(o);
             if (!reg) continue;
             for (Value v : captured(reg)) {
@@ -415,6 +423,8 @@ struct FormAttnRegionsPass : public PassWrapper<FormAttnRegionsPass, OperationPa
             }
           }
           for (Operation *a : added) ops.push_back(a), inSet.insert(a);
+          todo = added;
+          }
           llvm::sort(ops, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
         }
         // every use outside after the chunk's last op (each row's were after its own): the

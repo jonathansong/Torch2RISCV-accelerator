@@ -83,7 +83,8 @@ PicoRV32 control core). Start with `README.md`, then
 - Prefill chunk kernel (§6.7, 2026-10-19/20): `--iree-sa-fuse-attn-chunk` /
   `SA_FUSE_ATTN_CHUNK=1` (opt-in), kernel `attn_chunk`, IREE patch 0005; needs an
   export from the current `hf_generic` (rows after their cache writes). Bit-exact on
-  the sim (Gemma, Qwen3, Llama, up to 2048); not on the board yet.
-- Open: the chunk kernel on the board, then on by default; residual + RMSNorm +
+  the sim; accepted on the board on all four models (bundles `*c`, §6.7.1, 2026-10-20):
+  prefill −9% to −25% (40 tokens), −20% to −45% (2032 tokens), decode unchanged.
+- Open: the chunk kernel on by default; residual + RMSNorm +
   projection fusion (§5); why the tiled attention form's interleaving gains less than
   the model (§6.4.8).
