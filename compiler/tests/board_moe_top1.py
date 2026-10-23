@@ -2,8 +2,7 @@
 """KV260 M2 acceptance: PicoRV32 top-1 writes sa_moe_route v1 through RT_CALL.
 
 Copy this script, pynq_matmul.py, rt_fw.bin, the overlay and moe_top1.bin to
-the board, then run:
-  sudo python3 board_moe_top1.py --experts 4 --expert-stride 6784
+the board, then use run_board.sh so the PYNQ and XRT environments are active.
 """
 
 import argparse
