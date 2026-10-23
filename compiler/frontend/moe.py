@@ -12,11 +12,17 @@ from dataclasses import dataclass
 import json
 import math
 import os
+import struct
 
 import numpy as np
 
 
 F32 = np.float32
+ROUTE_MAX_K = 2
+ROUTE_RECORD_SIZE = 32
+ROUTE_IDS_OFFSET = 4
+ROUTE_OFFSETS_OFFSET = ROUTE_IDS_OFFSET + 4 * ROUTE_MAX_K
+ROUTE_WEIGHTS_OFFSET = ROUTE_OFFSETS_OFFSET + 4 * ROUTE_MAX_K
 
 
 def _align(value, alignment):
@@ -144,6 +150,53 @@ def route(scores, top_k, normalize=True):
     else:
         weights = selected
     return ids, weights.astype(F32)
+
+
+def pack_route_record(ids, offsets, weights):
+    """Packs the host/device v1 routing ABI into one aligned 32-byte record."""
+    ids = np.asarray(ids, dtype=np.uint32)
+    offsets = np.asarray(offsets, dtype=np.uint32)
+    weights = np.asarray(weights, dtype=F32)
+    if not 0 < ids.size <= ROUTE_MAX_K or offsets.shape != ids.shape or weights.shape != ids.shape:
+        raise ValueError(f"routing fields must have the same length in [1, {ROUTE_MAX_K}]")
+    padded_ids = np.zeros(ROUTE_MAX_K, np.uint32)
+    padded_offsets = np.zeros(ROUTE_MAX_K, np.uint32)
+    padded_weights = np.zeros(ROUTE_MAX_K, np.uint32)
+    padded_ids[:ids.size] = ids
+    padded_offsets[:ids.size] = offsets
+    padded_weights[:ids.size] = weights.view(np.uint32)
+    values = [ids.size, *padded_ids, *padded_offsets, *padded_weights, 0]
+    record = struct.pack("<8I", *[int(v) for v in values])
+    assert len(record) == ROUTE_RECORD_SIZE
+    return record
+
+
+def unpack_route_record(record):
+    if len(record) != ROUTE_RECORD_SIZE:
+        raise ValueError(f"routing record must be {ROUTE_RECORD_SIZE} bytes")
+    values = struct.unpack("<8I", record)
+    count = values[0]
+    if not 0 < count <= ROUTE_MAX_K:
+        raise ValueError(f"routing count must be in [1, {ROUTE_MAX_K}]")
+    ids = np.asarray(values[1:1 + count], np.uint32)
+    offsets = np.asarray(values[3:3 + count], np.uint32)
+    weight_bits = np.asarray(values[5:5 + count], np.uint32)
+    return ids, offsets, weight_bits.view(F32)
+
+
+def host_route_record(scores, manifest, top_k=1):
+    """Runs host top-k and returns its v1 record plus decoded routing values."""
+    if manifest.get("format") != "sa-moe-parameters-v1":
+        raise ValueError("unsupported MoE parameter manifest")
+    if top_k > ROUTE_MAX_K:
+        raise ValueError(f"routing ABI v1 supports at most top-{ROUTE_MAX_K}")
+    ids, weights = route(scores, top_k)
+    stride = int(manifest["expert_stride"])
+    offsets64 = ids.astype(np.uint64) * stride
+    if np.any(offsets64 > np.iinfo(np.uint32).max):
+        raise ValueError("expert byte offset does not fit in the v1 routing ABI")
+    offsets = offsets64.astype(np.uint32)
+    return pack_route_record(ids, offsets, weights), ids, offsets, weights
 
 
 def fp32_expert(x, weights, expert_id):

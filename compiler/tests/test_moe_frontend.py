@@ -27,6 +27,17 @@ class MoeFrontendTest(unittest.TestCase):
         np.testing.assert_array_equal(ids, [0, 1, 3])
         np.testing.assert_allclose(weights, np.full(3, 1 / 3, np.float32), rtol=0, atol=1e-7)
 
+    def test_host_routing_record_round_trip(self):
+        _, manifest = moe.pack_parameters(self.config, self.q)
+        scores = np.array([-2, 4, 1, 3], np.float32)
+        record, ids, offsets, weights = moe.host_route_record(scores, manifest, top_k=2)
+        self.assertEqual(len(record), moe.ROUTE_RECORD_SIZE)
+        got_ids, got_offsets, got_weights = moe.unpack_route_record(record)
+        np.testing.assert_array_equal(got_ids, ids)
+        np.testing.assert_array_equal(got_offsets, offsets)
+        np.testing.assert_array_equal(offsets, ids.astype(np.uint32) * manifest["expert_stride"])
+        np.testing.assert_array_equal(got_weights, weights)
+
     def test_forced_experts_match_manual_fp32_combine(self):
         ids = np.array([3, 1], np.int32)
         routing = np.array([0.25, 0.75], np.float32)
