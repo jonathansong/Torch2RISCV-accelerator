@@ -42,26 +42,24 @@ def expert_layout(dim, hidden, alignment=64):
 def top2_ffn_template(dim, hidden, d=16, alignment=64, ret=True):
     if dim <= 0 or hidden <= 0 or dim % d or hidden % d:
         raise ValueError("M3b requires positive dimensions aligned to D")
-    if max(dim, hidden) // d > 8:
-        raise ValueError("M3b currently supports at most 8 GEMV strips")
 
     offsets = expert_layout(dim, hidden, alignment)
     lay = CL.Layout(d)
     dw, hw = dim // d, hidden // d
+    if dw + hw > lay.sbank:
+        raise ValueError("M3b compact input and hidden activations do not fit SPAD_A")
 
     # Persistent and reusable ACC allocations. Each word contains D lanes.
     x = lay.acc0
     tmp_x = x + dw
     gate = tmp_x + 3
-    gate_s = gate + hw
-    up = gate_s + hw
-    up_s = up + hw
-    hidden_v = up_s + hw
+    up = gate + hw
+    hidden_v = up + hw
     tmp_h = hidden_v + hw
     down = tmp_h + 3
-    down_s = down + dw
-    combined = down_s + dw
-    if combined + dw > lay.cbank:
+    combined = down + dw
+    scale = combined + dw
+    if scale + 8 > lay.cbank:
         raise ValueError("M3b activation layout does not fit ACC bank 0")
 
     dl = DescList().ld(0, laddr(MEM_ACC, x), 1, dim * 4, dim * 4, base=0)
@@ -82,25 +80,28 @@ def top2_ffn_template(dim, hidden, d=16, alignment=64, ret=True):
 
     sx = quant_vector(x, dim, tmp_x, 0)
 
-    def projection(w_off, s_off, k, n, out, scale, a_strip):
-        strips = n // d
+    def projection(w_off, s_off, k, n, out, a_strip, act_scale):
+        """Chunked direct GEMV and W8A8 dequantization (at most 8 strips/command)."""
+        total_strips = n // d
         row_bytes = k * d
-        dl.gemv(w_off, laddr(MEM_ACC, out), strips, row_bytes, row_bytes, a_strip,
-                base=2, dyn=[("ddr", 6, True)])
-        dl.ld(s_off, laddr(MEM_ACC, scale), 1, n * 4, n * 4,
-              base=2, dyn=[("ddr", 6, True)])
-        dl.ve(laddr(MEM_ACC, out), laddr(MEM_ACC, scale), laddr(MEM_ACC, out), n,
-              VOPS["mul"], T_IF, fp=True, t2=F32)
+        for start in range(0, total_strips, 8):
+            strips = min(8, total_strips - start)
+            elements = strips * d
+            dl.gemv(w_off + start * row_bytes, laddr(MEM_ACC, out + start), strips,
+                    row_bytes, row_bytes, a_strip, base=2, dyn=[("ddr", 6, True)])
+            dl.ld(s_off + start * d * 4, laddr(MEM_ACC, scale), 1, elements * 4,
+                  elements * 4, base=2, dyn=[("ddr", 6, True)])
+            dl.ve(laddr(MEM_ACC, out + start), laddr(MEM_ACC, scale),
+                  laddr(MEM_ACC, out + start), elements, VOPS["mul"], T_IF, fp=True, t2=F32)
+            dl.ve(laddr(MEM_ACC, out + start), laddr(MEM_ACC, act_scale),
+                  laddr(MEM_ACC, out + start), elements, VOPS["mul"], T_FF, fp=True,
+                  m2="div", period=strips)
 
     def expert(route_offset, route_weight, first):
         dl.ldparam(route_offset, 6, base=1)
         dl.ldparam(route_weight, 7, base=1)
-        projection(offsets["gate_w"], offsets["gate_s"], dim, hidden, gate, gate_s, 0)
-        dl.ve(laddr(MEM_ACC, gate), laddr(MEM_ACC, sx), laddr(MEM_ACC, gate), hidden,
-              VOPS["mul"], T_FF, fp=True, m2="div", period=hw)
-        projection(offsets["up_w"], offsets["up_s"], dim, hidden, up, up_s, 0)
-        dl.ve(laddr(MEM_ACC, up), laddr(MEM_ACC, sx), laddr(MEM_ACC, up), hidden,
-              VOPS["mul"], T_FF, fp=True, m2="div", period=hw)
+        projection(offsets["gate_w"], offsets["gate_s"], dim, hidden, gate, 0, sx)
+        projection(offsets["up_w"], offsets["up_s"], dim, hidden, up, 0, sx)
 
         # hidden = SiLU(gate) * up = gate / (1 + exp(-gate)) * up.
         dl.ve(laddr(MEM_ACC, gate), 0, laddr(MEM_ACC, hidden_v), hidden,
@@ -113,9 +114,7 @@ def top2_ffn_template(dim, hidden, d=16, alignment=64, ret=True):
               VOPS["mul"], T_FF, fp=True, B=-0.0)
 
         sh = quant_vector(hidden_v, hidden, tmp_h, dw)
-        projection(offsets["down_w"], offsets["down_s"], hidden, dim, down, down_s, dw)
-        dl.ve(laddr(MEM_ACC, down), laddr(MEM_ACC, sh), laddr(MEM_ACC, down), dim,
-              VOPS["mul"], T_FF, fp=True, m2="div", period=dw)
+        projection(offsets["down_w"], offsets["down_s"], hidden, dim, down, dw, sh)
         target = combined if first else down
         dl.ve(laddr(MEM_ACC, down), 0, laddr(MEM_ACC, target), dim,
               VOPS["copy"], T_FF, fp=True, dyn=[("A", 7)])
