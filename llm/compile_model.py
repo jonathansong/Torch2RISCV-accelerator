@@ -93,8 +93,8 @@ class ModelCompiler:
         self.d = d or m.d
         if self.d != m.d:
             raise ValueError("the .w8a8 packing D differs")
-        if c.kv_dim != c.dim or c.head_size % self.d or c.seq_len % self.d:
-            raise ValueError("needs kv_dim == dim and head_size, seq_len multiples of D")
+        if c.heads % c.kv_heads or c.head_size % self.d or c.seq_len % self.d:
+            raise ValueError("needs grouped query heads and head_size, seq_len multiples of D")
         self.lay = CL.Layout(self.d)
         self.R = Region
         self.rm, self.rio, self.rkv = model, io, kv
@@ -117,8 +117,8 @@ class ModelCompiler:
         self.U = take(w(c.hidden))
         self.T1, self.T2 = take(w(2 * c.dim)), take(w(2 * c.dim))
         self.G, self.COS, self.SIN = take(w(c.dim)), take(w(c.dim)), take(w(c.dim))
-        self.TMP = take(8)                                          # quant_act: amax, s_x, 1/s_x
-        self.S = take(8)                                            # softmax: max, sum, recip; rmsnorm
+        self.TMP = take(3)                                          # quant_act: amax, s_x, 1/s_x
+        self.S = take(3)                                            # softmax: max, sum, recip; rmsnorm
         self.rmax = c.seq_len // d                                  # score words at most
         self.SCF, self.E = take(self.rmax), take(self.rmax)
         self.SC = take(d * self.rmax)                               # EX scores (D rows, crow = rmax)
@@ -207,7 +207,7 @@ class ModelCompiler:
         dl.ldparam(self.rio(ARG_POS), P_SCR, mul=rb, base=self.rio.base)
         for tab, dst in (("rope_cos", self.COS), ("rope_sin", self.SIN)):
             dl.ld(self.rm(m.offset(tab)), acc(dst), 1, rb, rb, base=self.rm.base, dyn=[("ddr", P_SCR, True)])
-        n, per = 2 * c.dim, c.dim // d
+        n, per = c.dim + c.kv_dim, c.dim // d
         dl.ve(acc(self.QKV), acc(self.COS), acc(self.T1), n, MUL, T_FF, fp=True, m2="mod", period=per, B=NEG0)
         dl.ve(acc(self.QKV), acc(self.SIN), acc(self.T2), n, MUL, T_FF, fp=True, m2="mod", period=per,
               swapneg=True, B=NEG0)
@@ -246,40 +246,51 @@ class ModelCompiler:
         kt, vb = self.attention_banks()
         if fence:
             dl.fence()                                  # this token's K / V rows are in DDR
-        dl.setreg((DescList.REG_PARAM + P_L0, 0), (DescList.REG_PARAM + P_L1, 0))
-        start = len(dl)
-        # scores
-        dl.ld(self.rkv(koff), laddr(MEM_SPAD_A, self.KRAW), 1, hs, c.kv_dim, base=self.rkv.base,
-              dyn=[("ddr", P_L0, True), ("rows", P_POSPAD)])
-        dl.transpose(laddr(MEM_SPAD_A, self.KRAW), laddr(MEM_SPAD_B, kt), d * d, I8 | I8 << 2, hw,
-                     dyn=[("len", P_KTLEN)])
-        dl.ve(acc(q), 0, acc(self.TMP), hs, COPY, T_FF, fp=True, func="abs", reduce="max",
-              dyn=[("src1", P_L1, True)])                                                        # amax
-        dl.ve(acc(self.TMP), 0, acc(self.TMP + 1), d, COPY, T_FF, fp=True, A=CL.INV127)            # s_q
-        dl.ve(acc(self.TMP), 0, acc(self.TMP + 2), d, COPY, T_FF, fp=True, A=CL.INV127, func="recip")
-        dl.ve(acc(q), acc(self.TMP + 2), laddr(MEM_SPAD_A, 0), hs * d, MUL, F32 | I8 << 2, fp=True,
-              m1="div", p1=d, m2="div", period=hs, dyn=[("src1", P_L1, True)])                  # q_h strip
-        dl.ex(0, kt, self.SC, hw, repeat=1, bstep=hs, cstep=1, crow=self.rmax, dyn=[("repeat", P_TILES)])
-        dl.ve(acc(self.SC), acc(self.TMP + 1), acc(self.SCF), d, MUL, I32 | F32 << 2, fp=True, t2=F32,
-              m2="div", period=self.rmax, A=a_k, B=NEG0, dyn=[("len", P_POSPAD)])                 # * s_q * a_k
-        # softmax over pos + 1 valid scores
-        dl.ve(acc(self.SCF), 0, acc(self.S), d, COPY, T_FF, fp=True, reduce="max",
-              dyn=[("len", P_POSPAD), ("valid", P_VALID)])                                      # m
-        dl.ve(acc(self.SCF), acc(self.S), acc(self.E), d, SUB, T_FF, fp=True, m2="div", period=self.rmax,
-              func="exp", B=NEG0, dyn=[("len", P_POSPAD), ("valid", P_VALID)])                  # e
-        dl.ve(acc(self.E), 0, acc(self.S + 1), d, COPY, T_FF, fp=True, reduce="sum", B=NEG0,
-              dyn=[("len", P_POSPAD)])                                                           # sum
-        dl.ve(acc(self.S + 1), 0, acc(self.S + 2), d, COPY, T_FF, fp=True, func="recip", B=NEG0)  # r
-        dl.ve(acc(self.E), acc(self.S + 2), laddr(MEM_SPAD_A, 0), d * d, MUL, F32 | I8 << 2, fp=True,
-              m1="div", p1=d, m2="div", period=smax, A=127.0, B=NEG0, dyn=[("len", P_PLEN)])     # p strip
-        # att_h = P V
-        dl.ld(self.rkv(voff), laddr(MEM_SPAD_B, vb), 1, hs, c.kv_dim, LD_INTERLEAVE, base=self.rkv.base,
-              dyn=[("ddr", P_L0, True), ("rows", P_POSPAD)])
-        dl.ex(0, vb, self.OC, 1, repeat=hw, bstep=d, cstep=1, crow=hw,
-              dyn=[("kt", P_TILES), ("bstep", P_POSPAD)])
-        dl.ve(acc(self.OC), 0, acc(att), hs, COPY, I32 | F32 << 2, fp=True, A=a_v, B=NEG0,
-              dyn=[("dst", P_L1, True)])
-        dl.loop_end(start - len(dl), c.heads, k1=P_L0, s1=hs, k2=P_L1, s2=hw)
+        rep = c.heads // c.kv_heads
+        if rep == 1:
+            dl.setreg((DescList.REG_PARAM + P_L0, 0), (DescList.REG_PARAM + P_L1, 0))
+
+        def head_group(kv_head):
+            if rep != 1:
+                dl.setreg((DescList.REG_PARAM + P_L0, kv_head * hs),
+                          (DescList.REG_PARAM + P_L1, kv_head * rep * hw))
+            start = len(dl)
+            # scores
+            dl.ld(self.rkv(koff), laddr(MEM_SPAD_A, self.KRAW), 1, hs, c.kv_dim, base=self.rkv.base,
+                  dyn=[("ddr", P_L0, True), ("rows", P_POSPAD)])
+            dl.transpose(laddr(MEM_SPAD_A, self.KRAW), laddr(MEM_SPAD_B, kt), d * d, I8 | I8 << 2, hw,
+                         dyn=[("len", P_KTLEN)])
+            dl.ve(acc(q), 0, acc(self.TMP), hs, COPY, T_FF, fp=True, func="abs", reduce="max",
+                  dyn=[("src1", P_L1, True)])                                                        # amax
+            dl.ve(acc(self.TMP), 0, acc(self.TMP + 1), d, COPY, T_FF, fp=True, A=CL.INV127)            # s_q
+            dl.ve(acc(self.TMP), 0, acc(self.TMP + 2), d, COPY, T_FF, fp=True, A=CL.INV127, func="recip")
+            dl.ve(acc(q), acc(self.TMP + 2), laddr(MEM_SPAD_A, 0), hs * d, MUL, F32 | I8 << 2, fp=True,
+                  m1="div", p1=d, m2="div", period=hs, dyn=[("src1", P_L1, True)])                  # q_h strip
+            dl.ex(0, kt, self.SC, hw, repeat=1, bstep=hs, cstep=1, crow=self.rmax, dyn=[("repeat", P_TILES)])
+            dl.ve(acc(self.SC), acc(self.TMP + 1), acc(self.SCF), d, MUL, I32 | F32 << 2, fp=True, t2=F32,
+                  m2="div", period=self.rmax, A=a_k, B=NEG0, dyn=[("len", P_POSPAD)])                 # * s_q * a_k
+            # softmax over pos + 1 valid scores
+            dl.ve(acc(self.SCF), 0, acc(self.S), d, COPY, T_FF, fp=True, reduce="max",
+                  dyn=[("len", P_POSPAD), ("valid", P_VALID)])                                      # m
+            dl.ve(acc(self.SCF), acc(self.S), acc(self.E), d, SUB, T_FF, fp=True, m2="div", period=self.rmax,
+                  func="exp", B=NEG0, dyn=[("len", P_POSPAD), ("valid", P_VALID)])                  # e
+            dl.ve(acc(self.E), 0, acc(self.S + 1), d, COPY, T_FF, fp=True, reduce="sum", B=NEG0,
+                  dyn=[("len", P_POSPAD)])                                                           # sum
+            dl.ve(acc(self.S + 1), 0, acc(self.S + 2), d, COPY, T_FF, fp=True, func="recip", B=NEG0)  # r
+            dl.ve(acc(self.E), acc(self.S + 2), laddr(MEM_SPAD_A, 0), d * d, MUL, F32 | I8 << 2, fp=True,
+                  m1="div", p1=d, m2="div", period=smax, A=127.0, B=NEG0, dyn=[("len", P_PLEN)])     # p strip
+            # att_h = P V
+            dl.ld(self.rkv(voff), laddr(MEM_SPAD_B, vb), 1, hs, c.kv_dim, LD_INTERLEAVE, base=self.rkv.base,
+                  dyn=[("ddr", P_L0, True), ("rows", P_POSPAD)])
+            dl.ex(0, vb, self.OC, 1, repeat=hw, bstep=d, cstep=1, crow=hw,
+                  dyn=[("kt", P_TILES), ("bstep", P_POSPAD)])
+            dl.ve(acc(self.OC), 0, acc(att), hs, COPY, I32 | F32 << 2, fp=True, A=a_v, B=NEG0,
+                  dyn=[("dst", P_L1, True)])
+            dl.loop_end(start - len(dl), rep if rep != 1 else c.heads,
+                        k1=P_L0, s1=0 if rep != 1 else hs, k2=P_L1, s2=hw)
+
+        for kv_head in range(c.kv_heads if rep != 1 else 1):
+            head_group(kv_head)
 
     def silu_mul(self, dl, h13=None, u=None, g0=0, groups=None):
         """U = (h1 * recip(1 + exp(-h1))) * h3, for groups [g0, g0 + groups) (default all)."""

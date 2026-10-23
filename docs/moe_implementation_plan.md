@@ -685,10 +685,78 @@ token/s upper bound
 
 Progress: Mixtral/Qwen2-MoE tensor adapters, tiny Mixtral capacity preflight,
 real-token routed FFN acceptance, and hybrid propagated FFN vectors for both
-tiny Mixtral layers pass on the simulator and KV260. M4e also passes a
-one-process two-layer board run with host attention and device MoE FFNs. A
-fully device-executed IREE/SA model and its teacher-forced logit comparison
-remain outside the validated scope.
+tiny Mixtral layers pass on the simulator and KV260. M4e passes a one-process
+two-layer board run with host attention and device MoE FFNs. M4f now runs the
+complete two-layer dense/attention/router/expert computation in the SA
+simulator and matches all three teacher-forced Hugging Face top tokens. Its
+KV260 bundle is staged, but a full-device board run and measured CMA use are
+still pending. Native IREE MoE compilation belongs to M5.
+
+#### M4f complete SA decoder (2026-10-24)
+
+`compiler/frontend/moe_device_dense.py` packs the dense Mixtral checkpoint
+to W8A8, including an 8-expert router padded to one D=16 output tile. It
+permutes Hugging Face split-half RoPE query/key rows into adjacent pairs so
+the existing SA RoPE primitive works without changing attention dot products.
+`llm/compile_model.py` now handles grouped-query attention (GQA), and the
+3-token D=8 regression is bit-exact against `DeviceModel` for both ordinary
+attention and GQA, including the int8 KV cache. The real tiny Mixtral shape
+(dim 1024, 32 query heads, 8 KV heads, head size 32) fits the D=16 local
+memory plan with 2040 of 2048 ACC bank words used.
+
+`compiler/runtime/tools/moe_model.py` emits three SA descriptor stages per
+token: layer 0, layer 1, and the final norm/classifier. Each layer executes
+embedding or prior FFN residual, RMSNorm, QKV projection, RoPE, GQA with KV
+cache, output projection, residual, second RMSNorm, and router projection.
+The already validated Top-2 route kernel and two-expert FFN run between
+stages. `compiler/tests/moe_full_device_sim.py` uses the functional simulator
+for all arithmetic; because it cannot run the RISC-V firmware, it constructs
+the Top-2 route record on the host from SA-produced scores. On KV260,
+`board_moe_full_device.py` calls that RISC-V kernel directly and binds the
+FFN output to its input buffer after the descriptor has loaded the input.
+ARM submits work and reads results; it does not calculate model activations,
+attention, router scores, expert outputs, or logits.
+
+The simulator ran token IDs `[1, 42, 43]` against the cached random-initialized
+`TitanML/tiny-mixtral` Hugging Face model:
+
+| Position | SA top token | HF top token | Logit relative L2 vs HF |
+|---:|---:|---:|---:|
+| 0 | 25591 | 25591 | 0.036509 |
+| 1 | 13899 | 13899 | 0.036336 |
+| 2 | 26962 | 26962 | 0.323339 |
+
+The position-2 logit gap is material despite token agreement, consistent
+with the earlier expert-only W8A8 hybrid result. No language quality claim
+follows from this random checkpoint and short sequence. The packed dense file
+is 71,240,512 bytes; one reusable packed expert layer is 88,358,976 bytes;
+the simulator DDR image is 159,858,688 bytes. These are host measurements,
+not a measured KV260 allocation. The board runner records its allocated
+buffer bytes and `/proc/meminfo` CMA before/after values.
+
+Host reproduction:
+
+```bash
+build/iree/venv/bin/python llm/test_l4.py --d 8 --tiny-tokens 3
+build/iree/venv/bin/python compiler/frontend/moe_device_dense.py
+build/iree/venv/bin/python compiler/tests/moe_full_device_sim.py
+build/iree/venv/bin/python compiler/tests/moe_stage_full_device_board.py
+```
+
+Transfer the self-contained bundle and run the pending board acceptance:
+
+```bash
+scp -r build/moe/m4f/board ubuntu@192.168.0.121:~/moe-m4f
+# On the KV260:
+cd ~/moe-m4f
+chmod +x run_board.sh
+./run_board.sh
+```
+
+The board runner requires all three board/simulator/HF top tokens to agree
+at every position and board/simulator logit relative L2 and maximum absolute
+error below 0.01. It writes `board_full_device_report.json`. The board run
+must pass before M4 is marked complete.
 
 #### M4c capacity preflight (2026-10-24)
 

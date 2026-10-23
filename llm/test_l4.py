@@ -38,14 +38,14 @@ F = np.float32
 DDR = 0x10000000
 
 
-def tiny_model(seed=3, dim=32, hidden=64, heads=2, layers=2, vocab=64, seq=16):
+def tiny_model(seed=3, dim=32, hidden=64, heads=2, kv_heads=None, layers=2, vocab=64, seq=16):
     """(cfg, w, kv_scales) of a random llama-style model; KV scales = absmax / 127
     over an fp32 run of random tokens."""
     rng = np.random.default_rng(seed)
-    cfg = checkpoint.Config(dim, hidden, layers, heads, heads, vocab, seq)
+    cfg = checkpoint.Config(dim, hidden, layers, heads, heads if kv_heads is None else kv_heads, vocab, seq)
     g = lambda *s: (rng.standard_normal(s) / np.sqrt(s[-1])).astype(F)
     w = {"tok": g(vocab, dim) * 4, "rms_att": 1 + 0.1 * g(layers, dim), "wq": g(layers, dim, dim),
-         "wk": g(layers, dim, dim), "wv": g(layers, dim, dim), "wo": g(layers, dim, dim),
+         "wk": g(layers, cfg.kv_dim, dim), "wv": g(layers, cfg.kv_dim, dim), "wo": g(layers, dim, dim),
          "rms_ffn": 1 + 0.1 * g(layers, dim), "w1": g(layers, hidden, dim), "w2": g(layers, dim, hidden),
          "w3": g(layers, hidden, dim), "rms_final": 1 + 0.1 * g(dim), "wcls": g(vocab, dim)}
     fm = Fp32Model(cfg, w)
@@ -156,6 +156,10 @@ def main():
         rng = np.random.default_rng(7)
         toks = [int(t) for t in rng.integers(0, cfg.vocab, args.tiny_tokens)]
         ok &= run_model("tiny", cfg, w, kv, W8A8(path), toks, args.layers)
+        cfg, w, kv = tiny_model(seed=11, heads=4, kv_heads=2)
+        path = os.path.join(tmp, "tiny_gqa.w8a8")
+        export(cfg, w, kv, args.d, path)
+        ok &= run_model("tiny-gqa", cfg, w, kv, W8A8(path), toks, args.layers)
         if args.checkpoint:
             cfg, w = checkpoint.load(args.checkpoint)
             kv = np.load(args.kv)
