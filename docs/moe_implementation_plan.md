@@ -1,6 +1,7 @@
 # KV260 上的 IREE 原生 MoE 实现方案
 
-> 状态：M0–M4b 已在模拟器和 KV260 验证；真实 Mixtral 单层 Top-2 FFN 通过
+> Status: M0–M4b validated; M4c real-token MoE FFNs for both Mixtral layers pass
+> on KV260. Full-model SA inference is pending.
 > 目标平台：AMD KV260 + PicoRV32 + SA accelerator
 > 编译路径：PyTorch/Hugging Face → IREE Flow → SAHL → SAHW → descriptor list 或 RISC-V 代码
 > 第一目标：不修改 GEMV RTL，实现 batch-1、W8A8、top-1/top-2 稀疏 MoE decode，并在模拟器和 KV260 上端到端验证。
@@ -682,7 +683,11 @@ token/s upper bound
 
 ### M4：真实 Hugging Face MoE
 
-进展：Mixtral/Qwen2-MoE adapter 已实现；公开 tiny Mixtral 第 0 层真实权重已在 simulator 和 KV260 完整 Top-2 FFN 验证。剩余工作是完整或明确截断模型的内存预检、模型级 router/FFN 集成，以及 token-level reference 对比。退出条件仍为模型在 sim 与 KV260 生成一致 token，内存预检准确。
+Progress: Mixtral/Qwen2-MoE tensor adapters, tiny Mixtral capacity preflight,
+and real-token routed FFN acceptance for both tiny Mixtral layers on the
+simulator and KV260 are complete. Full-model SA execution and teacher-forced
+logit/token comparison remain. The M4 exit condition is still matching model
+tokens on the simulator and KV260 with an accurate memory preflight.
 
 #### M4c capacity preflight (2026-10-24)
 
@@ -769,9 +774,9 @@ build/iree/venv/bin/python compiler/tests/moe_m4b_sim.py \
 
 Two standalone KV260 bundles were prepared at `build/moe/m4c/board/layer0`
 and `layer1`. Each reuses the M4b bitstream, firmware, and Top-2 descriptor,
-with its own packed layer weights and real-token acceptance vectors. Board
-acceptance is pending. The bundle includes the descriptor's local
-`compile_layer.py` dependency. The packaging script now builds the descriptor from inside each bundle as a host
+with its own packed layer weights and real-token acceptance vectors. The bundle
+includes the descriptor's local `compile_layer.py` dependency. The packaging
+script now builds the descriptor from inside each bundle as a host
 smoke check, so an omitted local Python module fails before board transfer.
 Copy the parent directory and run each layer separately:
 
@@ -781,6 +786,18 @@ scp -r build/moe/m4c/board ubuntu@192.168.0.121:~/moe-m4c
 cd ~/moe-m4c/layer0 && ./run_board.sh
 cd ~/moe-m4c/layer1 && ./run_board.sh
 ```
+
+The user ran both bundles on KV260 on 2026-10-24 and reported:
+
+| Layer | Expert IDs | Route cycles | Full FFN cycles | Max absolute error vs W8A8 host golden | Result |
+|---|---|---:|---:|---:|---|
+| 0 | `[7, 0]` | 53,008 | 408,694 | `0.000617288` | PASS |
+| 1 | `[2, 0]` | 55,287 | 408,591 | `7.15256e-7` | PASS |
+
+These are real-token activations and router scores produced by the full fp32
+Hugging Face forward pass, followed by standalone SA route and expert FFN
+execution on each layer. They do not yet prove that a W8A8 layer 0 output can
+feed layer 1 on the device while preserving the model's final token.
 
 M4c remains in progress. Model-level SA execution still needs attention,
 residual/KV state, sequential execution of both routed FFNs, and the output
