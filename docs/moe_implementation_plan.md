@@ -1,7 +1,7 @@
 # KV260 上的 IREE 原生 MoE 实现方案
 
-> Status: M0–M4b validated; M4c real-token MoE FFNs for both Mixtral layers pass
-> on KV260. Full-model SA inference is pending.
+> Status: M0–M4b validated; M4c/M4d real-token and propagated MoE FFN vectors
+> for both Mixtral layers pass on KV260. Full-model SA inference is pending.
 > 目标平台：AMD KV260 + PicoRV32 + SA accelerator
 > 编译路径：PyTorch/Hugging Face → IREE Flow → SAHL → SAHW → descriptor list 或 RISC-V 代码
 > 第一目标：不修改 GEMV RTL，实现 batch-1、W8A8、top-1/top-2 稀疏 MoE decode，并在模拟器和 KV260 上端到端验证。
@@ -684,10 +684,11 @@ token/s upper bound
 ### M4：真实 Hugging Face MoE
 
 Progress: Mixtral/Qwen2-MoE tensor adapters, tiny Mixtral capacity preflight,
-and real-token routed FFN acceptance for both tiny Mixtral layers on the
-simulator and KV260 are complete. Full-model SA execution and teacher-forced
-logit/token comparison remain. The M4 exit condition is still matching model
-tokens on the simulator and KV260 with an accurate memory preflight.
+real-token routed FFN acceptance, and hybrid propagated FFN vectors for both
+tiny Mixtral layers pass on the simulator and KV260. Full-model SA execution
+and teacher-forced logit/token comparison on the device remain. The M4 exit
+condition is still matching model tokens on the simulator and KV260 with an
+accurate memory preflight.
 
 #### M4c capacity preflight (2026-10-24)
 
@@ -833,8 +834,7 @@ error `0.0006171` in layer 0 and `1.3113e-6` in layer 1). The emitted
 `layer0/moe_acceptance.npz` and `layer1/moe_acceptance.npz` contain all three
 positions, including the layer 1 inputs after layer 0 SA outputs propagated
 through the decoder. The corresponding KV260 bundles already contain these
-vectors as `hybrid_acceptance.npz` and a `run_hybrid.sh` launcher. Board
-acceptance for these propagated vectors is pending.
+vectors as `hybrid_acceptance.npz` and a `run_hybrid.sh` launcher.
 
 To repeat the host run and simulator acceptance:
 
@@ -859,6 +859,22 @@ scp build/moe/m4c/board/layer1/{hybrid_acceptance.npz,run_hybrid.sh} \
 cd ~/moe-m4c/layer0 && chmod +x run_hybrid.sh && ./run_hybrid.sh
 cd ~/moe-m4c/layer1 && chmod +x run_hybrid.sh && ./run_hybrid.sh
 ```
+
+The user ran all six propagated-vector cases on KV260 on 2026-10-24:
+
+| Layer | Position | Experts | Route cycles | Full FFN cycles | Max absolute error vs W8A8 host golden | Result |
+|---|---:|---|---:|---:|---:|---|
+| 0 | 0 | `[7, 1]` | 52,353 | 408,646 | `0.000460662` | PASS |
+| 0 | 1 | `[7, 1]` | 53,155 | 408,538 | `1.07288e-6` | PASS |
+| 0 | 2 | `[7, 0]` | 52,938 | 408,680 | `0.000617288` | PASS |
+| 1 | 0 | `[6, 2]` | 51,437 | 408,684 | `8.68738e-6` | PASS |
+| 1 | 1 | `[2, 5]` | 52,755 | 408,543 | `4.41074e-6` | PASS |
+| 1 | 2 | `[2, 6]` | 53,110 | 408,631 | `5.36442e-7` | PASS |
+
+The layer 1 inputs incorporate layer 0 SA simulator outputs through the Hugging
+Face attention and residual path. Each board call still runs one route and FFN
+in isolation; the model's final logits and token are calculated on the host
+hybrid path, not on KV260.
 
 The remaining full-device M4 work is to place attention, residuals, KV cache,
 both MoE layers, and the output head into one SA execution flow, then compare
