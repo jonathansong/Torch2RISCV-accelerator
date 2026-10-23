@@ -74,7 +74,7 @@ MBOX_RING_BASE, MBOX_RING_SIZE, MBOX_RING_TAIL, MBOX_RING_HEAD = 0xB0, 0xB4, 0xB
 MBOX_CPL_BASE, MBOX_FW_STATE, MBOX_FW_VERSION, MBOX_HEARTBEAT = 0xC0, 0xC4, 0xC8, 0xCC
 MBOX_FW_CAPS = 0xD0                      # rt_fw (RT_VERSION >= 2): the unit's CAPS
 RT_READY = 0x52554E00
-RT_RUN_LIST, RT_NOP, RT_RESET, RT_EXIT = 0x01, 0x02, 0x03, 0x04
+RT_RUN_LIST, RT_NOP, RT_RESET, RT_EXIT, RT_CALL = 0x01, 0x02, 0x03, 0x04, 0x06
 RT_F_IRQ, RT_F_PERF = 1 << 8, 1 << 9
 
 # Performance counters (rtl/sysarray/sa_perf.v, docs/perf_counters_and_desc_dma_plan.md):
@@ -999,6 +999,19 @@ class Device:
 
     def run(self, dl, bases=(0, 0, 0, 0), params=None, count=0, timeout=5.0):
         return self.wait(self.submit(dl, bases, params, count), timeout)
+
+    def call(self, code_phys, args_phys, timeout=5.0, perf=False):
+        """Calls position-independent rv32 code through rt_fw's RT_CALL entry.
+
+        The function receives (args, args + 16 words). rt_fw version 4 or
+        newer is required; version 7 also reports instructions and counters.
+        The caller owns and keeps the code and argument buffers alive.
+        """
+        version = self.mm._mbox(MBOX_FW_VERSION)
+        if version < 4:
+            raise RuntimeError(f"rt_fw version {version} does not support RT_CALL")
+        seq = self.submit(int(code_phys), count=int(args_phys), kind=RT_CALL, perf=perf)
+        return self.wait(seq, timeout)
 
     def close(self):
         """EXIT entry (the firmware leaves its loop), then hold the core in reset."""
