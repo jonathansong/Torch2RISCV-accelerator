@@ -26,13 +26,14 @@ def main():
     parser.add_argument("--expert-stride", type=int, required=True)
     args = parser.parse_args()
     code_bytes = np.fromfile(args.kernel, np.uint8)
-    code = allocate(shape=(len(code_bytes),), dtype=np.uint8)
-    scores = allocate(shape=(args.experts,), dtype=np.float32)
-    route = allocate(shape=(8,), dtype=np.uint32)
-    call_args = allocate(shape=(18,), dtype=np.uint32)  # 16 bindings, then constants
-    device = None
+    code = scores = route = call_args = None
+    device = Device(args.bitfile, args.firmware)
     failures = 0
     try:
+        code = allocate(shape=(len(code_bytes),), dtype=np.uint8)
+        scores = allocate(shape=(args.experts,), dtype=np.float32)
+        route = allocate(shape=(8,), dtype=np.uint32)
+        call_args = allocate(shape=(18,), dtype=np.uint32)  # 16 bindings, then constants
         code[:] = code_bytes
         code.flush()
         call_args[:] = 0
@@ -59,7 +60,8 @@ def main():
         if device is not None:
             device.close()
         for buffer in (call_args, route, scores, code):
-            buffer.freebuffer()
+            if buffer is not None:
+                buffer.freebuffer()
     print("moe_top1 board PASS" if not failures else f"moe_top1 board FAIL: {failures} cases")
     return 1 if failures else 0
 
