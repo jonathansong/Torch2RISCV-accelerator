@@ -5,10 +5,13 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
+import sys
 
 
 STATIC_FILES = ("picorv32.bit", "picorv32.hwh", "rt_fw.bin", "moe_top2.bin",
-                "pynq_matmul.py", "moe_m3b.py", "sadesc.py", "run_board.sh")
+                "pynq_matmul.py", "compile_layer.py", "moe_m3b.py", "sadesc.py",
+                "run_board.sh")
 
 
 def bundle(template, trace_root, out):
@@ -35,6 +38,14 @@ def bundle(template, trace_root, out):
             shutil.copy2(os.path.join(source, name), os.path.join(target, name))
         shutil.copy2(os.path.join(source, "moe_token_acceptance.npz"),
                      os.path.join(target, "moe_acceptance.npz"))
+        # Catch missing local Python modules before the bundle reaches the board.
+        subprocess.run(
+            [sys.executable, "-c",
+             "import sys; from moe_m3b import top2_ffn_template; "
+             "assert len(top2_ffn_template(*map(int, sys.argv[1:]), ret=False).array()) > 0",
+             str(manifest["dim"]), str(manifest["hidden"]),
+             str(manifest["d"]), str(manifest["alignment"])],
+            cwd=target, check=True, capture_output=True, text=True)
         with open(os.path.join(target, "README.txt"), "w") as f:
             f.write(f"M4c Mixtral real-token layer {layer} acceptance.\n"
                     f"Input tokens: {report['tokens']}; HF last-token argmax: {report['last_hf_token']}.\n"

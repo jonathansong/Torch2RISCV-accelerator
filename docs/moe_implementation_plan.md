@@ -770,7 +770,10 @@ build/iree/venv/bin/python compiler/tests/moe_m4b_sim.py \
 Two standalone KV260 bundles were prepared at `build/moe/m4c/board/layer0`
 and `layer1`. Each reuses the M4b bitstream, firmware, and Top-2 descriptor,
 with its own packed layer weights and real-token acceptance vectors. Board
-acceptance is pending. Copy the parent directory and run each layer separately:
+acceptance is pending. The bundle includes the descriptor's local
+`compile_layer.py` dependency. The packaging script now builds the descriptor from inside each bundle as a host
+smoke check, so an omitted local Python module fails before board transfer.
+Copy the parent directory and run each layer separately:
 
 ```bash
 scp -r build/moe/m4c/board ubuntu@192.168.0.121:~/moe-m4c
