@@ -28,11 +28,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("bundle", help="directory containing params, manifest, and acceptance vectors")
     parser.add_argument("--cases", type=int, default=1)
+    parser.add_argument("--reference", help="optional token-derived acceptance .npz")
     args = parser.parse_args()
     with open(os.path.join(args.bundle, "moe_manifest.json")) as f:
         manifest = json.load(f)
     params = np.fromfile(os.path.join(args.bundle, "moe_params.bin"), np.uint8)
-    reference = np.load(os.path.join(args.bundle, "moe_acceptance.npz"))
+    reference = np.load(args.reference or os.path.join(args.bundle, "moe_acceptance.npz"))
     d, dim, hidden = (int(manifest[name]) for name in ("d", "dim", "hidden"))
     _, _, exports = sadesc.read(moe_m3b.make_executable(dim, hidden, d, int(manifest["alignment"])))
     rows = exports[0][1]
@@ -43,13 +44,16 @@ def main():
     size = align(listaddr + (len(rows) + 8) * 64 - base)
     sim = SaFuncSim(d, base, size)
     sim.ddr_write(template, rows.tobytes())
-    sim.ddr_write(xaddr, reference["x"])
+    vectors = reference["x"]
+    if vectors.ndim == 1:
+        vectors = np.broadcast_to(vectors, (len(reference["pairs"]), dim))
     sim.ddr_write(paramaddr, params)
     bindings = [xaddr, routeaddr, paramaddr + int(manifest["expert_table_offset"]), outaddr]
     dispatch = sadesc.dispatch_list(template, bindings, [])
     sim.ddr_write(listaddr, dispatch.array().tobytes())
     failures = 0
     for case in range(min(args.cases, len(reference["pairs"]))):
+        sim.ddr_write(xaddr, np.ascontiguousarray(vectors[case], np.float32))
         pair = reference["pairs"][case].astype(np.uint32)
         offsets = pair * np.uint32(manifest["expert_stride"])
         route = moe.pack_route_record(pair, offsets, reference["routing"][case])

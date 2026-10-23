@@ -48,7 +48,9 @@ def main():
         call_args = alloc((18,), np.uint32)
         x, packed, output = alloc((dim,), np.float32), alloc(params.shape, np.uint8), alloc((dim,), np.float32)
         code[:] = code_bytes; code.flush()
-        x[:] = reference["x"]; x.flush()
+        vectors = reference["x"]
+        if vectors.ndim == 1:
+            vectors = np.broadcast_to(vectors, (len(reference["pairs"]), dim))
         packed[:] = params; packed.flush()
         call_args[:] = 0
         call_args[0], call_args[1] = scores.physical_address, route.physical_address
@@ -56,6 +58,7 @@ def main():
         call_args.flush()
         dl = top2_ffn_template(dim, hidden, d, int(manifest["alignment"]), ret=False)
         for case, pair in enumerate(reference["pairs"]):
+            x[:] = vectors[case]; x.flush()
             scores[:] = reference["scores"][case]
             route[:] = 0; scores.flush(); route.flush()
             rc = device.call(code.physical_address, call_args.physical_address, perf=True)

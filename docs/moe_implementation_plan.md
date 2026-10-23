@@ -727,11 +727,63 @@ returned exit status 1 (52.2 MiB short at context 2048), and zero context return
 an argument error. JSON reports are local under `build/moe/m4b/` as
 `tiny-mixtral-preflight-t2048.json` and `tiny-mixtral-preflight-maxctx.json`.
 
-M4c remains in progress. Next integrate model-derived router scores with the
-existing expert FFN, attention/residual/KV execution, both decoder layers, and
-the output head. Then compare teacher-forced logits/tokens with a full-model
-reference, followed by simulator and KV260 acceptance. The M4b forced-score
-single-layer board results do not establish full-model token generation.
+#### M4c real-token layer traces (2026-10-24)
+
+`compiler/tests/moe_hf_token_trace.py` runs the complete fp32 Hugging Face
+decoder for a token sequence, captures the post-attention MoE input, router
+scores, expert IDs/weights, and FFN output for each selected layer, then compares
+the imported fp32 and W8A8 MoE implementations. For token IDs `[1, 42, 43]`
+from the random-initialized `TitanML/tiny-mixtral` checkpoint:
+
+| Layer | HF/SA expert IDs | fp32 vs HF relative L2 | W8A8 vs HF relative L2 | SA simulator vs W8A8 max absolute error |
+|---|---|---:|---:|---:|
+| 0 | `[7, 0]` | `5.63e-7` | `0.03436` | `0.0006171` |
+| 1 | `[2, 0]` | `5.42e-7` | `0.02780` | `6.56e-7` |
+
+Both routed layer FFNs passed the SA functional simulator using actual decoder
+activations and scores. The original M4b forced-score simulator acceptance also
+still passes. The full fp32 Hugging Face model's final argmax for this sequence
+is token ID `26962`; no SA model-level token result exists yet for comparison.
+The layer 1 input is captured from the fp32 Hugging Face upstream layers, so its
+standalone test does not measure propagation of W8A8 error from layer 0.
+
+Host reproduction:
+
+```bash
+build/iree/venv/bin/python compiler/tests/moe_hf_token_trace.py \
+  --model build/llm_cache/TitanML-tiny-mixtral \
+  --out build/moe/m4c/tiny-mixtral --tokens 1,42,43
+build/iree/venv/bin/python compiler/frontend/moe_hf.py \
+  --model build/llm_cache/TitanML-tiny-mixtral \
+  --out build/moe/m4c/tiny-mixtral/layer0 --layer 0
+build/iree/venv/bin/python compiler/frontend/moe_hf.py \
+  --model build/llm_cache/TitanML-tiny-mixtral \
+  --out build/moe/m4c/tiny-mixtral/layer1 --layer 1
+build/iree/venv/bin/python compiler/tests/moe_m4b_sim.py \
+  build/moe/m4c/tiny-mixtral/layer0 \
+  --reference build/moe/m4c/tiny-mixtral/layer0/moe_token_acceptance.npz
+build/iree/venv/bin/python compiler/tests/moe_m4b_sim.py \
+  build/moe/m4c/tiny-mixtral/layer1 \
+  --reference build/moe/m4c/tiny-mixtral/layer1/moe_token_acceptance.npz
+```
+
+Two standalone KV260 bundles were prepared at `build/moe/m4c/board/layer0`
+and `layer1`. Each reuses the M4b bitstream, firmware, and Top-2 descriptor,
+with its own packed layer weights and real-token acceptance vectors. Board
+acceptance is pending. Copy the parent directory and run each layer separately:
+
+```bash
+scp -r build/moe/m4c/board ubuntu@192.168.0.121:~/moe-m4c
+# On the board:
+cd ~/moe-m4c/layer0 && ./run_board.sh
+cd ~/moe-m4c/layer1 && ./run_board.sh
+```
+
+M4c remains in progress. Model-level SA execution still needs attention,
+residual/KV state, sequential execution of both routed FFNs, and the output
+head. Its teacher-forced logits and token IDs must then be compared with the
+complete Hugging Face reference on the simulator and KV260. The current board
+bundles check one FFN layer at a time, with HF-supplied input and router scores.
 
 ### M5：原生编译器表示
 
