@@ -684,6 +684,55 @@ token/s upper bound
 
 进展：Mixtral/Qwen2-MoE adapter 已实现；公开 tiny Mixtral 第 0 层真实权重已在 simulator 和 KV260 完整 Top-2 FFN 验证。剩余工作是完整或明确截断模型的内存预检、模型级 router/FFN 集成，以及 token-level reference 对比。退出条件仍为模型在 sim 与 KV260 生成一致 token，内存预检准确。
 
+#### M4c capacity preflight (2026-10-24)
+
+`compiler/tests/moe_mem_preflight.py` now estimates the full checkpoint footprint
+from safetensors headers, without loading tensor values. It separates experts,
+router, dense projections, embeddings, scales, and other parameters. The estimate
+assumes W8 linear weights, per-row fp32 scales, int8 embeddings and KV cache,
+64-byte alignment, a 2.5% packing allowance, and a configurable runtime margin.
+These are planned full-model representations, not a measured full-model binary.
+
+For the cached `TitanML/tiny-mixtral` checkpoint (2 layers, 8 experts per layer,
+top-2, dim 1024, expert hidden 3584, 8 KV heads of dimension 32):
+
+| Context | Parameter estimate | KV cache | Runtime margin | Total | 1280 MiB pool |
+|---|---:|---:|---:|---:|---|
+| 2048 | 242.2 MiB | 2.0 MiB | 64 MiB | 308.2 MiB | Fits by estimate |
+| 131072 | 242.2 MiB | 128.0 MiB | 64 MiB | 434.2 MiB | Fits by estimate |
+
+Expert weights and scales occupy approximately 84.2 MiB per layer. Selecting two
+of eight experts accesses approximately 42.1 MiB of expert weights/scales across
+the two layers per decode token, assuming no weight cache. This is a byte estimate,
+not measured bandwidth. The 131072-row result only checks memory; it does not
+establish runtime support, descriptor limits, or acceptable latency at that context.
+
+The board configuration in `memory_model.md` reserves a 1280 MiB u-dma-buf pool,
+while ordinary `pynq.allocate` uses the separate 256 MiB CMA pool. The current
+single-layer Python MoE runner uses CMA. A complete model therefore needs the
+u-dma-buf allocation path (as in `board_launcher.UdmabufWindow`) or another explicit
+loading strategy; increasing a size argument to `pynq.allocate` is insufficient.
+Check the actual board pool size and free allocations before deployment.
+
+Reproduce from the repository root:
+
+```bash
+build/iree/venv/bin/python compiler/tests/moe_mem_preflight.py \
+  build/llm_cache/TitanML-tiny-mixtral \
+  --kv-len 2048 --pool-mib 1280 --margin-mib 64
+```
+
+Both context estimates completed successfully. The 256 MiB pool check correctly
+returned exit status 1 (52.2 MiB short at context 2048), and zero context returned
+an argument error. JSON reports are local under `build/moe/m4b/` as
+`tiny-mixtral-preflight-t2048.json` and `tiny-mixtral-preflight-maxctx.json`.
+
+M4c remains in progress. Next integrate model-derived router scores with the
+existing expert FFN, attention/residual/KV execution, both decoder layers, and
+the output head. Then compare teacher-forced logits/tokens with a full-model
+reference, followed by simulator and KV260 acceptance. The M4b forced-score
+single-layer board results do not establish full-model token generation.
+
 ### M5：原生编译器表示
 
 交付 `FormMoeRegions`、稳定 SAHL 表示、descriptor/RISC-V 双路径和清晰 fallback。退出条件：不依赖模型专用手写 dispatch 即可识别所选 MoE 架构。
