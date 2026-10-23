@@ -1,7 +1,7 @@
 # KV260 上的 IREE 原生 MoE 实现方案
 
-> Status: M0–M4b validated; M4c/M4d real-token and propagated MoE FFN vectors
-> for both Mixtral layers pass on KV260. Full-model SA inference is pending.
+> Status: M0–M4e host-assisted two-layer Mixtral execution passes on KV260.
+> Full-device IREE/SA inference is pending.
 > 目标平台：AMD KV260 + PicoRV32 + SA accelerator
 > 编译路径：PyTorch/Hugging Face → IREE Flow → SAHL → SAHW → descriptor list 或 RISC-V 代码
 > 第一目标：不修改 GEMV RTL，实现 batch-1、W8A8、top-1/top-2 稀疏 MoE decode，并在模拟器和 KV260 上端到端验证。
@@ -685,10 +685,10 @@ token/s upper bound
 
 Progress: Mixtral/Qwen2-MoE tensor adapters, tiny Mixtral capacity preflight,
 real-token routed FFN acceptance, and hybrid propagated FFN vectors for both
-tiny Mixtral layers pass on the simulator and KV260. Full-model SA execution
-and teacher-forced logit/token comparison on the device remain. The M4 exit
-condition is still matching model tokens on the simulator and KV260 with an
-accurate memory preflight.
+tiny Mixtral layers pass on the simulator and KV260. M4e also passes a
+one-process two-layer board run with host attention and device MoE FFNs. A
+fully device-executed IREE/SA model and its teacher-forced logit comparison
+remain outside the validated scope.
 
 #### M4c capacity preflight (2026-10-24)
 
@@ -918,9 +918,30 @@ cd ~/moe-m4e && chmod +x run_board.sh && ./run_board.sh
 scp ubuntu@192.168.0.121:~/moe-m4e/board_model_report.json build/moe/m4e/
 ```
 
-Board acceptance is pending. If the integrated board result agrees with the
-simulator, the next work is an SA implementation of attention/KV and the dense
-projections, followed by an IREE-compiled model execution path.
+The user ran the integrated bundle on KV260 on 2026-10-24. Both layers loaded
+88,358,976 packed parameter bytes in turn and all six route/FFN calls passed:
+
+| Layer | Position | Experts | Route cycles | FFN cycles |
+|---|---:|---|---:|---:|
+| 0 | 0 | `[7, 1]` | 52,431 | 408,611 |
+| 0 | 1 | `[7, 1]` | 53,023 | 408,574 |
+| 0 | 2 | `[7, 0]` | 52,850 | 408,608 |
+| 1 | 0 | `[6, 2]` | 52,542 | 408,698 |
+| 1 | 1 | `[2, 5]` | 52,375 | 408,539 |
+| 1 | 2 | `[2, 6]` | 52,974 | 408,622 |
+
+| Position | Board/SA-sim/HF top token | Board vs SA-sim logit relative L2 | Max absolute error |
+|---|---:|---:|---:|
+| 0 | 25591 | `3.65624e-6` | `9.62615e-6` |
+| 1 | 13899 | `2.50264e-6` | `6.76513e-6` |
+| 2 | 26962 | `9.18536e-7` | `2.68221e-6` |
+
+The board and simulator hybrid logits agree closely; their top tokens also
+match Hugging Face on this short sequence. The M4d comparison showed that the
+hybrid's position 2 logits differ from fp32 Hugging Face by relative L2
+`0.32353`, so token agreement here does not imply fp32 logit agreement or
+language quality. The checkpoint is random-initialized. Next move attention,
+KV/cache, and dense projections into SA, then execute the model through IREE.
 
 ### M5：原生编译器表示
 
