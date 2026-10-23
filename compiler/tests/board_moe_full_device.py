@@ -144,6 +144,8 @@ def run(args):
         sim = data["sa"][:len(tokens)].copy()
     with np.load(args.hf_reference) as data:
         hf = data["hf"][:len(tokens)].copy()
+    with open(args.sim_report) as f:
+        sim_routes = json.load(f)["routing"]
     if got.shape != sim.shape or got.shape != hf.shape:
         raise ValueError("board, SA simulator, and HF logit shapes disagree")
     positions = [{"position": i, "board_top": int(np.argmax(got[i])),
@@ -152,11 +154,16 @@ def run(args):
                   "max_abs_vs_sim": float(np.max(np.abs(got[i] - sim[i]))),
                   "relative_l2_vs_hf": relative_l2(got[i], hf[i])}
                  for i in range(len(tokens))]
-    passed = all(row["board_top"] == row["sim_top"] == row["hf_top"] and
+    route_agreement = len(records) == len(sim_routes) and all(
+        row["position"] == expected["position"] and
+        row["layer"] == expected["layer"] and
+        row["experts"] == expected["experts"]
+        for row, expected in zip(records, sim_routes))
+    passed = route_agreement and all(row["board_top"] == row["sim_top"] == row["hf_top"] and
                  row["relative_l2_vs_sim"] < 0.01 and row["max_abs_vs_sim"] < 0.01
                  for row in positions)
     report = {"tokens": tokens, "positions": positions, "calls": records,
-              "memory": memory, "full_device_pass": passed,
+              "memory": memory, "route_agreement": route_agreement, "full_device_pass": passed,
               "execution_scope": "SA embedding/norm/GQA/attention/router/experts/head; RISC-V top-2; ARM dispatch only"}
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
@@ -174,6 +181,7 @@ def main():
     parser.add_argument("--dense", default=os.path.join(HERE, "mixtral_dense.w8a8"))
     parser.add_argument("--bundles", default=os.path.join(HERE, "experts"))
     parser.add_argument("--reference", default=os.path.join(HERE, "full_device_sim_logits.npz"))
+    parser.add_argument("--sim-report", default=os.path.join(HERE, "full_device_sim.json"))
     parser.add_argument("--hf-reference", default=os.path.join(HERE, "teacher_logits.npz"))
     parser.add_argument("--bitfile", default=os.path.join(HERE, "picorv32.bit"))
     parser.add_argument("--firmware", default=os.path.join(HERE, "rt_fw.bin"))

@@ -732,7 +732,9 @@ follows from this random checkpoint and short sequence. The packed dense file
 is 71,240,512 bytes; one reusable packed expert layer is 88,358,976 bytes;
 the simulator DDR image is 159,858,688 bytes. These are host measurements,
 not a measured KV260 allocation. The board runner records its allocated
-buffer bytes and `/proc/meminfo` CMA before/after values.
+buffer bytes and `/proc/meminfo` CMA before/after values. All six simulator
+expert pairs agree with the saved Hugging Face routing trace; the board
+runner checks the device route record against this simulator trace.
 
 Host reproduction:
 

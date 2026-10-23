@@ -100,6 +100,19 @@ def run(dense, bundles, reference, tokens, logits_out=None):
     got = np.stack(logits)
     if logits_out is not None:
         np.savez(logits_out, sa=got)
+    hf_routes = {}
+    for layer in range(c.layers):
+        path = os.path.join(os.path.dirname(reference), f"layer{layer}", "moe_acceptance.npz")
+        with np.load(path) as data:
+            hf_routes[layer] = (data["pairs"][:len(tokens)].copy(),
+                                data["routing"][:len(tokens)].copy())
+    for record in trace:
+        layer, pos = record["layer"], record["position"]
+        pairs, weights = hf_routes[layer]
+        record["hf_experts"] = pairs[pos].tolist()
+        record["route_agreement"] = record["experts"] == record["hf_experts"]
+        record["weight_max_abs_vs_hf"] = float(np.max(np.abs(
+            np.asarray(record["weights"], np.float32) - weights[pos])))
     with np.load(reference) as data:
         hf = data["hf"][:len(tokens)].copy()
     if hf.shape != got.shape:
@@ -132,7 +145,8 @@ def main():
     for row in report["positions"]:
         print(f"position {row['position']}: SA {row['sa_top']}, HF {row['hf_top']}, "
               f"relative L2 {row['relative_l2_vs_hf']:.6g}")
-    return 0 if all(row["sa_top"] == row["hf_top"] for row in report["positions"]) else 1
+    return 0 if (all(row["sa_top"] == row["hf_top"] for row in report["positions"]) and
+                 all(row["route_agreement"] for row in report["routing"])) else 1
 
 
 if __name__ == "__main__":

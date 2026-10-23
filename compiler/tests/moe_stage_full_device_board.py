@@ -18,6 +18,7 @@ def stage(dense, experts, reference, hf_reference, out):
     sources = {
         "mixtral_dense.w8a8": dense,
         "full_device_sim_logits.npz": reference,
+        "full_device_sim.json": os.path.join(os.path.dirname(reference), "full_device_sim.json"),
         "teacher_logits.npz": hf_reference,
         "board_moe_full_device.py": os.path.join(HERE, "board_moe_full_device.py"),
         "run_board.sh": os.path.join(HERE, "run_moe_full_device_board.sh"),
