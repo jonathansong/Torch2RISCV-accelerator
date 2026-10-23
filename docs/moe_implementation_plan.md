@@ -880,6 +880,48 @@ The remaining full-device M4 work is to place attention, residuals, KV cache,
 both MoE layers, and the output head into one SA execution flow, then compare
 its teacher-forced logits and token IDs with the Hugging Face reference.
 
+#### M4e one-process two-layer KV260 model runner (2026-10-24)
+
+`compiler/frontend/moe_mixtral_numpy.py` implements a portable batch-1
+Mixtral host path: embedding, fp32 RMSNorm, causal grouped-query attention with
+RoPE, residuals, router projection, and the output head. Its FFN callback can
+use fp32 experts, the SA functional simulator, or the KV260 device. For token
+IDs `[1, 42, 43]`, the pure fp32 NumPy path matches Hugging Face logits with
+relative L2 below `1e-6` at every position. With SA simulator FFNs it matches
+the M4d Hugging Face/SA hybrid logits with relative L2 below `8e-7` at every
+position. Both comparisons produce the same three top tokens.
+
+`compiler/tests/moe_pack_dense_checkpoint.py` extracts the 17 tensors needed
+by this host path into a 283,203,440-byte (271 MiB) safetensors checkpoint.
+No expert matrices are included. The reduced checkpoint also reproduces the
+M4d hybrid logits when used with the two existing packed expert bundles.
+
+`compiler/tests/board_moe_model.py` keeps one overlay and reuses one packed
+parameter buffer: it loads layer 0 weights once for three routed FFN calls,
+then layer 1 weights once for three calls. The NumPy host path connects the
+layers and computes final logits in the same process. The route kernel and
+FFN descriptor run on KV260; attention, residuals, KV-related computation,
+embedding, and output projection remain on ARM. It compares board logits with
+the saved M4d SA simulator hybrid logits and reports the Hugging Face top
+tokens separately. This is an integrated board model-level check, not a
+fully device-executed IREE model.
+
+The staged bundle is `build/moe/m4e/board` and reuses the already copied
+`~/moe-m4c/layer0` and `layer1` parameter/bitstream files. The new transfer
+is approximately 271 MiB plus small scripts/reference data:
+
+```bash
+scp -r build/moe/m4e/board ubuntu@192.168.0.121:~/moe-m4e
+# On KV260:
+cd ~/moe-m4e && chmod +x run_board.sh && ./run_board.sh
+# On the host after the board run:
+scp ubuntu@192.168.0.121:~/moe-m4e/board_model_report.json build/moe/m4e/
+```
+
+Board acceptance is pending. If the integrated board result agrees with the
+simulator, the next work is an SA implementation of attention/KV and the dense
+projections, followed by an IREE-compiled model execution path.
+
 ### M5：原生编译器表示
 
 交付 `FormMoeRegions`、稳定 SAHL 表示、descriptor/RISC-V 双路径和清晰 fallback。退出条件：不依赖模型专用手写 dispatch 即可识别所选 MoE 架构。
