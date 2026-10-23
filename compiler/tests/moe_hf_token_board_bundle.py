@@ -14,7 +14,7 @@ STATIC_FILES = ("picorv32.bit", "picorv32.hwh", "rt_fw.bin", "moe_top2.bin",
                 "run_board.sh")
 
 
-def bundle(template, trace_root, out):
+def bundle(template, trace_root, out, hybrid=None):
     if os.path.exists(out):
         raise FileExistsError(f"bundle already exists: {out}")
     with open(os.path.join(trace_root, "report.json")) as f:
@@ -38,6 +38,11 @@ def bundle(template, trace_root, out):
             shutil.copy2(os.path.join(source, name), os.path.join(target, name))
         shutil.copy2(os.path.join(source, "moe_token_acceptance.npz"),
                      os.path.join(target, "moe_acceptance.npz"))
+        if hybrid:
+            shutil.copy2(os.path.join(hybrid, f"layer{layer}", "moe_acceptance.npz"),
+                         os.path.join(target, "hybrid_acceptance.npz"))
+            shutil.copy2(os.path.join(os.path.dirname(__file__), "run_moe_hybrid_board.sh"),
+                         os.path.join(target, "run_hybrid.sh"))
         # Catch missing local Python modules before the bundle reaches the board.
         subprocess.run(
             [sys.executable, "-c",
@@ -59,8 +64,9 @@ def main():
     parser.add_argument("--template", default="build/moe/m4b/board")
     parser.add_argument("--trace", default="build/moe/m4c/tiny-mixtral")
     parser.add_argument("--out", default="build/moe/m4c/board")
+    parser.add_argument("--hybrid", help="optional hybrid-simulator board acceptance directory")
     args = parser.parse_args()
-    bundle(args.template, args.trace, args.out)
+    bundle(args.template, args.trace, args.out, args.hybrid)
 
 
 if __name__ == "__main__":

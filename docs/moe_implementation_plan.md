@@ -805,6 +805,65 @@ head. Its teacher-forced logits and token IDs must then be compared with the
 complete Hugging Face reference on the simulator and KV260. The current board
 bundles check one FFN layer at a time, with HF-supplied input and router scores.
 
+#### M4d hybrid decoder propagation (2026-10-24)
+
+`compiler/tests/moe_hf_hybrid_sim.py` runs a complete two-layer Hugging Face
+forward pass twice on token IDs `[1, 42, 43]`. The reference uses fp32 Hugging
+Face experts. The hybrid run replaces every routed FFN output with the SA
+functional simulator's W8A8 descriptor output. Its later layers therefore see
+the earlier SA result. Hugging Face still supplies embeddings, attention,
+residuals, normalization, and the output head; host code computes top-2 from
+the Hugging Face router scores. Six SA FFN calls run in total.
+
+| Position | HF top token | Hybrid top token | Logit relative L2 |
+|---|---:|---:|---:|
+| 0 | 25591 | 25591 | 0.01814 |
+| 1 | 13899 | 13899 | 0.02252 |
+| 2 | 26962 | 26962 | 0.32353 |
+
+All three top tokens agree for this random-initialized test checkpoint, but the
+last position's logits differ substantially (`0.90051` maximum absolute
+error). This is an observation on one short sequence, not a quality or
+full-device token agreement claim. The hybrid output is saved locally in
+`build/moe/m4c/hybrid-sim/report.json` and `teacher_logits.npz`.
+
+For every layer and position the script also calculates an independent W8A8
+host golden. All six SA simulator FFNs passed against it (maximum absolute
+error `0.0006171` in layer 0 and `1.3113e-6` in layer 1). The emitted
+`layer0/moe_acceptance.npz` and `layer1/moe_acceptance.npz` contain all three
+positions, including the layer 1 inputs after layer 0 SA outputs propagated
+through the decoder. The corresponding KV260 bundles already contain these
+vectors as `hybrid_acceptance.npz` and a `run_hybrid.sh` launcher. Board
+acceptance for these propagated vectors is pending.
+
+To repeat the host run and simulator acceptance:
+
+```bash
+build/iree/venv/bin/python compiler/tests/moe_hf_hybrid_sim.py
+build/iree/venv/bin/python compiler/tests/moe_m4b_sim.py \
+  build/moe/m4c/tiny-mixtral/layer0 --cases 3 \
+  --reference build/moe/m4c/hybrid-sim/layer0/moe_acceptance.npz
+build/iree/venv/bin/python compiler/tests/moe_m4b_sim.py \
+  build/moe/m4c/tiny-mixtral/layer1 --cases 3 \
+  --reference build/moe/m4c/hybrid-sim/layer1/moe_acceptance.npz
+```
+
+Only the small files below need to be added to the M4c board directories:
+
+```bash
+scp build/moe/m4c/board/layer0/{hybrid_acceptance.npz,run_hybrid.sh} \
+  ubuntu@192.168.0.121:~/moe-m4c/layer0/
+scp build/moe/m4c/board/layer1/{hybrid_acceptance.npz,run_hybrid.sh} \
+  ubuntu@192.168.0.121:~/moe-m4c/layer1/
+# On KV260, run each layer separately:
+cd ~/moe-m4c/layer0 && chmod +x run_hybrid.sh && ./run_hybrid.sh
+cd ~/moe-m4c/layer1 && chmod +x run_hybrid.sh && ./run_hybrid.sh
+```
+
+The remaining full-device M4 work is to place attention, residuals, KV cache,
+both MoE layers, and the output head into one SA execution flow, then compare
+its teacher-forced logits and token IDs with the Hugging Face reference.
+
 ### M5：原生编译器表示
 
 交付 `FormMoeRegions`、稳定 SAHL 表示、descriptor/RISC-V 双路径和清晰 fallback。退出条件：不依赖模型专用手写 dispatch 即可识别所选 MoE 架构。
