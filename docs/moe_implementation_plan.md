@@ -1186,7 +1186,7 @@ bridge's normalization uses soft-float helpers. Compiler integration must
 either embed those helpers in a position-independent code-table entry or
 implement the normalization without external calls.
 
-#### M5f connected KV260 acceptance bundle (pending board run)
+#### M5f connected KV260 acceptance (2026-10-24)
 
 `moe_m5f_board_bundle.py` stages `build/moe/m5f/board` from the accepted M5d
 IREE VMFB and M5e route bridge, plus the existing M4 W8A8 FFN template. Its
@@ -1195,8 +1195,19 @@ cases and checks raw values/IDs bit for bit. It then restarts the overlay and
 passes those actual IREE output tensors, via host files, into the rv32 route
 bridge, then uses the resulting record for the M4 device FFN. It checks IDs,
 parameter byte offsets, and the FFN output against a host reference, and
-writes `board_report.json`. The staged bundle passed host-side syntax and
-file-presence checks; it still needs `./run_board.sh` on KV260.
+writes `board_report.json`.
+
+The user ran `~/moe-m5f/run_board.sh` on KV260 with the D=16, 100 MHz
+overlay. All three actual IREE Top-2 outputs matched their references, then
+the rv32 bridge and M4 FFN passed:
+
+| Case | IDs | Route cycles | FFN cycles | Max absolute error | Result |
+|---|---|---:|---:|---:|---|
+| Ascending | `[15, 14]` | 46087 | 2696 | 4.61936e-7 | PASS |
+| Ties | `[0, 1]` | 29933 | 2704 | 1.19209e-7 | PASS |
+| Random | `[5, 1]` | 45978 | 2677 | 1.63913e-6 | PASS |
+
+The IREE phase completed six rt_fw entries and reported heartbeat 16357.
 
 The host file handoff and overlay restart make this an integration acceptance
 test, not one compiled IREE MoE executable. The next compiler task is to
