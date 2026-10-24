@@ -1390,6 +1390,15 @@ W8A8 tolerance. Copy the staged directory to KV260 as `~/moe-m5m` and run
 exports sequentially in a board script, so it does not yet meet the
 single-IREE-program M5 completion requirement.
 
+The first KV260 run of this bundle failed before the FFN: all five route
+records read as zero. The compiler-generated `sahl.route_top2` export uses a
+64-byte output subspan, whereas the board runner had allocated only the
+32-byte record and read from the binding base. The runner now allocates the
+full prefix plus record, reads words 16–23, and passes that physical subspan
+to the FFN. The M5k and M5g compiler-route board runners use the same rule;
+the M5e standalone C bridge still uses its zero-offset ABI. A host test now
+checks the offset explicitly. The corrected KV260 bundle still awaits rerun.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。

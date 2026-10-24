@@ -22,7 +22,8 @@ def main():
     stride = int(manifest["expert_stride"])
     params = np.fromfile(os.path.join(HERE, "moe_params.bin"), np.uint8)
     code_bytes = np.fromfile(os.path.join(HERE, "moe_route.bin"), np.uint8)
-    descriptor_d, _, exports = sadesc.read(open(os.path.join(HERE, "moe_ffn.sadesc"), "rb").read())
+    with open(os.path.join(HERE, "moe_ffn.sadesc"), "rb") as stream:
+        descriptor_d, _, exports = sadesc.read(stream.read())
     if descriptor_d != 16 or len(exports) != 1 or exports[0][0] != "moe_top2_ffn" or exports[0][2] != 4:
         raise RuntimeError("invalid compiled FFN descriptor")
     template = DescList()
@@ -48,7 +49,9 @@ def main():
         code = alloc(code_bytes.shape, np.uint8)
         values = alloc((2,), np.float32)
         ids = alloc((2,), np.uint32)
-        route = alloc((8,), np.uint32)
+        # sahl.route_top2 writes at binding 2 plus the fixture's 64-byte
+        # subspan offset. Reserve the prefix inside the physical allocation.
+        route = alloc((24,), np.uint32)
         args = alloc((18,), np.uint32)
         x = alloc((dim,), np.float32)
         packed = alloc(params.shape, np.uint8)
@@ -72,28 +75,30 @@ def main():
                 buffer.flush()
             rc = device.call(code.physical_address, args.physical_address, perf=True)
             route.invalidate()
-            route_weights = route[5:7].view(np.float32)
+            record = route[16:24]
+            route_weights = record[5:7].view(np.float32)
             expected_offsets = np.asarray(pair, np.uint32) * np.uint32(stride)
-            route_ok = (rc["status"] == 0 and route[0] == 2 and route[7] == 0 and
-                        np.array_equal(route[1:3], pair) and
-                        np.array_equal(route[3:5], expected_offsets) and
+            route_ok = (rc["status"] == 0 and record[0] == 2 and record[7] == 0 and
+                        np.array_equal(record[1:3], pair) and
+                        np.array_equal(record[3:5], expected_offsets) and
                         np.allclose(route_weights, routing, rtol=2e-4, atol=2e-4))
             if not route_ok:
-                print(f"{name}: FAIL invalid route {route.tolist()}", flush=True)
-                results.append({"name": name, "pass": False, "route": route.tolist(),
-                                "route_cycles": int(rc["cycles"])})
+                print(f"{name}: FAIL status {rc['status']} invalid route {record.tolist()}", flush=True)
+                results.append({"name": name, "pass": False, "status": int(rc["status"]),
+                                "route": record.tolist(), "route_cycles": int(rc["cycles"])})
                 continue
             fc = device.wait(device.submit(template, bases=[x.physical_address,
-                route.physical_address, packed.physical_address + manifest["expert_table_offset"],
+                route.physical_address + 64,
+                packed.physical_address + manifest["expert_table_offset"],
                 output.physical_address], perf=True))
             output.invalidate()
             error = float(np.max(np.abs(np.asarray(output) - expected)))
             passed = fc["status"] == 0 and np.allclose(output, expected, rtol=3e-3, atol=3e-3)
-            print(f"{name}: {'PASS' if passed else 'FAIL'} experts {route[1:3].tolist()}, "
+            print(f"{name}: {'PASS' if passed else 'FAIL'} experts {record[1:3].tolist()}, "
                   f"route {rc['cycles']} cycles, FFN {fc['cycles']} cycles, max error {error:.6g}",
                   flush=True)
             results.append({"name": name, "pass": bool(passed),
-                            "ids": route[1:3].tolist(), "route_cycles": int(rc["cycles"]),
+                            "ids": record[1:3].tolist(), "route_cycles": int(rc["cycles"]),
                             "ffn_cycles": int(fc["cycles"]), "max_error": error})
     finally:
         device.close()

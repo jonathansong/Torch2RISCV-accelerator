@@ -29,7 +29,9 @@ def main():
         code = alloc(binary.shape, np.uint8)
         values = alloc((2,), np.float32)
         ids = alloc((2,), np.uint32)
-        route = alloc((8,), np.uint32)
+        # The compiler export's third binding has a 64-byte subspan offset.
+        # Keep that offset inside a real allocation; the record is words 16:24.
+        route = alloc((24,), np.uint32)
         args = alloc((18,), np.uint32)
         code[:] = binary
         code.flush()
@@ -46,19 +48,21 @@ def main():
             route.flush()
             completion = device.call(code.physical_address, args.physical_address, perf=True)
             route.invalidate()
+            record = route[16:24]
             expected_offsets = ids.astype(np.uint32) * np.uint32(stride)
             expected_weights = np.asarray(case["weights"], np.float32)
-            weights = route[5:7].view(np.float32)
+            weights = record[5:7].view(np.float32)
             max_error = float(np.max(np.abs(weights - expected_weights)))
-            passed = (completion["status"] == 0 and route[0] == 2 and route[7] == 0 and
-                      np.array_equal(route[1:3], ids) and
-                      np.array_equal(route[3:5], expected_offsets) and
+            passed = (completion["status"] == 0 and record[0] == 2 and record[7] == 0 and
+                      np.array_equal(record[1:3], ids) and
+                      np.array_equal(record[3:5], expected_offsets) and
                       max_error <= 5e-5)
-            print(f"{name}: {'PASS' if passed else 'FAIL'} IDs {route[1:3].tolist()}, "
-                  f"offsets {route[3:5].tolist()}, max weight error {max_error:.6g}, "
-                  f"cycles {completion['cycles']}", flush=True)
+            print(f"{name}: {'PASS' if passed else 'FAIL'} status {completion['status']}, "
+                  f"IDs {record[1:3].tolist()}, offsets {record[3:5].tolist()}, "
+                  f"max weight error {max_error:.6g}, cycles {completion['cycles']}", flush=True)
             results.append({"name": name, "pass": bool(passed),
-                            "ids": route[1:3].tolist(), "offsets": route[3:5].tolist(),
+                            "status": int(completion["status"]),
+                            "ids": record[1:3].tolist(), "offsets": record[3:5].tolist(),
                             "max_weight_error": max_error, "cycles": int(completion["cycles"])})
     finally:
         device.close()

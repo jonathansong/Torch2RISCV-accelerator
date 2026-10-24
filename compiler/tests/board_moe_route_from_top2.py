@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """KV260 acceptance for the native Top-2 to M4 route-record bridge."""
 
+import argparse
 import json
 import os
 import sys
@@ -17,6 +18,13 @@ STRIDE = 6784
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--output-subspan", type=int, default=0,
+                        help="byte offset of the record within binding 2")
+    options = parser.parse_args()
+    if options.output_subspan < 0 or options.output_subspan % 4:
+        parser.error("--output-subspan must be a nonnegative multiple of four")
+    record_start = options.output_subspan // 4
     binary = np.fromfile(os.path.join(HERE, "moe_route_from_top2.bin"), np.uint8)
     device = Device(os.path.join(HERE, "picorv32.bit"), os.path.join(HERE, "rt_fw.bin"))
     buffers = []
@@ -30,7 +38,7 @@ def main():
         code = alloc(binary.shape, np.uint8)
         values = alloc((2,), np.float32)
         ids = alloc((2,), np.uint32)
-        route = alloc((8,), np.uint32)
+        route = alloc((record_start + 8,), np.uint32)
         args = alloc((18,), np.uint32)
         code[:] = binary
         code.flush()
@@ -50,20 +58,23 @@ def main():
             route.flush()
             completion = device.call(code.physical_address, args.physical_address, perf=True)
             route.invalidate()
-            ids_ok = np.array_equal(route[1:3], source_ids.astype(np.uint32))
-            offsets_ok = np.array_equal(route[3:5], source_ids.astype(np.uint32) * STRIDE)
+            record = route[record_start:record_start + 8]
+            ids_ok = np.array_equal(record[1:3], source_ids.astype(np.uint32))
+            offsets_ok = np.array_equal(record[3:5], source_ids.astype(np.uint32) * STRIDE)
             selected = source_values.astype(np.float32)
             reference = np.exp(selected - selected[0]).astype(np.float32)
             reference /= reference.sum(dtype=np.float32)
-            weights = route[5:7].view(np.float32)
+            weights = record[5:7].view(np.float32)
             weights_ok = np.allclose(weights, reference, rtol=2e-4, atol=2e-4)
-            ok = (completion["status"] == 0 and route[0] == 2 and route[7] == 0 and
+            ok = (completion["status"] == 0 and record[0] == 2 and record[7] == 0 and
                   ids_ok and offsets_ok and weights_ok)
-            results.append({"name": name, "pass": bool(ok), "ids": route[1:3].tolist(),
-                            "offsets": route[3:5].tolist(), "weights": weights.tolist(),
+            results.append({"name": name, "pass": bool(ok), "status": int(completion["status"]),
+                            "ids": record[1:3].tolist(),
+                            "offsets": record[3:5].tolist(), "weights": weights.tolist(),
                             "cycles": int(completion["cycles"])})
-            print(f"{name}: {'PASS' if ok else 'FAIL'} IDs {route[1:3].tolist()}, "
-                  f"weights {weights.tolist()}, cycles {completion['cycles']}")
+            print(f"{name}: {'PASS' if ok else 'FAIL'} status {completion['status']}, "
+                  f"IDs {record[1:3].tolist()}, weights {weights.tolist()}, "
+                  f"cycles {completion['cycles']}")
     finally:
         device.close()
         for value in reversed(buffers):

@@ -58,10 +58,16 @@ class ModelRouteHostTest(unittest.TestCase):
                         ids = np.asarray(case["ids"], np.uint32)
                         ctypes.memmove(base, values.ctypes.data, values.nbytes)
                         ctypes.memmove(base + 64, ids.ctypes.data, ids.nbytes)
-                        fn((ctypes.c_uint32 * 3)(base, base + 64, base + 128 - 64),
+                        ctypes.memset(base + 128, 0, 96)
+                        # Match the board binding: the 32-byte record starts
+                        # 64 bytes into its allocated output buffer.
+                        fn((ctypes.c_uint32 * 3)(base, base + 64, base + 128),
                            (ctypes.c_uint32 * 1)(0))
                         record = np.ctypeslib.as_array(
+                            (ctypes.c_uint32 * 8).from_address(base + 192)).copy()
+                        prefix = np.ctypeslib.as_array(
                             (ctypes.c_uint32 * 8).from_address(base + 128)).copy()
+                        np.testing.assert_array_equal(prefix, np.zeros(8, np.uint32))
                         self.assertEqual(record[0], 2)
                         np.testing.assert_array_equal(record[1:3], ids)
                         np.testing.assert_array_equal(record[3:5],

@@ -51,7 +51,7 @@ for f in /etc/profile.d/pynq_venv.sh /etc/profile.d/xrt_setup.sh /opt/xilinx/xrt
   if [ -f "$f" ]; then source "$f" >/dev/null; fi
 done
 cd "$(dirname "$0")"
-exec python3 board_moe_route_from_top2.py "$@"
+exec python3 board_moe_route_from_top2.py --output-subspan=64 "$@"
 """)
     run.chmod(0o755)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
