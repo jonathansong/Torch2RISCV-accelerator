@@ -1435,6 +1435,32 @@ the absence of a single compiled IREE MoE program remain the M5 gap.
 The board's `board_report.json` reported `pass: true` and every case
 reported `ffn_status: 0`.
 
+#### M5n single-VMFB route-to-FFN dispatch prototype (host compiled, KV260 pending)
+
+`compiler/frontend/moe_iree_chain.py` packages the compiler-generated
+RISC-V route export and the reusable FFN descriptor as two SA executables in
+one HAL module. Its public `main` takes Top-2 values/IDs, the activation,
+packed parameters, a 96-byte route buffer, and an output buffer. It dispatches
+the route kernel, inserts an execution barrier, dispatches the shared W8A8
+FFN with the route record at byte offset 64, and submits one command buffer.
+The buffer and parameter offsets come from the generated MoE manifest. Both
+route and output buffers are returned for validation. This removes the board
+script's dispatch-to-dispatch handoff for this isolated stage; router matmul
+and Top-2 selection still precede the wrapper and the full model is not yet
+compiled as this program.
+
+The real-layer wrapper compiled to a 39 KiB VMFB. Its VM IR contains exactly
+two HAL dispatch calls, one barrier, and one queue execute. The available SA
+host runtime was not built, so this is a compiler/IR check rather than an
+execution result. The current KV260 IREE runtime uses a 32 MiB u-dma-buf
+window, which cannot hold the real layer's 88 MiB packed parameters. For the
+first board execution, `moe_m5n_board_bundle.py` stages a 4-expert synthetic
+layer with 28 KiB of parameters and three inputs in `build/moe/m5n/board`.
+Copy that directory to `~/moe-m5n` on KV260 and run `./run_board.sh`; the
+runner compares route IDs/offsets and the full W8A8 output to the reference.
+KV260 acceptance is pending. Real-model execution through this VMFB also
+requires a larger or externally mapped parameter buffer in the SA runtime.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。

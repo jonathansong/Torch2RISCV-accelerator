@@ -3,6 +3,7 @@
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ for directory in ("compiler/frontend", "compiler/runtime/tools", "llm"):
 
 import moe  # noqa: E402
 from moe_device_bundle import build, recognized_fields, route_source  # noqa: E402
+from moe_iree_chain import build as build_chain, COMPILE  # noqa: E402
 from synth_hf import write_safetensors  # noqa: E402
 import sadesc  # noqa: E402
 from sa_funcsim import SaFuncSim  # noqa: E402
@@ -88,6 +90,19 @@ class MoeDeviceBundleTest(unittest.TestCase):
             expected = sum((weight * moe.w8a8_expert(xq, xs, quantized, int(expert))).astype(np.float32)
                            for expert, weight in zip(ids, routing))
             np.testing.assert_allclose(got, expected, rtol=3e-3, atol=3e-3)
+
+            # A single VMFB carries both existing device exports and schedules
+            # the route record producer before its FFN consumer.
+            chain = build_chain(out, root / "chain")
+            self.assertGreater(chain.stat().st_size, 0)
+            lowered = root / "chain_vm.mlir"
+            subprocess.run([str(COMPILE), str(root / "chain/moe_chain.mlir"),
+                            "--compile-from=hal", "--compile-to=vm", "-o", str(lowered)],
+                           check=True, capture_output=True, text=True)
+            vm = lowered.read_text()
+            self.assertEqual(vm.count("vm.call.variadic @hal.command_buffer.dispatch("), 2)
+            self.assertEqual(vm.count("vm.call @hal.command_buffer.execution_barrier("), 1)
+            self.assertEqual(vm.count("vm.call @hal.device.queue.execute("), 1)
 
     def test_rejects_other_device_width(self):
         with self.assertRaisesRegex(ValueError, "D=16"):
