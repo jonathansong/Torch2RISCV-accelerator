@@ -28,6 +28,12 @@ def main():
         raise RuntimeError("invalid compiled FFN descriptor")
     template = DescList()
     template.rows = exports[0][1].tolist()
+    # The executable export ends in RET for IREE's command-list caller. This
+    # board runner submits the list directly, so it needs a top-level END.
+    if template.rows[-1][0] & 0xFF != DescList.RET:
+        raise RuntimeError("compiled FFN export does not end in RET")
+    template.rows.pop()
+    template.end(0x5A)
     cases = []
     for filename in ("moe_acceptance.npz", "moe_token_acceptance.npz"):
         reference = np.load(os.path.join(HERE, filename))
@@ -95,10 +101,13 @@ def main():
             error = float(np.max(np.abs(np.asarray(output) - expected)))
             passed = fc["status"] == 0 and np.allclose(output, expected, rtol=3e-3, atol=3e-3)
             print(f"{name}: {'PASS' if passed else 'FAIL'} experts {record[1:3].tolist()}, "
-                  f"route {rc['cycles']} cycles, FFN {fc['cycles']} cycles, max error {error:.6g}",
+                  f"route {rc['cycles']} cycles, FFN status {fc['status']}, "
+                  f"FFN {fc['cycles']} cycles, max |output| {float(np.max(np.abs(output))):.6g}, "
+                  f"max error {error:.6g}",
                   flush=True)
             results.append({"name": name, "pass": bool(passed),
                             "ids": record[1:3].tolist(), "route_cycles": int(rc["cycles"]),
+                            "ffn_status": int(fc["status"]),
                             "ffn_cycles": int(fc["cycles"]), "max_error": error})
     finally:
         device.close()

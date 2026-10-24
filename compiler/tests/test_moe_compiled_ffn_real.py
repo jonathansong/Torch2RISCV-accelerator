@@ -9,10 +9,12 @@ import unittest
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
-for directory in ("compiler/frontend", "compiler/runtime/tools", "llm"):
+for directory in ("compiler/frontend", "compiler/runtime/tools", "llm", "driver"):
     sys.path.insert(0, str(REPO / directory))
 import moe  # noqa: E402
 import sadesc  # noqa: E402
+import moe_m3b  # noqa: E402
+from pynq_matmul import DescList  # noqa: E402
 from sa_funcsim import SaFuncSim  # noqa: E402
 
 BUNDLE = REPO / "build/moe/m5m/board"
@@ -29,6 +31,13 @@ class CompiledRealFfnTest(unittest.TestCase):
         self.assertEqual(d, 16)
         self.assertEqual(len(exports), 1)
         self.assertEqual(exports[0][2], 4)
+        direct = DescList()
+        direct.rows = exports[0][1].tolist()
+        self.assertEqual(direct.rows[-1][0] & 0xFF, DescList.RET)
+        direct.rows.pop()
+        direct.end(0x5A)
+        np.testing.assert_array_equal(direct.array(),
+            moe_m3b.top2_ffn_template(dim, manifest["hidden"], d, ret=False).array())
         base = 0x10000000
         template = base
         xaddr = base + 0x10000
@@ -37,7 +46,7 @@ class CompiledRealFfnTest(unittest.TestCase):
         outaddr = (paramaddr + len(params) + 0xFFFF) & ~0xFFFF
         listaddr = outaddr + 0x10000
         sim = SaFuncSim(16, base, 128 * 1024 * 1024)
-        sim.ddr_write(template, exports[0][1].tobytes())
+        sim.ddr_write(template, direct.array().tobytes())
         sim.ddr_write(paramaddr, params)
         for filename in ("moe_acceptance.npz", "moe_token_acceptance.npz"):
             reference = np.load(BUNDLE / filename)

@@ -1397,7 +1397,17 @@ records read as zero. The compiler-generated `sahl.route_top2` export uses a
 full prefix plus record, reads words 16–23, and passes that physical subspan
 to the FFN. The M5k and M5g compiler-route board runners use the same rule;
 the M5e standalone C bridge still uses its zero-offset ABI. A host test now
-checks the offset explicitly. The corrected KV260 bundle still awaits rerun.
+checks the offset explicitly.
+
+The next KV260 run produced valid route records for all five cases, but each
+FFN output stayed zero. The compiled descriptor's 542 rows are identical to
+M4's accepted direct-submit template except for the final `RET`. The board
+runner submitted this export at top level, where `sa_cmdfetch.v` treats
+`RET` without `CALL` as an error. The runner now replaces only that row with
+`END` before direct submission and reports completion status and output
+magnitude. The host regression checks byte-for-byte equality with the M4
+direct-submit list and executes all five W8A8 references. KV260 validation
+of this second correction is pending.
 
 ### M6：Prefill/grouped execution
 
