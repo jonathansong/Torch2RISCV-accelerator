@@ -54,7 +54,7 @@ class MoeDeviceBundleTest(unittest.TestCase):
             self.assertTrue(any("batch_matmul" in name for name in coverage["host"]))
             self.assertEqual(coverage, json.loads((out / "compiler_bundle.json").read_text())
                              ["native_module_dispatches"])
-            self.assertEqual(len(result["artifacts"]), 8)
+            self.assertEqual(len(result["artifacts"]), 11)
             for name, info in result["artifacts"].items():
                 self.assertEqual((out / name).stat().st_size, info["bytes"])
                 self.assertGreater(info["bytes"], 0)
@@ -66,6 +66,8 @@ class MoeDeviceBundleTest(unittest.TestCase):
             self.assertIn("_topk_", top2_exports[0][0])
             self.assertEqual(top2_exports[0][2], 3)
             self.assertGreater((out / "moe_router.vmvx").stat().st_size, 0)
+            self.assertGreater((out / "moe_chain.vmfb").stat().st_size, 0)
+            np.testing.assert_array_equal(np.load(out / "moe_router.npy"), weights.router)
 
             # Execute the newly generated reusable FFN export using the same
             # model-derived packed parameters and dynamic route offsets.
@@ -126,6 +128,8 @@ class MoeDeviceBundleTest(unittest.TestCase):
             router_chain = build_chain(out, root / "router_chain",
                                        include_top2=True, include_router=True)
             self.assertGreater(router_chain.stat().st_size, full_chain.stat().st_size)
+            self.assertEqual((out / "moe_chain.mlir").read_bytes(),
+                             (root / "router_chain/moe_chain.mlir").read_bytes())
             router_vm = root / "router_chain_vm.mlir"
             subprocess.run([str(COMPILE), str(root / "router_chain/moe_chain.mlir"),
                             "--compile-from=hal", "--compile-to=vm", "-o", str(router_vm)],

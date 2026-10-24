@@ -1527,7 +1527,7 @@ entries, and heartbeat 28,737. A real-layer board run needs a larger selected
 u-dma-buf window, and the wrapper is not yet formed automatically from the
 recognized MoE graph.
 
-#### M5q real Mixtral layer in the single VMFB (host staged, KV260 pending)
+#### M5q real Mixtral layer in the single VMFB (KV260 passed)
 
 The KV260 configuration reserves a 1280 MiB u-dma-buf pool at physical
 address `0x10000000` (`boards/kv260/README.md`); the prior IREE tests merely
@@ -1540,9 +1540,32 @@ headroom for the runtime, activations, descriptors, and output. The staged
 router scores and selected IDs against the original checkpoint before
 packaging. The output reference is the M4 W8A8 expert result for that token.
 The board bundle is `build/moe/m5q/board`; its runner checks scores, IDs,
-route offsets, and the final vector. KV260 execution is pending. The bundle
-still uses an explicitly assembled HAL wrapper rather than a compiler pass
-that rewrites the whole recognized MoE region into this program.
+route offsets, and the final vector. The KV260 run passed with the 128 MiB
+window: router score maximum error `5.960464e-7`, selected experts `[7, 0]`,
+route offsets `[77,299,712, 0]`, output maximum magnitude `0.696704`, and
+maximum output error `0.000625316`. The report recorded route status 2,
+`pass: true`, three firmware entries, and heartbeat 1,050,809. This accepts
+the real model-derived four-stage device path in one VMFB. The bundle still
+uses an explicitly assembled HAL wrapper rather than a compiler pass that
+rewrites the whole recognized MoE region into this program.
+
+#### M5r automatic single-VMFB compiler bundle (host verified, KV260 pending)
+
+`compiler/frontend/moe_device_bundle.py` now builds the router weights and
+four-stage `moe_chain.mlir`/`moe_chain.vmfb` as part of its normal checkpoint
+build. One invocation recognizes the Mixtral Top-2 FFN, checks its shape and
+packed-stride ABI, extracts the model-compiled router and Top-2 executables,
+compiles the route kernel, creates the reusable FFN descriptor, and assembles
+router→Top-2→route→FFN into one VMFB. The bundle records hashes for all 11
+artifacts. `moe_m5q_board_bundle.py` stages the VMFB and router weights
+directly from that bundle, without loading the checkpoint or separately
+building a wrapper. The synthetic compiler-bundle test passed. The real
+layer-0 checkpoint bundle regenerated successfully, and its generated HAL
+source is byte-identical to the source used for the accepted M5q board run.
+The newly built VMFB has a different byte hash, so board acceptance of this
+automatic path remains pending. This is frontend assembly of compiler outputs;
+the native IREE pass recognizes the architecture but does not yet rewrite the
+entire graph into the four-stage HAL chain.
 
 ### M6：Prefill/grouped execution
 

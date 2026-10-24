@@ -14,44 +14,39 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO / "compiler/frontend"))
-import moe_hf  # noqa: E402
 import moe  # noqa: E402
-from moe_iree_chain import build as build_chain  # noqa: E402
 
 OVERLAY = REPO / "boards/kv260/build/output/d16_100mhz_w128_p6_gemv_np4_pcpi"
 RUNTIME = REPO / "build/iree/build-sa-aarch64/tools/iree-run-module"
 BUNDLE = REPO / "build/moe/m5k/real-layer0"
-MODEL = REPO / "build/llm_cache/TitanML-tiny-mixtral"
 REFERENCE = REPO / "build/moe/m4c/tiny-mixtral/layer0/moe_token_acceptance.npz"
 WINDOW_MB = 128
 
 
-def stage(out, bundle=BUNDLE, model=MODEL, reference=REFERENCE, runtime=RUNTIME):
+def stage(out, bundle=BUNDLE, reference=REFERENCE, runtime=RUNTIME):
     out, bundle = Path(out).resolve(), Path(bundle).resolve()
     manifest = json.loads((bundle / "moe_manifest.json").read_text())
     if manifest["d"] != 16 or manifest["experts"] != 8 or manifest["dim"] != 1024:
         raise ValueError("expected the D=16, eight-expert tiny Mixtral layer")
     if manifest["total_bytes"] + (16 << 20) > (WINDOW_MB << 20):
         raise ValueError("packed parameters leave insufficient room in the 128 MiB window")
-    chain = out.parent / "real-chain"
-    build_chain(bundle, chain, include_top2=True, include_router=True)
-    _, weights, source = moe_hf.load_layer(str(model), 0, d=16)
-    if source["adapter"] != "mixtral":
-        raise ValueError("expected Mixtral checkpoint")
+    router = np.load(bundle / "moe_router.npy")
+    if router.shape != (8, 1024) or router.dtype != np.float32:
+        raise ValueError("expected model-derived FP32 router weights")
     with np.load(reference) as data:
         x = np.asarray(data["x"], dtype=np.float32).reshape(1, 1024)
         scores = np.asarray(data["scores"], dtype=np.float32).reshape(1, 8)
         ids = np.asarray(data["pairs"], dtype=np.int32).reshape(1, 2)
         expected = np.asarray(data["output"], dtype=np.float32).reshape(1, 1024)
     values = np.take_along_axis(scores, ids, axis=1)
-    router_scores = weights.router @ x.reshape(-1)
+    router_scores = router @ x.reshape(-1)
     if not np.allclose(router_scores, scores.reshape(-1), rtol=2e-4, atol=2e-5):
         raise ValueError("reference router scores do not match the checkpoint")
     selected, _ = moe.route(scores.reshape(-1), 2)
     if not np.array_equal(selected, ids.reshape(-1)):
         raise ValueError("reference Top-2 IDs do not match router scores")
     out.mkdir(parents=True, exist_ok=True)
-    files = [chain / "moe_chain.vmfb", bundle / "moe_manifest.json",
+    files = [bundle / "moe_chain.vmfb", bundle / "moe_manifest.json",
              OVERLAY / "picorv32.bit", OVERLAY / "picorv32.hwh",
              REPO / "firmware/rt/rt_fw.bin",
              REPO / "compiler/runtime/test/board_launcher.py",
@@ -62,7 +57,7 @@ def stage(out, bundle=BUNDLE, model=MODEL, reference=REFERENCE, runtime=RUNTIME)
             raise FileNotFoundError(path)
         shutil.copy2(path, out / path.name)
     np.save(out / "moe_params.npy", np.fromfile(bundle / "moe_params.bin", dtype=np.uint8))
-    np.save(out / "router.npy", np.asarray(weights.router, dtype=np.float32))
+    shutil.copy2(bundle / "moe_router.npy", out / "router.npy")
     case = out / "token"
     case.mkdir(exist_ok=True)
     np.save(case / "x.npy", x)
@@ -102,8 +97,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=REPO / "build/moe/m5q/board")
     parser.add_argument("--bundle", type=Path, default=BUNDLE)
-    parser.add_argument("--model", type=Path, default=MODEL)
     parser.add_argument("--reference", type=Path, default=REFERENCE)
     parser.add_argument("--runtime", type=Path, default=RUNTIME)
     args = parser.parse_args()
-    stage(args.out, args.bundle, args.model, args.reference, args.runtime)
+    stage(args.out, args.bundle, args.reference, args.runtime)

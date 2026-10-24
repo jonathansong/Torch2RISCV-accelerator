@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Build model-derived IREE and reusable SA MoE device artifacts.
+"""Build model-derived IREE MoE artifacts and a single route-to-FFN VMFB.
 
-The artifacts remain separate exports. This checks the compiler's recognized
-MoE shape against the packed W8A8 ABI; orchestration into one VMFB is a later
-lowering step.
+Checks the recognized Mixtral MoE shape against the packed W8A8 ABI, then
+assembles the extracted executables into one HAL program.
 """
 
 import argparse
@@ -16,12 +15,15 @@ import subprocess
 import sys
 import tempfile
 
+import numpy as np
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "compiler/runtime/tools"))
 
 import moe_hf  # noqa: E402
 from moe_native import NativeMixtralMoe, export  # noqa: E402
 import moe_m3b  # noqa: E402
+from moe_iree_chain import build as build_moe_chain  # noqa: E402
 import sadesc  # noqa: E402
 
 COMPILE = REPO / "build/iree/build-compiler/tools/iree-compile"
@@ -163,13 +165,16 @@ def build(model, layer, out, d=16):
     if not flags & 2 or not code_length or code_offset + code_length > len(binary):
         raise RuntimeError("missing compiler-generated embedded route kernel")
     (out / "moe_route.bin").write_bytes(binary[code_offset:code_offset + code_length])
+    np.save(out / "moe_router.npy", np.asarray(weights.router, dtype=np.float32))
+    build_moe_chain(out, out, include_top2=True, include_router=True)
     result = {"format": "sa-moe-compiler-bundle-v1", "source": source,
               "recognized": recognized, "d": d,
               "native_module_dispatches": coverage,
               "artifacts": {name: artifact_info(out / name)
                             for name in ("moe_layer.vmfb", "moe_layer.irpa", "moe_params.bin",
-                                         "moe_router.vmvx", "moe_top2.sadesc", "moe_ffn.sadesc", "route.vmfb",
-                                         "moe_route.bin")}}
+                                         "moe_router.npy", "moe_router.vmvx", "moe_top2.sadesc",
+                                         "moe_ffn.sadesc", "route.vmfb", "moe_route.bin",
+                                         "moe_chain.mlir", "moe_chain.vmfb")}}
     (out / "compiler_bundle.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
