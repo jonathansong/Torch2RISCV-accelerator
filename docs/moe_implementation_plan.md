@@ -1186,10 +1186,27 @@ bridge's normalization uses soft-float helpers. Compiler integration must
 either embed those helpers in a position-independent code-table entry or
 implement the normalization without external calls.
 
-Next connect Top-2 values/IDs to the route bridge in the compiler/runtime,
-then extend the pattern through dynamic expert indexing and weighted combine. Lower the
-expert computation to one reusable SA FFN template. Compile a single Mixtral
-layer from IREE input and compare route IDs, weights, and output to M4.
+#### M5f connected KV260 acceptance bundle (pending board run)
+
+`moe_m5f_board_bundle.py` stages `build/moe/m5f/board` from the accepted M5d
+IREE VMFB and M5e route bridge, plus the existing M4 W8A8 FFN template. Its
+`board_moe_iree_ffn.py` first runs the actual IREE router export for three
+cases and checks raw values/IDs bit for bit. It then restarts the overlay and
+passes those actual IREE output tensors, via host files, into the rv32 route
+bridge, then uses the resulting record for the M4 device FFN. It checks IDs,
+parameter byte offsets, and the FFN output against a host reference, and
+writes `board_report.json`. The staged bundle passed host-side syntax and
+file-presence checks; it still needs `./run_board.sh` on KV260.
+
+The host file handoff and overlay restart make this an integration acceptance
+test, not one compiled IREE MoE executable. The next compiler task is to
+express the normalization and expert parameter selection in the SA dialects
+and emit them as device work following `sahl.top2`.
+
+Then extend the compiler pattern through dynamic expert indexing and weighted
+combine. Lower the expert computation to one reusable SA FFN template. Compile
+a single Mixtral layer from IREE input and compare route IDs, weights, and
+output to M4.
 
 ### M6：Prefill/grouped execution
 
