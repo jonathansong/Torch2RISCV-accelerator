@@ -32,6 +32,7 @@ def main():
     subprocess.run([str(COMPILE), str(source), "--compile-from=hal", "-o",
                     str(OUT / "moe_model_debug.vmfb")], check=True)
     shutil.copy2(Path(__file__).with_name("board_moe_m5t_diagnose.py"), OUT)
+    shutil.copy2(SOURCE.with_name("moe_top2_abi.json"), OUT)
     reference = REPO / "build/moe/m4c/tiny-mixtral/layer0/moe_token_acceptance.npz"
     with np.load(reference) as data:
         np.save(OUT / "scores_expected.npy", data["scores"][0])

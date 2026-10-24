@@ -27,6 +27,9 @@ def main():
     if not runner.is_file():
         raise FileNotFoundError(runner)
     manifest = json.loads((HERE / "moe_manifest.json").read_text())
+    abi_file = HERE / "moe_top2_abi.json"
+    top2_abi = (json.loads(abi_file.read_text()) if abi_file.is_file() else
+                {"values_offset": 0, "ids_offset": 64})
     mm, buf, env = BL.start(str(HERE / "picorv32.bit"), str(HERE / "rt_fw.bin"),
                             mb=args.window_mb)
     env["SA_RV"] = "embedded"
@@ -84,8 +87,10 @@ def main():
                                                    rtol=2e-4 if args.real else 1e-5,
                                                    atol=2e-5 if args.real else 1e-5))
             if top2:
-                selected_values = np.load(case / "values_device.npy").reshape(-1)
-                selected_ids = np.load(case / "ids_device.npy").view("<i4")[16:18]
+                value_start = top2_abi["values_offset"] // 4
+                id_start = top2_abi["ids_offset"] // 4
+                selected_values = np.load(case / "values_device.npy").reshape(-1)[value_start:value_start + 2]
+                selected_ids = np.load(case / "ids_device.npy").view("<i4")[id_start:id_start + 2]
                 valid = (valid and np.array_equal(selected_ids, ids)
                          and np.allclose(selected_values,
                                          np.load(case / "values.npy").reshape(-1),

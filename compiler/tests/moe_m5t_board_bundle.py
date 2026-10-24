@@ -43,10 +43,12 @@ def stage(out, bundle=BUNDLE, runtime=RUNTIME):
     dim, experts = manifest["dim"], manifest["experts"]
     if (manifest["d"], dim, experts, manifest["top_k"]) != (16, 1024, 8, 2):
         raise ValueError("expected real layer-0 D=16 Mixtral Top-2 bundle")
+    abi = json.loads((bundle / "moe_top2_abi.json").read_text())
     # This is a peak upper bound: archive router + packed weights, five scratch
     # buffers, one input, and 2 MiB of command/runtime allocations.
     required = (manifest["total_bytes"] + experts * dim * 4 +
-                (experts * 4 + 8 + 72 + 96 + dim * 4) + dim * 4 + (2 << 20))
+                (experts * 4 + abi["values_offset"] + 8 + abi["ids_offset"] + 8 +
+                 96 + dim * 4) + dim * 4 + (2 << 20))
     if required > WINDOW_BYTES:
         raise ValueError(f"MoE buffers need {required} bytes in a {WINDOW_BYTES}-byte window")
     router = np.load(bundle / "moe_router.npy")
@@ -69,6 +71,7 @@ def stage(out, bundle=BUNDLE, runtime=RUNTIME):
             "router": router.nbytes, "params": manifest["total_bytes"]}:
         raise ValueError("parameter archive disagrees with packed manifest")
     files = [bundle / "moe_model.vmfb", bundle / "moe_native.irpa",
+             bundle / "moe_top2_abi.json",
              OVERLAY / "picorv32.bit", OVERLAY / "picorv32.hwh",
              REPO / "firmware/rt/rt_fw.bin", REPO / "driver/pynq_matmul.py",
              REPO / "compiler/runtime/test/board_launcher.py",

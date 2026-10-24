@@ -1646,6 +1646,19 @@ with the SA lit suite and golden guard, before the native path is accepted.
 The longer-term M6 work remains batched tokens, grouped expert execution,
 and full-model generation integration.
 
+The first M5t KV260 run completed all four programs but returned NaNs. A
+five-output diagnostic run showed accurate router scores while Top-2 values
+and IDs remained at their initial `-inf`/`INT32_MAX` values. Comparing the
+accepted M5q and new Top-2 binaries showed that the one-output Torch export
+changed the compiler-generated write subspans from values/IDs offsets 0/64
+to 64/128 bytes. The wrapper had bound only 8/72 bytes, so Top-2 wrote beyond
+the scratch buffers. The bundle builder now reads the three subspan offsets
+from IREE's executable configuration and writes `moe_top2_abi.json`; the
+compiler-owned chain uses those offsets for buffer sizes, initialization,
+Top-2 bindings, and route bindings. Host integration and compiler regressions
+are rerun before a second KV260 acceptance. The second board result remains
+pending.
+
 After copying `build/moe/m5t/board` to KV260, the final acceptance command is:
 
 ```bash

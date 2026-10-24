@@ -47,6 +47,7 @@ def stage(out, bundle=BUNDLE, reference=REFERENCE, runtime=RUNTIME):
         raise ValueError("reference Top-2 IDs do not match router scores")
     out.mkdir(parents=True, exist_ok=True)
     files = [bundle / "moe_chain.vmfb", bundle / "moe_manifest.json",
+             bundle / "moe_top2_abi.json",
              OVERLAY / "picorv32.bit", OVERLAY / "picorv32.hwh",
              REPO / "firmware/rt/rt_fw.bin",
              REPO / "compiler/runtime/test/board_launcher.py",
@@ -56,6 +57,7 @@ def stage(out, bundle=BUNDLE, reference=REFERENCE, runtime=RUNTIME):
         if not path.is_file():
             raise FileNotFoundError(path)
         shutil.copy2(path, out / path.name)
+    top2_abi = json.loads((bundle / "moe_top2_abi.json").read_text())
     np.save(out / "moe_params.npy", np.fromfile(bundle / "moe_params.bin", dtype=np.uint8))
     shutil.copy2(bundle / "moe_router.npy", out / "router.npy")
     case = out / "token"
@@ -64,11 +66,14 @@ def stage(out, bundle=BUNDLE, reference=REFERENCE, runtime=RUNTIME):
     np.save(case / "scores.npy", scores)
     np.save(case / "scores_init.npy", np.zeros((1, 8), dtype=np.float32))
     np.save(case / "values.npy", values)
-    np.save(case / "values_init.npy", np.full((1, 2), -np.inf, dtype=np.float32))
+    np.save(case / "values_init.npy",
+            np.full(((top2_abi["values_offset"] + 8) // 4,), -np.inf,
+                    dtype=np.float32))
     np.save(case / "ids.npy", ids)
-    ids_init = np.zeros(72, dtype=np.uint8)
-    ids_init[64:72] = np.full(2, np.iinfo(np.int32).max,
-                               dtype=np.int32).view(np.uint8)
+    ids_init = np.zeros(top2_abi["ids_offset"] + 8, dtype=np.uint8)
+    at = top2_abi["ids_offset"]
+    ids_init[at:at + 8] = np.full(2, np.iinfo(np.int32).max,
+                                   dtype=np.int32).view(np.uint8)
     np.save(case / "ids_init.npy", ids_init)
     np.save(case / "route_zero.npy", np.zeros(96, dtype=np.uint8))
     np.save(case / "out_zero.npy", np.zeros((1, 1024), dtype=np.float32))

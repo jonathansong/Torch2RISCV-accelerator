@@ -14,6 +14,10 @@ R"SA_MOE(
     %c64 = arith.constant 64 : index
     %c72 = arith.constant 72 : index
     %c96 = arith.constant 96 : index
+    %cvalues_storage = arith.constant @VALUES_STORAGE_BYTES@ : index
+    %cids_storage = arith.constant @IDS_STORAGE_BYTES@ : index
+    %cvalues_offset = arith.constant @VALUES_OFFSET@ : index
+    %cids_offset = arith.constant @IDS_OFFSET@ : index
     %cscores = arith.constant @SCORES_BYTES@ : index
     %crouter = arith.constant @ROUTER_BYTES@ : index
     %cparam = arith.constant @PARAM_OFFSET@ : index
@@ -52,15 +56,15 @@ R"SA_MOE(
         target(%top2_exe : !hal.executable)[%c0]
         workgroups([%c1, %c1, %c1]) constants([])
         bindings([(%scores : !hal.buffer)[%c0, %cscores],
-                  (%values : !hal.buffer)[%c0, %c8],
-                  (%ids : !hal.buffer)[%c0, %c72]]) flags("None")
+                  (%values : !hal.buffer)[%c0, %cvalues_storage],
+                  (%ids : !hal.buffer)[%c0, %cids_storage]]) flags("None")
     hal.command_buffer.execution_barrier<%cmd : !hal.command_buffer>
         source("CommandIssue") target("CommandProcess") flags("None")
     hal.command_buffer.dispatch<%cmd : !hal.command_buffer>
         target(%route_exe : !hal.executable)[%c0]
         workgroups([%c1, %c1, %c1]) constants([])
-        bindings([(%values : !hal.buffer)[%c0, %c8],
-                  (%ids : !hal.buffer)[%c64, %c8],
+        bindings([(%values : !hal.buffer)[%cvalues_offset, %c8],
+                  (%ids : !hal.buffer)[%cids_offset, %c8],
                   (%route_buffer : !hal.buffer)[%c0, %c96]]) flags("None")
     hal.command_buffer.execution_barrier<%cmd : !hal.command_buffer>
         source("CommandIssue") target("CommandProcess") flags("None")

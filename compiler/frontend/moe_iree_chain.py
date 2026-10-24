@@ -37,7 +37,7 @@ def vmvx_binary_op(name, data):
 
 
 def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
-           experts=None, router_binary=None):
+           experts=None, router_binary=None, top2_abi=None):
     for name, data, bindings in (("route_top2", route_binary, 3),
                                  ("moe_top2_ffn", ffn_binary, 4)):
         d, _, exports = sadesc.read(data)
@@ -54,6 +54,11 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
     if router_binary is not None and top2_binary is None:
         raise ValueError("router dispatch requires the Top-2 dispatch")
     activation_bytes = dim * 4
+    top2_abi = top2_abi or {"scores_offset": 0, "values_offset": 0, "ids_offset": 64}
+    if top2_abi["scores_offset"] != 0:
+        raise ValueError("unsupported nonzero Top-2 score binding offset")
+    values_offset, ids_offset = top2_abi["values_offset"], top2_abi["ids_offset"]
+    values_storage, ids_storage = values_offset + 8, ids_offset + 8
     top2_binary_op = binary_op("top2", top2_binary) if top2_binary is not None else ""
     router_op = vmvx_binary_op("router", router_binary) if router_binary is not None else ""
     router_arg = ("                         %router_view: !hal.buffer_view,\n"
@@ -62,7 +67,8 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
     scores_size = f"    %cscores = arith.constant {experts * 4} : index\n" if top2_binary is not None else ""
     router_size = (f"    %crouter = arith.constant {experts * activation_bytes} : index\n"
                    if router_binary is not None else "")
-    ids_binding = ("[%c64, %c8]" if top2_binary is not None else "[%c0, %c8]")
+    ids_binding = ("[%cids_offset, %c8]" if top2_binary is not None else "[%c0, %c8]")
+    values_binding = ("[%cvalues_offset, %c8]" if top2_binary is not None else "[%c0, %c8]")
     top2_exe = ("    %top2_exe = hal.executable.create device(%device : !hal.device)\n"
                 "        affinity(%affinity) target(@top2::@sa_desc_v1) : !hal.executable\n"
                 if top2_binary is not None else "")
@@ -88,8 +94,8 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
         target(%top2_exe : !hal.executable)[%c0]
         workgroups([%c1, %c1, %c1]) constants([])
         bindings([(%scores : !hal.buffer)[%c0, %cscores],
-                  (%values : !hal.buffer)[%c0, %c8],
-                  (%ids : !hal.buffer)[%c0, %c72]]) flags("None")
+                  (%values : !hal.buffer)[%c0, %cvalues_storage],
+                  (%ids : !hal.buffer)[%c0, %cids_storage]]) flags("None")
     hal.command_buffer.execution_barrier<%cmd : !hal.command_buffer>
         source("CommandIssue") target("CommandProcess") flags("None")'''
                      if top2_binary is not None else "")
@@ -119,6 +125,10 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
     %c64 = arith.constant 64 : index
     %c72 = arith.constant 72 : index
     %c96 = arith.constant 96 : index
+    %cvalues_storage = arith.constant {values_storage} : index
+    %cids_storage = arith.constant {ids_storage} : index
+    %cvalues_offset = arith.constant {values_offset} : index
+    %cids_offset = arith.constant {ids_offset} : index
 {scores_size}{router_size}    %cparam = arith.constant {param_offset} : index
     %cx = arith.constant {activation_bytes} : index
     %affinity = arith.constant -1 : i64
@@ -142,7 +152,7 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
     hal.command_buffer.dispatch<%cmd : !hal.command_buffer>
         target(%route_exe : !hal.executable)[%c0]
         workgroups([%c1, %c1, %c1]) constants([])
-        bindings([(%values : !hal.buffer)[%c0, %c8],
+        bindings([(%values : !hal.buffer){values_binding},
                   (%ids : !hal.buffer){ids_binding},
                   (%route_buffer : !hal.buffer)[%c0, %c96]]) flags("None")
     hal.command_buffer.execution_barrier<%cmd : !hal.command_buffer>
@@ -180,10 +190,12 @@ def build(bundle, out, *, include_top2=False, include_router=False):
     vmfb = out / "moe_chain.vmfb"
     top2_binary = ((bundle / "moe_top2.sadesc").read_bytes() if include_top2 else None)
     router_binary = ((bundle / "moe_router.vmvx").read_bytes() if include_router else None)
+    abi_path = bundle / "moe_top2_abi.json"
+    top2_abi = json.loads(abi_path.read_text()) if abi_path.is_file() else None
     mlir.write_text(source(route_binary, ffn_binary, dim=manifest["dim"],
                            param_offset=manifest["expert_table_offset"],
                            top2_binary=top2_binary, experts=manifest["experts"],
-                           router_binary=router_binary))
+                           router_binary=router_binary, top2_abi=top2_abi))
     subprocess.run([str(COMPILE), str(mlir), "--compile-from=hal", "-o", str(vmfb)],
                    check=True)
     return vmfb

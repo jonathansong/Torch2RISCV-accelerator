@@ -55,8 +55,10 @@ def stage(out, runtime=RUNTIME, *, include_top2=False, include_router=False):
     build_device_bundle(model, 0, bundle)
     build_chain(bundle, chain, include_top2=include_top2,
                 include_router=include_router)
+    top2_abi = json.loads((bundle / "moe_top2_abi.json").read_text())
     out.mkdir(parents=True, exist_ok=True)
     files = [chain / "moe_chain.vmfb", bundle / "moe_params.bin",
+             bundle / "moe_top2_abi.json",
              bundle / "moe_manifest.json", OVERLAY / "picorv32.bit",
              OVERLAY / "picorv32.hwh", REPO / "firmware/rt/rt_fw.bin",
              REPO / "compiler/runtime/test/board_launcher.py",
@@ -89,10 +91,13 @@ def stage(out, runtime=RUNTIME, *, include_top2=False, include_router=False):
             np.save(case / "scores.npy", scores.reshape(1, 4).astype(np.float32))
             if include_router:
                 np.save(case / "scores_init.npy", np.zeros((1, 4), dtype=np.float32))
-            np.save(case / "values_init.npy", np.full((1, 2), -np.inf, dtype=np.float32))
-            ids_init = np.zeros(72, dtype=np.uint8)
-            ids_init[64:72] = np.full(2, np.iinfo(np.int32).max,
-                                       dtype=np.int32).view(np.uint8)
+            np.save(case / "values_init.npy",
+                    np.full(((top2_abi["values_offset"] + 8) // 4,), -np.inf,
+                            dtype=np.float32))
+            ids_init = np.zeros(top2_abi["ids_offset"] + 8, dtype=np.uint8)
+            at = top2_abi["ids_offset"]
+            ids_init[at:at + 8] = np.full(2, np.iinfo(np.int32).max,
+                                           dtype=np.int32).view(np.uint8)
             np.save(case / "ids_init.npy", ids_init)
         np.save(case / "x.npy", x.reshape(1, 32))
         np.save(case / "route_zero.npy", np.zeros(96, dtype=np.uint8))

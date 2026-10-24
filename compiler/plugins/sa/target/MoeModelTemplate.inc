@@ -4,9 +4,11 @@ R"SA_MOE(
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
     %c8 = arith.constant 8 : index
-    %c64 = arith.constant 64 : index
-    %c72 = arith.constant 72 : index
     %c96 = arith.constant 96 : index
+    %cvalues_storage = arith.constant @VALUES_STORAGE_BYTES@ : index
+    %cids_storage = arith.constant @IDS_STORAGE_BYTES@ : index
+    %cvalues_offset = arith.constant @VALUES_OFFSET@ : index
+    %cids_offset = arith.constant @IDS_OFFSET@ : index
     %cx = arith.constant @ACTIVATION_BYTES@ : index
     %cscores = arith.constant @SCORES_BYTES@ : index
     %crouter = arith.constant @ROUTER_BYTES@ : index
@@ -37,9 +39,9 @@ R"SA_MOE(
     %scores = hal.allocator.allocate<%allocator : !hal.allocator>
         affinity(%affinity) type(%memory_type) usage(%usage) : !hal.buffer{%cscores}
     %values = hal.allocator.allocate<%allocator : !hal.allocator>
-        affinity(%affinity) type(%memory_type) usage(%usage) : !hal.buffer{%c8}
+        affinity(%affinity) type(%memory_type) usage(%usage) : !hal.buffer{%cvalues_storage}
     %ids = hal.allocator.allocate<%allocator : !hal.allocator>
-        affinity(%affinity) type(%memory_type) usage(%usage) : !hal.buffer{%c72}
+        affinity(%affinity) type(%memory_type) usage(%usage) : !hal.buffer{%cids_storage}
     %route = hal.allocator.allocate<%allocator : !hal.allocator>
         affinity(%affinity) type(%memory_type) usage(%usage) : !hal.buffer{%c96}
     %out = hal.allocator.allocate<%allocator : !hal.allocator>
@@ -49,11 +51,11 @@ R"SA_MOE(
     hal.command_buffer.fill_buffer<%init : !hal.command_buffer>
         target(%scores : !hal.buffer)[%c0, %cscores] pattern(%zero : i32) flags("None")
     hal.command_buffer.fill_buffer<%init : !hal.command_buffer>
-        target(%values : !hal.buffer)[%c0, %c8] pattern(%neg_inf : i32) flags("None")
+        target(%values : !hal.buffer)[%c0, %cvalues_storage] pattern(%neg_inf : i32) flags("None")
     hal.command_buffer.fill_buffer<%init : !hal.command_buffer>
-        target(%ids : !hal.buffer)[%c0, %c72] pattern(%zero : i32) flags("None")
+        target(%ids : !hal.buffer)[%c0, %cids_storage] pattern(%zero : i32) flags("None")
     hal.command_buffer.fill_buffer<%init : !hal.command_buffer>
-        target(%ids : !hal.buffer)[%c64, %c8] pattern(%max_id : i32) flags("None")
+        target(%ids : !hal.buffer)[%cids_offset, %c8] pattern(%max_id : i32) flags("None")
     hal.command_buffer.fill_buffer<%init : !hal.command_buffer>
         target(%route : !hal.buffer)[%c0, %c96] pattern(%zero : i32) flags("None")
     hal.command_buffer.fill_buffer<%init : !hal.command_buffer>
@@ -69,10 +71,10 @@ R"SA_MOE(
     %encoding = hal.encoding_type<dense_row_major> : i32
     %scores_view = hal.buffer_view.create buffer(%scores : !hal.buffer)[%c0, %cscores]
         shape([%c1, %cexperts]) type(%f32) encoding(%encoding) : !hal.buffer_view
-    %values_view = hal.buffer_view.create buffer(%values : !hal.buffer)[%c0, %c8]
-        shape([%c1, %c2]) type(%f32) encoding(%encoding) : !hal.buffer_view
-    %ids_view = hal.buffer_view.create buffer(%ids : !hal.buffer)[%c0, %c72]
-        shape([%c72]) type(%i8) encoding(%encoding) : !hal.buffer_view
+    %values_view = hal.buffer_view.create buffer(%values : !hal.buffer)[%c0, %cvalues_storage]
+        shape([%cvalues_storage]) type(%i8) encoding(%encoding) : !hal.buffer_view
+    %ids_view = hal.buffer_view.create buffer(%ids : !hal.buffer)[%c0, %cids_storage]
+        shape([%cids_storage]) type(%i8) encoding(%encoding) : !hal.buffer_view
     %router_view = hal.buffer_view.create buffer(%weights#0 : !hal.buffer)[%c0, %crouter]
         shape([%cexperts, %cdim]) type(%f32) encoding(%encoding) : !hal.buffer_view
     %params_view = hal.buffer_view.create buffer(%weights#1 : !hal.buffer)[%c0, %cparams]

@@ -165,6 +165,24 @@ struct LowerMoeChainPass
       module.emitError("incomplete compiled MoE executables");
       return signalPassFailure();
     }
+    auto abiBytes = readFile(dir / "moe_top2_abi.json");
+    if (!abiBytes) {
+      module.emitError("missing Top-2 binding-offset ABI");
+      return signalPassFailure();
+    }
+    auto abiJSON = llvm::json::parse(*abiBytes);
+    auto *abi = abiJSON ? abiJSON->getAsObject() : nullptr;
+    auto scoresOffset = abi ? abi->getInteger("scores_offset") : std::nullopt;
+    auto valuesOffset = abi ? abi->getInteger("values_offset") : std::nullopt;
+    auto idsOffset = abi ? abi->getInteger("ids_offset") : std::nullopt;
+    if (!scoresOffset || !valuesOffset || !idsOffset || *scoresOffset != 0 ||
+        *valuesOffset < 0 || *valuesOffset > 4096 || *valuesOffset % 64 ||
+        *idsOffset < 0 || *idsOffset > 4096 || *idsOffset % 64) {
+      module.emitError("unsupported or missing Top-2 binding-offset ABI");
+      return signalPassFailure();
+    }
+    const int64_t valuesStorage = *valuesOffset + 8;
+    const int64_t idsStorage = *idsOffset + 8;
     std::string source = "module {\n";
     source += binaryOp("route", "sa-desc-v1", *route);
     source += binaryOp("ffn", "sa-desc-v1", *ffn);
@@ -175,6 +193,10 @@ struct LowerMoeChainPass
     replaceAll(body, "@ROUTER_BYTES@", *experts * *dim * 4);
     replaceAll(body, "@PARAM_OFFSET@", *offset);
     replaceAll(body, "@ACTIVATION_BYTES@", *dim * 4);
+    replaceAll(body, "@VALUES_OFFSET@", *valuesOffset);
+    replaceAll(body, "@IDS_OFFSET@", *idsOffset);
+    replaceAll(body, "@VALUES_STORAGE_BYTES@", valuesStorage);
+    replaceAll(body, "@IDS_STORAGE_BYTES@", idsStorage);
     replaceText(body, "@MODEL_FENCE_DECL@",
                 modelABI ? "    %done = hal.fence.create device(%device : !hal.device) flags(\"None\") : !hal.fence\n"
                          "    %done_timeout = arith.constant -1 : i32" : "");
@@ -199,6 +221,10 @@ struct LowerMoeChainPass
       replaceAll(wrapper, "@ACTIVATION_BYTES@", *dim * 4);
       replaceAll(wrapper, "@EXPERTS@", *experts);
       replaceAll(wrapper, "@DIM@", *dim);
+      replaceAll(wrapper, "@VALUES_OFFSET@", *valuesOffset);
+      replaceAll(wrapper, "@IDS_OFFSET@", *idsOffset);
+      replaceAll(wrapper, "@VALUES_STORAGE_BYTES@", valuesStorage);
+      replaceAll(wrapper, "@IDS_STORAGE_BYTES@", idsStorage);
       source += wrapper;
     }
     source += "}\n";

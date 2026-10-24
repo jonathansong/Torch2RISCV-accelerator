@@ -39,7 +39,7 @@ def artifact_info(path):
 
 def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
                  codegen_report=False, binary_dir=None, native_bundle=None,
-                 model_abi=False):
+                 model_abi=False, config_dir=None):
     command = [str(COMPILE), str(source), "--iree-hal-target-device=sa",
                f"--iree-parameter-import=model={irpa}", "--iree-sa-form-moe",
                "--iree-sa-riscv", "--iree-sa-host-fallback",
@@ -51,6 +51,8 @@ def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
         command.append("--iree-sa-codegen-report")
     if binary_dir is not None:
         command.append(f"--iree-hal-dump-executable-binaries-to={binary_dir}")
+    if config_dir is not None:
+        command.append(f"--iree-hal-dump-executable-configurations-to={config_dir}")
     if native_bundle is not None:
         command.append(f"--iree-sa-moe-bundle={native_bundle}")
     if model_abi:
@@ -100,6 +102,27 @@ def route_source(experts, stride):
                                f"{{experts = {experts} : i64, stride = {stride} : i64}}")
 
 
+def top2_binding_abi(config_dir, export_name):
+    """Read the Top-2 executable's actual HAL binding subspan offsets."""
+    dispatch = export_name.split("_topk_", 1)[0]
+    path = Path(config_dir) / f"configured_module_{dispatch}.mlir"
+    source = path.read_text().split("hal.executable.variant public @sa_desc_v1", 1)[1]
+    source = source.split("hal.executable.variant public @vmvx_bytecode_fb", 1)[0]
+    constants = {name: int(value) for name, value in
+                 re.findall(r"(%\w+) = arith.constant (\d+) : index", source)}
+    bindings = {}
+    for binding, offset in re.findall(
+            r"hal\.interface\.binding\.subspan[^\n]*binding\((\d+)\)[^\n]*offset\((%\w+)\)", source):
+        if offset not in constants or int(binding) in bindings:
+            raise ValueError("Top-2 configuration has an ambiguous binding offset")
+        bindings[int(binding)] = constants[offset]
+    if set(bindings) != {0, 1, 2} or bindings[0] != 0 or any(
+            offset < 0 or offset > 4096 or offset % 64 for offset in bindings.values()):
+        raise ValueError(f"unsupported Top-2 binding offsets: {bindings}")
+    return {"scores_offset": bindings[0], "values_offset": bindings[1],
+            "ids_offset": bindings[2]}
+
+
 def build(model, layer, out, d=16):
     if d != 16:
         raise ValueError("the current route export and KV260 template require D=16")
@@ -121,9 +144,11 @@ def build(model, layer, out, d=16):
 
     module = out / "moe_layer.vmfb"
     with tempfile.TemporaryDirectory() as binary_dir:
+        config_dir = Path(binary_dir) / "config"
         coverage = dispatch_coverage(compile_iree(mlir, irpa, module, d=d,
                                                   codegen_report=True,
-                                                  binary_dir=binary_dir))
+                                                  binary_dir=binary_dir,
+                                                  config_dir=config_dir))
         top2 = []
         for path in Path(binary_dir).glob("*.sadesc"):
             binary = path.read_bytes()
@@ -135,6 +160,9 @@ def build(model, layer, out, d=16):
         if len(top2) != 1:
             raise RuntimeError(f"expected one native Top-2 export, got {len(top2)}")
         (out / "moe_top2.sadesc").write_bytes(top2[0])
+        top2_name = sadesc.read(top2[0])[2][0][0]
+        (out / "moe_top2_abi.json").write_text(
+            json.dumps(top2_binding_abi(config_dir, top2_name), indent=2) + "\n")
         router = [re.fullmatch(rf"main\$async_dispatch_(\d+)_matmul_1x{config.experts}x{config.dim}_f32", name)
                   for name in coverage["host"]]
         router = [match.group(1) for match in router if match]
@@ -188,7 +216,8 @@ def build(model, layer, out, d=16):
               "artifacts": {name: artifact_info(out / name)
                             for name in ("moe_layer.vmfb", "moe_layer.irpa", "moe_params.bin",
                                          "moe_router.npy", "moe_router.vmvx", "moe_top2.sadesc",
-                                         "moe_ffn.sadesc", "route.vmfb", "moe_route.bin",
+                                         "moe_ffn.sadesc", "moe_top2_abi.json",
+                                         "route.vmfb", "moe_route.bin",
                                          "moe_chain.mlir", "moe_chain.vmfb",
                                          "moe_native.irpa", "moe_model.mlir",
                                          "moe_model.vmfb")}}
