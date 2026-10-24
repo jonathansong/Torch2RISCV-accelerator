@@ -25,6 +25,10 @@ void registerCloneCheapProducersPass();
 std::unique_ptr<Pass> createFormFfnRegionsPass(bool enabled);
 void registerFormFfnRegionsPass();
 
+// M5: batch-1 top-2 router projection and selection in one dispatch region.
+std::unique_ptr<Pass> createFormMoeRegionsPass(bool enabled);
+void registerFormMoeRegionsPass();
+
 // Dispatch creation, after the regions are formed: decode's attention (q path,
 // scores, probabilities, p . V, int8 output) merged into one flow.dispatch.region
 // (FormAttnRegions.cpp, docs/fusion_design.md §6.4.1).

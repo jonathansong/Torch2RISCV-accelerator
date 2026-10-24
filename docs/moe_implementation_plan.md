@@ -1034,6 +1034,32 @@ KV/cache, and dense projections into SA, then execute the model through IREE.
 
 交付 `FormMoeRegions`、稳定 SAHL 表示、descriptor/RISC-V 双路径和清晰 fallback。退出条件：不依赖模型专用手写 dispatch 即可识别所选 MoE 架构。
 
+#### M5a router recognition (2026-10-24)
+
+The first opt-in compiler slice is `FormMoeRegions.cpp`, registered as
+`--iree-sa-form-moe-regions` in `iree-opt` and enabled in the SA preprocessing
+pipeline by `iree-compile --iree-sa-form-moe`. It recognizes a static batch-1
+router projection feeding descending `iree_linalg_ext.topk` with K=2 and 4–16
+experts. The pass wraps the Top-2 operation in one `flow.dispatch.region` and
+records `sa.moe.experts`, `sa.moe.top_k`, and `sa.moe.kind`. It leaves the
+projection and Top-2 semantics intact; it does not yet lower the region to the
+RISC-V route kernel or include expert FFNs. The option is off by default.
+
+`sa_form_moe_regions.mlir` covers the recognized pattern, K=3 rejection, and
+Top-2 without a router projection. The rebuilt `iree-opt` and `iree-compile`
+pass this test, the complete SA lit suite, and the available golden guard.
+The missing `build/golden/manifest.json` was regenerated from the four source
+directories currently present: 636 unique dispatches, of which 26 are
+recorded as compilation failures. The other historical source directories
+are absent locally, so this baseline has four-case coverage, not the full
+historical corpus. The generated `build/golden` directory occupies 8.6 MiB
+and is local build data.
+
+Next extend the pattern through route normalization, dynamic expert indexing,
+and weighted combine; lower it to the existing Top-2 RISC-V kernel and one
+reusable SA expert FFN template. Then compile a single Mixtral layer from
+IREE input and compare route IDs, weights, and output to the M4 reference.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。

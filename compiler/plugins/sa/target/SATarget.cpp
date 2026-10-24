@@ -80,6 +80,8 @@ struct SAOptions {
   // The gated FFN of decode in one dispatch (docs/fusion_design.md §4): the two
   // projections, the gating, the amax and the int8 output (FormFfnRegions.cpp).
   bool fuseFfn = false;
+  // M5: form a router/top-2 region before ordinary dispatch creation.
+  bool formMoe = false;
   // Decode's attention in one dispatch (docs/fusion_design.md §6): the q path, the
   // scores, the probabilities, p . V and the int8 output (FormAttnRegions.cpp).
   bool fuseAttn = false;
@@ -123,6 +125,8 @@ struct SAOptions {
     binder.opt<bool>("iree-sa-fuse-ffn", fuseFfn, llvm::cl::cat(category),
                      llvm::cl::desc("Decode's gated FFN (two projections, gating, amax, int8 output) in one dispatch "
                                     "(docs/fusion_design.md)."));
+    binder.opt<bool>("iree-sa-form-moe", formMoe, llvm::cl::cat(category),
+                    llvm::cl::desc("Recognize batch-1 top-2 MoE router regions (M5 prototype)."));
     binder.opt<bool>("iree-sa-fuse-attn", fuseAttn, llvm::cl::cat(category),
                      llvm::cl::desc("Decode's attention (q path, scores, probabilities, p . V, int8 output) in one "
                                     "dispatch (docs/fusion_design.md §6)."));
@@ -373,6 +377,7 @@ struct SASession final
     sa::registerPackLinearWeightsPass();
     sa::registerCloneCheapProducersPass();
     sa::registerFormFfnRegionsPass();
+    sa::registerFormMoeRegionsPass();
     sa::registerFormAttnRegionsPass();
     sa::registerLowerWorkgroupCountPass();
     sa::registerSahwPasses();
@@ -385,6 +390,7 @@ struct SASession final
   void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
     passManager.addPass(sa::createPackLinearWeightsPass(options.d));
     passManager.addPass(sa::createCloneCheapProducersPass());
+    if (options.formMoe) passManager.addPass(sa::createFormMoeRegionsPass(true));
     if (options.fuseFfn) {
       // unit dimensions folded first, as GlobalOptimization would (it skips ops
       // already in a dispatch region): the region then holds the forms the backend knows

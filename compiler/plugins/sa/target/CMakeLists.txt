@@ -28,6 +28,7 @@ iree_cc_library(
     "DescList.cpp"
     "FormAttnRegions.cpp"
     "FormFfnRegions.cpp"
+    "FormMoeRegions.cpp"
     "LowerWorkgroupCount.cpp"
     "PackLinearWeights.cpp"
     "SATarget.cpp"
