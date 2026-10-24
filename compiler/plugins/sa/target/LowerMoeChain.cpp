@@ -21,6 +21,9 @@ namespace {
 constexpr char kChainBody[] =
 #include "MoeChainTemplate.inc"
 ;
+constexpr char kModelBody[] =
+#include "MoeModelTemplate.inc"
+;
 
 std::optional<std::string> readFile(const std::filesystem::path &path) {
   auto file = llvm::MemoryBuffer::getFile(path.string());
@@ -54,12 +57,23 @@ void replaceAll(std::string &source, StringRef token, int64_t value) {
   }
 }
 
+void replaceText(std::string &source, StringRef token, StringRef replacement) {
+  size_t at = 0;
+  while ((at = source.find(token.str(), at)) != std::string::npos) {
+    source.replace(at, token.size(), replacement.str());
+    at += replacement.size();
+  }
+}
+
 struct LowerMoeChainPass
     : public PassWrapper<LowerMoeChainPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerMoeChainPass)
 
   LowerMoeChainPass() = default;
-  explicit LowerMoeChainPass(std::string path) { bundle = std::move(path); }
+  explicit LowerMoeChainPass(std::string path, bool modelInterface) {
+    bundle = std::move(path);
+    modelABI = modelInterface;
+  }
   LowerMoeChainPass(const LowerMoeChainPass &other) : PassWrapper(other) {}
 
   StringRef getArgument() const override { return "iree-sa-lower-moe-chain"; }
@@ -161,7 +175,33 @@ struct LowerMoeChainPass
     replaceAll(body, "@ROUTER_BYTES@", *experts * *dim * 4);
     replaceAll(body, "@PARAM_OFFSET@", *offset);
     replaceAll(body, "@ACTIVATION_BYTES@", *dim * 4);
-    source += body + "}\n";
+    replaceText(body, "@MODEL_FENCE_DECL@",
+                modelABI ? "    %done = hal.fence.create device(%device : !hal.device) flags(\"None\") : !hal.fence\n"
+                         "    %done_timeout = arith.constant -1 : i32" : "");
+    replaceText(body, "@MODEL_FENCE_SIGNAL@", modelABI ? "%done" : "%no_fence");
+    replaceText(body, "@MODEL_FENCE_WAIT@",
+                modelABI ? "    %done_status = hal.fence.await until([%done]) timeout_millis(%done_timeout) flags(\"None\") : i32" : "");
+    if (modelABI) {
+      size_t name = body.find("util.func public @main");
+      if (name == std::string::npos) {
+        module.emitError("missing MoE device entry in HAL template");
+        return signalPassFailure();
+      }
+      body.replace(name, sizeof("util.func public @main") - 1,
+                   "util.func private @device");
+    }
+    source += body;
+    if (modelABI) {
+      std::string wrapper = kModelBody;
+      replaceAll(wrapper, "@SCORES_BYTES@", *experts * 4);
+      replaceAll(wrapper, "@ROUTER_BYTES@", *experts * *dim * 4);
+      replaceAll(wrapper, "@PARAM_BYTES@", *totalBytes);
+      replaceAll(wrapper, "@ACTIVATION_BYTES@", *dim * 4);
+      replaceAll(wrapper, "@EXPERTS@", *experts);
+      replaceAll(wrapper, "@DIM@", *dim);
+      source += wrapper;
+    }
+    source += "}\n";
     llvm::SourceMgr sourceMgr;
     sourceMgr.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBufferCopy(source, "native-moe-chain"),
                                  llvm::SMLoc());
@@ -176,12 +216,15 @@ struct LowerMoeChainPass
   Option<std::string> bundle{*this, "bundle",
                              llvm::cl::desc("Directory of compiler-generated MoE executables"),
                              llvm::cl::init("")};
+  Option<bool> modelABI{*this, "model-abi",
+                        llvm::cl::desc("Load packed weights and expose the one-input model ABI"),
+                        llvm::cl::init(false)};
 };
 
 }  // namespace
 
-std::unique_ptr<Pass> createLowerMoeChainPass(const std::string &bundle) {
-  return std::make_unique<LowerMoeChainPass>(bundle);
+std::unique_ptr<Pass> createLowerMoeChainPass(const std::string &bundle, bool modelABI) {
+  return std::make_unique<LowerMoeChainPass>(bundle, modelABI);
 }
 void registerLowerMoeChainPass() { PassRegistration<LowerMoeChainPass>(); }
 

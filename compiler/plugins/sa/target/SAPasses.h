@@ -31,7 +31,7 @@ std::unique_ptr<Pass> createFormMoeRegionsPass(bool enabled);
 void registerFormMoeRegionsPass();
 
 // Replace a recognized MoE graph with its compiled SA HAL chain.
-std::unique_ptr<Pass> createLowerMoeChainPass(const std::string &bundle);
+std::unique_ptr<Pass> createLowerMoeChainPass(const std::string &bundle, bool modelABI = false);
 void registerLowerMoeChainPass();
 
 // Dispatch creation, after the regions are formed: decode's attention (q path,

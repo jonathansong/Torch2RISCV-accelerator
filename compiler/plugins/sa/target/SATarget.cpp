@@ -83,6 +83,7 @@ struct SAOptions {
   // M5: form a router/top-2 region before ordinary dispatch creation.
   bool formMoe = false;
   std::string moeBundle;
+  bool moeModelABI = false;
   // Decode's attention in one dispatch (docs/fusion_design.md §6): the q path, the
   // scores, the probabilities, p . V and the int8 output (FormAttnRegions.cpp).
   bool fuseAttn = false;
@@ -130,6 +131,8 @@ struct SAOptions {
                     llvm::cl::desc("Recognize batch-1 top-2 MoE router regions (M5 prototype)."));
     binder.opt<std::string>("iree-sa-moe-bundle", moeBundle, llvm::cl::cat(category),
                             llvm::cl::desc("Lower a recognized MoE graph using model-derived SA executables."));
+    binder.opt<bool>("iree-sa-moe-model-abi", moeModelABI, llvm::cl::cat(category),
+                     llvm::cl::desc("Expose one activation input and one MoE output, loading packed parameters from scope 'moe'."));
     binder.opt<bool>("iree-sa-fuse-attn", fuseAttn, llvm::cl::cat(category),
                      llvm::cl::desc("Decode's attention (q path, scores, probabilities, p . V, int8 output) in one "
                                     "dispatch (docs/fusion_design.md §6)."));
@@ -398,7 +401,7 @@ struct SASession final
     passManager.addPass(sa::createCloneCheapProducersPass());
     if (options.formMoe) passManager.addPass(sa::createFormMoeRegionsPass(true));
     if (!options.moeBundle.empty())
-      passManager.addPass(sa::createLowerMoeChainPass(options.moeBundle));
+      passManager.addPass(sa::createLowerMoeChainPass(options.moeBundle, options.moeModelABI));
     if (options.fuseFfn) {
       // unit dimensions folded first, as GlobalOptimization would (it skips ops
       // already in a dispatch region): the region then holds the forms the backend knows

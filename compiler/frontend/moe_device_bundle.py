@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "compiler/runtime/tools"))
 
 import moe_hf  # noqa: E402
-from moe_native import NativeMixtralMoe, export  # noqa: E402
+from moe_native import NativeMixtralMoeOutput, export  # noqa: E402
 import moe_m3b  # noqa: E402
 import sadesc  # noqa: E402
 
@@ -38,7 +38,8 @@ def artifact_info(path):
 
 
 def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
-                 codegen_report=False, binary_dir=None, native_bundle=None):
+                 codegen_report=False, binary_dir=None, native_bundle=None,
+                 model_abi=False):
     command = [str(COMPILE), str(source), "--iree-hal-target-device=sa",
                f"--iree-parameter-import=model={irpa}", "--iree-sa-form-moe",
                "--iree-sa-riscv", "--iree-sa-host-fallback",
@@ -52,6 +53,8 @@ def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
         command.append(f"--iree-hal-dump-executable-binaries-to={binary_dir}")
     if native_bundle is not None:
         command.append(f"--iree-sa-moe-bundle={native_bundle}")
+    if model_abi:
+        command.append("--iree-sa-moe-model-abi")
     return subprocess.run(command + ["-o", str(out)], check=True,
                           capture_output=True, text=True).stderr
 
@@ -105,7 +108,7 @@ def build(model, layer, out, d=16):
     config, weights, source = moe_hf.load_layer(str(model), layer, d=d)
     if source["adapter"] != "mixtral" or not source["normalize_topk"] or config.top_k != 2:
         raise ValueError("expected a normalized Top-2 Mixtral checkpoint")
-    mlir, irpa = export(NativeMixtralMoe(weights), str(out))
+    mlir, irpa = export(NativeMixtralMoeOutput(weights), str(out))
     preprocessing = out / "preprocessing.mlir"
     compile_iree(mlir, irpa, preprocessing, preprocessing=True, d=d)
     recognized = recognized_fields(preprocessing)
@@ -167,9 +170,18 @@ def build(model, layer, out, d=16):
         raise RuntimeError("missing compiler-generated embedded route kernel")
     (out / "moe_route.bin").write_bytes(binary[code_offset:code_offset + code_length])
     np.save(out / "moe_router.npy", np.asarray(weights.router, dtype=np.float32))
+    import iree.runtime as rt
+    archive = rt.ParameterIndex()
+    archive.add_buffer("router", np.ascontiguousarray(weights.router).tobytes())
+    archive.add_buffer("params", (out / "moe_params.bin").read_bytes())
+    archive.create_archive_file(str(out / "moe_native.irpa"))
     compile_iree(mlir, irpa, out / "moe_chain.mlir", preprocessing=True,
                  d=d, native_bundle=out)
     compile_iree(mlir, irpa, out / "moe_chain.vmfb", d=d, native_bundle=out)
+    compile_iree(mlir, irpa, out / "moe_model.mlir", preprocessing=True,
+                 d=d, native_bundle=out, model_abi=True)
+    compile_iree(mlir, irpa, out / "moe_model.vmfb", d=d,
+                 native_bundle=out, model_abi=True)
     result = {"format": "sa-moe-compiler-bundle-v1", "source": source,
               "recognized": recognized, "d": d,
               "native_module_dispatches": coverage,
@@ -177,7 +189,9 @@ def build(model, layer, out, d=16):
                             for name in ("moe_layer.vmfb", "moe_layer.irpa", "moe_params.bin",
                                          "moe_router.npy", "moe_router.vmvx", "moe_top2.sadesc",
                                          "moe_ffn.sadesc", "route.vmfb", "moe_route.bin",
-                                         "moe_chain.mlir", "moe_chain.vmfb")}}
+                                         "moe_chain.mlir", "moe_chain.vmfb",
+                                         "moe_native.irpa", "moe_model.mlir",
+                                         "moe_model.vmfb")}}
     (out / "compiler_bundle.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 

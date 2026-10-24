@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import iree.runtime as rt
 
 REPO = Path(__file__).resolve().parents[2]
 for directory in ("compiler/frontend", "compiler/runtime/tools", "llm"):
@@ -54,7 +55,7 @@ class MoeDeviceBundleTest(unittest.TestCase):
             self.assertTrue(any("batch_matmul" in name for name in coverage["host"]))
             self.assertEqual(coverage, json.loads((out / "compiler_bundle.json").read_text())
                              ["native_module_dispatches"])
-            self.assertEqual(len(result["artifacts"]), 11)
+            self.assertEqual(len(result["artifacts"]), 14)
             for name, info in result["artifacts"].items():
                 self.assertEqual((out / name).stat().st_size, info["bytes"])
                 self.assertGreater(info["bytes"], 0)
@@ -67,6 +68,30 @@ class MoeDeviceBundleTest(unittest.TestCase):
             self.assertEqual(top2_exports[0][2], 3)
             self.assertGreater((out / "moe_router.vmvx").stat().st_size, 0)
             self.assertGreater((out / "moe_chain.vmfb").stat().st_size, 0)
+            self.assertGreater((out / "moe_model.vmfb").stat().st_size, 0)
+            model_ir = (out / "moe_model.mlir").read_text()
+            self.assertEqual(model_ir.count("io_parameters.load"), 1)
+            self.assertEqual(model_ir.count("hal.command_buffer.fill_buffer"), 6)
+            self.assertEqual(model_ir.count("hal.command_buffer.dispatch"), 4)
+            self.assertEqual(model_ir.count("hal.fence.await"), 2)
+            self.assertIn("util.func public @main(%arg0: !hal.buffer_view) -> !hal.buffer_view", model_ir)
+            archive = rt.ParameterIndex()
+            archive.load(str(out / "moe_native.irpa"))
+            self.assertEqual({key: entry.length for key, entry in archive.items()},
+                             {"router": weights.router.nbytes,
+                              "params": manifest["total_bytes"]})
+            probe_vmfb = root / "parameter_probe.vmfb"
+            subprocess.run([str(COMPILE), str(REPO / "compiler/tests/moe_parameter_probe.mlir"),
+                            "--compile-from=hal", "-o", str(probe_vmfb)],
+                           check=True, capture_output=True, text=True)
+            probe_output = root / "router_probe.npy"
+            subprocess.run([str(COMPILE.parent / "iree-run-module"),
+                            "--device=local-task", f"--module={probe_vmfb}",
+                            f"--parameters=moe={out / 'moe_native.irpa'}",
+                            "--function=main", f"--output=@{probe_output}"],
+                           check=True, capture_output=True, text=True)
+            np.testing.assert_allclose(np.load(probe_output),
+                                       weights.router.reshape(-1)[:8], rtol=0, atol=0)
             np.testing.assert_array_equal(np.load(out / "moe_router.npy"), weights.router)
 
             bad_bundle = root / "bad_bundle"

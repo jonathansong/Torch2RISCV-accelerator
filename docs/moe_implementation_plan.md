@@ -1,7 +1,8 @@
 # KV260 上的 IREE 原生 MoE 实现方案
 
-> Status: M0–M4e host-assisted two-layer Mixtral execution passes on KV260.
-> Full-device IREE/SA inference is pending.
+> Status: M0–M4 full-device Mixtral inference and M5r single-VMFB MoE pass on
+> KV260. M5t one-input compiler-lowered MoE passes host checks; its final
+> KV260 acceptance is pending.
 > 目标平台：AMD KV260 + PicoRV32 + SA accelerator
 > 编译路径：PyTorch/Hugging Face → IREE Flow → SAHL → SAHW → descriptor list 或 RISC-V 代码
 > 第一目标：不修改 GEMV RTL，实现 batch-1、W8A8、top-1/top-2 稀疏 MoE decode，并在模拟器和 KV260 上端到端验证。
@@ -1611,8 +1612,54 @@ ownership of the HAL chain and the explicit SA buffer-view device ABI. It
 does not preserve the original one-input Torch function ABI: the specialized
 entry still receives activation, router weights, packed parameters, and
 caller-allocated scratch/output buffers. That ABI integration remains the
-open M5 completion gate. Per the user's request, no new KV260 test is staged
-until this remaining work and its host checks are complete.
+open M5 completion gate at this checkpoint.
+
+#### M5t one-input native model ABI (host verified, KV260 pending)
+
+`--iree-sa-moe-model-abi` keeps the compiler-owned four-stage HAL chain inside
+the VMFB and exposes `main(x: !hal.buffer_view) -> !hal.buffer_view`. The
+specialized entry loads the model-derived router and packed W8A8 parameters
+from the `moe` IREE parameter archive, allocates and initializes Top-2, route,
+and output buffers on the SA device, executes router→Top-2→route→FFN, waits for
+completion, and returns the combined output. The original exported Torch
+function has the same one-tensor-input/one-tensor-output interface. The
+diagnostic eight-buffer-view entry remains available in `moe_chain.vmfb` for
+device debugging; it is not the delivered model interface.
+
+`moe_device_bundle.py` emits `moe_model.mlir`, `moe_model.vmfb`, and
+`moe_native.irpa` while compiling the original Torch MLIR. The archive has
+`router` and `params` entries. The synthetic integration test checks the
+recognized shape, exact archive entries and sizes, one-input HAL signature,
+four dispatches, buffer initialization, completion fences, and rejection of a
+bad expert stride. A host local-task probe loads the archive and returns its
+router values exactly. The SA runtime already implements host-mapped buffer
+fill and direct queue reads from synchronous parameter files. These checks
+validate the new ABI plumbing before a board run; they do not establish its
+KV260 numerical result.
+
+`moe_m5t_board_bundle.py` stages the one-input VMFB, archive, runtime,
+overlay, firmware, and four real layer-0 inputs. It verifies each saved
+reference against the checkpoint router and checks the selected expert IDs
+before staging. The board runner uses only the activation input and returns
+the MoE output. M5 requires its board report to pass all four cases, along
+with the SA lit suite and golden guard, before the native path is accepted.
+The longer-term M6 work remains batched tokens, grouped expert execution,
+and full-model generation integration.
+
+After copying `build/moe/m5t/board` to KV260, the final acceptance command is:
+
+```bash
+# Host:
+scp -r build/moe/m5t/board ubuntu@192.168.0.121:~/moe-m5t
+# KV260:
+cd ~/moe-m5t && ./run_board.sh
+# Host, after the board run:
+scp ubuntu@192.168.0.121:~/moe-m5t/board_report.json build/moe/m5t/
+```
+
+The runner checks each of the four model-derived outputs against the saved
+W8A8 reference (`rtol=atol=3e-3`) and records the result in
+`board_report.json`. Its board result is pending.
 
 ### M6：Prefill/grouped execution
 

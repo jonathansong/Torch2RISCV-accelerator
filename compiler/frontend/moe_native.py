@@ -47,6 +47,13 @@ class NativeMixtralMoe(torch.nn.Module):
         return result, scores, ids, routing
 
 
+class NativeMixtralMoeOutput(NativeMixtralMoe):
+    """The model-facing MoE function: one activation input, one output tensor."""
+
+    def forward(self, x):
+        return super().forward(x)[0]
+
+
 def export(model, out):
     from iree.turbine import aot
 

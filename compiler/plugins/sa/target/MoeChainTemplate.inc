@@ -73,9 +73,11 @@ R"SA_MOE(
                   (%out : !hal.buffer)[%c0, %cx]]) flags("None")
     hal.command_buffer.finalize<%cmd : !hal.command_buffer>
     %no_fence = util.null : !hal.fence
+@MODEL_FENCE_DECL@
     hal.device.queue.execute<%device : !hal.device>
-        affinity(%affinity) wait(%no_fence) signal(%no_fence)
+        affinity(%affinity) wait(%no_fence) signal(@MODEL_FENCE_SIGNAL@)
         commands(%cmd) flags("None")
+@MODEL_FENCE_WAIT@
     util.return %scores_view, %values_view, %ids_view, %route_view, %out_view : !hal.buffer_view, !hal.buffer_view, !hal.buffer_view, !hal.buffer_view, !hal.buffer_view
   }
 )SA_MOE"
