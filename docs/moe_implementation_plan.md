@@ -1121,7 +1121,8 @@ RISC-V-only guard, so board acceptance requires rebuilding it with
 `compiler/scripts/build_sa_runtime.sh aarch64` and restaging the bundle.
 On KV260, `run_board.sh` starts the overlay and calls `iree-run-module` with
 `SA_RV=embedded`; `board_moe_compiler_top2.py` checks both outputs bit for bit
-for ascending, tied, and random router scores. No board result has been
+for ascending, tied, and random router scores and writes `board_report.json`.
+No board result has been
 recorded yet.
 
 Next run the generated Top-2 export on KV260, then extend the pattern through
