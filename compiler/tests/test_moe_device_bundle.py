@@ -69,6 +69,17 @@ class MoeDeviceBundleTest(unittest.TestCase):
             self.assertGreater((out / "moe_chain.vmfb").stat().st_size, 0)
             np.testing.assert_array_equal(np.load(out / "moe_router.npy"), weights.router)
 
+            bad_bundle = root / "bad_bundle"
+            bad_bundle.mkdir()
+            bad_manifest = dict(manifest, expert_stride=manifest["expert_stride"] - 64)
+            (bad_bundle / "moe_manifest.json").write_text(json.dumps(bad_manifest))
+            rejected = subprocess.run([
+                str(COMPILE.parent / "iree-opt"), str(out / "preprocessing.mlir"),
+                f"--iree-sa-lower-moe-chain=bundle={bad_bundle}"],
+                capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("disagrees with packed ABI", rejected.stderr)
+
             # Execute the newly generated reusable FFN export using the same
             # model-derived packed parameters and dynamic route offsets.
             descriptor_d, _, exports = sadesc.read((out / "moe_ffn.sadesc").read_bytes())
@@ -128,8 +139,15 @@ class MoeDeviceBundleTest(unittest.TestCase):
             router_chain = build_chain(out, root / "router_chain",
                                        include_top2=True, include_router=True)
             self.assertGreater(router_chain.stat().st_size, full_chain.stat().st_size)
-            self.assertEqual((out / "moe_chain.mlir").read_bytes(),
-                             (root / "router_chain/moe_chain.mlir").read_bytes())
+            native_ir = root / "native_normalized.mlir"
+            manual_ir = root / "manual_normalized.mlir"
+            for source, target in ((out / "moe_chain.mlir", native_ir),
+                                   (root / "router_chain/moe_chain.mlir", manual_ir)):
+                subprocess.run([str(COMPILE.parent / "iree-opt"), str(source),
+                                "-o", str(target)], check=True,
+                               capture_output=True, text=True)
+            self.assertEqual(native_ir.read_text().replace("module @module {", "module {", 1),
+                             manual_ir.read_text())
             router_vm = root / "router_chain_vm.mlir"
             subprocess.run([str(COMPILE), str(root / "router_chain/moe_chain.mlir"),
                             "--compile-from=hal", "--compile-to=vm", "-o", str(router_vm)],

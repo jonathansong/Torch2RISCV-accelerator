@@ -1587,6 +1587,33 @@ the real layer-0 KV260 token case, SA lit tests, and the golden guard must
 pass. M5r proves the device execution chain and frontend checkpoint-to-VMFB
 packaging, but does not satisfy this native lowering gate.
 
+#### M5s compiler-owned HAL chain lowering (host verified, board deferred)
+
+`--iree-sa-moe-bundle=<dir>` enables the new `LowerMoeChain` SA preprocessing
+pass after `FormMoeRegions`. The pass requires exactly one recognized
+`mixtral_top2_ffn` function, checks the model's dimension, hidden size,
+expert count, and packed stride against `moe_manifest.json`, validates the
+supported D=16 normalized Top-2 W8A8 layout and capacity, and reads the four
+compiled executables from the bundle. It builds the generic router→Top-2→route
+→FFN HAL program inside the compiler. `moe_device_bundle.py` now invokes
+`iree-compile` on the original exported Torch MLIR with this option; it no
+longer calls the Python HAL chain assembler to build the delivered VMFB.
+The option is off by default, so unsupported models retain the existing
+compiler path.
+
+The synthetic checkpoint integration test passed, including rejection of a
+manifest with a mismatched expert stride. The regenerated real layer-0 native
+HAL IR is identical to the previously board-accepted four-stage IR after
+normalizing the top-level module name. The incremental compiler build,
+existing native Torch fallback test, route host test, W8A8 FFN test, raw
+Top-2 test, SA lit suite, and golden guard passed. This validates compiler
+ownership of the HAL chain and the explicit SA buffer-view device ABI. It
+does not preserve the original one-input Torch function ABI: the specialized
+entry still receives activation, router weights, packed parameters, and
+caller-allocated scratch/output buffers. That ABI integration remains the
+open M5 completion gate. Per the user's request, no new KV260 test is staged
+until this remaining work and its host checks are complete.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。

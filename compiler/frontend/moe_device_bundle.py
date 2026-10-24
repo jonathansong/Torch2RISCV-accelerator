@@ -23,7 +23,6 @@ sys.path.insert(0, str(REPO / "compiler/runtime/tools"))
 import moe_hf  # noqa: E402
 from moe_native import NativeMixtralMoe, export  # noqa: E402
 import moe_m3b  # noqa: E402
-from moe_iree_chain import build as build_moe_chain  # noqa: E402
 import sadesc  # noqa: E402
 
 COMPILE = REPO / "build/iree/build-compiler/tools/iree-compile"
@@ -39,7 +38,7 @@ def artifact_info(path):
 
 
 def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
-                 codegen_report=False, binary_dir=None):
+                 codegen_report=False, binary_dir=None, native_bundle=None):
     command = [str(COMPILE), str(source), "--iree-hal-target-device=sa",
                f"--iree-parameter-import=model={irpa}", "--iree-sa-form-moe",
                "--iree-sa-riscv", "--iree-sa-host-fallback",
@@ -51,6 +50,8 @@ def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
         command.append("--iree-sa-codegen-report")
     if binary_dir is not None:
         command.append(f"--iree-hal-dump-executable-binaries-to={binary_dir}")
+    if native_bundle is not None:
+        command.append(f"--iree-sa-moe-bundle={native_bundle}")
     return subprocess.run(command + ["-o", str(out)], check=True,
                           capture_output=True, text=True).stderr
 
@@ -166,7 +167,9 @@ def build(model, layer, out, d=16):
         raise RuntimeError("missing compiler-generated embedded route kernel")
     (out / "moe_route.bin").write_bytes(binary[code_offset:code_offset + code_length])
     np.save(out / "moe_router.npy", np.asarray(weights.router, dtype=np.float32))
-    build_moe_chain(out, out, include_top2=True, include_router=True)
+    compile_iree(mlir, irpa, out / "moe_chain.mlir", preprocessing=True,
+                 d=d, native_bundle=out)
+    compile_iree(mlir, irpa, out / "moe_chain.vmfb", d=d, native_bundle=out)
     result = {"format": "sa-moe-compiler-bundle-v1", "source": source,
               "recognized": recognized, "d": d,
               "native_module_dispatches": coverage,

@@ -29,6 +29,7 @@ iree_cc_library(
     "FormAttnRegions.cpp"
     "FormFfnRegions.cpp"
     "FormMoeRegions.cpp"
+    "LowerMoeChain.cpp"
     "LowerWorkgroupCount.cpp"
     "PackLinearWeights.cpp"
     "SATarget.cpp"
