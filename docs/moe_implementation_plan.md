@@ -1111,6 +1111,19 @@ NaNs, infinities, signed zero, ties, and random scores. Host firmware tests
 cover the standalone C kernel. The generated export still needs a KV260 board execution test and
 comparison to the IREE/host reference before it is accepted as device-correct.
 
+The D=16, four-port KV260 fixture is `moe_router_w8_top2_d16.mlir` (16
+experts). `test_moe_compiler_riscv.py` verifies that it compiles. Run
+`compiler/tests/moe_m5d_board_bundle.py` to stage the VMFB, overlay, firmware,
+three input cases and reference outputs in `build/moe/m5d/board`. The bundle
+generator copies `build/iree/build-sa-aarch64/tools/iree-run-module` when that
+runtime exists. The local aarch64 runtime has not yet been built with the new
+RISC-V-only guard, so board acceptance requires rebuilding it with
+`compiler/scripts/build_sa_runtime.sh aarch64` and restaging the bundle.
+On KV260, `run_board.sh` starts the overlay and calls `iree-run-module` with
+`SA_RV=embedded`; `board_moe_compiler_top2.py` checks both outputs bit for bit
+for ascending, tied, and random router scores. No board result has been
+recorded yet.
+
 Next run the generated Top-2 export on KV260, then extend the pattern through
 route normalization, dynamic expert indexing, and weighted combine. Lower the
 expert computation to one reusable SA FFN template. Compile a single Mixtral

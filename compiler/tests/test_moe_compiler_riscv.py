@@ -19,9 +19,20 @@ from test_moe_top2_raw import topk_reference
 REPO = Path(__file__).resolve().parents[2]
 COMPILE = REPO / "build/iree/build-compiler/tools/iree-compile"
 SOURCE = Path(__file__).with_name("moe_router_w8_top2.mlir")
+BOARD_SOURCE = Path(__file__).with_name("moe_router_w8_top2_d16.mlir")
 
 
 class MoeCompilerRiscvTest(unittest.TestCase):
+    def test_kv260_d16_router_compiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "router.vmfb"
+            result = subprocess.run([str(COMPILE), str(BOARD_SOURCE), "--iree-hal-target-device=sa",
+                                     "--iree-sa-form-moe", "--iree-sa-riscv", "--iree-sa-d=16",
+                                     "--iree-sa-gemv-ports=4", "--iree-hal-link-executables=false",
+                                     "-o", str(out)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreater(out.stat().st_size, 0)
+
     def test_router_code_table_and_required_option(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
