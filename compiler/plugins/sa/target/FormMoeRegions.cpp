@@ -16,6 +16,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include <cstdint>
 #include <limits>
 
 namespace mlir::iree_compiler::sa {
@@ -292,6 +293,30 @@ std::optional<std::pair<int64_t, int64_t>> mixtralExpertShape(
   return std::pair<int64_t, int64_t>{dim, hidden};
 }
 
+// sa-moe-parameters-v1 stores each weight before its per-row f32 scales,
+// aligning every section to 64 bytes. The route record needs this stride.
+std::optional<int64_t> packedExpertStride(int64_t dim, int64_t hidden,
+                                          int64_t experts) {
+  if (dim <= 0 || hidden <= 0 || dim > (1 << 20) || hidden > (1 << 20))
+    return std::nullopt;
+  uint64_t weightBytes = uint64_t(dim) * uint64_t(hidden);
+  uint64_t offset = 0;
+  auto append = [&](uint64_t bytes) {
+    offset = (offset + 63) & ~uint64_t(63);
+    offset += bytes;
+  };
+  append(weightBytes);
+  append(uint64_t(hidden) * 4);
+  append(weightBytes);
+  append(uint64_t(hidden) * 4);
+  append(weightBytes);
+  append(uint64_t(dim) * 4);
+  uint64_t stride = (offset + 63) & ~uint64_t(63);
+  if (stride == 0 || stride * uint64_t(experts - 1) > UINT32_MAX)
+    return std::nullopt;
+  return int64_t(stride);
+}
+
 struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FormMoeRegionsPass)
 
@@ -326,11 +351,14 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
         scope = scope->getParentOp();
       if (scope)
         if (auto shape = mixtralExpertShape(scope, topk, experts)) {
-          scope->setAttr("sa.moe.arch", rewriter.getStringAttr("mixtral_top2_ffn"));
-          scope->setAttr("sa.moe.dim", rewriter.getI64IntegerAttr(shape->first));
-          scope->setAttr("sa.moe.hidden", rewriter.getI64IntegerAttr(shape->second));
-          scope->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
-          ++fullBlocks;
+          if (auto stride = packedExpertStride(shape->first, shape->second, experts)) {
+            scope->setAttr("sa.moe.arch", rewriter.getStringAttr("mixtral_top2_ffn"));
+            scope->setAttr("sa.moe.dim", rewriter.getI64IntegerAttr(shape->first));
+            scope->setAttr("sa.moe.hidden", rewriter.getI64IntegerAttr(shape->second));
+            scope->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
+            scope->setAttr("sa.moe.expert_stride", rewriter.getI64IntegerAttr(*stride));
+            ++fullBlocks;
+          }
         }
       topk->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
       topk->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(2));

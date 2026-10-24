@@ -1291,6 +1291,8 @@ on KV260 with the D=16, 100 MHz overlay: ramp selected IDs `[3, 0]` with
 maximum output error `3.3527613e-8`, zero selected `[0, 1]` with zero error,
 and random selected `[2, 1]` with maximum output error `1.1920929e-7`.
 All three cases passed; rt_fw completed six entries with heartbeat 52944.
+The board-generated `board_report.json` independently records `pass: true`
+and the same three IDs, error vectors, entry count, and heartbeat.
 This accepts a Torch-exported full synthetic MoE layer using SA Top-2 and
 VMVX host fallback for the remaining operators. The real layer board case is
 still pending. `test_moe_native_sim.py` can run the synthetic VMFB when a host
@@ -1323,6 +1325,17 @@ layer. The cached real layer-0 preprocessing IR also records `dim=1024`,
 lit suite, and available golden guard pass. The next lowering step still
 needs to consume this representation, automatically form the route-record
 dispatch, and connect a reusable W8A8 expert template to it.
+
+#### M5j packed expert stride contract (host verified)
+
+The recognition pass now records `sa.moe.expert_stride`, calculated from the
+`sa-moe-parameters-v1` W8A8 layout with 64-byte aligned weight and scale
+sections. It rejects a stride whose highest expert offset exceeds the route
+record's 32-bit field. The synthetic compile test checks this attribute
+against the frontend packer's manifest. On the cached real Mixtral layer 0,
+the compiler and the existing M4 manifest both report 11,042,816 bytes per
+expert. This is metadata for the forthcoming route-record lowering; the
+current Torch VMFB still runs expert selection and FFN through host fallback.
 
 ### M6：Prefill/grouped execution
 

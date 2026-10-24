@@ -22,7 +22,9 @@ class NativeMoeCompileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             config = moe.MoeConfig(32, 64, 4, 2)
-            mlir, irpa = export(NativeMixtralMoe(moe.synthetic_weights(config, seed=94)), directory)
+            weights = moe.synthetic_weights(config, seed=94)
+            mlir, irpa = export(NativeMixtralMoe(weights), directory)
+            _, manifest = moe.pack_parameters(config, moe.quantize_weights(config, weights))
             source = Path(mlir).read_text()
             self.assertIn("torch.aten.sort", source)
             self.assertIn("torch.aten.index_select", source)
@@ -39,6 +41,7 @@ class NativeMoeCompileTest(unittest.TestCase):
             self.assertIn("sa.moe.dim = 32 : i64", processed)
             self.assertIn("sa.moe.hidden = 64 : i64", processed)
             self.assertIn("sa.moe.experts = 4 : i64", processed)
+            self.assertIn(f"sa.moe.expert_stride = {manifest['expert_stride']} : i64", processed)
             binaries = path / "binaries"
             binaries.mkdir()
             result = subprocess.run([
