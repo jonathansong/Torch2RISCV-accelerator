@@ -555,8 +555,8 @@ prefill 时输入为 `T×H`，各 token 路由不同。高效执行需要：
 - P0：prefill 暂时走 VMVX/LLVM CPU；
 - P1：设备 router/top-k，逐 token GEMV 保证正确；
 - P2：按 expert grouping 后循环 GEMV；
-- P3：`M_e >= D` 时选择 systolic GEMM；
-- P4：增加 `sahl.grouped_gemm`，自动选择 GEMV/GEMM；
+- P3：为足够大的 `M_e` 增加 systolic GEMM；`M_e >= D` 只是首个测试点，最终阈值由实测成本决定；
+- P4：增加 `sahl.grouped_gemm`，按每组大小和实测成本选择 GEMV/GEMM；
 - P5：grouping、expert compute 和 scatter 流水化。
 
 ## 15. Runtime 与主机接口
@@ -1701,7 +1701,187 @@ W8A8 reference (`rtol=atol=3e-3`) and records the result in
 
 ### M6：Prefill/grouped execution
 
-交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。
+M6 is **planned, not implemented**. Its deliverable is a native, batched
+Mixtral Top-2 expert block: count tokens per expert, exclusive prefix sum,
+gather, execute only nonempty expert groups, and scatter/weighted combine.
+The first optimization reuses the M5 W8A8 GEMV; the second uses the existing
+systolic matrix path for groups where that wins. The one-token M5 ABI and its
+accepted KV260 result remain the decode baseline. This section is the
+implementation and acceptance contract for M6.
+
+#### M6.1 Scope and execution contract
+
+- Start with batch size 1, `T` prompt tokens in one MoE layer, `E=8`, `K=2`,
+  `H=1024`, expert hidden size `I=3584`, and the D=16 KV260 overlay. Keep
+  the packed `sa-moe-parameters-v1` weights, 64-byte section alignment,
+  expert stride, and W8A8 numeric reference used by M5. Add synthetic
+  `E=4, H=32, I=64` fixtures for fast development. Extend other shapes only
+  after this path passes.
+- The model-facing entry takes `x: [T,H] f32` and returns `y: [T,H] f32`.
+  `T` is bounded by a compiled maximum and supplied at runtime; the last
+  prompt chunk may have fewer than 16 tokens. `T=1` must select the existing
+  M5 route/FFN path. Reject or fall back for `T=0`, unsupported `E/K`,
+  out-of-range memory, or router values outside M5's finite-score contract.
+- For each token independently, compute fp32 router scores, descending Top-2
+  with lower expert ID first on equal scores, and softmax over the selected
+  two scores. Each token appears in exactly two *distinct* expert groups.
+  Expert order changes scheduling only: the final output is the sum of the
+  two selected W8A8 expert outputs weighted in Top-2 rank order. Preserve
+  the M5 intermediate quantization and rounding points in the baseline;
+  assess any GEMM numeric changes against the same W8A8 oracle.
+- Group **within one layer and one prefill chunk**, after that layer's dense
+  attention has produced all `T` input rows. Finish scatter before the next
+  layer consumes them. Do not move tokens across causal attention steps or
+  combine different layers' parameter tables. ARM submits the compiled
+  program; it must not read back per-token IDs to schedule expert work.
+
+#### M6.2 Device buffers and grouped routing ABI
+
+Introduce a versioned `sa_moe_group_v1` *internal* ABI, separate from M5's
+32-byte `sa_moe_route_v1` single-token record. Keep all offsets and addresses
+as byte offsets from validated device-window bases. The first implementation
+uses 32-bit counts/indices and checks `2*T` and every byte range before
+issuing DMA or a descriptor.
+
+| Buffer | Logical shape and type | Producer / consumer |
+|---|---|---|
+| `scores` | `[T,E] f32` | router / Top-2 |
+| `ids`, `weights` | `[T,2] i32`, `[T,2] f32` | Top-2 / grouping and combine |
+| `count`, `offset` | `[E] u32`, `[E+1] u32` | histogram and exclusive scan / all groups |
+| `cursor` | `[E] u32` | stable grouping scratch, initialized to zero |
+| `slot_token`, `slot_rank` | `[2*T] u32`, `[2*T] u8` | grouping / gather and scatter |
+| `packed_x`, `input_scale` | `[2*T,H] i8`, `[2*T] f32` | gather + W8A8 quantization / grouped FFN |
+| `group_output` | `[2*T,H] f32`, or one group tile plus rank-indexed output staging | grouped FFN / combine |
+| `y` | `[T,H] f32` | weighted scatter / next layer |
+
+Initially compute `count[e]` from all `ids[t,r]`; perform an exclusive scan
+with `offset[0]=0`, `offset[e+1]=offset[e]+count[e]`, and require
+`offset[E]=2*T`. Assign slot `offset[e]+cursor[e]` in increasing `(t,r)`
+order, then increment `cursor[e]`. Store `(token,rank)` in the slot. This
+stable order makes traces and reference comparison deterministic. Gather
+each token activation into its two slots, quantize with the M5 per-token
+input scale, and use the existing packed expert weight table. Do not copy
+or repack expert weights per prompt. The first implementation retains
+`group_output` for all slots, then initializes `y` to zero and accumulates
+rank 0 followed by rank 1 for each token. If this exceeds the scratch
+budget, process one expert group or output tile at a time into two
+rank-indexed `[T,H]` staging buffers and combine those in rank order after
+all groups finish. Do not scatter directly to `y` in expert order: that
+would reverse fp32 addition order for some tokens. Avoid concurrent writes
+to the same token and unspecified fp32 atomic addition. Record the chosen
+scratch schedule in the manifest.
+
+The compiler emits the group buffer sizes and alignments into the bundle
+manifest. Runtime preflight checks `weights + routing + worst-case scratch`
+against the actual u-dma-buf window (the accepted M5 real layer uses
+128 MiB), as well as the largest DMA/descriptor offset. A chunk too large
+is split at the MoE-layer boundary; the last chunk uses its true `T`.
+
+#### M6.3 Compiler and device lowering
+
+1. **Frontend and recognition.** Extend `compiler/frontend/moe_native.py`
+   from its batch-1 single-token graph to a separate prefill export with a
+   `[T,H]` input. Extend `FormMoeRegions.cpp` to recognize per-row Top-2
+   and the complete shared-expert FFN, attach `sa.moe.*` shape/semantics
+   metadata, and refuse ambiguous matches. Keep the existing M5 matcher
+   for `T=1`. `LowerMoeChain.cpp` must build the grouping/FFN/scatter HAL
+   chain from the recognized graph and the packed manifest, not from
+   handwritten per-expert dispatch lists.
+2. **Routing and grouping.** Reuse the M5 router and `sahl.top2` semantics
+   for each row. Add explicit SAHL operations (or one verified SAHL region)
+   for histogram, exclusive scan, stable slot assignment, and ordered
+   scatter; define their buffer effects and shape checks in
+   `compiler/plugins/sa/dialect/SahlOps.td`. Lower the small `E` control
+   work to embedded RISC-V through `SahwToRiscv.cpp`, using the existing
+   SA runtime's device window. A VMVX/LLVM reference path is retained for
+   unsupported shapes and for differential tests. Do not schedule the next
+   device phase by reading `count` back on ARM.
+3. **Grouped expert kernel.** Add `sahl.grouped_gemm` as the contraction
+   boundary in `SahlOps.td`: operands include packed activations and scales,
+   `offset/count`, the shared expert weight base/stride, and a destination;
+   verify `E`, `K`, `H`, `I`, bounds, and layout. Use it for gate, up, and
+   down projections around the same SiLU and hidden requantization as M5.
+   The group loop skips `count[e]==0`, computes the expert base once, and
+   reuses *one* code template across all experts. The first lowering in
+   `transforms/SahlExpandKernels.cpp` loops the existing `sahl.gemv` over
+   slots, with the dynamic expert offset already proven by M5. Lower to
+   SAHW/RISC-V through the existing `transforms/SahlToSahw.cpp` and
+   `transforms/SahwToRiscv.cpp` paths. Add a systolic tiled GEMM lowering
+   only after its per-group numerical and cycle tests pass. Tail rows are
+   masked/padded without reading outside the group.
+4. **Scheduling and ABI ownership.** Version the grouped metadata and
+   validate it in `compiler/frontend/moe_device_bundle.py` and the SA
+   runtime before launch. A device-side loop consumes the dynamic counts
+   and starts only nonempty groups. If IREE's static dispatch schedule
+   cannot express that device-dependent loop without host synchronization,
+   keep the outer loop inside one embedded RISC-V executable and expose
+   only its completed output buffer to the next dispatch. Preserve the
+   existing M5 and dense-model compilation paths under a separate M6
+   feature flag until the grouped acceptance gate closes.
+
+#### M6.4 Delivery sequence and measurable gates
+
+| Step | Implementation | Gate before the next step |
+|---|---|---|
+| P0: reference and baseline | Batched Torch/NumPy W8A8 oracle; run `T` M5 token calls in prefill order. Save IDs, weights, outputs, bytes, and per-phase cycles. | Exact IDs and per-token M5 output agreement for synthetic and real layer-0 inputs. |
+| P1: batched route | Compile `[T,H]` router/Top-2 and device grouping buffers; initially run each selected FFN via the M5 template. | Counts sum to `2*T`; exact offsets/slots; no ARM ID readback; board matches W8A8 oracle. |
+| P2: grouped GEMV | Execute only nonempty groups, reusing one FFN template and expert parameter table; ordered scatter/combine. | Empty groups produce zero FFN launches; `T=1` unchanged; simulator and KV260 pass all routing distributions. |
+| P3: tiled GEMM | Add a systolic gate/up/down path with masked tails, per-row scales, SiLU and down-input requantization. Compare with GEMV at several `M_e` and shapes. | Per-group W8A8 accuracy passes; no out-of-bounds DMA; real board cycle data establishes a crossover. |
+| P4: automatic choice | Lower `sahl.grouped_gemm` to GEMV or GEMM using an explicit cost table/threshold, with a forced-mode debug option. | Same IDs/output in both modes within tolerance; measured prefill speedup over P0; no material decode regression. |
+| P4b: model integration | Connect the grouped MoE layer to the existing M4f two-layer full-device model's prefill path; keep its one-token decode path on M5. | Sim and KV260 match saved W8A8 per-layer activations and prompt logits/tokens; generated model bundle and memory preflight are reproducible. |
+| P5: optional pipeline | Overlap grouping, weight streaming, expert tiles, and scatter only after P4 profiling identifies a bottleneck. | End-to-end speedup and memory safety rechecked; P5 is not required to close core M6. |
+
+The hardware width `D=16` is **not** automatically the profitable GEMM
+threshold. With `T=16`, `E=8`, and Top-2, balanced routing gives mean
+`M_e=4`; most groups may favor GEMV. Start the crossover sweep at
+`M_e={1,2,4,8,16,32,64}` and include both balanced and skewed routing.
+Measure packing, grouping, dispatch, weight traffic, compute, and scatter
+cycles before choosing a threshold. Larger chunks (`T=40/64/128`) are
+candidate GEMM workloads, subject to memory preflight; keep `T=16` as the
+existing model's default prefill comparison. If GEMM never wins for the
+supported chunk sizes, ship grouped GEMV and record the measured result;
+do not claim a GEMM speedup.
+
+#### M6.5 Tests, artifacts, and exit criteria
+
+- Add host tests beside `compiler/tests/test_moe_native*.py` for group
+  counts, exclusive scan, stable slot order, duplicate-ID rejection, empty
+  experts, all-token skew, ties, chunk tails, invalid lengths/offsets,
+  routing-score contract, and overflow/window preflight. Exercise
+  `T={1,2,15,16,17,40,64,128}` where the memory limit allows.
+- Add SAHL verifier/lowering tests beside
+  `compiler/plugins/sa/test/sahl_moe_route_top2.mlir`, plus simulator
+  differential tests for every group size used in the GEMV/GEMM crossover.
+  Compare exact IDs/counts/offsets/slot mapping, intermediate W8A8
+  activations/scales, expert outputs, and final `y` to the P0 oracle. Use
+  the M5 real-model `rtol=atol=3e-3` output criterion unless a stricter
+  fixture-specific criterion is established; report maximum absolute and
+  relative errors separately.
+- Build a reproducible M6 board bundle under `build/moe/m6/board` containing
+  VMFB, packed parameters, overlay/firmware dependencies, `run_board.sh`,
+  version/manifest/checksums, and deterministic synthetic and
+  `TitanML/tiny-mixtral` layer-0 fixtures. The runner writes
+  `board_report.json` with per-case IDs, counts, offsets, output error,
+  cycles by phase, nonempty/empty expert counts, GEMV/GEMM selections,
+  firmware entries, and peak device-window use. Record the exact build
+  commit and board bundle hash in this document after acceptance. Add a
+  generated two-layer prefill bundle with layer-wise W8A8 reference traces;
+  compare final prompt logits and generated tokens with the existing M4f
+  model oracle while keeping decode on M5.
+- Compare P0 token-by-token, P2 grouped GEMV, and P4 automatic mode on the
+  **same** overlay, clock, model, prompt tokens, and warmup policy. Report
+  median of at least five measured runs at `T=16` and at one larger `T`
+  that fits. Count grouping and scatter overhead in end-to-end prefill
+  cycles. The core M6 performance gate is at least 10% lower median MoE
+  prefill cycles than P0 for one documented realistic chunk, with no more
+  than 5% `T=1` regression; also publish any slower cases. The threshold
+  is a proposed acceptance target, not an achieved result.
+- Close M6 only when a compiler-produced batched MoE program passes host,
+  simulator, and KV260 tests; zero-count experts issue no FFN work; the
+  grouped ABI and memory preflight are verified; a real layer-0 W8A8
+  fixture and the two-layer prefill/decode model integration pass; and the
+  measured performance gate above is met. Wider MoE architectures and
+  pipelines beyond two layers remain separate follow-on acceptance work.
 
 ## 20. 风险、取舍与回退策略
 
