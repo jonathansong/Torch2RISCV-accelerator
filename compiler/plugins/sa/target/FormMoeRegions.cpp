@@ -16,6 +16,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include <limits>
 
 namespace mlir::iree_compiler::sa {
 namespace {
@@ -45,6 +46,97 @@ bool hasTopkInitialization(IREE::LinalgExt::TopkOp topk) {
   auto index = dyn_cast<IntegerAttr>(indicesConstant.getValue());
   return value && value.getValue().isInfinity() && value.getValue().isNegative() &&
          index && index.getValue().getSExtValue() == 0x7fffffff;
+}
+
+bool isIotaIndices(Value value) {
+  auto generic = value.getDefiningOp<linalg::GenericOp>();
+  if (!generic)
+    if (auto expand = value.getDefiningOp<tensor::ExpandShapeOp>())
+      generic = expand.getSrc().getDefiningOp<linalg::GenericOp>();
+  if (!generic || generic.getNumDpsInputs() || generic.getNumDpsInits() != 1 ||
+      generic.getNumLoops() != generic.getNumParallelLoops() ||
+      (generic.getNumLoops() != 1 && generic.getNumLoops() != 2) ||
+      !generic.getIndexingMapsArray().front().isIdentity())
+    return false;
+  auto yield = dyn_cast<linalg::YieldOp>(generic.getRegion().front().getTerminator());
+  auto cast = yield && yield.getValues().size() == 1
+                  ? yield.getValues()[0].getDefiningOp<arith::IndexCastOp>() : arith::IndexCastOp();
+  auto index = cast ? cast.getIn().getDefiningOp<linalg::IndexOp>() : linalg::IndexOp();
+  return cast && cast.getType().isInteger(64) &&
+         index && index.getDim() == generic.getNumLoops() - 1;
+}
+
+tensor::ExtractSliceOp top2PrefixSlice(Value sorted) {
+  if (!sorted.hasOneUse()) return {};
+  auto slice = dyn_cast<tensor::ExtractSliceOp>(*sorted.user_begin());
+  if (!slice || slice.getStaticOffsets() != ArrayRef<int64_t>({0, 0}) ||
+      slice.getStaticSizes() != ArrayRef<int64_t>({1, 2}) ||
+      slice.getStaticStrides() != ArrayRef<int64_t>({1, 1}))
+    return {};
+  auto type = dyn_cast<RankedTensorType>(slice.getType());
+  return type && ((type.getRank() == 1 && type.getDimSize(0) == 2) ||
+                  (type.getRank() == 2 && type.getShape() == ArrayRef<int64_t>({1, 2})))
+             ? slice : tensor::ExtractSliceOp();
+}
+
+bool rewriteTorchTop2Sort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
+  if (sort.getNumResults() != 2 || sort.getDimension() != 1) return false;
+  auto scoresType = dyn_cast<RankedTensorType>(sort.getOutputs()[0].getType());
+  auto idsType = dyn_cast<RankedTensorType>(sort.getOutputs()[1].getType());
+  if (!scoresType || !idsType || !scoresType.hasStaticShape() || !idsType.hasStaticShape() ||
+      scoresType.getRank() != 2 || idsType.getRank() != 2 ||
+      scoresType.getDimSize(0) != 1 || idsType.getShape() != scoresType.getShape() ||
+      !scoresType.getElementType().isF32() || !idsType.getElementType().isInteger(64))
+    return false;
+  int64_t experts = scoresType.getDimSize(1);
+  if (experts < 4 || experts > 16 || !isIotaIndices(sort.getOutputs()[1])) return false;
+  llvm::DenseSet<Operation *> seen;
+  if (!comesFromProjection(sort.getOutputs()[0], seen)) return false;
+  auto valueSlice = top2PrefixSlice(sort.getResult(0));
+  auto indexSlice = top2PrefixSlice(sort.getResult(1));
+  if (!valueSlice || !indexSlice) return false;
+  Block &comparator = sort.getRegion().front();
+  if (comparator.getOperations().size() != 2 || comparator.getNumArguments() != 4) return false;
+  auto cmp = dyn_cast<arith::CmpFOp>(comparator.front());
+  if (!cmp || cmp.getPredicate() != arith::CmpFPredicate::OGE ||
+      cmp.getLhs() != comparator.getArgument(0) || cmp.getRhs() != comparator.getArgument(1))
+    return false;
+
+  rewriter.setInsertionPoint(sort);
+  auto loc = sort.getLoc();
+  auto f32 = rewriter.getF32Type();
+  auto i32 = rewriter.getI32Type();
+  auto valuesType = RankedTensorType::get({1, 2}, f32);
+  auto indicesType = RankedTensorType::get({1, 2}, i32);
+  Value negInf = arith::ConstantFloatOp::create(rewriter, loc,
+      f32, APFloat(-std::numeric_limits<float>::infinity()));
+  Value maxIndex = arith::ConstantIntOp::create(rewriter, loc, INT32_MAX, 32);
+  Value emptyValues = tensor::EmptyOp::create(rewriter, loc, valuesType.getShape(), f32);
+  Value emptyIndices = tensor::EmptyOp::create(rewriter, loc, indicesType.getShape(), i32);
+  Value initValues = linalg::FillOp::create(rewriter, loc, negInf, emptyValues).getResult(0);
+  Value initIndices = linalg::FillOp::create(rewriter, loc, maxIndex, emptyIndices).getResult(0);
+  auto topk = IREE::LinalgExt::TopkOp::create(rewriter, loc, TypeRange{valuesType, indicesType},
+      sort.getOutputs()[0], Value(), initValues, initIndices, 1);
+  Block *body = rewriter.createBlock(&topk.getRegion(), {}, {f32, f32}, {loc, loc});
+  rewriter.setInsertionPointToEnd(body);
+  Value greater = arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OGT,
+                                        body->getArgument(0), body->getArgument(1));
+  IREE::LinalgExt::YieldOp::create(rewriter, loc, greater);
+  rewriter.setInsertionPointAfter(topk);
+  SmallVector<ReassociationIndices> reassociation{{0, 1}};
+  Value values2 = topk.getResult(0);
+  auto indices64Type = RankedTensorType::get({1, 2}, rewriter.getI64Type());
+  Value ids2 = arith::ExtSIOp::create(rewriter, loc, indices64Type, topk.getResult(1));
+  if (cast<RankedTensorType>(valueSlice.getType()).getRank() == 1)
+    values2 = tensor::CollapseShapeOp::create(rewriter, loc, valueSlice.getType(),
+                                               values2, reassociation);
+  if (cast<RankedTensorType>(indexSlice.getType()).getRank() == 1)
+    ids2 = tensor::CollapseShapeOp::create(rewriter, loc, indexSlice.getType(),
+                                            ids2, reassociation);
+  rewriter.replaceOp(valueSlice, values2);
+  rewriter.replaceOp(indexSlice, ids2);
+  rewriter.eraseOp(sort);
+  return true;
 }
 
 std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
@@ -97,11 +189,15 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
 
   void runOnOperation() override {
     if (!enabled || (!force && !targetsSA(getOperation()))) return;
+    IRRewriter rewriter(&getContext());
+    SmallVector<IREE::LinalgExt::SortOp> sorts;
+    getOperation()->walk([&](IREE::LinalgExt::SortOp sort) { sorts.push_back(sort); });
+    unsigned convertedSorts = 0;
+    for (auto sort : sorts) convertedSorts += rewriteTorchTop2Sort(sort, rewriter);
     SmallVector<std::pair<IREE::LinalgExt::TopkOp, int64_t>> matches;
     getOperation()->walk([&](IREE::LinalgExt::TopkOp topk) {
       if (auto experts = routerExperts(topk)) matches.emplace_back(topk, *experts);
     });
-    IRRewriter rewriter(&getContext());
     for (auto [topk, experts] : matches) {
       topk->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
       topk->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(2));
@@ -113,7 +209,8 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
       (*region)->setAttr("sa.moe.kind", rewriter.getStringAttr("route_top2"));
     }
     if (report)
-      llvm::errs() << "sa form-moe-regions: " << matches.size() << " top-2 router regions\n";
+      llvm::errs() << "sa form-moe-regions: " << matches.size() << " top-2 router regions ("
+                   << convertedSorts << " Torch sort prefixes)\n";
   }
 
   Option<bool> enabled{*this, "enabled", llvm::cl::desc("Form MoE router regions"), llvm::cl::init(true)};

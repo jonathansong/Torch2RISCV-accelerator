@@ -141,3 +141,35 @@ func.func @not_router(%scores: tensor<1x8xf32>) -> (tensor<1x2xf32>, tensor<1x2x
   } -> tensor<1x2xf32>, tensor<1x2xi32>
   return %v, %i : tensor<1x2xf32>, tensor<1x2xi32>
 }
+
+// -----
+
+// torch.topk is imported as a full descending sort and a two-element prefix.
+// The pass must form the same device Top-2 region for that frontend spelling.
+// CHECK-LABEL: func.func @torch_sort_prefix
+// CHECK:       linalg.matmul
+// CHECK:       flow.dispatch.region
+// CHECK-SAME:    sa.moe.experts = 4 : i64
+// CHECK:         iree_linalg_ext.topk
+// CHECK-NOT:   iree_linalg_ext.sort
+func.func @torch_sort_prefix(%x: tensor<1x32xf32>, %w: tensor<32x4xf32>) -> (tensor<1x2xf32>, tensor<1x2xi64>) {
+  %c0 = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<1x4xf32>
+  %init = linalg.fill ins(%c0 : f32) outs(%empty : tensor<1x4xf32>) -> tensor<1x4xf32>
+  %scores = linalg.matmul ins(%x, %w : tensor<1x32xf32>, tensor<32x4xf32>) outs(%init : tensor<1x4xf32>) -> tensor<1x4xf32>
+  %ids_empty = tensor.empty() : tensor<1x4xi64>
+  %ids = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} outs(%ids_empty : tensor<1x4xi64>) {
+  ^bb0(%old: i64):
+    %index = linalg.index 1 : index
+    %cast = arith.index_cast %index : index to i64
+    linalg.yield %cast : i64
+  } -> tensor<1x4xi64>
+  %sorted:2 = iree_linalg_ext.sort dimension(1) outs(%scores, %ids : tensor<1x4xf32>, tensor<1x4xi64>) {
+  ^bb0(%a: f32, %b: f32, %ia: i64, %ib: i64):
+    %ge = arith.cmpf oge, %a, %b : f32
+    iree_linalg_ext.yield %ge : i1
+  } -> tensor<1x4xf32>, tensor<1x4xi64>
+  %values = tensor.extract_slice %sorted#0[0, 0] [1, 2] [1, 1] : tensor<1x4xf32> to tensor<1x2xf32>
+  %indices = tensor.extract_slice %sorted#1[0, 0] [1, 2] [1, 1] : tensor<1x4xi64> to tensor<1x2xi64>
+  return %values, %indices : tensor<1x2xf32>, tensor<1x2xi64>
+}

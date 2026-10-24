@@ -1244,10 +1244,46 @@ overlay as M5e. This board acceptance is pending. The fixture currently
 contains an explicit `sahl.route_top2` export; the production model frontend
 does not yet form it automatically or connect its output to a compiled FFN.
 
-Then extend the compiler pattern through dynamic expert indexing and weighted
-combine. Lower the expert computation to one reusable SA FFN template. Compile
-a single Mixtral layer from IREE input and compare route IDs, weights, and
-output to M4.
+#### M5h Torch frontend and real architecture recognition (board pending)
+
+`compiler/frontend/moe_native.py` exports a tensor-level batch-1 Mixtral
+expert block with shared expert-axis parameters. It expresses router
+projection, descending sort and Top-2 prefix, normalization, dynamic expert
+selection, batched gate/up/down projections, SwiGLU, and weighted combine as
+ordinary Torch operations. There is no model-specific dispatch list in this
+frontend. The non-stable Torch sort used here produces ascending expert IDs
+for ties in the tested CPU frontend; this agrees with the M4 reference in the
+synthetic numerical test. IREE Turbine emits MLIR and an external parameter
+archive. The frontend currently uses fp32 weights and computes only the MoE
+block, not the whole transformer layer.
+
+IREE imports this Torch sort as a full descending `iree_linalg_ext.sort` over
+scores and i64 iota IDs followed by two static prefix slices. The opt-in
+`FormMoeRegions` pass recognizes that precise batch-1 pattern for 4–16
+experts, substitutes the initialized i32 Top-2 operation, and extends its
+IDs to i64 for the remaining Torch graph. Unmatched sorts retain IREE's
+ordinary path. `sa_form_moe_regions.mlir` covers this additional spelling.
+`test_moe_native.py` checks the synthetic layer against the M4 fp32 reference,
+including zero and random inputs. `test_moe_native_compile.py` checks that a
+Torch-exported layer produces exactly one embedded RISC-V Top-2 SA export and
+records the currently required host fallback boundaries.
+
+The cached `TitanML-tiny-mixtral` layer 0 (8 experts, hidden size 1024,
+intermediate size 3584) exported to `build/moe/m5h/real-layer0` and compiled
+with `--iree-sa-form-moe --iree-sa-riscv --iree-sa-host-fallback`. The
+codegen report confirms that the real router's Top-2 runs on SA. Router fp32
+matmul, Top-2 softmax, i64 expert gather, three fp32 batched FFN matmuls, and
+final reduction still fall back to host. This is architecture recognition,
+not a fully device-resident Mixtral FFN.
+
+`moe_m5h_board_bundle.py` stages a synthetic full-layer IREE VMFB, parameters,
+reference arrays, overlay, runtime, and script in `build/moe/m5h/board`.
+Copy this directory to KV260 as `~/moe-m5h` and run `./run_board.sh`. It checks
+three inputs including a zero-score tie case. Board acceptance is pending.
+The earlier M5g compiler-generated route-record export also awaits board
+acceptance. Integrating that operation automatically after the Torch Top-2,
+then using its dynamic offsets to run one reusable W8A8 expert template and
+weighted combine, remains required before M5 is complete.
 
 ### M6：Prefill/grouped execution
 
