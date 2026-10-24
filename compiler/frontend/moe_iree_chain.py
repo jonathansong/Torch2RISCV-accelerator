@@ -47,6 +47,7 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
     top2_binary_op = binary_op("top2", top2_binary) if top2_binary is not None else ""
     scores_arg = "%scores_view: !hal.buffer_view,\n                         " if top2_binary is not None else ""
     scores_size = f"    %cscores = arith.constant {experts * 4} : index\n" if top2_binary is not None else ""
+    ids_binding = ("[%c64, %c8]" if top2_binary is not None else "[%c0, %c8]")
     top2_exe = ("    %top2_exe = hal.executable.create device(%device : !hal.device)\n"
                 "        affinity(%affinity) target(@top2::@sa_desc_v1) : !hal.executable\n"
                 if top2_binary is not None else "")
@@ -58,7 +59,7 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
         workgroups([%c1, %c1, %c1]) constants([])
         bindings([(%scores : !hal.buffer)[%c0, %cscores],
                   (%values : !hal.buffer)[%c0, %c8],
-                  (%ids : !hal.buffer)[%c0, %c8]]) flags("None")
+                  (%ids : !hal.buffer)[%c0, %c72]]) flags("None")
     hal.command_buffer.execution_barrier<%cmd : !hal.command_buffer>
         source("CommandIssue") target("CommandProcess") flags("None")'''
                      if top2_binary is not None else "")
@@ -81,6 +82,7 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
     %c8 = arith.constant 8 : index
     %c32 = arith.constant 32 : index
     %c64 = arith.constant 64 : index
+    %c72 = arith.constant 72 : index
     %c96 = arith.constant 96 : index
 {scores_size}    %cparam = arith.constant {param_offset} : index
     %cx = arith.constant {activation_bytes} : index
@@ -105,7 +107,7 @@ def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
         target(%route_exe : !hal.executable)[%c0]
         workgroups([%c1, %c1, %c1]) constants([])
         bindings([(%values : !hal.buffer)[%c0, %c8],
-                  (%ids : !hal.buffer)[%c0, %c8],
+                  (%ids : !hal.buffer){ids_binding},
                   (%route_buffer : !hal.buffer)[%c0, %c96]]) flags("None")
     hal.command_buffer.execution_barrier<%cmd : !hal.command_buffer>
         source("CommandIssue") target("CommandProcess") flags("None")

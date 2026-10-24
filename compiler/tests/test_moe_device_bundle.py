@@ -118,6 +118,9 @@ class MoeDeviceBundleTest(unittest.TestCase):
             self.assertEqual(text.count("vm.call.variadic @hal.command_buffer.dispatch("), 3)
             self.assertEqual(text.count("vm.call @hal.command_buffer.execution_barrier("), 2)
             self.assertEqual(text.count("vm.call @hal.device.queue.execute("), 1)
+            chain_source = (root / "top2_chain/moe_chain.mlir").read_text()
+            self.assertIn("(%ids : !hal.buffer)[%c0, %c72]", chain_source)
+            self.assertIn("(%ids : !hal.buffer)[%c64, %c8]", chain_source)
 
     def test_rejects_other_device_width(self):
         with self.assertRaisesRegex(ValueError, "D=16"):

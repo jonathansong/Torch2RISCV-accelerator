@@ -59,19 +59,26 @@ def main():
             record = route[16:24]
             offsets = ids.astype(np.uint32) * np.uint32(manifest["expert_stride"])
             error = float(np.max(np.abs(got - expected)))
+            magnitude = float(np.max(np.abs(got)))
             valid = (route.size == 24 and record[0] == 2
                      and np.array_equal(record[1:3], ids.astype(np.uint32))
                      and np.array_equal(record[3:5], offsets)
                      and np.isfinite(got).all() and error <= 3e-3)
+            selected_ids = None
             if args.top2:
                 selected_values = np.load(case / "values_device.npy").reshape(-1)
-                selected_ids = np.load(case / "ids_device.npy").reshape(-1)
+                selected_ids = np.load(case / "ids_device.npy").view("<i4")[16:18]
                 valid = (valid and np.array_equal(selected_ids, ids)
                          and np.array_equal(selected_values,
                                             np.load(case / "values.npy").reshape(-1)))
-            print(f"{name}: {'PASS' if valid else 'FAIL'} experts {ids.tolist()}, max error {error:.6g}")
+            print(f"{name}: {'PASS' if valid else 'FAIL'} experts {ids.tolist()}, "
+                  f"Top-2 {selected_ids.tolist() if selected_ids is not None else 'input'}, "
+                  f"route {record[:5].tolist()}, max |output| {magnitude:.6g}, "
+                  f"max error {error:.6g}")
             cases.append({"name": name, "pass": bool(valid), "ids": ids.tolist(),
-                          "max_error": error})
+                          "top2_ids": selected_ids.tolist() if selected_ids is not None else None,
+                          "route_status": int(record[0]), "route_ids": record[1:3].tolist(),
+                          "max_output": magnitude, "max_error": error})
     finally:
         head, beat = BL.stop(mm, buf)
     result = {"pass": all(case["pass"] for case in cases), "cases": cases,

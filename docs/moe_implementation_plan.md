@@ -1485,6 +1485,13 @@ current 32 MiB IREE board window.
 values/IDs, route record IDs/offsets, and W8A8 output. Copy the directory to
 `~/moe-m5o` on KV260 and run `./run_board.sh`. Board acceptance is pending.
 
+The first KV260 run completed all nine firmware entries but failed all three
+outputs. Inspection of the model-compiled Top-2 RISC-V export showed that its
+ID output uses binding 2 at byte offset 64. The initial wrapper passed only
+an 8-byte ID buffer and the next route dispatch read its base. The corrected
+wrapper allocates 72 bytes for IDs, binds that full buffer to Top-2, and binds
+bytes 64–71 to route. Board verification of this correction is pending.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。

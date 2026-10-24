@@ -77,8 +77,10 @@ def stage(out, runtime=RUNTIME, *, include_top2=False):
         if include_top2:
             np.save(case / "scores.npy", scores.reshape(1, 4).astype(np.float32))
             np.save(case / "values_init.npy", np.full((1, 2), -np.inf, dtype=np.float32))
-            np.save(case / "ids_init.npy", np.full((1, 2), np.iinfo(np.int32).max,
-                                                   dtype=np.int32))
+            ids_init = np.zeros(72, dtype=np.uint8)
+            ids_init[64:72] = np.full(2, np.iinfo(np.int32).max,
+                                       dtype=np.int32).view(np.uint8)
+            np.save(case / "ids_init.npy", ids_init)
         np.save(case / "x.npy", x.reshape(1, 32))
         np.save(case / "route_zero.npy", np.zeros(96, dtype=np.uint8))
         np.save(case / "out_zero.npy", np.zeros((1, 32), dtype=np.float32))
