@@ -1362,6 +1362,19 @@ test cases pass. The split artifacts still require host orchestration;
 automatic route dispatch and FFN invocation inside one IREE program remain
 the M5 completion work.
 
+#### M5l model-specialized route acceptance bundle (host verified, KV260 pending)
+
+`moe_m5k_route_board_bundle.py` stages `build/moe/m5k/board-route` using the
+compiler-generated real-layer route kernel. Its three fixtures include the
+saved M4/HF token route, tied scores, and expert 7 to exercise a 77,299,712
+byte parameter offset. The runner checks IDs, both offsets, normalized
+weights, and firmware completion. `test_moe_model_route_host.py` executes the
+generated LLVM IR for the same model-specialized route export on x86-64;
+all three cases match, including the real expert stride. Copy the staged
+directory to KV260 as `~/moe-m5k-route` and run `./run_board.sh`. Board
+acceptance is pending. This check does not yet connect the separate route
+export to the IREE model VMFB or FFN dispatch.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。
