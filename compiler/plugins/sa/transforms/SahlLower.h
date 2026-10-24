@@ -96,6 +96,7 @@ class Lowerer {
 public:
   Lowerer(func::FuncOp f, const TargetConfig &cfg, sahw::TemplateOp t, sahw::BodyOp body)
       : f(f), cfg(cfg), d(cfg.d), lay(uint32_t(cfg.d), uint32_t(cfg.spadBytes), uint32_t(cfg.accBytes)),
+        templ(t),
         regB(body), bb(OpBuilder::atBlockEnd(&body.getRegion().front())), loc(f.getLoc()), mem(lay) {
   }
 
@@ -110,6 +111,7 @@ private:
   const TargetConfig &cfg;
   int64_t d;
   ::sa::Layout lay;
+  sahw::TemplateOp templ;
   OpBuilder regB, bb;
   Location loc;
   // a kernel's placed SPAD_A words are relative to this (sahl.claim_spad "sa.relative")

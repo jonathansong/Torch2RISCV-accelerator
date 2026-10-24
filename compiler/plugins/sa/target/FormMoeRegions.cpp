@@ -34,6 +34,19 @@ bool comesFromProjection(Value value, llvm::DenseSet<Operation *> &seen, unsigne
   return comesFromProjection(op->getOperand(0), seen, depth + 1);
 }
 
+bool hasTopkInitialization(IREE::LinalgExt::TopkOp topk) {
+  auto valuesFill = topk.getOutputValues().getDefiningOp<linalg::FillOp>();
+  auto indicesFill = topk.getOutputIndices().getDefiningOp<linalg::FillOp>();
+  if (!valuesFill || !indicesFill) return false;
+  auto valuesConstant = valuesFill.getDpsInputs()[0].getDefiningOp<arith::ConstantOp>();
+  auto indicesConstant = indicesFill.getDpsInputs()[0].getDefiningOp<arith::ConstantOp>();
+  if (!valuesConstant || !indicesConstant) return false;
+  auto value = dyn_cast<FloatAttr>(valuesConstant.getValue());
+  auto index = dyn_cast<IntegerAttr>(indicesConstant.getValue());
+  return value && value.getValue().isInfinity() && value.getValue().isNegative() &&
+         index && index.getValue().getSExtValue() == 0x7fffffff;
+}
+
 std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
   if (topk.getIndices()) return std::nullopt;
   auto scores = dyn_cast<RankedTensorType>(topk.getValues().getType());
@@ -50,6 +63,10 @@ std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
     return std::nullopt;
   int64_t experts = scores.getDimSize(1);
   if (experts < 4 || experts > 16) return std::nullopt;
+  // Top-K's scalar implementation reads both output buffers before inserting
+  // each candidate. Only the descending sentinel initialization is safe to
+  // replace with a fresh Top-2 selection.
+  if (!hasTopkInitialization(topk)) return std::nullopt;
   // This must be the router projection, rather than an unrelated top-k.
   llvm::DenseSet<Operation *> seen;
   if (!comesFromProjection(topk.getValues(), seen)) return std::nullopt;

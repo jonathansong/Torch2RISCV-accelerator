@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Raw Top-2 firmware preserves finite-score IREE routing values and IDs."""
+"""Raw Top-2 firmware matches IREE TopkOp's descending scalar insertion."""
 
 import ctypes
 import os
@@ -12,6 +12,22 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import moe_top2_raw_kernel  # noqa: E402
+
+
+def topk_reference(scores):
+    values = np.array([-np.inf, -np.inf], dtype=np.float32)
+    indices = np.array([0x7FFFFFFF, 0x7FFFFFFF], dtype=np.int32)
+    for i, score in enumerate(scores):
+        carry, carry_id = score, i
+        for k in range(2):
+            old, old_id = values[k], int(indices[k])
+            forward, reverse = bool(carry > old), bool(old > carry)
+            take_id = forward or (forward == reverse and carry_id < old_id)
+            values[k] = carry if forward else old
+            indices[k] = carry_id if take_id else old_id
+            carry = old if forward else carry
+            carry_id = old_id if take_id else carry_id
+    return values, indices
 
 
 class RawTop2Test(unittest.TestCase):
@@ -47,6 +63,8 @@ class RawTop2Test(unittest.TestCase):
         cases = [np.array([2.0, 2.0, 1.0, 2.0]),
                  np.array([-0.0, 0.0, -0.0, 0.0]),
                  np.array([3.0, 3.0, 3.0, 3.0]),
+                 np.array([np.nan, 2.0, 3.0, 4.0]),
+                 np.array([2.0, np.nan, -np.inf, np.inf]),
                  np.array([-4.0, -3.0, -2.0, -1.0]),
                  np.array([1.0, 0.0, 0.0, 0.0])]
         cases.extend(rng.standard_normal(n).astype(np.float32) for n in (4, 8, 16) for _ in range(20))
@@ -54,9 +72,9 @@ class RawTop2Test(unittest.TestCase):
             scores = np.ascontiguousarray(scores, dtype=np.float32)
             with self.subTest(scores=scores):
                 values, indices = self.route(scores)
-                expected_ids = sorted(range(len(scores)), key=lambda i: (-scores[i], i))[:2]
+                expected_values, expected_ids = topk_reference(scores)
                 np.testing.assert_array_equal(indices, expected_ids)
-                np.testing.assert_array_equal(values.view(np.uint32), scores[expected_ids].view(np.uint32))
+                np.testing.assert_array_equal(values.view(np.uint32), expected_values.view(np.uint32))
 
 
 if __name__ == "__main__":

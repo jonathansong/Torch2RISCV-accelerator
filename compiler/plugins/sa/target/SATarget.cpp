@@ -245,6 +245,8 @@ public:
         return exportOp.emitError() << "sa target: " << layout.getBindings().size() << " bindings (at most 16)";
       auto it = templates.find(exportOp.getSymName());
       if (it == templates.end()) return exportOp.emitError() << "sa target: no sahw.template for this export";
+      if (it->second->hasAttr("sa.riscv_only") && !options.riscv)
+        return exportOp.emitError("sa target: MoE Top-2 requires --iree-sa-riscv");
       sa::SerializedExport se;
       if (failed(sa::serializeTemplate(it->second, se))) return failure();
       if (!options.emitRiscv.empty() && !it->second.getUnsupported()) {   // (an export on the host: none)

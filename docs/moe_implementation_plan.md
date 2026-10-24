@@ -1065,9 +1065,8 @@ one f32 score buffer, one f32 Top-2 value buffer, and one i32 expert ID
 buffer. Unmarked Top-K operations remain on their existing IREE path.
 
 `sahl_moe_top2.mlir` verifies both paths. A full `iree-compile` probe with a
-W8 router confirmed that the mark reaches the SA executable. Compilation
-currently stops with an explicit `sahl-to-sahw` diagnostic because the new
-SAHL operation has no device lowering. The existing M4 RISC-V route kernel
+W8 router confirmed that the mark reaches the SA executable. This M5b step
+preceded the RISC-V-only device lowering described below. The existing M4 RISC-V route kernel
 outputs a packed route record with normalized weights; `sahl.top2` represents
 raw values and IDs, so they cannot yet be substituted for each other. This
 step does not execute a native IREE MoE model. The available golden guard
@@ -1084,16 +1083,35 @@ packed normalized route record used by the hand-built FFN dispatches.
 
 `compiler/tests/moe_top2_raw_kernel.py` builds a position-independent rv32imc
 blob and a host twin. `test_moe_top2_raw.py` checks 4, 8, and 16 experts,
-negative scores, ties, signed zero, and deterministic random finite scores
-against stable descending selection. The raw kernel is not yet called by an
-IREE executable. Before wiring it into the SA RISC-V code table, the compiler
-must either prove finite router scores or reproduce IREE Top-K's ordered
-comparison behavior for NaNs. The SA runtime must also reject a RISC-V-only
-export when embedded code execution is disabled; a descriptor RET would
-silently leave its outputs unwritten.
+negative scores, ties, signed zero, infinities, NaNs, and deterministic random
+scores against IREE Top-K's scalar insertion rules. Both output tensors must
+be initialized: f32 values to negative infinity and i32 IDs to `INT32_MAX`.
+`FormMoeRegions` now checks those producer fills before marking a dispatch;
+an uninitialized Top-K remains on IREE's ordinary path.
 
-Next connect the raw Top-2 kernel to SA executable code generation with a
-runtime check for embedded RISC-V execution, then extend the pattern through
+#### M5d embedded RISC-V export (2026-10-24)
+
+`sahl-to-sahw` recognizes one isolated `sahl.top2` dispatch, records the three
+DDR binding addresses, and emits a RISC-V-only template. In-process LLVM
+code generation emits a specialized rv32imc function for the expert count.
+It uses integer operations to implement ordered f32 comparison, avoiding
+soft-float calls and relocations in the embedded code. The SA descriptor
+extension has a RISC-V-only bit; the runtime rejects the export unless its
+own embedded code runs with `SA_RV=embedded` on the board. Compilation
+requires `--iree-sa-riscv` and rejects a route dispatch mixed with other
+device computations.
+
+`moe_router_w8_top2.mlir` and `test_moe_compiler_riscv.py` exercise the full
+IREE compile path: the W8 router reaches an SA executable, the Top-2 export
+has flag 2 and a nonempty code-table entry, and omission of `--iree-sa-riscv`
+fails with a targeted diagnostic. The test also executes the emitted
+target-neutral LLVM IR on the x86-64 host using 32-bit binding addresses,
+including a nonzero subspan offset, and compares selected values and IDs for
+NaNs, infinities, signed zero, ties, and random scores. Host firmware tests
+cover the standalone C kernel. The generated export still needs a KV260 board execution test and
+comparison to the IREE/host reference before it is accepted as device-correct.
+
+Next run the generated Top-2 export on KV260, then extend the pattern through
 route normalization, dynamic expert indexing, and weighted combine. Lower the
 expert computation to one reusable SA FFN template. Compile a single Mixtral
 layer from IREE input and compare route IDs, weights, and output to M4.

@@ -36,7 +36,8 @@ File layout (little-endian):
     0 prefix descriptors (its RET included; 0: none)   4 bindings read by the prefix (mask)
     8 bindings written (mask, ST)   12 bindings read (mask, LD / LDPARAM, the prefix included)
     16 head descriptors (the body's leading loads and a RET; 0: none)
-    20 flags (bit 0: the export touches SPAD_B)   24 the prefix's register   28 0
+    20 flags (bit 0: touches SPAD_B; bit 1: requires its embedded RISC-V code)
+    24 the prefix's register   28 0
   value = ((constant * mul) >> log2(div)) + add, and for BASE + the binding's
   physical address. The default setup (no table) is BASE i = binding i,
   PARAM j = push constant j. With a table, dynamic binding offsets (IREE

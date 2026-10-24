@@ -1,6 +1,8 @@
-/* Raw batch-1 Top-2 for an IREE dispatch. The input scores must be finite.
- * Equal scores keep the lower expert ID. This is deliberately separate from
- * moe_top2.c, which produces normalized weights and parameter offsets. */
+/* Raw batch-1 Top-2 for an IREE dispatch. Match TopkOp's scalar insertion
+ * with output values initialized to -inf and indices to INT32_MAX. In
+ * particular, NaNs make both ordered comparisons false; value and ID may
+ * then be selected independently. This is separate from moe_top2.c, which
+ * produces normalized weights and parameter offsets. */
 #include <stdint.h>
 
 #ifdef MOE_TOP2_RAW_HOST
@@ -18,29 +20,26 @@ void r5_entry(const uint32_t* args, const uint32_t* constants) {
   const uint32_t n = constants[0];
   if (n < 2) return;
 
-  float first = scores[0], second = scores[1];
-  uint32_t first_id = 0, second_id = 1;
-  if (second > first) {
-    float tmp = first;
-    first = second;
-    second = tmp;
-    first_id = 1;
-    second_id = 0;
-  }
-  for (uint32_t i = 2; i < n; ++i) {
-    const float value = scores[i];
-    if (value > first) {
-      second = first;
-      second_id = first_id;
-      first = value;
-      first_id = i;
-    } else if (value > second) {
-      second = value;
-      second_id = i;
+  union { uint32_t bits; float value; } neg_inf = {0xFF800000u};
+  float selected[2] = {neg_inf.value, neg_inf.value};
+  uint32_t selected_id[2] = {0x7FFFFFFFu, 0x7FFFFFFFu};
+  for (uint32_t i = 0; i < n; ++i) {
+    float carry = scores[i];
+    uint32_t carry_id = i;
+    for (uint32_t k = 0; k < 2; ++k) {
+      const float old = selected[k];
+      const uint32_t old_id = selected_id[k];
+      const int forward = carry > old;
+      const int reverse = old > carry;
+      const int take_id = forward || (forward == reverse && (int32_t)carry_id < (int32_t)old_id);
+      selected[k] = forward ? carry : old;
+      selected_id[k] = take_id ? carry_id : old_id;
+      carry = forward ? old : carry;
+      carry_id = take_id ? old_id : carry_id;
     }
   }
-  values[0] = first;
-  values[1] = second;
-  indices[0] = first_id;
-  indices[1] = second_id;
+  values[0] = selected[0];
+  values[1] = selected[1];
+  indices[0] = selected_id[0];
+  indices[1] = selected_id[1];
 }

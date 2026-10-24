@@ -24,8 +24,12 @@ func.func @route_top2(%x: tensor<1x4xf32>, %w: tensor<4x8xf32>) -> (tensor<1x2xf
   } -> tensor<1x8xf32>
   %ve = tensor.empty() : tensor<1x2xf32>
   %ie = tensor.empty() : tensor<1x2xi32>
+  %ninf = arith.constant 0xFF800000 : f32
+  %maxidx = arith.constant 2147483647 : i32
+  %vi = linalg.fill ins(%ninf : f32) outs(%ve : tensor<1x2xf32>) -> tensor<1x2xf32>
+  %ii = linalg.fill ins(%maxidx : i32) outs(%ie : tensor<1x2xi32>) -> tensor<1x2xi32>
   %v, %i = iree_linalg_ext.topk dimension(1) ins(%scaled : tensor<1x8xf32>)
-      outs(%ve, %ie : tensor<1x2xf32>, tensor<1x2xi32>) {
+      outs(%vi, %ii : tensor<1x2xf32>, tensor<1x2xi32>) {
   ^bb0(%a: f32, %b: f32):
     %gt = arith.cmpf ogt, %a, %b : f32
     iree_linalg_ext.yield %gt : i1
@@ -67,6 +71,30 @@ func.func @quantized_router(%x: tensor<32xi8>, %w: tensor<1x32x8xi8>) -> (tensor
     %score = arith.sitofp %raw_score : i32 to f32
     linalg.yield %score : f32
   } -> tensor<1x8xf32>
+  %ve = tensor.empty() : tensor<1x2xf32>
+  %ie = tensor.empty() : tensor<1x2xi32>
+  %ninf = arith.constant 0xFF800000 : f32
+  %maxidx = arith.constant 2147483647 : i32
+  %vi = linalg.fill ins(%ninf : f32) outs(%ve : tensor<1x2xf32>) -> tensor<1x2xf32>
+  %ii = linalg.fill ins(%maxidx : i32) outs(%ie : tensor<1x2xi32>) -> tensor<1x2xi32>
+  %v, %i = iree_linalg_ext.topk dimension(1) ins(%scores : tensor<1x8xf32>)
+      outs(%vi, %ii : tensor<1x2xf32>, tensor<1x2xi32>) {
+  ^bb0(%a: f32, %b: f32):
+    %gt = arith.cmpf ogt, %a, %b : f32
+    iree_linalg_ext.yield %gt : i1
+  } -> tensor<1x2xf32>, tensor<1x2xi32>
+  return %v, %i : tensor<1x2xf32>, tensor<1x2xi32>
+}
+
+// -----
+
+// The Top-K scalar implementation reads its output initializers. Empty
+// outputs cannot be replaced by the raw Top-2 kernel.
+// CHECK-LABEL: func.func @uninitialized_top2
+// CHECK-NOT: flow.dispatch.region
+func.func @uninitialized_top2(%x: tensor<1x4xf32>, %w: tensor<4x8xf32>) -> (tensor<1x2xf32>, tensor<1x2xi32>) {
+  %e = tensor.empty() : tensor<1x8xf32>
+  %scores = linalg.matmul ins(%x, %w : tensor<1x4xf32>, tensor<4x8xf32>) outs(%e : tensor<1x8xf32>) -> tensor<1x8xf32>
   %ve = tensor.empty() : tensor<1x2xf32>
   %ie = tensor.empty() : tensor<1x2xi32>
   %v, %i = iree_linalg_ext.topk dimension(1) ins(%scores : tensor<1x8xf32>)

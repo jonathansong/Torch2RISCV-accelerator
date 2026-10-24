@@ -72,6 +72,7 @@ typedef struct sa_export_t {
   uint32_t prefix_reads, writes, reads;   // binding masks
   uint32_t prefix_reg;
   bool spad_b;
+  bool rv_only;             // the descriptor body is a RET; require this export's embedded code
   uint32_t descriptor_count;
   uint32_t est_cycles;
   uint32_t setup_count;     // 0: the default setup
@@ -215,6 +216,9 @@ static iree_status_t sa_executable_issue_call(iree_hal_local_executable_t* base,
     return iree_ok_status();
   }
   const sa_export_t* x = &e->exports[ordinal];
+  if (x->rv_only)
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "sa: MoE Top-2 requires the embedded RISC-V dispatch path");
   uint32_t regs[24], vals[24], n = 0;
   IREE_RETURN_IF_ERROR(sa_export_regs(e, x, dispatch_state->binding_count, dispatch_state->binding_ptrs,
                                       dispatch_state->constant_count, dispatch_state->constants, regs, vals, &n));
@@ -246,6 +250,9 @@ iree_status_t sa_executable_append(iree_hal_executable_t* executable, uint32_t o
                                       &xm->rv_phys));
     xm->rv_state = xm->rv_phys ? 2 : 1;
   }
+  if (x->rv_only && (xm->rv_state != 2 || !xm->rv_embedded || xm->rv_phys != xm->rv_embedded))
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "sa: MoE Top-2 requires SA_RV=embedded on the board");
   if (xm->rv_state == 2) {
     uint32_t phys[16];
     for (uint32_t i = 0; i < binding_count && i < 16; ++i) {
@@ -445,6 +452,7 @@ static iree_status_t sa_executable_create(sa_context_t* context, iree_const_byte
     e->exports[i].reads = ext.reads;
     e->exports[i].prefix_reg = ext.prefix_reg;
     e->exports[i].spad_b = (ext.flags & 1) != 0;
+    e->exports[i].rv_only = (ext.flags & 2) != 0;
     e->exports[i].descriptor_count = x.descriptor_count;
     e->exports[i].est_cycles = x.est_cycles;
     e->attrs[i].binding_count = (uint8_t)x.binding_count;

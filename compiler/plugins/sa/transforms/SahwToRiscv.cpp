@@ -395,6 +395,64 @@ std::string riscvSymbol(StringRef exportName) {
 }
 
 namespace {
+// Ordered f32 greater-than using integer operations only. rv32imc has no F
+// extension, and this code table cannot contain calls to soft-float helpers.
+llvm::Value *rawTop2Greater(RvEmitter &e, llvm::Value *a, llvm::Value *b) {
+  auto ab = e.b.CreateAnd(a, e.c32(0x7FFFFFFF));
+  auto bb = e.b.CreateAnd(b, e.c32(0x7FFFFFFF));
+  auto nan = e.b.CreateOr(e.b.CreateICmpUGT(ab, e.c32(0x7F800000)),
+                          e.b.CreateICmpUGT(bb, e.c32(0x7F800000)));
+  auto bothZero = e.b.CreateAnd(e.b.CreateICmpEQ(ab, e.c32(0)), e.b.CreateICmpEQ(bb, e.c32(0)));
+  auto sa = e.b.CreateLShr(a, e.c32(31));
+  auto sb = e.b.CreateLShr(b, e.c32(31));
+  auto differentSigns = e.b.CreateICmpNE(sa, sb);
+  auto sameSignGreater = e.b.CreateSelect(e.b.CreateICmpEQ(sa, e.c32(0)),
+                                           e.b.CreateICmpUGT(a, b), e.b.CreateICmpULT(a, b));
+  auto greater = e.b.CreateSelect(differentSigns, e.b.CreateICmpULT(sa, sb), sameSignGreater);
+  return e.b.CreateAnd(greater, e.b.CreateNot(e.b.CreateOr(nan, bothZero)));
+}
+
+LogicalResult buildRawTop2(RvEmitter &e, sahw::TemplateOp t) {
+  auto experts = t->getAttrOfType<IntegerAttr>("sa.moe.raw_top2");
+  auto addresses = t->getAttrOfType<DenseI64ArrayAttr>("sa.moe.addresses");
+  if (!experts || experts.getInt() < 4 || experts.getInt() > 16 || !addresses || addresses.size() != 18)
+    return t.emitError("sa riscv: invalid raw Top-2 metadata");
+  auto fields = addresses.asArrayRef();
+  llvm::Value *pointers[3];
+  for (int i = 0; i < 3; ++i) {
+    auto a = fields.slice(6 * i, 6);
+    if (a[0] < 0 || a[0] >= t.getBindings() || a[3] < 0 || a[3] > 63 || a[5] < 0)
+      return t.emitError("sa riscv: invalid raw Top-2 binding or offset");
+    auto phys = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, e.bindArg, unsigned(a[0])));
+    auto offset = e.b.CreateAdd(e.lin(a[1], a[2], a[3], a[4]), e.c32(a[5]));
+    pointers[i] = e.b.CreateIntToPtr(e.b.CreateAdd(phys, offset), e.ptr);
+  }
+  llvm::Value *values[2] = {e.c32(0xFF800000), e.c32(0xFF800000)};
+  llvm::Value *indices[2] = {e.c32(0x7FFFFFFF), e.c32(0x7FFFFFFF)};
+  for (int64_t i = 0; i < experts.getInt(); ++i) {
+    llvm::Value *carry = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, pointers[0], unsigned(i)));
+    llvm::Value *carryId = e.c32(i);
+    for (unsigned k = 0; k < 2; ++k) {
+      auto forward = rawTop2Greater(e, carry, values[k]);
+      auto reverse = rawTop2Greater(e, values[k], carry);
+      auto equal = e.b.CreateICmpEQ(forward, reverse);
+      auto before = e.b.CreateICmpSLT(carryId, indices[k]);
+      auto takeId = e.b.CreateOr(forward, e.b.CreateAnd(equal, before));
+      auto nextValue = e.b.CreateSelect(forward, carry, values[k]);
+      auto nextId = e.b.CreateSelect(takeId, carryId, indices[k]);
+      carry = e.b.CreateSelect(forward, values[k], carry);
+      carryId = e.b.CreateSelect(takeId, indices[k], carryId);
+      values[k] = nextValue;
+      indices[k] = nextId;
+    }
+  }
+  for (unsigned k = 0; k < 2; ++k) {
+    e.b.CreateStore(values[k], e.b.CreateConstGEP1_32(e.i32, pointers[1], k));
+    e.b.CreateStore(indices[k], e.b.CreateConstGEP1_32(e.i32, pointers[2], k));
+  }
+  return success();
+}
+
 // The export's function into the emitter's module.
 LogicalResult buildFunction(RvEmitter &e, sahw::TemplateOp t) {
   if (t.getUnsupported()) return t.emitError("sahw to riscv: an unsupported export");
@@ -409,6 +467,11 @@ LogicalResult buildFunction(RvEmitter &e, sahw::TemplateOp t) {
   e.pcArg->setName("push_constants");
   e.entry = llvm::BasicBlock::Create(e.ctx, "entry", e.fn);
   e.b.SetInsertPoint(e.entry);
+  if (t->hasAttr("sa.moe.raw_top2")) {
+    if (failed(buildRawTop2(e, t))) return failure();
+    e.b.CreateRetVoid();
+    return success();
+  }
   sahw::PrefixOp prefix;
   sahw::HeadOp head;
   sahw::BodyOp body;

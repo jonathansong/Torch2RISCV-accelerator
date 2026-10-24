@@ -242,6 +242,7 @@ LogicalResult serializeTemplate(sahw::TemplateOp t, SerializedExport &out) {
   out.reads = s.reads | s.prefixReads;
   out.prefixReg = s.prefixReg < 0 ? 0 : uint32_t(s.prefixReg);
   out.flags = s.spadB ? 1 : 0;
+  if (t->hasAttr("sa.riscv_only")) out.flags |= 2;
   out.cycles = uint32_t(t.getEstCycles());
   if (t.getUnsupported()) {
     out.cycles = 0xFFFFFFFFu;

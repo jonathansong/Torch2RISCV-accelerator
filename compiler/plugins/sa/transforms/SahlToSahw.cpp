@@ -208,14 +208,40 @@ bool Lowerer::lowerBlock(Block &block) {
     if (auto bc = dyn_cast<arith::BitcastOp>(op); bc && bc.getType().isF32() && linOf(bc.getIn())) continue;
     if (isa<arith::AddIOp, arith::MulIOp>(op) && op->hasAttr("sa.index")) continue;   // (an expanded kernel's count: its Lin used)
     if (auto l = dyn_cast<sahl::LoadOp>(op)) {
+      bool rawTop2Input = false;
+      for (auto top2 : block.getOps<sahl::Top2Op>())
+        rawTop2Input |= top2.getScores() == l.getDst();
+      if (rawTop2Input) continue;
       if (!load(l)) return false;
       continue;
     }
     if (auto s = dyn_cast<sahl::StoreOp>(op)) {
+      bool rawTop2Output = false;
+      for (auto top2 : block.getOps<sahl::Top2Op>())
+        rawTop2Output |= top2.getValues() == s.getSrc() || top2.getIndices() == s.getSrc();
+      if (rawTop2Output) continue;
       if (!store(s)) return false;
       continue;
     }
     if (auto fl = dyn_cast<linalg::FillOp>(op)) {
+      // The RISC-V-only raw Top-2 kernel starts from these exact sentinels in
+      // registers. The tensor fills were fused into its dispatch; emitting a
+      // separate descriptor fill would be redundant (and i32 fills are not
+      // supported by the generic descriptor path).
+      bool top2Sentinel = false;
+      for (auto top2 : block.getOps<sahl::Top2Op>()) {
+        if (fl.getDpsInits()[0] == top2.getValues()) {
+          auto c = fl.getDpsInputs()[0].getDefiningOp<arith::ConstantOp>();
+          auto v = c ? dyn_cast<FloatAttr>(c.getValue()) : FloatAttr();
+          top2Sentinel = v && v.getValue().isInfinity() && v.getValue().isNegative();
+        } else if (fl.getDpsInits()[0] == top2.getIndices()) {
+          auto c = fl.getDpsInputs()[0].getDefiningOp<arith::ConstantOp>();
+          auto v = c ? dyn_cast<IntegerAttr>(c.getValue()) : IntegerAttr();
+          top2Sentinel = v && v.getValue().getSExtValue() == 0x7fffffff;
+        }
+        if (top2Sentinel) break;
+      }
+      if (top2Sentinel) continue;
       auto c = constF32(fl.getDpsInputs()[0]);
       if (!c) return fail("fill with a non-constant or non-fp32 value");
       fills[fl.getDpsInits()[0]] = *c;
@@ -286,8 +312,41 @@ bool Lowerer::lowerBlock(Block &block) {
       }
       continue;
     }
-    if (isa<sahl::Top2Op>(op))
-      return fail("M5 Top-2 router is represented in SAHL but has no device lowering yet");
+    if (auto top2 = dyn_cast<sahl::Top2Op>(op)) {
+      SmallVector<int64_t> addresses;
+      Value scoreDdr = top2.getScores(), valuesDdr = top2.getValues(), indicesDdr = top2.getIndices();
+      unsigned scoreLoads = 0, valueStores = 0, indexStores = 0;
+      for (auto l : block.getOps<sahl::LoadOp>()) {
+        if (l.getDst() == top2.getScores()) {
+          scoreDdr = l.getSrc();
+          ++scoreLoads;
+        }
+      }
+      for (auto s : block.getOps<sahl::StoreOp>()) {
+        if (s.getSrc() == top2.getValues()) {
+          valuesDdr = s.getDst();
+          ++valueStores;
+        }
+        if (s.getSrc() == top2.getIndices()) {
+          indicesDdr = s.getDst();
+          ++indexStores;
+        }
+      }
+      if (scoreLoads > 1 || valueStores > 1 || indexStores > 1)
+        return fail("Top-2 requires one input load and at most one store per output");
+      for (Value v : {scoreDdr, valuesDdr, indicesDdr}) {
+        auto r = ddrOf(v);
+        if (!r || r->dyn || r->dynRows || r->dynMid || r->pitch) return fail("Top-2 requires contiguous DDR buffers");
+        auto base = r->base.getDefiningOp<sahw::BaseOp>();
+        if (!base) return fail("Top-2 requires a binding base");
+        addresses.append({int64_t(base.getBinding()), int64_t(base.getConstant()), int64_t(base.getMul()),
+                          int64_t(base.getShift()), int64_t(base.getAdd()), r->off});
+      }
+      templ->setAttr("sa.moe.raw_top2", bb.getI64IntegerAttr(top2.getExperts()));
+      templ->setAttr("sa.moe.addresses", bb.getDenseI64ArrayAttr(addresses));
+      templ->setAttr("sa.riscv_only", bb.getUnitAttr());
+      continue;
+    }
     return fail("unsupported operation " + op->getName().getStringRef().str());
   }
   return err.empty();
@@ -1229,6 +1288,13 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
       Lowerer low(f, cfg, t, body);
       if (!low.run()) {
         f.emitError() << "sahl-to-sahw: " << low.err;
+        t.erase();
+        return signalPassFailure();
+      }
+      if (t->hasAttr("sa.riscv_only") &&
+          (llvm::range_size(f.getBody().front().getOps<sahl::Top2Op>()) != 1 ||
+           !body.getRegion().front().empty())) {
+        f.emitError("sahl-to-sahw: raw Top-2 RISC-V dispatch must contain only the router selection");
         t.erase();
         return signalPassFailure();
       }
