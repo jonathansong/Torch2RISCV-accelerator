@@ -1337,6 +1337,31 @@ the compiler and the existing M4 manifest both report 11,042,816 bytes per
 expert. This is metadata for the forthcoming route-record lowering; the
 current Torch VMFB still runs expert selection and FFN through host fallback.
 
+#### M5k model-derived split device bundle (host and simulator verified)
+
+`compiler/frontend/moe_device_bundle.py` consumes a Mixtral checkpoint and
+the IREE frontend. It compiles the Torch layer to SA preprocessing IR and
+requires exactly one `mixtral_top2_ffn` recognition. The recognized dimension,
+intermediate size, expert count, and stride must match the W8A8 parameter
+packer's manifest before any route or FFN artifact is accepted. The script
+then emits the IREE model VMFB, packed parameters, one reusable four-binding
+FFN descriptor, and a compiler-generated integer-only route kernel specialized
+to the model's expert count and stride. `compiler_bundle.json` records sizes
+and hashes. The current route MLIR is instantiated from a generic SAHL
+executable fixture; it is still a separate export, not a dispatch formed in
+the model VMFB.
+
+The cached real layer-0 bundle in `build/moe/m5k/real-layer0` reports eight
+experts, dimension 1024, intermediate size 3584, and stride 11,042,816. Its
+packed W8A8 parameter blob is 88,358,976 bytes; the route RV32 kernel is
+880 bytes and the shared FFN descriptor is 34,828 bytes. The synthetic
+bundle test compiles a temporary Mixtral checkpoint, checks the compiler and
+packer ABI, then executes its generated FFN descriptor in `SaFuncSim` with
+dynamic route offsets and compares the output to the W8A8 reference. Both
+test cases pass. The split artifacts still require host orchestration;
+automatic route dispatch and FFN invocation inside one IREE program remain
+the M5 completion work.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。
