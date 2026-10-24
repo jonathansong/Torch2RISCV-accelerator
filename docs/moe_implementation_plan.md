@@ -1108,25 +1108,41 @@ fails with a targeted diagnostic. The test also executes the emitted
 target-neutral LLVM IR on the x86-64 host using 32-bit binding addresses,
 including a nonzero subspan offset, and compares selected values and IDs for
 NaNs, infinities, signed zero, ties, and random scores. Host firmware tests
-cover the standalone C kernel. The generated export still needs a KV260 board execution test and
-comparison to the IREE/host reference before it is accepted as device-correct.
+cover the standalone C kernel. KV260 execution of the generated export is
+recorded below.
 
 The D=16, four-port KV260 fixture is `moe_router_w8_top2_d16.mlir` (16
 experts). `test_moe_compiler_riscv.py` verifies that it compiles. Run
 `compiler/tests/moe_m5d_board_bundle.py` to stage the VMFB, overlay, firmware,
 three input cases and reference outputs in `build/moe/m5d/board`. The bundle
 generator copies `build/iree/build-sa-aarch64/tools/iree-run-module` when that
-runtime exists. The local aarch64 runtime has not yet been built with the new
-RISC-V-only guard, so board acceptance requires rebuilding it with
-`compiler/scripts/build_sa_runtime.sh aarch64` and restaging the bundle.
+runtime exists. Build it with `compiler/scripts/build_sa_runtime.sh aarch64`
+and restage the bundle after changes to the SA runtime.
 On KV260, `run_board.sh` starts the overlay and calls `iree-run-module` with
 `SA_RV=embedded`; `board_moe_compiler_top2.py` checks both outputs bit for bit
 for ascending, tied, and random router scores and writes `board_report.json`.
-No board result has been
-recorded yet.
 
-Next run the generated Top-2 export on KV260, then extend the pattern through
-route normalization, dynamic expert indexing, and weighted combine. Lower the
+#### M5d KV260 acceptance (2026-10-24)
+
+The user ran `~/moe-m5d/run_board.sh` on KV260 with the D=16, 100 MHz,
+four-port GEMV/PCPI overlay and the newly built aarch64 SA runtime. All three
+cases matched the generated host references bit for bit:
+
+| Case | Top-2 IDs | Raw values | Result |
+|---|---|---|---|
+| Ascending | `[15, 14]` | `[7.0, 6.0]` | PASS |
+| Ties | `[0, 1]` | `[5.0, 5.0]` | PASS |
+| Random | `[5, 1]` | `[54.0, 40.0]` | PASS |
+
+`board_report.json` records `pass: true`, six completed rt_fw entries, and
+heartbeat 16313. The local report copy is in `build/moe/m5d/board`; its VMFB
+SHA-256 is `0faf071beb5c9b4880361a2af35ba22bc314bdba3f71425046d70f147c8026f0`.
+This accepts the native IREE Top-2 router export on KV260. It does not yet
+cover route normalization, dynamic expert parameter selection, expert FFN,
+or an end-to-end Mixtral layer compiled from IREE.
+
+Next extend the pattern through route normalization, dynamic expert indexing,
+and weighted combine. Lower the
 expert computation to one reusable SA FFN template. Compile a single Mixtral
 layer from IREE input and compare route IDs, weights, and output to M4.
 
