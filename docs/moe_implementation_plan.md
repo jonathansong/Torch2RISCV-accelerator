@@ -1,7 +1,8 @@
 # KV260 上的 IREE 原生 MoE 实现方案
 
-> Status: M0–M4 full-device Mixtral inference and M5 native one-input MoE
-> compilation pass on KV260. M5t completed four real layer-0 board cases.
+> Status (2026-10-24): M0–M4 full-device Mixtral inference and M5 native
+> one-input MoE compilation accepted on KV260. M5t passed four real layer-0
+> cases; maximum absolute output error was `0.000625316`. M6 remains open.
 > 目标平台：AMD KV260 + PicoRV32 + SA accelerator
 > 编译路径：PyTorch/Hugging Face → IREE Flow → SAHL → SAHW → descriptor list 或 RISC-V 代码
 > 第一目标：不修改 GEMV RTL，实现 batch-1、W8A8、top-1/top-2 稀疏 MoE decode，并在模拟器和 KV260 上端到端验证。
@@ -14,7 +15,7 @@
 
 ## 1.1 M0–M4 实现与验证结果
 
-截至 2026 年 10 月，M0–M4b 已完成。M3 先验证 Top-2 路由、两次动态 GEMV 和 VE 加权合并，M3b 补齐完整 W8A8 gated expert FFN；M4a 验证 Hugging Face checkpoint 适配，M4b 使用公开 tiny Mixtral 的真实第 0 层权重，在模拟器和 KV260 上执行完整 Top-2 FFN。M0–M3 的基础板端验收使用 4-expert synthetic MoE，M4b 实际模型为 8 experts、`D=16`、`dim=1024`、`hidden=3584`。
+截至 2026 年 10 月，M0–M4f 已完成。下表汇总 M0–M4b 的早期验收；M4f 随后完成两层 Mixtral 的全设备推理（详见下文）。M3 先验证 Top-2 路由、两次动态 GEMV 和 VE 加权合并，M3b 补齐完整 W8A8 gated expert FFN；M4a 验证 Hugging Face checkpoint 适配，M4b 使用公开 tiny Mixtral 的真实第 0 层权重，在模拟器和 KV260 上执行完整 Top-2 FFN。M0–M3 的基础板端验收使用 4-expert synthetic MoE，M4b 实际模型为 8 experts、`D=16`、`dim=1024`、`hidden=3584`。
 
 | 阶段 | 已实现内容 | 验证环境 | 结果 |
 |---|---|---|---|
@@ -1209,12 +1210,12 @@ the rv32 bridge and M4 FFN passed:
 
 The IREE phase completed six rt_fw entries and reported heartbeat 16357.
 
-The host file handoff and overlay restart make this an integration acceptance
-test, not one compiled IREE MoE executable. The next compiler task is to
-express the normalization and expert parameter selection in the SA dialects
-and emit them as device work following `sahl.top2`.
+The host file handoff and overlay restart made this an integration acceptance
+test rather than one compiled IREE MoE executable. Later M5g–M5t work
+expressed the normalization and expert parameter selection in the SA dialects
+and emitted them as device work following `sahl.top2`.
 
-#### M5g native route-record export (host verified, KV260 pending)
+#### M5g native route-record export (standalone board probe pending)
 
 `sahl.route_top2` now represents the second MoE boundary: selected f32 values,
 selected i32 IDs, and a 32-byte v1 route record, with a static expert count
@@ -1240,9 +1241,10 @@ tests and the available golden guard pass.
 
 `moe_m5g_board_bundle.py` stages the compiler-generated code in
 `build/moe/m5g/board`, with the same three D=16 router fixtures and KV260
-overlay as M5e. This board acceptance is pending. The fixture currently
-contains an explicit `sahl.route_top2` export; the production model frontend
-does not yet form it automatically or connect its output to a compiled FFN.
+overlay as M5e. This standalone board probe has not been run. At the M5g
+checkpoint, the fixture contained an explicit `sahl.route_top2` export and
+had not yet connected it to a compiled FFN. The later M5t integrated board
+run covered the route-record producer and FFN consumer in one VMFB.
 
 #### M5h Torch frontend and real architecture recognition (synthetic board accepted)
 
@@ -1367,12 +1369,12 @@ the compiler's per-dispatch report. For the real layer-0 model, the native
 `moe_layer.vmfb` has 2 SA dispatches (Top-2 and one elementwise operation)
 and 9 host fallback dispatches. The router matmul, softmax, three expert
 batch matmuls, and large expert gathers are among the fallback operations.
-This distinguishes the existing single-file fp32 model from the separate
-device route/FFN exports. The compiler still needs to replace the recognized
-expert region with a packed W8A8 FFN dispatch and create a shared route-record
-buffer consumed by that dispatch.
+At the M5k checkpoint, the single-file fp32 model still differed from the
+separate device route/FFN exports. M5s and M5t subsequently replaced the
+recognized expert graph with the packed W8A8 FFN path and its shared route
+record.
 
-#### M5l model-specialized route acceptance bundle (host verified, KV260 pending)
+#### M5l model-specialized route bundle (standalone board probe pending)
 
 `moe_m5k_route_board_bundle.py` stages `build/moe/m5k/board-route` using the
 compiler-generated real-layer route kernel. Its three fixtures include the
@@ -1381,9 +1383,10 @@ byte parameter offset. The runner checks IDs, both offsets, normalized
 weights, and firmware completion. `test_moe_model_route_host.py` executes the
 generated LLVM IR for the same model-specialized route export on x86-64;
 all three cases match, including the real expert stride. Copy the staged
-directory to KV260 as `~/moe-m5k-route` and run `./run_board.sh`. Board
-acceptance is pending. This check does not yet connect the separate route
-export to the IREE model VMFB or FFN dispatch.
+directory to KV260 as `~/moe-m5k-route` and run `./run_board.sh`. This
+standalone board probe has not been run. At the M5l checkpoint it did not
+connect the route export to the IREE model VMFB or FFN dispatch; M5t later
+verified that connection in its integrated board run.
 
 #### M5m real model route and FFN bundle (KV260 passed)
 
@@ -1574,20 +1577,18 @@ into the four-stage HAL chain.
 
 #### M5 native lowering completion gate (closed by M5t)
 
-The remaining compiler work is to replace the recognized fp32 expert graph,
-not merely annotate it or assemble a second VMFB in the frontend. The pass
-must consume the recognized Top-2 IDs and values, create the route-record
-buffer, dispatch the reusable W8A8 FFN against imported packed parameters,
-and return the combined output through the original function result. It must
-preserve ordinary compilation for unmatched models and make the supported
-shape and score constraints explicit. Acceptance requires an `iree-compile`
-invocation of the supported exported MoE function to emit this route→FFN
-dependency without calling `moe_iree_chain.py`; a synthetic host/SA test,
-the real layer-0 KV260 token case, SA lit tests, and the golden guard must
-pass. M5r proves the device execution chain and frontend checkpoint-to-VMFB
-packaging, but does not satisfy this native lowering gate.
+The completion gate required the compiler to replace the recognized fp32
+expert graph with a route-record producer and reusable W8A8 FFN dispatch,
+then return the combined output through the original function result. It
+also required ordinary compilation to remain available for unmatched models
+and the supported shape and score constraints to be explicit. The accepted
+path compiles the supported exported MoE function with `iree-compile` and
+forms the route→FFN dependency without calling `moe_iree_chain.py`. The
+synthetic integration test, real layer-0 KV260 cases, SA lit suite, and
+golden guard passed. M5r had established the device chain and packaging;
+M5s/M5t completed compiler ownership and the one-input model ABI.
 
-#### M5s compiler-owned HAL chain lowering (host verified, board deferred)
+#### M5s compiler-owned HAL chain lowering (integrated board path accepted in M5t)
 
 `--iree-sa-moe-bundle=<dir>` enables the new `LowerMoeChain` SA preprocessing
 pass after `FormMoeRegions`. The pass requires exactly one recognized
@@ -1676,6 +1677,12 @@ This closes the M5 native one-input MoE layer acceptance gate. The
 standalone M5g/M5l probes are still unrun; the integrated board execution
 covers their route-record path. M6 remains responsible for batched tokens,
 grouped experts, and model generation integration.
+
+M5's supported production path is the normalized Top-2 Mixtral layer at
+batch size 1, D=16, with 4–16 experts and packed W8A8 parameters. The
+KV260 acceptance uses `TitanML/tiny-mixtral` layer 0 (`dim=1024`, expert
+hidden size 3584, 8 experts). Other MoE architectures and full model
+generation have not been accepted through this native M5 compiler path.
 
 To reproduce the accepted run, use:
 
