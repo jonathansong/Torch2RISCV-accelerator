@@ -9,14 +9,30 @@
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Flow/Transforms/RegionOpUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "llvm/ADT/DenseSet.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler::sa {
 namespace {
+
+bool comesFromProjection(Value value, llvm::DenseSet<Operation *> &seen, unsigned depth = 0) {
+  Operation *op = value.getDefiningOp();
+  if (!op || depth > 8 || !seen.insert(op).second) return false;
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+    if (linalgOp.getNumReductionLoops() == 1 && linalgOp.getNumDpsInputs() >= 2) return true;
+    if (linalgOp.getNumReductionLoops() != 0) return false;
+    for (Value input : linalgOp.getDpsInputs())
+      if (comesFromProjection(input, seen, depth + 1)) return true;
+    return false;
+  }
+  if (!isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::CastOp>(op)) return false;
+  return comesFromProjection(op->getOperand(0), seen, depth + 1);
+}
 
 std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
   if (topk.getIndices()) return std::nullopt;
@@ -35,8 +51,8 @@ std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
   int64_t experts = scores.getDimSize(1);
   if (experts < 4 || experts > 16) return std::nullopt;
   // This must be the router projection, rather than an unrelated top-k.
-  auto projection = dyn_cast_or_null<linalg::LinalgOp>(topk.getValues().getDefiningOp());
-  if (!projection || projection.getNumReductionLoops() != 1) return std::nullopt;
+  llvm::DenseSet<Operation *> seen;
+  if (!comesFromProjection(topk.getValues(), seen)) return std::nullopt;
   Block &comparator = topk.getRegion().front();
   if (comparator.getOperations().size() != 2) return std::nullopt;
   auto cmp = dyn_cast<arith::CmpFOp>(comparator.front());
@@ -70,6 +86,8 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
     });
     IRRewriter rewriter(&getContext());
     for (auto [topk, experts] : matches) {
+      topk->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
+      topk->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(2));
       rewriter.setInsertionPoint(topk);
       auto region = IREE::Flow::wrapOpInDispatchRegion(rewriter, topk);
       if (failed(region)) return signalPassFailure();

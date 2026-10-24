@@ -286,6 +286,8 @@ bool Lowerer::lowerBlock(Block &block) {
       }
       continue;
     }
+    if (isa<sahl::Top2Op>(op))
+      return fail("M5 Top-2 router is represented in SAHL but has no device lowering yet");
     return fail("unsupported operation " + op->getName().getStringRef().str());
   }
   return err.empty();

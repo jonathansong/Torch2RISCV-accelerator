@@ -669,6 +669,21 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
     SmallVector<Operation *> ops;
     for (Operation &op : f.getBody().front()) ops.push_back(&op);
     for (Operation *op : ops) {
+      if (auto topk = dyn_cast<IREE::LinalgExt::TopkOp>(op);
+          topk && topk->hasAttr("sa.moe.experts")) {
+        auto experts = topk->getAttrOfType<IntegerAttr>("sa.moe.experts");
+        if (!experts || !isa<MemRefType>(topk.getValues().getType()) ||
+            !isa<MemRefType>(topk.getOutputValues().getType()) ||
+            !isa<MemRefType>(topk.getOutputIndices().getType())) {
+          topk.emitError("sa-to-sahl: MoE Top-2 requires bufferized memrefs");
+          return signalPassFailure();
+        }
+        OpBuilder b(topk);
+        sahl::Top2Op::create(b, topk.getLoc(), topk.getValues(), topk.getOutputValues(),
+                             topk.getOutputIndices(), experts);
+        topk.erase();
+        continue;
+      }
       if (auto c = dyn_cast<memref::CopyOp>(op)) {
         OpBuilder b(c);
         bool srcDdr = bool(ddrRoot(c.getSource())), dstDdr = bool(ddrRoot(c.getTarget()));

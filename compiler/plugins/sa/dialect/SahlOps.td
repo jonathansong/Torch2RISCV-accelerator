@@ -71,6 +71,22 @@ def Sahl_ScatterOp : Sahl_Op<"scatter"> {
   let assemblyFormat = "$updates `,` $indices `,` $dest attr-dict `:` type($updates) `,` type($indices) `,` type($dest)";
 }
 
+def Sahl_Top2Op : Sahl_Op<"top2"> {
+  let summary = "Batch-1 descending Top-2 router selection in DDR";
+  let description = [{
+    M5's route boundary after bufferization. `scores` is [1, experts] f32;
+    `values` is [1, 2] f32 and `indices` is [1, 2] i32. The comparator is
+    ordered greater-than, matching the recognized iree_linalg_ext.topk.
+    This operation only represents raw Top-2 values and IDs; it does not
+    normalize routing weights or select expert parameter records.
+  }];
+  let arguments = (ins Arg<AnyMemRef, "router scores", [MemRead]>:$scores,
+                       Arg<AnyMemRef, "selected values", [MemWrite]>:$values,
+                       Arg<AnyMemRef, "selected expert IDs", [MemWrite]>:$indices,
+                       I64Attr:$experts);
+  let assemblyFormat = "$scores `,` $values `,` $indices attr-dict `:` type($scores) `,` type($values) `,` type($indices)";
+}
+
 def Sahl_ScopeOp : Sahl_Op<"scope", [SingleBlock, NoTerminator]> {
   let summary = "A piece of a dispatch: the local memory allocated inside is released at its end";
   let description = [{

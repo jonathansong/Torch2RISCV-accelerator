@@ -1045,8 +1045,8 @@ records `sa.moe.experts`, `sa.moe.top_k`, and `sa.moe.kind`. It leaves the
 projection and Top-2 semantics intact; it does not yet lower the region to the
 RISC-V route kernel or include expert FFNs. The option is off by default.
 
-`sa_form_moe_regions.mlir` covers the recognized pattern, K=3 rejection, and
-Top-2 without a router projection. The rebuilt `iree-opt` and `iree-compile`
+`sa_form_moe_regions.mlir` covers direct and W8-quantized router projections,
+K=3 rejection, and Top-2 without a router projection. The rebuilt `iree-opt` and `iree-compile`
 pass this test, the complete SA lit suite, and the available golden guard.
 The missing `build/golden/manifest.json` was regenerated from the four source
 directories currently present: 636 unique dispatches, of which 26 are
@@ -1054,6 +1054,24 @@ recorded as compilation failures. The other historical source directories
 are absent locally, so this baseline has four-case coverage, not the full
 historical corpus. The generated `build/golden` directory occupies 8.6 MiB
 and is local build data.
+
+#### M5b SAHL Top-2 boundary (2026-10-24)
+
+The recognizer now follows elementwise score conversion from a quantized
+contraction to the router Top-2. It also marks the inner Top-K operation so
+the classification survives dispatch formation and bufferization. The
+`iree-sa-to-sahl` pass replaces a marked, bufferized Top-K with `sahl.top2`:
+one f32 score buffer, one f32 Top-2 value buffer, and one i32 expert ID
+buffer. Unmarked Top-K operations remain on their existing IREE path.
+
+`sahl_moe_top2.mlir` verifies both paths. A full `iree-compile` probe with a
+W8 router confirmed that the mark reaches the SA executable. Compilation
+currently stops with an explicit `sahl-to-sahw` diagnostic because the new
+SAHL operation has no device lowering. The existing M4 RISC-V route kernel
+outputs a packed route record with normalized weights; `sahl.top2` represents
+raw values and IDs, so they cannot yet be substituted for each other. This
+step does not execute a native IREE MoE model. The available golden guard
+still passes: 636/636 dispatches identical across four local cases.
 
 Next extend the pattern through route normalization, dynamic expert indexing,
 and weighted combine; lower it to the existing Top-2 RISC-V kernel and one
