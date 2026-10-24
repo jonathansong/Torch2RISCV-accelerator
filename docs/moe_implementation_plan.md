@@ -1160,8 +1160,14 @@ gap, and deterministic random 4-, 8-, and 16-expert cases. It also checks
 invalid-input rejection and PIC relocation invariance. The added
 `test_moe_m3b.py` case feeds the bridge record to the existing W8A8 Top-2
 FFN simulator and checks the combined output against the host reference.
-These are host tests; the bridge has not yet run on KV260 or been emitted by
-the IREE compiler. The end-to-end IREE MoE path therefore remains incomplete.
+`moe_m5e_board_bundle.py` stages the bridge binary and three finite Top-2
+fixtures from M5d in `build/moe/m5e/board`. Copy that directory to KV260 and
+run `./run_board.sh`; `board_moe_route_from_top2.py` checks selected IDs,
+byte offsets, normalized weights, and a successful firmware completion for
+each case, then writes `board_report.json`. This board test uses the saved
+M5d reference tensors as input, so it validates the bridge kernel independently
+of the native IREE export. The bridge has not yet been emitted by the IREE
+compiler or accepted on KV260. The end-to-end IREE MoE path remains incomplete.
 
 Next connect Top-2 values/IDs to the route bridge in the compiler/runtime,
 then extend the pattern through dynamic expert indexing and weighted combine. Lower the
