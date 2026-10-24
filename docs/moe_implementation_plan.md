@@ -1435,7 +1435,7 @@ the absence of a single compiled IREE MoE program remain the M5 gap.
 The board's `board_report.json` reported `pass: true` and every case
 reported `ffn_status: 0`.
 
-#### M5n single-VMFB route-to-FFN dispatch prototype (host compiled, KV260 pending)
+#### M5n single-VMFB route-to-FFN dispatch prototype (KV260 passed)
 
 `compiler/frontend/moe_iree_chain.py` packages the compiler-generated
 RISC-V route export and the reusable FFN descriptor as two SA executables in
@@ -1458,8 +1458,32 @@ first board execution, `moe_m5n_board_bundle.py` stages a 4-expert synthetic
 layer with 28 KiB of parameters and three inputs in `build/moe/m5n/board`.
 Copy that directory to `~/moe-m5n` on KV260 and run `./run_board.sh`; the
 runner compares route IDs/offsets and the full W8A8 output to the reference.
-KV260 acceptance is pending. Real-model execution through this VMFB also
-requires a larger or externally mapped parameter buffer in the SA runtime.
+The KV260 run passed all three cases. `ramp` selected `[3, 0]` with maximum
+error `9.581447e-6`; `reverse` selected `[2, 1]` with `6.139278e-6`;
+`random` selected `[0, 2]` with `1.233816e-5`. The board reported
+`pass: true`, six firmware entries, and heartbeat 1,697,747. Real-model
+execution through this VMFB also requires a larger or externally mapped
+parameter buffer in the SA runtime.
+
+#### M5o native Top-2, route, and FFN in one VMFB (host compiled, KV260 pending)
+
+The model-derived bundle now extracts the successful three-binding Top-2 SA
+binary from the full model compilation and records it as `moe_top2.sadesc`.
+With `moe_iree_chain.py --include-top2`, one VMFB dispatches that compiler
+export on router scores, then the specialized route kernel, then the shared
+W8A8 FFN. The selected values and IDs are internal outputs of the first
+dispatch and are also returned for acceptance checks. The caller initializes
+their output buffers to negative infinity and `INT32_MAX`, matching the
+recognized Top-K operation's initial values. The synthetic bundle test
+verifies three dispatches, two barriers, and one queue execute in the lowered
+VM IR. A real-layer wrapper also compiles. Router score production still
+precedes this wrapper; the model's 88 MiB parameter blob still exceeds the
+current 32 MiB IREE board window.
+
+`moe_m5n_board_bundle.py --out build/moe/m5o/board --include-top2` stages a
+4-expert synthetic board test. Its three cases check compiler-selected Top-2
+values/IDs, route record IDs/offsets, and W8A8 output. Copy the directory to
+`~/moe-m5o` on KV260 and run `./run_board.sh`. Board acceptance is pending.
 
 ### M6：Prefill/grouped execution
 

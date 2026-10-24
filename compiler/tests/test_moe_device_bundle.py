@@ -54,13 +54,17 @@ class MoeDeviceBundleTest(unittest.TestCase):
             self.assertTrue(any("batch_matmul" in name for name in coverage["host"]))
             self.assertEqual(coverage, json.loads((out / "compiler_bundle.json").read_text())
                              ["native_module_dispatches"])
-            self.assertEqual(len(result["artifacts"]), 6)
+            self.assertEqual(len(result["artifacts"]), 7)
             for name, info in result["artifacts"].items():
                 self.assertEqual((out / name).stat().st_size, info["bytes"])
                 self.assertGreater(info["bytes"], 0)
             self.assertIn("experts = 4 : i64, stride = 6784 : i64",
                           (out / "route.mlir").read_text())
             self.assertGreater((out / "moe_route.bin").stat().st_size, 0)
+            _, _, top2_exports = sadesc.read((out / "moe_top2.sadesc").read_bytes())
+            self.assertEqual(len(top2_exports), 1)
+            self.assertIn("_topk_", top2_exports[0][0])
+            self.assertEqual(top2_exports[0][2], 3)
 
             # Execute the newly generated reusable FFN export using the same
             # model-derived packed parameters and dynamic route offsets.
@@ -103,6 +107,17 @@ class MoeDeviceBundleTest(unittest.TestCase):
             self.assertEqual(vm.count("vm.call.variadic @hal.command_buffer.dispatch("), 2)
             self.assertEqual(vm.count("vm.call @hal.command_buffer.execution_barrier("), 1)
             self.assertEqual(vm.count("vm.call @hal.device.queue.execute("), 1)
+
+            full_chain = build_chain(out, root / "top2_chain", include_top2=True)
+            self.assertGreater(full_chain.stat().st_size, chain.stat().st_size)
+            top2_vm = root / "top2_chain_vm.mlir"
+            subprocess.run([str(COMPILE), str(root / "top2_chain/moe_chain.mlir"),
+                            "--compile-from=hal", "--compile-to=vm", "-o", str(top2_vm)],
+                           check=True, capture_output=True, text=True)
+            text = top2_vm.read_text()
+            self.assertEqual(text.count("vm.call.variadic @hal.command_buffer.dispatch("), 3)
+            self.assertEqual(text.count("vm.call @hal.command_buffer.execution_barrier("), 2)
+            self.assertEqual(text.count("vm.call @hal.device.queue.execute("), 1)
 
     def test_rejects_other_device_width(self):
         with self.assertRaisesRegex(ValueError, "D=16"):

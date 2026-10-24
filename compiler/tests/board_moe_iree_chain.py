@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """KV260 acceptance for a single IREE route-to-FFN VMFB."""
 
+import argparse
 import json
 from pathlib import Path
 import subprocess
@@ -14,6 +15,9 @@ import board_launcher as BL  # noqa: E402
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--top2", action="store_true", help="run compiled Top-2 before route and FFN")
+    args = parser.parse_args()
     runner = HERE / "iree-run-module"
     if not runner.is_file():
         raise FileNotFoundError(runner)
@@ -25,13 +29,23 @@ def main():
         for name in ("ramp", "reverse", "random"):
             case = HERE / name
             command = [str(runner), "--device=sa", f"--module={HERE / 'moe_chain.vmfb'}",
-                       "--function=main", f"--input=@{case / 'values.npy'}",
-                       f"--input=@{case / 'ids.npy'}", f"--input=@{case / 'x.npy'}",
+                       "--function=main"]
+            if args.top2:
+                command += [f"--input=@{case / 'scores.npy'}",
+                            f"--input=@{case / 'values_init.npy'}",
+                            f"--input=@{case / 'ids_init.npy'}"]
+            else:
+                command += [f"--input=@{case / 'values.npy'}",
+                            f"--input=@{case / 'ids.npy'}"]
+            command += [f"--input=@{case / 'x.npy'}",
                        f"--input=@{HERE / 'moe_params.npy'}",
                        f"--input=@{case / 'route_zero.npy'}",
-                       f"--input=@{case / 'out_zero.npy'}",
-                       f"--output=@{case / 'route.npy'}",
-                       f"--output=@{case / 'out.npy'}"]
+                       f"--input=@{case / 'out_zero.npy'}"]
+            if args.top2:
+                command += [f"--output=@{case / 'values_device.npy'}",
+                            f"--output=@{case / 'ids_device.npy'}"]
+            command += [f"--output=@{case / 'route.npy'}",
+                        f"--output=@{case / 'out.npy'}"]
             run = subprocess.run(command, capture_output=True, text=True, env=env)
             if run.returncode:
                 error = (run.stdout + run.stderr)[-2000:]
@@ -49,6 +63,12 @@ def main():
                      and np.array_equal(record[1:3], ids.astype(np.uint32))
                      and np.array_equal(record[3:5], offsets)
                      and np.isfinite(got).all() and error <= 3e-3)
+            if args.top2:
+                selected_values = np.load(case / "values_device.npy").reshape(-1)
+                selected_ids = np.load(case / "ids_device.npy").reshape(-1)
+                valid = (valid and np.array_equal(selected_ids, ids)
+                         and np.array_equal(selected_values,
+                                            np.load(case / "values.npy").reshape(-1)))
             print(f"{name}: {'PASS' if valid else 'FAIL'} experts {ids.tolist()}, max error {error:.6g}")
             cases.append({"name": name, "pass": bool(valid), "ids": ids.tolist(),
                           "max_error": error})

@@ -28,7 +28,8 @@ def binary_op(name, data):
             '  }\n')
 
 
-def source(route_binary, ffn_binary, *, dim, param_offset):
+def source(route_binary, ffn_binary, *, dim, param_offset, top2_binary=None,
+           experts=None):
     for name, data, bindings in (("route_top2", route_binary, 3),
                                  ("moe_top2_ffn", ffn_binary, 4)):
         d, _, exports = sadesc.read(data)
@@ -36,30 +37,60 @@ def source(route_binary, ffn_binary, *, dim, param_offset):
             raise ValueError(f"{name}: incompatible D=16 SA executable")
     if dim <= 0 or param_offset < 0 or param_offset % 64:
         raise ValueError("invalid dimension or packed expert-table offset")
+    if top2_binary is not None:
+        d, _, exports = sadesc.read(top2_binary)
+        if d != 16 or len(exports) != 1 or "_topk_" not in exports[0][0] or exports[0][2] != 3:
+            raise ValueError("incompatible compiled Top-2 export")
+        if experts is None or experts < 4 or experts > 16:
+            raise ValueError("Top-2 requires 4..16 experts")
     activation_bytes = dim * 4
+    top2_binary_op = binary_op("top2", top2_binary) if top2_binary is not None else ""
+    scores_arg = "%scores_view: !hal.buffer_view,\n                         " if top2_binary is not None else ""
+    scores_size = f"    %cscores = arith.constant {experts * 4} : index\n" if top2_binary is not None else ""
+    top2_exe = ("    %top2_exe = hal.executable.create device(%device : !hal.device)\n"
+                "        affinity(%affinity) target(@top2::@sa_desc_v1) : !hal.executable\n"
+                if top2_binary is not None else "")
+    scores_buffer = ("    %scores = hal.buffer_view.buffer<%scores_view : !hal.buffer_view> : !hal.buffer\n"
+                     if top2_binary is not None else "")
+    top2_dispatch = ('''
+    hal.command_buffer.dispatch<%cmd : !hal.command_buffer>
+        target(%top2_exe : !hal.executable)[%c0]
+        workgroups([%c1, %c1, %c1]) constants([])
+        bindings([(%scores : !hal.buffer)[%c0, %cscores],
+                  (%values : !hal.buffer)[%c0, %c8],
+                  (%ids : !hal.buffer)[%c0, %c8]]) flags("None")
+    hal.command_buffer.execution_barrier<%cmd : !hal.command_buffer>
+        source("CommandIssue") target("CommandProcess") flags("None")'''
+                     if top2_binary is not None else "")
+    returned = ("%values_view, %ids_view, %route_view, %out_view : "
+                "!hal.buffer_view, !hal.buffer_view, !hal.buffer_view, !hal.buffer_view"
+                if top2_binary is not None else
+                "%route_view, %out_view : !hal.buffer_view, !hal.buffer_view")
+    return_types = ("(!hal.buffer_view, !hal.buffer_view, !hal.buffer_view, !hal.buffer_view)"
+                    if top2_binary is not None else "(!hal.buffer_view, !hal.buffer_view)")
     return ("module {\n" + binary_op("route", route_binary)
-            + binary_op("ffn", ffn_binary) + f'''
-  util.func public @main(%values_view: !hal.buffer_view,
+            + binary_op("ffn", ffn_binary) + top2_binary_op + f'''
+  util.func public @main({scores_arg}%values_view: !hal.buffer_view,
                          %ids_view: !hal.buffer_view,
                          %x_view: !hal.buffer_view,
                          %params_view: !hal.buffer_view,
                          %route_view: !hal.buffer_view,
-                         %out_view: !hal.buffer_view) -> (!hal.buffer_view, !hal.buffer_view) {{
+                         %out_view: !hal.buffer_view) -> {return_types} {{
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c8 = arith.constant 8 : index
     %c32 = arith.constant 32 : index
     %c64 = arith.constant 64 : index
     %c96 = arith.constant 96 : index
-    %cparam = arith.constant {param_offset} : index
+{scores_size}    %cparam = arith.constant {param_offset} : index
     %cx = arith.constant {activation_bytes} : index
     %affinity = arith.constant -1 : i64
     %device = hal.devices.get %c0 : !hal.device
-    %route_exe = hal.executable.create device(%device : !hal.device)
+{top2_exe}    %route_exe = hal.executable.create device(%device : !hal.device)
         affinity(%affinity) target(@route::@sa_desc_v1) : !hal.executable
     %ffn_exe = hal.executable.create device(%device : !hal.device)
         affinity(%affinity) target(@ffn::@sa_desc_v1) : !hal.executable
-    %values = hal.buffer_view.buffer<%values_view : !hal.buffer_view> : !hal.buffer
+{scores_buffer}    %values = hal.buffer_view.buffer<%values_view : !hal.buffer_view> : !hal.buffer
     %ids = hal.buffer_view.buffer<%ids_view : !hal.buffer_view> : !hal.buffer
     %x = hal.buffer_view.buffer<%x_view : !hal.buffer_view> : !hal.buffer
     %params = hal.buffer_view.buffer<%params_view : !hal.buffer_view> : !hal.buffer
@@ -69,6 +100,7 @@ def source(route_binary, ffn_binary, *, dim, param_offset):
     %expert_bytes = arith.subi %params_size, %cparam : index
     %cmd = hal.command_buffer.create device(%device : !hal.device)
         mode("OneShot") categories("Dispatch") affinity(%affinity) : !hal.command_buffer
+{top2_dispatch}
     hal.command_buffer.dispatch<%cmd : !hal.command_buffer>
         target(%route_exe : !hal.executable)[%c0]
         workgroups([%c1, %c1, %c1]) constants([])
@@ -89,13 +121,13 @@ def source(route_binary, ffn_binary, *, dim, param_offset):
     hal.device.queue.execute<%device : !hal.device>
         affinity(%affinity) wait(%no_fence) signal(%no_fence)
         commands(%cmd) flags("None")
-    util.return %route_view, %out_view : !hal.buffer_view, !hal.buffer_view
+    util.return {returned}
   }}
 }}
 ''')
 
 
-def build(bundle, out):
+def build(bundle, out, *, include_top2=False):
     bundle, out = Path(bundle), Path(out)
     manifest = json.loads((bundle / "moe_manifest.json").read_text())
     if manifest["d"] != 16 or manifest["top_k"] != 2:
@@ -108,8 +140,10 @@ def build(bundle, out):
     out.mkdir(parents=True, exist_ok=True)
     mlir = out / "moe_chain.mlir"
     vmfb = out / "moe_chain.vmfb"
+    top2_binary = ((bundle / "moe_top2.sadesc").read_bytes() if include_top2 else None)
     mlir.write_text(source(route_binary, ffn_binary, dim=manifest["dim"],
-                           param_offset=manifest["expert_table_offset"]))
+                           param_offset=manifest["expert_table_offset"],
+                           top2_binary=top2_binary, experts=manifest["experts"]))
     subprocess.run([str(COMPILE), str(mlir), "--compile-from=hal", "-o", str(vmfb)],
                    check=True)
     return vmfb
@@ -119,8 +153,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--include-top2", action="store_true")
     args = parser.parse_args()
-    print(build(args.bundle, args.out))
+    print(build(args.bundle, args.out, include_top2=args.include_top2))
 
 
 if __name__ == "__main__":

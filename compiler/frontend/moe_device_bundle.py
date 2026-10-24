@@ -14,6 +14,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "compiler/runtime/tools"))
@@ -36,7 +37,7 @@ def artifact_info(path):
 
 
 def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
-                 codegen_report=False):
+                 codegen_report=False, binary_dir=None):
     command = [str(COMPILE), str(source), "--iree-hal-target-device=sa",
                f"--iree-parameter-import=model={irpa}", "--iree-sa-form-moe",
                "--iree-sa-riscv", "--iree-sa-host-fallback",
@@ -46,6 +47,8 @@ def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
         command.append("--compile-to=preprocessing")
     if codegen_report:
         command.append("--iree-sa-codegen-report")
+    if binary_dir is not None:
+        command.append(f"--iree-hal-dump-executable-binaries-to={binary_dir}")
     return subprocess.run(command + ["-o", str(out)], check=True,
                           capture_output=True, text=True).stderr
 
@@ -111,8 +114,21 @@ def build(model, layer, out, d=16):
         raise ValueError(f"compiler/packer MoE ABI mismatch: {recognized} != {expected}")
 
     module = out / "moe_layer.vmfb"
-    coverage = dispatch_coverage(compile_iree(mlir, irpa, module, d=d,
-                                              codegen_report=True))
+    with tempfile.TemporaryDirectory() as binary_dir:
+        coverage = dispatch_coverage(compile_iree(mlir, irpa, module, d=d,
+                                                  codegen_report=True,
+                                                  binary_dir=binary_dir))
+        top2 = []
+        for path in Path(binary_dir).glob("*.sadesc"):
+            binary = path.read_bytes()
+            descriptor_d, _, exports = sadesc.read(binary)
+            if len(exports) == 1 and "_topk_" in exports[0][0]:
+                if descriptor_d != d or exports[0][2] != 3:
+                    raise RuntimeError("compiled Top-2 has an incompatible SA ABI")
+                top2.append(binary)
+        if len(top2) != 1:
+            raise RuntimeError(f"expected one native Top-2 export, got {len(top2)}")
+        (out / "moe_top2.sadesc").write_bytes(top2[0])
     ffn = out / "moe_ffn.sadesc"
     ffn_bytes = moe_m3b.make_executable(config.dim, config.hidden, d)
     descriptor_d, _, exports = sadesc.read(ffn_bytes)
@@ -143,7 +159,8 @@ def build(model, layer, out, d=16):
               "native_module_dispatches": coverage,
               "artifacts": {name: artifact_info(out / name)
                             for name in ("moe_layer.vmfb", "moe_layer.irpa", "moe_params.bin",
-                                         "moe_ffn.sadesc", "route.vmfb", "moe_route.bin")}}
+                                         "moe_top2.sadesc", "moe_ffn.sadesc", "route.vmfb",
+                                         "moe_route.bin")}}
     (out / "compiler_bundle.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
