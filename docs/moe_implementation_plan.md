@@ -1073,10 +1073,30 @@ raw values and IDs, so they cannot yet be substituted for each other. This
 step does not execute a native IREE MoE model. The available golden guard
 still passes: 636/636 dispatches identical across four local cases.
 
-Next extend the pattern through route normalization, dynamic expert indexing,
-and weighted combine; lower it to the existing Top-2 RISC-V kernel and one
-reusable SA expert FFN template. Then compile a single Mixtral layer from
-IREE input and compare route IDs, weights, and output to the M4 reference.
+#### M5c raw Top-2 device kernel (2026-10-24)
+
+`firmware/moe_top2_raw/moe_top2_raw.c` adds a separate PicoRV32 kernel for
+the compiler's raw Top-2 boundary. Its bindings are score input, value output,
+and `i32` expert ID output; the first push constant is the expert count. It
+writes the selected scores and IDs without normalization or expert parameter
+lookup. The existing M4 `sa_moe_route` kernel remains responsible for the
+packed normalized route record used by the hand-built FFN dispatches.
+
+`compiler/tests/moe_top2_raw_kernel.py` builds a position-independent rv32imc
+blob and a host twin. `test_moe_top2_raw.py` checks 4, 8, and 16 experts,
+negative scores, ties, signed zero, and deterministic random finite scores
+against stable descending selection. The raw kernel is not yet called by an
+IREE executable. Before wiring it into the SA RISC-V code table, the compiler
+must either prove finite router scores or reproduce IREE Top-K's ordered
+comparison behavior for NaNs. The SA runtime must also reject a RISC-V-only
+export when embedded code execution is disabled; a descriptor RET would
+silently leave its outputs unwritten.
+
+Next connect the raw Top-2 kernel to SA executable code generation with a
+runtime check for embedded RISC-V execution, then extend the pattern through
+route normalization, dynamic expert indexing, and weighted combine. Lower the
+expert computation to one reusable SA FFN template. Compile a single Mixtral
+layer from IREE input and compare route IDs, weights, and output to M4.
 
 ### M6：Prefill/grouped execution
 
