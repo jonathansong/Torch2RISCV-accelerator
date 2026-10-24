@@ -18,8 +18,10 @@ for path in (os.path.join(REPO, "compiler", "frontend"), os.path.join(REPO, "com
 import moe  # noqa: E402
 import moe_m3b  # noqa: E402
 import moe_top2_kernel  # noqa: E402
+import moe_route_from_top2_kernel  # noqa: E402
 import sadesc  # noqa: E402
 from sa_funcsim import SaFuncSim  # noqa: E402
+from test_moe_top2_raw import topk_reference  # noqa: E402
 
 
 class MoeM3bTest(unittest.TestCase):
@@ -33,6 +35,10 @@ class MoeM3bTest(unittest.TestCase):
         cls.callback = callback_type(lambda address: cls.keep[address].ctypes.data)
         cls.lib.moe_top2_host_init(cls.callback)
         cls.lib.r5_entry.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
+        _, bridge_host = moe_route_from_top2_kernel.build(os.path.join(cls.temp.name, "bridge"))
+        cls.bridge = ctypes.CDLL(bridge_host)
+        cls.bridge.moe_route_from_top2_host_init(cls.callback)
+        cls.bridge.r5_entry.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
 
     @classmethod
     def tearDownClass(cls):
@@ -71,6 +77,23 @@ class MoeM3bTest(unittest.TestCase):
         sim.ddr_write(listaddr, dispatch.array().tobytes())
         sim.run_list(listaddr)
         return sim.ddr_read(outaddr, self.config.dim * 4).view("<f4")
+
+    def test_native_top2_route_feeds_existing_ffn(self):
+        scores = np.array([1.25, -0.5, 2.75, 0.25], np.float32)
+        values, ids = topk_reference(scores)
+        record = np.zeros(moe.ROUTE_RECORD_SIZE, np.uint8)
+        self.keep.clear()
+        self.keep.update({0x1000: values, 0x2000: ids, 0x3000: record})
+        args = (ctypes.c_uint32 * 3)(0x1000, 0x2000, 0x3000)
+        constants = (ctypes.c_uint32 * 2)(self.config.experts, self.manifest["expert_stride"])
+        self.bridge.r5_entry(args, constants)
+        np.testing.assert_array_equal(record, np.frombuffer(self.device_route(scores), np.uint8))
+        got = self.run_ffn(record.tobytes())
+        route_ids, _, weights = moe.unpack_route_record(record.tobytes())
+        xq, xs = moe.quantize_activation(self.x)
+        expected = sum((weight * moe.w8a8_expert(xq, xs, self.q, int(expert))).astype(np.float32)
+                       for expert, weight in zip(route_ids, weights))
+        np.testing.assert_allclose(got, expected, rtol=3e-3, atol=3e-3)
 
     def test_layout_matches_parameter_manifest(self):
         layout = moe_m3b.expert_layout(self.config.dim, self.config.hidden, self.config.alignment)

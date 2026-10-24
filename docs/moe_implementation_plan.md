@@ -1141,8 +1141,30 @@ This accepts the native IREE Top-2 router export on KV260. It does not yet
 cover route normalization, dynamic expert parameter selection, expert FFN,
 or an end-to-end Mixtral layer compiled from IREE.
 
-Next extend the pattern through route normalization, dynamic expert indexing,
-and weighted combine. Lower the
+#### M5e native Top-2 to M4 route ABI bridge (host verified, 2026-10-24)
+
+`firmware/moe_route_from_top2/moe_route_from_top2.c` consumes the two raw f32
+values and i32 IDs emitted by the native IREE Top-2 export. Given the expert
+count and packed expert stride, it computes the same approximate two-way
+softmax as the M4 router and writes the existing 32-byte `sa_moe_route` v1
+record: count, IDs, byte offsets, and f32 weight bits. The bridge is a separate
+position-independent rv32imc kernel with a host twin. Invalid IDs, non-finite
+values, unordered values, zero stride, and overflowing parameter offsets
+produce a zero-count record; the caller must check this before launching an
+FFN. The supported path assumes finite router scores, which is the input
+domain of the Mixtral layer fixtures.
+
+`test_moe_route_from_top2.py` verifies that this record matches M4's original
+score-to-route kernel byte for byte on ties, negative scores, a wide score
+gap, and deterministic random 4-, 8-, and 16-expert cases. It also checks
+invalid-input rejection and PIC relocation invariance. The added
+`test_moe_m3b.py` case feeds the bridge record to the existing W8A8 Top-2
+FFN simulator and checks the combined output against the host reference.
+These are host tests; the bridge has not yet run on KV260 or been emitted by
+the IREE compiler. The end-to-end IREE MoE path therefore remains incomplete.
+
+Next connect Top-2 values/IDs to the route bridge in the compiler/runtime,
+then extend the pattern through dynamic expert indexing and weighted combine. Lower the
 expert computation to one reusable SA FFN template. Compile a single Mixtral
 layer from IREE input and compare route IDs, weights, and output to M4.
 
