@@ -1375,7 +1375,7 @@ directory to KV260 as `~/moe-m5k-route` and run `./run_board.sh`. Board
 acceptance is pending. This check does not yet connect the separate route
 export to the IREE model VMFB or FFN dispatch.
 
-#### M5m real model route and FFN bundle (simulator verified, KV260 pending)
+#### M5m real model route and FFN bundle (KV260 passed)
 
 `moe_m5m_board_bundle.py` stages `build/moe/m5m/board` with the real layer-0
 W8A8 parameter blob, model-derived compiler route code, and the shared FFN
@@ -1386,7 +1386,7 @@ output against the M4 W8A8 references. The host test
 `test_moe_compiled_ffn_real.py` executed the same descriptor and parameter
 blob for all five cases in `SaFuncSim`; all outputs match within the M4
 W8A8 tolerance. Copy the staged directory to KV260 as `~/moe-m5m` and run
-`./run_board.sh`; board acceptance is pending. This bundle runs the two
+`./run_board.sh`. This bundle runs the two
 exports sequentially in a board script, so it does not yet meet the
 single-IREE-program M5 completion requirement.
 
@@ -1406,8 +1406,24 @@ runner submitted this export at top level, where `sa_cmdfetch.v` treats
 `RET` without `CALL` as an error. The runner now replaces only that row with
 `END` before direct submission and reports completion status and output
 magnitude. The host regression checks byte-for-byte equality with the M4
-direct-submit list and executes all five W8A8 references. KV260 validation
-of this second correction is pending.
+direct-submit list and executes all five W8A8 references. The corrected
+KV260 run passed all five cases with `FFN status 0`. Four expert-pair cases
+had maximum output error between `5.1856e-6` and `6.29202e-6`; the real
+token selected experts `[7, 0]`, ran the route in 8,455 cycles and the FFN
+in 408,645 cycles, and had maximum output error `0.000625316`. This accepts
+the real model-derived split route+FFN path on KV260. Host orchestration and
+the absence of a single compiled IREE MoE program remain the M5 gap.
+
+| Fixture | Experts | Route cycles | FFN cycles | Maximum output error |
+|---|---|---:|---:|---:|
+| `moe_acceptance.npz:0` | `[0, 1]` | 8,498 | 408,598 | `5.684793e-6` |
+| `moe_acceptance.npz:1` | `[1, 2]` | 8,481 | 408,675 | `5.185604e-6` |
+| `moe_acceptance.npz:2` | `[2, 3]` | 8,420 | 408,597 | `5.498528e-6` |
+| `moe_acceptance.npz:3` | `[3, 4]` | 8,487 | 408,684 | `6.292015e-6` |
+| `moe_token_acceptance.npz:0` | `[7, 0]` | 8,455 | 408,645 | `6.253161e-4` |
+
+The board's `board_report.json` reported `pass: true` and every case
+reported `ffn_status: 0`.
 
 ### M6：Prefill/grouped execution
 
