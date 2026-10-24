@@ -1452,8 +1452,9 @@ compiled as this program.
 The real-layer wrapper compiled to a 39 KiB VMFB. Its VM IR contains exactly
 two HAL dispatch calls, one barrier, and one queue execute. The available SA
 host runtime was not built, so this is a compiler/IR check rather than an
-execution result. The current KV260 IREE runtime uses a 32 MiB u-dma-buf
-window, which cannot hold the real layer's 88 MiB packed parameters. For the
+execution result. The M5n launcher selected a 32 MiB window from the KV260's
+larger u-dma-buf allocation; that selected window cannot hold the real layer's
+88 MiB packed parameters. For the
 first board execution, `moe_m5n_board_bundle.py` stages a 4-expert synthetic
 layer with 28 KiB of parameters and three inputs in `build/moe/m5n/board`.
 Copy that directory to `~/moe-m5n` on KV260 and run `./run_board.sh`; the
@@ -1462,8 +1463,7 @@ The KV260 run passed all three cases. `ramp` selected `[3, 0]` with maximum
 error `9.581447e-6`; `reverse` selected `[2, 1]` with `6.139278e-6`;
 `random` selected `[0, 2]` with `1.233816e-5`. The board reported
 `pass: true`, six firmware entries, and heartbeat 1,697,747. Real-model
-execution through this VMFB also requires a larger or externally mapped
-parameter buffer in the SA runtime.
+execution through this VMFB requires selecting a larger u-dma-buf window.
 
 #### M5o native Top-2, route, and FFN in one VMFB (KV260 passed)
 
@@ -1478,7 +1478,7 @@ recognized Top-K operation's initial values. The synthetic bundle test
 verifies three dispatches, two barriers, and one queue execute in the lowered
 VM IR. A real-layer wrapper also compiles. Router score production still
 precedes this wrapper; the model's 88 MiB parameter blob still exceeds the
-current 32 MiB IREE board window.
+32 MiB window selected by the synthetic board runner.
 
 `moe_m5n_board_bundle.py --out build/moe/m5o/board --include-top2` stages a
 4-expert synthetic board test. Its three cases check compiler-selected Top-2
@@ -1502,7 +1502,7 @@ bytes 64–71 to route. The corrected VMFB passed all three KV260 cases:
 nine firmware entries, and heartbeat 24,809. These results accept the
 single-VMFB Top-2→route→FFN execution for the four-expert synthetic layer.
 
-#### M5p router fallback, Top-2, route, and FFN in one VMFB (host compiled, KV260 pending)
+#### M5p router fallback, Top-2, route, and FFN in one VMFB (KV260 passed)
 
 The model-derived bundle now extracts the router matmul's VMVX fallback
 executable as `moe_router.vmvx`. With `--include-top2 --include-router`, the
@@ -1514,9 +1514,35 @@ dispatches and their three barriers. The synthetic and real-layer wrappers
 compile; the synthetic VM IR check confirms four dispatches and one queue
 submission. The synthetic board bundle in `build/moe/m5p/board` compares
 router scores, selected IDs/values, route offsets, and the W8A8 output for
-three inputs. Board acceptance is pending. The real layer still exceeds the
-32 MiB IREE board window, and the wrapper is not yet formed automatically
-from the recognized MoE graph.
+three inputs. The KV260 run passed all three cases:
+
+| Case | Experts | Maximum router score error | Maximum W8A8 output error |
+|---|---|---:|---:|
+| `ramp` | `[3, 0]` | `8.940697e-8` | `7.897615e-7` |
+| `reverse` | `[2, 1]` | `1.192093e-7` | `5.275011e-6` |
+| `random` | `[0, 2]` | `1.192093e-7` | `3.013015e-5` |
+
+The report recorded `pass: true`, route status 2 in every case, nine firmware
+entries, and heartbeat 28,737. A real-layer board run needs a larger selected
+u-dma-buf window, and the wrapper is not yet formed automatically from the
+recognized MoE graph.
+
+#### M5q real Mixtral layer in the single VMFB (host staged, KV260 pending)
+
+The KV260 configuration reserves a 1280 MiB u-dma-buf pool at physical
+address `0x10000000` (`boards/kv260/README.md`); the prior IREE tests merely
+selected a 32 MiB slice of it. `board_launcher.start` accepts a larger window
+and passes its size to the SA runtime. `moe_m5q_board_bundle.py` stages the
+real TitanML tiny-Mixtral layer-0 Top-2 chain with an explicit 128 MiB window.
+The packed parameters occupy 88,358,976 bytes, leaving more than 16 MiB of
+headroom for the runtime, activations, descriptors, and output. The staged
+`token` case uses the saved M4 Hugging Face token trace, validating the FP32
+router scores and selected IDs against the original checkpoint before
+packaging. The output reference is the M4 W8A8 expert result for that token.
+The board bundle is `build/moe/m5q/board`; its runner checks scores, IDs,
+route offsets, and the final vector. KV260 execution is pending. The bundle
+still uses an explicitly assembled HAL wrapper rather than a compiler pass
+that rewrites the whole recognized MoE region into this program.
 
 ### M6：Prefill/grouped execution
 

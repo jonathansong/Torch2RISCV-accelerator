@@ -18,17 +18,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--top2", action="store_true", help="run compiled Top-2 before route and FFN")
     parser.add_argument("--router", action="store_true", help="run VMVX router before Top-2, route, and FFN")
+    parser.add_argument("--cases", default="ramp,reverse,random", help="comma-separated staged case names")
+    parser.add_argument("--window-mb", type=int, default=32)
+    parser.add_argument("--real", action="store_true", help="use the real-model router tolerance")
     args = parser.parse_args()
     top2 = args.top2 or args.router
     runner = HERE / "iree-run-module"
     if not runner.is_file():
         raise FileNotFoundError(runner)
     manifest = json.loads((HERE / "moe_manifest.json").read_text())
-    mm, buf, env = BL.start(str(HERE / "picorv32.bit"), str(HERE / "rt_fw.bin"), mb=32)
+    mm, buf, env = BL.start(str(HERE / "picorv32.bit"), str(HERE / "rt_fw.bin"),
+                            mb=args.window_mb)
     env["SA_RV"] = "embedded"
     cases = []
     try:
-        for name in ("ramp", "reverse", "random"):
+        for name in args.cases.split(","):
             case = HERE / name
             command = [str(runner), "--device=sa", f"--module={HERE / 'moe_chain.vmfb'}",
                        "--function=main"]
@@ -77,15 +81,16 @@ def main():
                 reference_scores = np.load(case / "scores.npy").reshape(-1)
                 score_error = float(np.max(np.abs(device_scores - reference_scores)))
                 valid = valid and bool(np.allclose(device_scores, reference_scores,
-                                                   rtol=1e-5, atol=1e-5))
+                                                   rtol=2e-4 if args.real else 1e-5,
+                                                   atol=2e-5 if args.real else 1e-5))
             if top2:
                 selected_values = np.load(case / "values_device.npy").reshape(-1)
                 selected_ids = np.load(case / "ids_device.npy").view("<i4")[16:18]
                 valid = (valid and np.array_equal(selected_ids, ids)
                          and np.allclose(selected_values,
                                          np.load(case / "values.npy").reshape(-1),
-                                         rtol=1e-5 if args.router else 0,
-                                         atol=1e-5 if args.router else 0))
+                                         rtol=2e-4 if args.real else 1e-5 if args.router else 0,
+                                         atol=2e-5 if args.real else 1e-5 if args.router else 0))
             print(f"{name}: {'PASS' if valid else 'FAIL'} experts {ids.tolist()}, "
                   f"router error {score_error if score_error is not None else 'input'}, "
                   f"Top-2 {selected_ids.tolist() if selected_ids is not None else 'input'}, "
@@ -99,6 +104,7 @@ def main():
     finally:
         head, beat = BL.stop(mm, buf)
     result = {"pass": all(case["pass"] for case in cases), "cases": cases,
+              "window_mb": args.window_mb,
               "rt_entries": head, "heartbeat": beat}
     (HERE / "board_report.json").write_text(json.dumps(result, indent=2) + "\n")
     print("single-VMFB route+FFN board PASS" if result["pass"]
