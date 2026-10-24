@@ -412,6 +412,80 @@ llvm::Value *rawTop2Greater(RvEmitter &e, llvm::Value *a, llvm::Value *b) {
   return e.b.CreateAnd(greater, e.b.CreateNot(e.b.CreateOr(nan, bothZero)));
 }
 
+llvm::Value *routeScoreQ16(RvEmitter &e, llvm::Value *bits) {
+  auto exponent = e.b.CreateAnd(e.b.CreateLShr(bits, e.c32(23)), e.c32(255));
+  auto mantissa = e.b.CreateOr(e.b.CreateAnd(bits, e.c32(0x7FFFFF)), e.c32(0x800000));
+  auto shift = e.b.CreateSub(exponent, e.c32(134));
+  auto left = e.b.CreateShl(mantissa, e.b.CreateAnd(shift, e.c32(31)));
+  auto rightShift = e.b.CreateSub(e.c32(0), shift);
+  auto right = e.b.CreateLShr(mantissa, e.b.CreateAnd(rightShift, e.c32(31)));
+  auto magnitude = e.b.CreateSelect(e.b.CreateICmpSGE(shift, e.c32(0)), left,
+                                    e.b.CreateSelect(e.b.CreateICmpSGT(shift, e.c32(-24)), right, e.c32(0)));
+  auto signedValue = e.b.CreateSelect(e.b.CreateICmpNE(e.b.CreateLShr(bits, e.c32(31)), e.c32(0)),
+                                      e.b.CreateSub(e.c32(0), magnitude), magnitude);
+  return e.b.CreateSelect(e.b.CreateICmpEQ(exponent, e.c32(0)), e.c32(0), signedValue);
+}
+
+llvm::Value *routeQ15ToF32(RvEmitter &e, llvm::Value *v) {
+  llvm::Value *remaining = v, *p = e.c32(0);
+  for (unsigned shift : {8u, 4u, 2u, 1u}) {
+    auto take = e.b.CreateICmpUGE(remaining, e.c32(1u << shift));
+    remaining = e.b.CreateSelect(take, e.b.CreateLShr(remaining, e.c32(shift)), remaining);
+    p = e.b.CreateAdd(p, e.b.CreateSelect(take, e.c32(shift), e.c32(0)));
+  }
+  auto exponent = e.b.CreateShl(e.b.CreateAdd(p, e.c32(112)), e.c32(23));
+  auto mantissa = e.b.CreateAnd(e.b.CreateShl(v, e.b.CreateSub(e.c32(23), p)), e.c32(0x7FFFFF));
+  return e.b.CreateSelect(e.b.CreateICmpEQ(v, e.c32(0)), e.c32(0), e.b.CreateOr(exponent, mantissa));
+}
+
+LogicalResult buildRouteTop2(RvEmitter &e, sahw::TemplateOp t) {
+  auto spec = t->getAttrOfType<DenseI64ArrayAttr>("sa.moe.route_top2");
+  auto addresses = t->getAttrOfType<DenseI64ArrayAttr>("sa.moe.addresses");
+  if (!spec || spec.size() != 2 || !addresses || addresses.size() != 18 ||
+      spec[0] < 4 || spec[0] > 16 || spec[1] <= 0 ||
+      spec[1] > UINT32_MAX / (spec[0] - 1))
+    return t.emitError("sa riscv: invalid Top-2 route metadata");
+  auto fields = addresses.asArrayRef();
+  llvm::Value *pointers[3];
+  for (int i = 0; i < 3; ++i) {
+    auto a = fields.slice(6 * i, 6);
+    if (a[0] < 0 || a[0] >= t.getBindings() || a[3] < 0 || a[3] > 63 || a[5] < 0)
+      return t.emitError("sa riscv: invalid Top-2 route binding or offset");
+    auto phys = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, e.bindArg, unsigned(a[0])));
+    auto offset = e.b.CreateAdd(e.lin(a[1], a[2], a[3], a[4]), e.c32(a[5]));
+    pointers[i] = e.b.CreateIntToPtr(e.b.CreateAdd(phys, offset), e.ptr);
+  }
+  auto value0 = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, pointers[0], 0));
+  auto value1 = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, pointers[0], 1));
+  auto id0 = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, pointers[1], 0));
+  auto id1 = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, pointers[1], 1));
+  auto exp0 = e.b.CreateAnd(e.b.CreateLShr(value0, e.c32(23)), e.c32(255));
+  auto exp1 = e.b.CreateAnd(e.b.CreateLShr(value1, e.c32(23)), e.c32(255));
+  auto q0 = routeScoreQ16(e, value0), q1 = routeScoreQ16(e, value1);
+  auto valid = e.b.CreateAnd(e.b.CreateICmpULT(id0, e.c32(spec[0])), e.b.CreateICmpULT(id1, e.c32(spec[0])));
+  valid = e.b.CreateAnd(valid, e.b.CreateICmpNE(id0, id1));
+  valid = e.b.CreateAnd(valid, e.b.CreateICmpULE(exp0, e.c32(135)));
+  valid = e.b.CreateAnd(valid, e.b.CreateICmpULE(exp1, e.c32(135)));
+  valid = e.b.CreateAnd(valid, e.b.CreateICmpSGE(q0, q1));
+  auto delta = e.b.CreateSub(q1, q0);
+  auto saturated = e.b.CreateICmpSLE(delta, e.c32(-16 * 65536));
+  llvm::Value *expQ31 = e.b.CreateAdd(e.c32(1u << 31), delta);
+  for (unsigned i = 0; i < 15; ++i) {
+    auto wide = e.b.CreateZExt(expQ31, e.i64);
+    auto squared = e.b.CreateMul(wide, wide);
+    expQ31 = e.b.CreateTrunc(e.b.CreateLShr(e.b.CreateAdd(squared, e.c64(1u << 30)), e.c64(31)), e.i32);
+  }
+  expQ31 = e.b.CreateSelect(saturated, e.c32(0), expQ31);
+  auto expQ15 = e.b.CreateLShr(e.b.CreateAdd(expQ31, e.c32(1u << 15)), e.c32(16));
+  auto w1 = e.b.CreateUDiv(e.b.CreateShl(expQ15, e.c32(15)), e.b.CreateAdd(expQ15, e.c32(1u << 15)));
+  llvm::Value *words[8] = {e.b.CreateSelect(valid, e.c32(2), e.c32(0)), id0, id1,
+                            e.b.CreateMul(id0, e.c32(spec[1])), e.b.CreateMul(id1, e.c32(spec[1])),
+                            routeQ15ToF32(e, e.b.CreateSub(e.c32(1u << 15), w1)), routeQ15ToF32(e, w1), e.c32(0)};
+  for (unsigned i = 0; i < 8; ++i)
+    e.b.CreateStore(words[i], e.b.CreateConstGEP1_32(e.i32, pointers[2], i));
+  return success();
+}
+
 LogicalResult buildRawTop2(RvEmitter &e, sahw::TemplateOp t) {
   auto experts = t->getAttrOfType<IntegerAttr>("sa.moe.raw_top2");
   auto addresses = t->getAttrOfType<DenseI64ArrayAttr>("sa.moe.addresses");
@@ -469,6 +543,11 @@ LogicalResult buildFunction(RvEmitter &e, sahw::TemplateOp t) {
   e.b.SetInsertPoint(e.entry);
   if (t->hasAttr("sa.moe.raw_top2")) {
     if (failed(buildRawTop2(e, t))) return failure();
+    e.b.CreateRetVoid();
+    return success();
+  }
+  if (t->hasAttr("sa.moe.route_top2")) {
+    if (failed(buildRouteTop2(e, t))) return failure();
     e.b.CreateRetVoid();
     return success();
   }

@@ -1214,6 +1214,36 @@ test, not one compiled IREE MoE executable. The next compiler task is to
 express the normalization and expert parameter selection in the SA dialects
 and emit them as device work following `sahl.top2`.
 
+#### M5g native route-record export (host verified, KV260 pending)
+
+`sahl.route_top2` now represents the second MoE boundary: selected f32 values,
+selected i32 IDs, and a 32-byte v1 route record, with a static expert count
+and packed parameter stride. `sahl-to-sahw` lowers an isolated route operation
+to a RISC-V-only template. `SahwToRiscv` emits integer-only rv32imc code into
+the SA executable's code table. It decodes finite f32 scores into Q16,
+approximates the two-way exponential by fifteen Q31 squarings, normalizes in
+Q15, and encodes the two output weights as f32 bits. This path makes no
+soft-float calls and has no relocations or data section. It accepts finite
+selected scores with absolute value below 512; an invalid input writes a
+zero-count record, which must be rejected before launching the FFN.
+
+The independent C prototype is `firmware/moe_route_from_top2_int`, with an
+946-byte position-independent RV32 blob. `test_moe_route_from_top2_int.py`
+checks ties, large gaps, invalid inputs, and 600 deterministic random
+4/8/16-expert cases; the largest weight error against exact two-way softmax
+is below 5e-5. `moe_route_top2_export.mlir` checks the compiler's complete
+SA target serialization. Its code table contains 882 bytes of RV32 code.
+`test_moe_compiler_route.py` executes the emitted target-neutral LLVM IR on
+the host with 32-bit binding addresses and a nonzero output subspan offset;
+IDs, parameter offsets, and weights pass the same error bound. All 27 SA lit
+tests and the available golden guard pass.
+
+`moe_m5g_board_bundle.py` stages the compiler-generated code in
+`build/moe/m5g/board`, with the same three D=16 router fixtures and KV260
+overlay as M5e. This board acceptance is pending. The fixture currently
+contains an explicit `sahl.route_top2` export; the production model frontend
+does not yet form it automatically or connect its output to a compiled FFN.
+
 Then extend the compiler pattern through dynamic expert indexing and weighted
 combine. Lower the expert computation to one reusable SA FFN template. Compile
 a single Mixtral layer from IREE input and compare route IDs, weights, and
