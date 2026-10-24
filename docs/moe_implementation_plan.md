@@ -1375,6 +1375,21 @@ directory to KV260 as `~/moe-m5k-route` and run `./run_board.sh`. Board
 acceptance is pending. This check does not yet connect the separate route
 export to the IREE model VMFB or FFN dispatch.
 
+#### M5m real model route and FFN bundle (simulator verified, KV260 pending)
+
+`moe_m5m_board_bundle.py` stages `build/moe/m5m/board` with the real layer-0
+W8A8 parameter blob, model-derived compiler route code, and the shared FFN
+descriptor emitted in M5k. The runner reads the compiled descriptor's rows
+directly and executes five cases: four M4 expert pairs plus the saved real
+token. It checks route IDs, dynamic offsets, normalized weights, and the FFN
+output against the M4 W8A8 references. The host test
+`test_moe_compiled_ffn_real.py` executed the same descriptor and parameter
+blob for all five cases in `SaFuncSim`; all outputs match within the M4
+W8A8 tolerance. Copy the staged directory to KV260 as `~/moe-m5m` and run
+`./run_board.sh`; board acceptance is pending. This bundle runs the two
+exports sequentially in a board script, so it does not yet meet the
+single-IREE-program M5 completion requirement.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。
