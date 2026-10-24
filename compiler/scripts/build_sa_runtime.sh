@@ -23,14 +23,20 @@ case "$which" in
     ;;
   aarch64)
     B=$SA_REPO/build/iree/build-sa-aarch64
+    HOST_TOOLS=$SA_REPO/build/iree/build-compiler/tools
+    [ -x "$HOST_TOOLS/iree-flatcc-cli" ] || {
+      echo "missing host tool $HOST_TOOLS/iree-flatcc-cli; build the compiler tools first" >&2
+      exit 1
+    }
     cmake -S "$IREE_SRC" -B "$B" "${common[@]}" \
       -DCMAKE_TOOLCHAIN_FILE="$SA_COMPILER/runtime/toolchains/aarch64-linux-gnu.cmake" \
-      -DIREE_HOST_BIN_DIR="$SA_REPO/build/iree/install-host/bin" \
+      -DIREE_HOST_BIN_DIR="$HOST_TOOLS" \
       -DIREE_HAL_EXECUTABLE_LOADER_DEFAULTS=OFF -DIREE_HAL_EXECUTABLE_LOADER_EMBEDDED_ELF=ON \
       -DIREE_HAL_EXECUTABLE_LOADER_VMVX_MODULE=ON -DIREE_HAL_EXECUTABLE_PLUGIN_DEFAULTS=OFF \
       -DIREE_HAL_EXECUTABLE_PLUGIN_EMBEDDED_ELF=ON >/dev/null
     ;;
   *) echo "usage: $0 host|aarch64" >&2; exit 2 ;;
 esac
-cmake --build "$B" -j "$SA_JOBS" --target sa_hal_test sa-llm-run iree-run-module 2>&1 | grep -v dlopen | tail -n 30 || true
-echo "built: $(find "$B" -name sa_hal_test -type f) $B/tools/iree-run-module"
+cmake --build "$B" -j "$SA_JOBS" --target sa_hal_test sa-llm-run iree-run-module 2>&1 | sed '/dlopen/d' | tail -n 30
+[ -x "$B/tools/iree-run-module" ] || { echo "iree-run-module was not produced" >&2; exit 1; }
+echo "built: $B/tools/iree-run-module"
