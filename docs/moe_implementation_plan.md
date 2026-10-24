@@ -1267,6 +1267,8 @@ ordinary path. `sa_form_moe_regions.mlir` covers this additional spelling.
 including zero and random inputs. `test_moe_native_compile.py` checks that a
 Torch-exported layer produces exactly one embedded RISC-V Top-2 SA export and
 records the currently required host fallback boundaries.
+`test_moe_native_real.py` compares the cached real layer-0 token against the
+existing M4/HF reference; output, scores, IDs, and routing weights pass.
 
 The cached `TitanML-tiny-mixtral` layer 0 (8 experts, hidden size 1024,
 intermediate size 3584) exported to `build/moe/m5h/real-layer0` and compiled
@@ -1279,7 +1281,14 @@ not a fully device-resident Mixtral FFN.
 `moe_m5h_board_bundle.py` stages a synthetic full-layer IREE VMFB, parameters,
 reference arrays, overlay, runtime, and script in `build/moe/m5h/board`.
 Copy this directory to KV260 as `~/moe-m5h` and run `./run_board.sh`. It checks
-three inputs including a zero-score tie case. Board acceptance is pending.
+three inputs including a zero-score tie case. The same generator with
+`--model build/llm_cache/TitanML-tiny-mixtral --layer 0
+--reference build/moe/m4c/tiny-mixtral/layer0/moe_token_acceptance.npz
+--out build/moe/m5h/real-board` stages a real layer-0 token case (347 MiB)
+against the existing M4/HF output. Copy it separately to KV260 and run its
+`run_board.sh` after the synthetic bundle succeeds. Both board acceptances
+are pending. `test_moe_native_sim.py` can run the synthetic VMFB when a host
+SA runtime is installed; it skips because `build-sa-host` is absent locally.
 The earlier M5g compiler-generated route-record export also awaits board
 acceptance. Integrating that operation automatically after the Torch Top-2,
 then using its dynamic offsets to run one reusable W8A8 expert template and

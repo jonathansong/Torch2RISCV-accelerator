@@ -20,9 +20,11 @@ def main():
     mm, buffer, env = BL.start(os.path.join(HERE, "picorv32.bit"),
                                os.path.join(HERE, "rt_fw.bin"), mb=32)
     env["SA_RV"] = "embedded"
+    with open(os.path.join(HERE, "cases.json")) as stream:
+        manifest = json.load(stream)
     cases = []
     try:
-        for name in ("ramp", "zero", "random"):
+        for name in manifest["cases"]:
             path = os.path.join(HERE, name)
             outputs = [os.path.join(path, f"out_{i}.npy") for i in range(4)]
             command = [runner, "--device=sa", f"--module={HERE}/moe_layer.vmfb",
@@ -37,7 +39,8 @@ def main():
             ref = [np.load(os.path.join(path, f"ref_{i}.npy")) for i in range(4)]
             ids_ok = np.array_equal(got[2], ref[2])
             errors = [float(np.max(np.abs(got[i] - ref[i]))) for i in (0, 1, 3)]
-            passed = ids_ok and errors[0] <= 2e-5 and errors[1] <= 2e-5 and errors[2] <= 2e-5
+            tolerance = manifest["max_abs_error"]
+            passed = ids_ok and all(error <= tolerance for error in errors)
             print(f"{name}: {'PASS' if passed else 'FAIL'} IDs {got[2].reshape(-1).tolist()}, "
                   f"max errors {errors}")
             cases.append({"name": name, "pass": bool(passed),
@@ -45,7 +48,7 @@ def main():
     finally:
         head, beat = BL.stop(mm, buffer)
         print(f"rt_fw completed {head} entries, heartbeat {beat}")
-    passed = all(case["pass"] for case in cases) and len(cases) == 3
+    passed = all(case["pass"] for case in cases) and len(cases) == len(manifest["cases"])
     with open(os.path.join(HERE, "board_report.json"), "w") as stream:
         json.dump({"pass": passed, "cases": cases, "rt_entries": head,
                    "heartbeat": beat}, stream, indent=2)
