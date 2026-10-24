@@ -1,8 +1,7 @@
 # KV260 上的 IREE 原生 MoE 实现方案
 
-> Status: M0–M4 full-device Mixtral inference and M5r single-VMFB MoE pass on
-> KV260. M5t one-input compiler-lowered MoE passes host checks; its final
-> KV260 acceptance is pending.
+> Status: M0–M4 full-device Mixtral inference and M5 native one-input MoE
+> compilation pass on KV260. M5t completed four real layer-0 board cases.
 > 目标平台：AMD KV260 + PicoRV32 + SA accelerator
 > 编译路径：PyTorch/Hugging Face → IREE Flow → SAHL → SAHW → descriptor list 或 RISC-V 代码
 > 第一目标：不修改 GEMV RTL，实现 batch-1、W8A8、top-1/top-2 稀疏 MoE decode，并在模拟器和 KV260 上端到端验证。
@@ -1573,7 +1572,7 @@ frontend path. It is frontend assembly of compiler outputs; the native IREE
 pass recognizes the architecture but does not yet rewrite the entire graph
 into the four-stage HAL chain.
 
-#### M5 native lowering completion gate (open)
+#### M5 native lowering completion gate (closed by M5t)
 
 The remaining compiler work is to replace the recognized fp32 expert graph,
 not merely annotate it or assemble a second VMFB in the frontend. The pass
@@ -1614,7 +1613,7 @@ entry still receives activation, router weights, packed parameters, and
 caller-allocated scratch/output buffers. That ABI integration remains the
 open M5 completion gate at this checkpoint.
 
-#### M5t one-input native model ABI (host verified, KV260 pending)
+#### M5t one-input native model ABI (KV260 accepted)
 
 `--iree-sa-moe-model-abi` keeps the compiler-owned four-stage HAL chain inside
 the VMFB and exposes `main(x: !hal.buffer_view) -> !hal.buffer_view`. The
@@ -1634,8 +1633,7 @@ four dispatches, buffer initialization, completion fences, and rejection of a
 bad expert stride. A host local-task probe loads the archive and returns its
 router values exactly. The SA runtime already implements host-mapped buffer
 fill and direct queue reads from synchronous parameter files. These checks
-validate the new ABI plumbing before a board run; they do not establish its
-KV260 numerical result.
+validated the ABI plumbing before the board run.
 
 `moe_m5t_board_bundle.py` stages the one-input VMFB, archive, runtime,
 overlay, firmware, and four real layer-0 inputs. It verifies each saved
@@ -1655,11 +1653,31 @@ to 64/128 bytes. The wrapper had bound only 8/72 bytes, so Top-2 wrote beyond
 the scratch buffers. The bundle builder now reads the three subspan offsets
 from IREE's executable configuration and writes `moe_top2_abi.json`; the
 compiler-owned chain uses those offsets for buffer sizes, initialization,
-Top-2 bindings, and route bindings. Host integration and compiler regressions
-are rerun before a second KV260 acceptance. The second board result remains
-pending.
+Top-2 bindings, and route bindings. The updated synthetic integration test,
+27 SA lit tests, and 636-dispatch golden corpus passed before the second board
+run.
 
-After copying `build/moe/m5t/board` to KV260, the final acceptance command is:
+The user ran the corrected one-input `moe_model.vmfb` on the D=16, 100 MHz
+KV260 overlay with a 128 MiB u-dma-buf window. All four real layer-0 cases
+passed against the saved W8A8 reference:
+
+| Case | Maximum absolute output error |
+|---|---:|
+| `hybrid0` | `0.0004735291004180908` |
+| `hybrid1` | `0.000027894973754882812` |
+| `hybrid2` | `0.0006253160536289215` |
+| `token0` | `0.0006253160536289215` |
+
+The reported `board_report.json` had `pass: true`, 12 completed firmware
+entries, and heartbeat 1,157,129. The corrected bundle carries commit
+`73c143f` and VMFB SHA-256
+`d9b326cdeccecc9cc6ee25af6b7b2e1d4eeccdf7ef0ddf25a545021a971acdb9`.
+This closes the M5 native one-input MoE layer acceptance gate. The
+standalone M5g/M5l probes are still unrun; the integrated board execution
+covers their route-record path. M6 remains responsible for batched tokens,
+grouped experts, and model generation integration.
+
+To reproduce the accepted run, use:
 
 ```bash
 # Host:
@@ -1672,7 +1690,7 @@ scp ubuntu@192.168.0.121:~/moe-m5t/board_report.json build/moe/m5t/
 
 The runner checks each of the four model-derived outputs against the saved
 W8A8 reference (`rtol=atol=3e-3`) and records the result in
-`board_report.json`. Its board result is pending.
+`board_report.json`.
 
 ### M6：Prefill/grouped execution
 
