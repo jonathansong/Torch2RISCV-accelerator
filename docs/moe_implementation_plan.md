@@ -1549,7 +1549,7 @@ the real model-derived four-stage device path in one VMFB. The bundle still
 uses an explicitly assembled HAL wrapper rather than a compiler pass that
 rewrites the whole recognized MoE region into this program.
 
-#### M5r automatic single-VMFB compiler bundle (host verified, KV260 pending)
+#### M5r automatic single-VMFB compiler bundle (KV260 passed)
 
 `compiler/frontend/moe_device_bundle.py` now builds the router weights and
 four-stage `moe_chain.mlir`/`moe_chain.vmfb` as part of its normal checkpoint
@@ -1562,10 +1562,30 @@ directly from that bundle, without loading the checkpoint or separately
 building a wrapper. The synthetic compiler-bundle test passed. The real
 layer-0 checkpoint bundle regenerated successfully, and its generated HAL
 source is byte-identical to the source used for the accepted M5q board run.
-The newly built VMFB has a different byte hash, so board acceptance of this
-automatic path remains pending. This is frontend assembly of compiler outputs;
-the native IREE pass recognizes the architecture but does not yet rewrite the
-entire graph into the four-stage HAL chain.
+The newly built VMFB has a different byte hash, so it was independently
+retested on KV260. The real layer-0 token passed: experts `[7, 0]`, router
+maximum error `5.960464e-7`, route status 2 with offsets `[77,299,712, 0]`,
+output maximum magnitude `0.696704`, and output maximum error `0.000625316`.
+The board report recorded `pass: true`, a 128 MiB window, three firmware
+entries, and heartbeat 107,453. This accepts the automatic checkpoint-to-VMFB
+frontend path. It is frontend assembly of compiler outputs; the native IREE
+pass recognizes the architecture but does not yet rewrite the entire graph
+into the four-stage HAL chain.
+
+#### M5 native lowering completion gate (open)
+
+The remaining compiler work is to replace the recognized fp32 expert graph,
+not merely annotate it or assemble a second VMFB in the frontend. The pass
+must consume the recognized Top-2 IDs and values, create the route-record
+buffer, dispatch the reusable W8A8 FFN against imported packed parameters,
+and return the combined output through the original function result. It must
+preserve ordinary compilation for unmatched models and make the supported
+shape and score constraints explicit. Acceptance requires an `iree-compile`
+invocation of the supported exported MoE function to emit this route→FFN
+dependency without calling `moe_iree_chain.py`; a synthetic host/SA test,
+the real layer-0 KV260 token case, SA lit tests, and the golden guard must
+pass. M5r proves the device execution chain and frontend checkpoint-to-VMFB
+packaging, but does not satisfy this native lowering gate.
 
 ### M6：Prefill/grouped execution
 
