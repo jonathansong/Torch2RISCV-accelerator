@@ -26,6 +26,19 @@ class NativeMoeCompileTest(unittest.TestCase):
             source = Path(mlir).read_text()
             self.assertIn("torch.aten.sort", source)
             self.assertIn("torch.aten.index_select", source)
+            preprocessing = path / "preprocessing.mlir"
+            initial = subprocess.run([
+                str(compiler), mlir, "--iree-hal-target-device=sa",
+                f"--iree-parameter-import=model={irpa}", "--iree-sa-form-moe",
+                "--iree-sa-riscv", "--iree-sa-host-fallback",
+                "--compile-to=preprocessing", "-o", str(preprocessing)],
+                capture_output=True, text=True)
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            processed = preprocessing.read_text()
+            self.assertIn('sa.moe.arch = "mixtral_top2_ffn"', processed)
+            self.assertIn("sa.moe.dim = 32 : i64", processed)
+            self.assertIn("sa.moe.hidden = 64 : i64", processed)
+            self.assertIn("sa.moe.experts = 4 : i64", processed)
             binaries = path / "binaries"
             binaries.mkdir()
             result = subprocess.run([

@@ -172,6 +172,126 @@ std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
   return experts;
 }
 
+bool derivesFromTop2Ids(Value value, IREE::LinalgExt::TopkOp topk, unsigned depth = 0) {
+  if (value == topk.getResult(1)) return true;
+  if (depth > 4) return false;
+  Operation *producer = value.getDefiningOp();
+  if (!producer || producer->getNumOperands() != 1 ||
+      !isa<arith::ExtSIOp, tensor::CollapseShapeOp, tensor::ExpandShapeOp,
+           tensor::CastOp>(producer))
+    return false;
+  return derivesFromTop2Ids(producer->getOperand(0), topk, depth + 1);
+}
+
+bool derivesFrom(Value value, Value ancestor, unsigned depth = 0) {
+  if (value == ancestor) return true;
+  if (depth > 16) return false;
+  Operation *producer = value.getDefiningOp();
+  if (!producer) return false;
+  for (Value operand : producer->getOperands())
+    if (derivesFrom(operand, ancestor, depth + 1)) return true;
+  return false;
+}
+
+// This is an annotation only. It intentionally requires the three expert
+// tables to share the same dynamic Top-2 IDs and verifies both FFN dimensions;
+// unsupported computation continues on IREE's ordinary fallback path.
+std::optional<std::pair<int64_t, int64_t>> mixtralExpertShape(
+    Operation *scope, IREE::LinalgExt::TopkOp topk, int64_t experts) {
+  auto projection = topk.getValues().getDefiningOp<linalg::MatmulOp>();
+  if (!projection) return std::nullopt;
+  auto input = dyn_cast<RankedTensorType>(projection.getDpsInputs()[0].getType());
+  if (!input || input.getRank() != 2 || input.getDimSize(0) != 1 ||
+      !input.getElementType().isF32()) return std::nullopt;
+  int64_t dim = input.getDimSize(1);
+  if (dim <= 0) return std::nullopt;
+  SmallVector<RankedTensorType> gathered;
+  scope->walk([&](linalg::GenericOp generic) {
+    if (generic.getNumDpsInputs() != 1 || generic->getNumResults() != 1 ||
+        !derivesFromTop2Ids(generic.getDpsInputs()[0], topk))
+      return;
+    auto result = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
+    if (!result || result.getRank() != 3 || result.getDimSize(0) != 2 ||
+        !result.getElementType().isF32())
+      return;
+    tensor::ExtractOp extract;
+    generic.walk([&](tensor::ExtractOp op) { extract = op; });
+    if (!extract || extract.getIndices().size() != 3) return;
+    auto expertIndex = extract.getIndices()[0].getDefiningOp<arith::IndexCastOp>();
+    auto row = extract.getIndices()[1].getDefiningOp<linalg::IndexOp>();
+    auto column = extract.getIndices()[2].getDefiningOp<linalg::IndexOp>();
+    if (!expertIndex || expertIndex.getIn() != generic.getRegion().front().getArgument(0) ||
+        !row || row.getDim() != 1 || !column || column.getDim() != 2)
+      return;
+    auto table = dyn_cast<RankedTensorType>(extract.getTensor().getType());
+    if (!table || table.getRank() != 3 || table.getDimSize(0) != experts ||
+        table.getDimSize(1) != result.getDimSize(1) ||
+        table.getDimSize(2) != result.getDimSize(2))
+      return;
+    gathered.push_back(result);
+  });
+  if (gathered.size() != 3) return std::nullopt;
+  int64_t hidden = 0;
+  unsigned inputTables = 0, outputTables = 0;
+  for (auto type : gathered) {
+    if (type.getDimSize(2) == dim) {
+      if (!hidden) hidden = type.getDimSize(1);
+      if (hidden == type.getDimSize(1)) ++inputTables;
+    } else if (type.getDimSize(1) == dim) {
+      if (!hidden) hidden = type.getDimSize(2);
+      if (hidden == type.getDimSize(2)) ++outputTables;
+    }
+  }
+  if (hidden <= dim || inputTables != 2 || outputTables != 1) return std::nullopt;
+  unsigned inputMatmuls = 0, outputMatmuls = 0;
+  Value downResult;
+  scope->walk([&](linalg::BatchMatmulOp matmul) {
+    auto lhs = dyn_cast<RankedTensorType>(matmul.getDpsInputs()[0].getType());
+    auto rhs = dyn_cast<RankedTensorType>(matmul.getDpsInputs()[1].getType());
+    if (!lhs || !rhs || lhs.getRank() != 3 || rhs.getRank() != 3 ||
+        lhs.getDimSize(0) != 2 || rhs.getDimSize(0) != 2 || rhs.getDimSize(2) != 1)
+      return;
+    if (lhs.getDimSize(1) == hidden && lhs.getDimSize(2) == dim &&
+        rhs.getDimSize(1) == dim)
+      ++inputMatmuls;
+    if (lhs.getDimSize(1) == dim && lhs.getDimSize(2) == hidden &&
+        rhs.getDimSize(1) == hidden) {
+      ++outputMatmuls;
+      downResult = matmul->getResult(0);
+    }
+  });
+  if (inputMatmuls != 2 || outputMatmuls != 1) return std::nullopt;
+  Value weightedResult;
+  scope->walk([&](linalg::GenericOp generic) {
+    if (generic.getNumDpsInputs() != 2 || generic->getNumResults() != 1) return;
+    auto type = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
+    if (!type || type.getShape() != ArrayRef<int64_t>({2, dim})) return;
+    Value first = generic.getDpsInputs()[0], second = generic.getDpsInputs()[1];
+    if (!((derivesFrom(first, downResult) && derivesFrom(second, topk.getResult(0))) ||
+          (derivesFrom(second, downResult) && derivesFrom(first, topk.getResult(0)))))
+      return;
+    auto yield = dyn_cast<linalg::YieldOp>(generic.getRegion().front().getTerminator());
+    if (yield && yield.getValues().size() == 1 &&
+        yield.getValues()[0].getDefiningOp<arith::MulFOp>())
+      weightedResult = generic->getResult(0);
+  });
+  if (!weightedResult) return std::nullopt;
+  bool combined = false;
+  scope->walk([&](linalg::GenericOp generic) {
+    if (generic.getNumDpsInputs() != 1 || generic.getDpsInputs()[0] != weightedResult ||
+        generic.getNumReductionLoops() != 1 || generic->getNumResults() != 1)
+      return;
+    auto type = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
+    auto yield = dyn_cast<linalg::YieldOp>(generic.getRegion().front().getTerminator());
+    if (type && type.getShape() == ArrayRef<int64_t>({1, dim}) && yield &&
+        yield.getValues().size() == 1 &&
+        yield.getValues()[0].getDefiningOp<arith::AddFOp>())
+      combined = true;
+  });
+  if (!combined) return std::nullopt;
+  return std::pair<int64_t, int64_t>{dim, hidden};
+}
+
 struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FormMoeRegionsPass)
 
@@ -198,7 +318,20 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
     getOperation()->walk([&](IREE::LinalgExt::TopkOp topk) {
       if (auto experts = routerExperts(topk)) matches.emplace_back(topk, *experts);
     });
+    unsigned fullBlocks = 0;
     for (auto [topk, experts] : matches) {
+      Operation *scope = topk->getParentOp();
+      while (scope && scope->getName().getStringRef() != "util.func" &&
+             scope->getName().getStringRef() != "func.func")
+        scope = scope->getParentOp();
+      if (scope)
+        if (auto shape = mixtralExpertShape(scope, topk, experts)) {
+          scope->setAttr("sa.moe.arch", rewriter.getStringAttr("mixtral_top2_ffn"));
+          scope->setAttr("sa.moe.dim", rewriter.getI64IntegerAttr(shape->first));
+          scope->setAttr("sa.moe.hidden", rewriter.getI64IntegerAttr(shape->second));
+          scope->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
+          ++fullBlocks;
+        }
       topk->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
       topk->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(2));
       rewriter.setInsertionPoint(topk);
@@ -210,7 +343,8 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
     }
     if (report)
       llvm::errs() << "sa form-moe-regions: " << matches.size() << " top-2 router regions ("
-                   << convertedSorts << " Torch sort prefixes)\n";
+                   << convertedSorts << " Torch sort prefixes), " << fullBlocks
+                   << " full expert blocks\n";
   }
 
   Option<bool> enabled{*this, "enabled", llvm::cl::desc("Form MoE router regions"), llvm::cl::init(true)};

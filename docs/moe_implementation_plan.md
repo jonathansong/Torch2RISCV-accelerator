@@ -1300,6 +1300,30 @@ acceptance. Integrating that operation automatically after the Torch Top-2,
 then using its dynamic offsets to run one reusable W8A8 expert template and
 weighted combine, remains required before M5 is complete.
 
+#### M5i full expert-graph recognition (host verified)
+
+The opt-in `FormMoeRegions` pass also identifies the full tensor-level
+Mixtral FFN shape, after forming Top-2. It requires all three expert tables
+to be indexed along their expert dimension by the same selected IDs, two
+`[2, intermediate, hidden]` input projections and one
+`[2, hidden, intermediate]` output projection, and the corresponding three
+batch matmuls. It annotates the containing IREE function with
+`sa.moe.arch = "mixtral_top2_ffn"` and static `sa.moe.dim`,
+`sa.moe.hidden`, and `sa.moe.experts`. The annotation does not alter the
+computation or claim device execution of the FFN.
+
+The pattern also requires the down-projection result to be multiplied by
+weights derived from the same Top-2 values, then reduced across the two
+experts into one output row. This prevents a router plus unrelated expert
+table reads from being labeled as a complete MoE block.
+
+`test_moe_native_compile.py` checks the annotation on the exported synthetic
+layer. The cached real layer-0 preprocessing IR also records `dim=1024`,
+`hidden=3584`, and `experts=8`. The incremental compiler build, complete SA
+lit suite, and available golden guard pass. The next lowering step still
+needs to consume this representation, automatically form the route-record
+dispatch, and connect a reusable W8A8 expert template to it.
+
 ### M6：Prefill/grouped execution
 
 交付 token count、prefix sum、gather/scatter、grouped GEMV，以及大组切换 systolic GEMM。退出条件：空 expert 不执行，相比逐 token prefill 有可测加速。
