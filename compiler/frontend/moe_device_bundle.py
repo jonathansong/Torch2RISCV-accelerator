@@ -129,6 +129,15 @@ def build(model, layer, out, d=16):
         if len(top2) != 1:
             raise RuntimeError(f"expected one native Top-2 export, got {len(top2)}")
         (out / "moe_top2.sadesc").write_bytes(top2[0])
+        router = [re.fullmatch(rf"main\$async_dispatch_(\d+)_matmul_1x{config.experts}x{config.dim}_f32", name)
+                  for name in coverage["host"]]
+        router = [match.group(1) for match in router if match]
+        if len(router) != 1:
+            raise RuntimeError(f"expected one host router matmul, got {len(router)}")
+        router_binary = Path(binary_dir) / f"module_main$async_dispatch_{router[0]}_vmvx_bytecode_fb.vmfb"
+        if not router_binary.is_file():
+            raise RuntimeError("missing model-compiled VMVX router executable")
+        (out / "moe_router.vmvx").write_bytes(router_binary.read_bytes())
     ffn = out / "moe_ffn.sadesc"
     ffn_bytes = moe_m3b.make_executable(config.dim, config.hidden, d)
     descriptor_d, _, exports = sadesc.read(ffn_bytes)
@@ -159,7 +168,7 @@ def build(model, layer, out, d=16):
               "native_module_dispatches": coverage,
               "artifacts": {name: artifact_info(out / name)
                             for name in ("moe_layer.vmfb", "moe_layer.irpa", "moe_params.bin",
-                                         "moe_top2.sadesc", "moe_ffn.sadesc", "route.vmfb",
+                                         "moe_router.vmvx", "moe_top2.sadesc", "moe_ffn.sadesc", "route.vmfb",
                                          "moe_route.bin")}}
     (out / "compiler_bundle.json").write_text(json.dumps(result, indent=2) + "\n")
     return result

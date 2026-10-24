@@ -40,7 +40,9 @@ def checkpoint(path, weights):
     write_safetensors(str(path / "model.safetensors"), tensors)
 
 
-def stage(out, runtime=RUNTIME, *, include_top2=False):
+def stage(out, runtime=RUNTIME, *, include_top2=False, include_router=False):
+    if include_router and not include_top2:
+        raise ValueError("router requires Top-2 in the VMFB")
     out = Path(out).resolve()
     root = out.parent
     config = moe.MoeConfig(32, 64, 4, 2)
@@ -51,7 +53,8 @@ def stage(out, runtime=RUNTIME, *, include_top2=False):
     chain = root / "synthetic-chain"
     checkpoint(model, weights)
     build_device_bundle(model, 0, bundle)
-    build_chain(bundle, chain, include_top2=include_top2)
+    build_chain(bundle, chain, include_top2=include_top2,
+                include_router=include_router)
     out.mkdir(parents=True, exist_ok=True)
     files = [chain / "moe_chain.vmfb", bundle / "moe_params.bin",
              bundle / "moe_manifest.json", OVERLAY / "picorv32.bit",
@@ -65,17 +68,27 @@ def stage(out, runtime=RUNTIME, *, include_top2=False):
             raise FileNotFoundError(path)
         shutil.copy2(path, out / path.name)
     np.save(out / "moe_params.npy", np.fromfile(out / "moe_params.bin", dtype=np.uint8))
+    if include_router:
+        np.save(out / "router.npy", weights.router.astype(np.float32))
     for name, x in (("ramp", np.linspace(-0.625, 0.75, 32, dtype=np.float32)),
                     ("reverse", np.linspace(0.75, -0.625, 32, dtype=np.float32)),
                     ("random", np.random.default_rng(340).normal(size=32).astype(np.float32))):
         case = out / name
         case.mkdir(exist_ok=True)
-        expected, scores, ids, routing = moe.moe_forward(x, config, packed, quantized=True)
+        if include_router:
+            _, scores, ids, routing = moe.moe_forward(x, config, weights)
+            xq, xs = moe.quantize_activation(x)
+            expected = sum((weight * moe.w8a8_expert(xq, xs, packed, int(expert))).astype(np.float32)
+                           for expert, weight in zip(ids, routing))
+        else:
+            expected, scores, ids, routing = moe.moe_forward(x, config, packed, quantized=True)
         values = scores[ids]
         np.save(case / "values.npy", values.reshape(1, 2).astype(np.float32))
         np.save(case / "ids.npy", ids.reshape(1, 2).astype(np.int32))
         if include_top2:
             np.save(case / "scores.npy", scores.reshape(1, 4).astype(np.float32))
+            if include_router:
+                np.save(case / "scores_init.npy", np.zeros((1, 4), dtype=np.float32))
             np.save(case / "values_init.npy", np.full((1, 2), -np.inf, dtype=np.float32))
             ids_init = np.zeros(72, dtype=np.uint8)
             ids_init[64:72] = np.full(2, np.iinfo(np.int32).max,
@@ -93,13 +106,15 @@ for f in /etc/profile.d/pynq_venv.sh /etc/profile.d/xrt_setup.sh /opt/xilinx/xrt
   if [ -f "$f" ]; then source "$f" >/dev/null; fi
 done
 cd "$(dirname "$0")"
-exec python3 board_moe_iree_chain.py ''' + ('--top2 ' if include_top2 else '') + '''"$@"
+exec python3 board_moe_iree_chain.py ''' + ('--router ' if include_router else
+                                            '--top2 ' if include_top2 else '') + '''"$@"
 ''')
     run.chmod(0o755)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
     digest = hashlib.sha256((out / "moe_chain.vmfb").read_bytes()).hexdigest()
     (out / "VERSION").write_text(f"commit {revision}\nVMFB sha256 {digest}\n")
-    print(f"staged {out}: one VMFB ({'Top-2+' if include_top2 else ''}route+FFN), 3 synthetic cases, "
+    print(f"staged {out}: one VMFB ({'router+' if include_router else ''}"
+          f"{'Top-2+' if include_top2 else ''}route+FFN), 3 synthetic cases, "
           f"runtime {'present' if Path(runtime).is_file() else 'missing'}")
 
 
@@ -108,5 +123,7 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=Path, default=REPO / "build/moe/m5n/board")
     parser.add_argument("--runtime", type=Path, default=RUNTIME)
     parser.add_argument("--include-top2", action="store_true")
+    parser.add_argument("--include-router", action="store_true")
     args = parser.parse_args()
-    stage(args.out, args.runtime, include_top2=args.include_top2)
+    stage(args.out, args.runtime, include_top2=args.include_top2,
+          include_router=args.include_router)

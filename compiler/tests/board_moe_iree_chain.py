@@ -17,7 +17,9 @@ import board_launcher as BL  # noqa: E402
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--top2", action="store_true", help="run compiled Top-2 before route and FFN")
+    parser.add_argument("--router", action="store_true", help="run VMVX router before Top-2, route, and FFN")
     args = parser.parse_args()
+    top2 = args.top2 or args.router
     runner = HERE / "iree-run-module"
     if not runner.is_file():
         raise FileNotFoundError(runner)
@@ -30,18 +32,22 @@ def main():
             case = HERE / name
             command = [str(runner), "--device=sa", f"--module={HERE / 'moe_chain.vmfb'}",
                        "--function=main"]
-            if args.top2:
-                command += [f"--input=@{case / 'scores.npy'}",
+            if top2:
+                command += [f"--input=@{case / ('scores_init.npy' if args.router else 'scores.npy')}",
                             f"--input=@{case / 'values_init.npy'}",
                             f"--input=@{case / 'ids_init.npy'}"]
             else:
                 command += [f"--input=@{case / 'values.npy'}",
                             f"--input=@{case / 'ids.npy'}"]
-            command += [f"--input=@{case / 'x.npy'}",
-                       f"--input=@{HERE / 'moe_params.npy'}",
+            command.append(f"--input=@{case / 'x.npy'}")
+            if args.router:
+                command += [f"--input=@{HERE / 'router.npy'}"]
+            command += [f"--input=@{HERE / 'moe_params.npy'}",
                        f"--input=@{case / 'route_zero.npy'}",
                        f"--input=@{case / 'out_zero.npy'}"]
-            if args.top2:
+            if args.router:
+                command += [f"--output=@{case / 'scores_device.npy'}"]
+            if top2:
                 command += [f"--output=@{case / 'values_device.npy'}",
                             f"--output=@{case / 'ids_device.npy'}"]
             command += [f"--output=@{case / 'route.npy'}",
@@ -65,18 +71,29 @@ def main():
                      and np.array_equal(record[3:5], offsets)
                      and np.isfinite(got).all() and error <= 3e-3)
             selected_ids = None
-            if args.top2:
+            score_error = None
+            if args.router:
+                device_scores = np.load(case / "scores_device.npy").reshape(-1)
+                reference_scores = np.load(case / "scores.npy").reshape(-1)
+                score_error = float(np.max(np.abs(device_scores - reference_scores)))
+                valid = valid and bool(np.allclose(device_scores, reference_scores,
+                                                   rtol=1e-5, atol=1e-5))
+            if top2:
                 selected_values = np.load(case / "values_device.npy").reshape(-1)
                 selected_ids = np.load(case / "ids_device.npy").view("<i4")[16:18]
                 valid = (valid and np.array_equal(selected_ids, ids)
-                         and np.array_equal(selected_values,
-                                            np.load(case / "values.npy").reshape(-1)))
+                         and np.allclose(selected_values,
+                                         np.load(case / "values.npy").reshape(-1),
+                                         rtol=1e-5 if args.router else 0,
+                                         atol=1e-5 if args.router else 0))
             print(f"{name}: {'PASS' if valid else 'FAIL'} experts {ids.tolist()}, "
+                  f"router error {score_error if score_error is not None else 'input'}, "
                   f"Top-2 {selected_ids.tolist() if selected_ids is not None else 'input'}, "
                   f"route {record[:5].tolist()}, max |output| {magnitude:.6g}, "
                   f"max error {error:.6g}")
             cases.append({"name": name, "pass": bool(valid), "ids": ids.tolist(),
                           "top2_ids": selected_ids.tolist() if selected_ids is not None else None,
+                          "router_error": score_error,
                           "route_status": int(record[0]), "route_ids": record[1:3].tolist(),
                           "max_output": magnitude, "max_error": error})
     finally:

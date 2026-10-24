@@ -1465,7 +1465,7 @@ error `9.581447e-6`; `reverse` selected `[2, 1]` with `6.139278e-6`;
 execution through this VMFB also requires a larger or externally mapped
 parameter buffer in the SA runtime.
 
-#### M5o native Top-2, route, and FFN in one VMFB (host compiled, KV260 pending)
+#### M5o native Top-2, route, and FFN in one VMFB (KV260 passed)
 
 The model-derived bundle now extracts the successful three-binding Top-2 SA
 binary from the full model compilation and records it as `moe_top2.sadesc`.
@@ -1483,14 +1483,40 @@ current 32 MiB IREE board window.
 `moe_m5n_board_bundle.py --out build/moe/m5o/board --include-top2` stages a
 4-expert synthetic board test. Its three cases check compiler-selected Top-2
 values/IDs, route record IDs/offsets, and W8A8 output. Copy the directory to
-`~/moe-m5o` on KV260 and run `./run_board.sh`. Board acceptance is pending.
+`~/moe-m5o` on KV260 and run `./run_board.sh`.
 
 The first KV260 run completed all nine firmware entries but failed all three
 outputs. Inspection of the model-compiled Top-2 RISC-V export showed that its
 ID output uses binding 2 at byte offset 64. The initial wrapper passed only
 an 8-byte ID buffer and the next route dispatch read its base. The corrected
 wrapper allocates 72 bytes for IDs, binds that full buffer to Top-2, and binds
-bytes 64–71 to route. Board verification of this correction is pending.
+bytes 64–71 to route. The corrected VMFB passed all three KV260 cases:
+
+| Case | Top-2/route IDs | Route offsets | Maximum output error |
+|---|---|---|---:|
+| `ramp` | `[3, 0]` | `[20352, 0]` | `9.581447e-6` |
+| `reverse` | `[2, 1]` | `[13568, 6784]` | `6.139278e-6` |
+| `random` | `[0, 2]` | `[0, 13568]` | `1.233816e-5` |
+
+`board_report.json` reported `pass: true`, route status 2 in every case,
+nine firmware entries, and heartbeat 24,809. These results accept the
+single-VMFB Top-2→route→FFN execution for the four-expert synthetic layer.
+
+#### M5p router fallback, Top-2, route, and FFN in one VMFB (host compiled, KV260 pending)
+
+The model-derived bundle now extracts the router matmul's VMVX fallback
+executable as `moe_router.vmvx`. With `--include-top2 --include-router`, the
+single HAL program dispatches this FP32 router on the ARM, followed by the
+SA RISC-V Top-2 and route kernels and the shared W8A8 FFN descriptor. The
+caller supplies the input activation and FP32 router weights, but no scores,
+selected values, IDs, or route record. The same command buffer owns the four
+dispatches and their three barriers. The synthetic and real-layer wrappers
+compile; the synthetic VM IR check confirms four dispatches and one queue
+submission. The synthetic board bundle in `build/moe/m5p/board` compares
+router scores, selected IDs/values, route offsets, and the W8A8 output for
+three inputs. Board acceptance is pending. The real layer still exceeds the
+32 MiB IREE board window, and the wrapper is not yet formed automatically
+from the recognized MoE graph.
 
 ### M6：Prefill/grouped execution
 
