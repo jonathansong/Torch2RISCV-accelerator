@@ -1244,7 +1244,7 @@ overlay as M5e. This board acceptance is pending. The fixture currently
 contains an explicit `sahl.route_top2` export; the production model frontend
 does not yet form it automatically or connect its output to a compiled FFN.
 
-#### M5h Torch frontend and real architecture recognition (board pending)
+#### M5h Torch frontend and real architecture recognition (synthetic board accepted)
 
 `compiler/frontend/moe_native.py` exports a tensor-level batch-1 Mixtral
 expert block with shared expert-axis parameters. It expresses router
@@ -1286,8 +1286,14 @@ three inputs including a zero-score tie case. The same generator with
 --reference build/moe/m4c/tiny-mixtral/layer0/moe_token_acceptance.npz
 --out build/moe/m5h/real-board` stages a real layer-0 token case (347 MiB)
 against the existing M4/HF output. Copy it separately to KV260 and run its
-`run_board.sh` after the synthetic bundle succeeds. Both board acceptances
-are pending. `test_moe_native_sim.py` can run the synthetic VMFB when a host
+`run_board.sh` after the synthetic bundle succeeds. The synthetic bundle ran
+on KV260 with the D=16, 100 MHz overlay: ramp selected IDs `[3, 0]` with
+maximum output error `3.3527613e-8`, zero selected `[0, 1]` with zero error,
+and random selected `[2, 1]` with maximum output error `1.1920929e-7`.
+All three cases passed; rt_fw completed six entries with heartbeat 52944.
+This accepts a Torch-exported full synthetic MoE layer using SA Top-2 and
+VMVX host fallback for the remaining operators. The real layer board case is
+still pending. `test_moe_native_sim.py` can run the synthetic VMFB when a host
 SA runtime is installed; it skips because `build-sa-host` is absent locally.
 The earlier M5g compiler-generated route-record export also awaits board
 acceptance. Integrating that operation automatically after the Torch Top-2,
