@@ -683,14 +683,13 @@ token/s upper bound
 
 ### M4：真实 Hugging Face MoE
 
-Progress: Mixtral/Qwen2-MoE tensor adapters, tiny Mixtral capacity preflight,
-real-token routed FFN acceptance, and hybrid propagated FFN vectors for both
-tiny Mixtral layers pass on the simulator and KV260. M4e passes a one-process
-two-layer board run with host attention and device MoE FFNs. M4f now runs the
-complete two-layer dense/attention/router/expert computation in the SA
-simulator and matches all three teacher-forced Hugging Face top tokens. Its
-KV260 bundle is staged, but a full-device board run and measured CMA use are
-still pending. Native IREE MoE compilation belongs to M5.
+Status: complete for the two-layer `TitanML/tiny-mixtral` batch-1 decode
+acceptance. Mixtral/Qwen2-MoE tensor adapters, capacity preflight, real-token
+routed FFN acceptance, and hybrid propagation passed earlier. M4f runs the
+complete two-layer dense/attention/router/expert computation on the SA
+simulator and KV260. All three teacher-forced top tokens and all six expert
+pairs match the Hugging Face reference; board logits agree with the SA
+simulator. Native IREE MoE compilation belongs to M5.
 
 #### M4f complete SA decoder (2026-10-24)
 
@@ -699,7 +698,7 @@ to W8A8, including an 8-expert router padded to one D=16 output tile. It
 permutes Hugging Face split-half RoPE query/key rows into adjacent pairs so
 the existing SA RoPE primitive works without changing attention dot products.
 `llm/compile_model.py` now handles grouped-query attention (GQA), and the
-3-token D=8 regression is bit-exact against `DeviceModel` for both ordinary
+16-token D=8 regression is bit-exact against `DeviceModel` for both ordinary
 attention and GQA, including the int8 KV cache. The real tiny Mixtral shape
 (dim 1024, 32 query heads, 8 KV heads, head size 32) fits the D=16 local
 memory plan with 2040 of 2048 ACC bank words used.
@@ -730,22 +729,40 @@ The position-2 logit gap is material despite token agreement, consistent
 with the earlier expert-only W8A8 hybrid result. No language quality claim
 follows from this random checkpoint and short sequence. The packed dense file
 is 71,240,512 bytes; one reusable packed expert layer is 88,358,976 bytes;
-the simulator DDR image is 159,858,688 bytes. These are host measurements,
-not a measured KV260 allocation. The board runner records its allocated
-buffer bytes and `/proc/meminfo` CMA before/after values. All six simulator
-expert pairs agree with the saved Hugging Face routing trace; the board
-runner checks the device route record against this simulator trace.
+the simulator DDR image is 159,858,688 bytes. All six simulator expert pairs
+agree with the saved Hugging Face routing trace.
+
+The KV260 run reported `full-device Mixtral board PASS`. Its copied
+`build/moe/m4f/board/board_full_device_report.json` contains the complete
+per-layer cycles, routes, logit comparisons, and memory report:
+
+| Position | Board / SA sim / HF top token | Board vs sim logit relative L2 | Max absolute error | Layer 0 / 1 experts |
+|---:|---:|---:|---:|---|
+| 0 | 25591 | 5.82037e-7 | 1.90735e-6 | `[7,1]` / `[6,2]` |
+| 1 | 13899 | 3.69794e-7 | 1.19209e-6 | `[7,1]` / `[2,5]` |
+| 2 | 26962 | 3.42988e-7 | 9.53674e-7 | `[7,0]` / `[2,6]` |
+
+The six layer calls took 227,772–228,373 dense cycles, 51,276–53,264
+RISC-V route cycles, and 408,527–408,643 routed expert FFN cycles each.
+Actual allocated board buffers totaled 159,815,570 bytes: 71,240,512 dense
+parameter bytes, one 88,358,976-byte reusable expert slot, 196,608 IO bytes,
+16,384 KV bytes, and smaller route/kernel buffers. `/proc/meminfo` reported
+`CmaTotal` 1,572,864 KiB and `CmaFree` 2,776 KiB before the runner's buffer
+allocations versus 744 KiB after. That counter change is not the sum of the
+allocated buffers, so it should not be interpreted as the model footprint;
+the successful allocations and their recorded sizes are the direct evidence
+that this configuration fits the board's available memory path.
 
 Host reproduction:
 
 ```bash
-build/iree/venv/bin/python llm/test_l4.py --d 8 --tiny-tokens 3
+build/iree/venv/bin/python llm/test_l4.py --d 8 --tiny-tokens 16
 build/iree/venv/bin/python compiler/frontend/moe_device_dense.py
 build/iree/venv/bin/python compiler/tests/moe_full_device_sim.py
 build/iree/venv/bin/python compiler/tests/moe_stage_full_device_board.py
 ```
 
-Transfer the self-contained bundle and run the pending board acceptance:
+To repeat the passed board acceptance, transfer the self-contained bundle:
 
 ```bash
 scp -r build/moe/m4f/board ubuntu@192.168.0.121:~/moe-m4f
@@ -755,10 +772,10 @@ chmod +x run_board.sh
 ./run_board.sh
 ```
 
-The board runner requires all three board/simulator/HF top tokens to agree
-at every position and board/simulator logit relative L2 and maximum absolute
-error below 0.01. It writes `board_full_device_report.json`. The board run
-must pass before M4 is marked complete.
+The board runner requires all three board/simulator/HF top tokens and all six
+board/simulator expert pairs to agree. Board/simulator logit relative L2 and
+maximum absolute error must remain below 0.01. It writes
+`board_full_device_report.json`.
 
 #### M4c capacity preflight (2026-10-24)
 
