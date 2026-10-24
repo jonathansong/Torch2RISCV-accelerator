@@ -1362,6 +1362,16 @@ test cases pass. The split artifacts still require host orchestration;
 automatic route dispatch and FFN invocation inside one IREE program remain
 the M5 completion work.
 
+The bundle manifest now includes `native_module_dispatches`, collected from
+the compiler's per-dispatch report. For the real layer-0 model, the native
+`moe_layer.vmfb` has 2 SA dispatches (Top-2 and one elementwise operation)
+and 9 host fallback dispatches. The router matmul, softmax, three expert
+batch matmuls, and large expert gathers are among the fallback operations.
+This distinguishes the existing single-file fp32 model from the separate
+device route/FFN exports. The compiler still needs to replace the recognized
+expert region with a packed W8A8 FFN dispatch and create a shared route-record
+buffer consumed by that dispatch.
+
 #### M5l model-specialized route acceptance bundle (host verified, KV260 pending)
 
 `moe_m5k_route_board_bundle.py` stages `build/moe/m5k/board-route` using the

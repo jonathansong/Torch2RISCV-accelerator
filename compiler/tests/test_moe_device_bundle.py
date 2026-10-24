@@ -47,6 +47,11 @@ class MoeDeviceBundleTest(unittest.TestCase):
             manifest = json.loads((out / "moe_manifest.json").read_text())
             self.assertEqual(manifest["expert_stride"], result["recognized"]["expert_stride"])
             self.assertEqual(recognized_fields(out / "preprocessing.mlir"), result["recognized"])
+            coverage = result["native_module_dispatches"]
+            self.assertTrue(any("topk" in name for name in coverage["sa"]))
+            self.assertTrue(any("batch_matmul" in name for name in coverage["host"]))
+            self.assertEqual(coverage, json.loads((out / "compiler_bundle.json").read_text())
+                             ["native_module_dispatches"])
             self.assertEqual(len(result["artifacts"]), 6)
             for name, info in result["artifacts"].items():
                 self.assertEqual((out / name).stat().st_size, info["bytes"])

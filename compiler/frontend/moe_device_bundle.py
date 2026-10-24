@@ -35,7 +35,8 @@ def artifact_info(path):
     return {"bytes": path.stat().st_size, "sha256": digest.hexdigest()}
 
 
-def compile_iree(source, irpa, out, *, preprocessing=False, d=16):
+def compile_iree(source, irpa, out, *, preprocessing=False, d=16,
+                 codegen_report=False):
     command = [str(COMPILE), str(source), "--iree-hal-target-device=sa",
                f"--iree-parameter-import=model={irpa}", "--iree-sa-form-moe",
                "--iree-sa-riscv", "--iree-sa-host-fallback",
@@ -43,7 +44,26 @@ def compile_iree(source, irpa, out, *, preprocessing=False, d=16):
                "--iree-opt-const-expr-max-size-increase-threshold=0"]
     if preprocessing:
         command.append("--compile-to=preprocessing")
-    subprocess.run(command + ["-o", str(out)], check=True, capture_output=True, text=True)
+    if codegen_report:
+        command.append("--iree-sa-codegen-report")
+    return subprocess.run(command + ["-o", str(out)], check=True,
+                          capture_output=True, text=True).stderr
+
+
+def dispatch_coverage(report):
+    """Summarize final SA codegen decisions without counting failure diagnostics twice."""
+    decisions = {}
+    for line in report.splitlines():
+        match = re.fullmatch(r"sa codegen: (.*): (ok|on the host(?: \(.*\))?)", line)
+        if match:
+            name, decision = match.groups()
+            if name in decisions:
+                raise ValueError(f"duplicate SA codegen decision for {name}")
+            decisions[name] = "sa" if decision == "ok" else "host"
+    if not decisions:
+        raise ValueError("IREE emitted no SA codegen decisions")
+    return {"sa": sorted(name for name, target in decisions.items() if target == "sa"),
+            "host": sorted(name for name, target in decisions.items() if target == "host")}
 
 
 def recognized_fields(path):
@@ -91,7 +111,8 @@ def build(model, layer, out, d=16):
         raise ValueError(f"compiler/packer MoE ABI mismatch: {recognized} != {expected}")
 
     module = out / "moe_layer.vmfb"
-    compile_iree(mlir, irpa, module, d=d)
+    coverage = dispatch_coverage(compile_iree(mlir, irpa, module, d=d,
+                                              codegen_report=True))
     ffn = out / "moe_ffn.sadesc"
     ffn_bytes = moe_m3b.make_executable(config.dim, config.hidden, d)
     descriptor_d, _, exports = sadesc.read(ffn_bytes)
@@ -119,6 +140,7 @@ def build(model, layer, out, d=16):
     (out / "moe_route.bin").write_bytes(binary[code_offset:code_offset + code_length])
     result = {"format": "sa-moe-compiler-bundle-v1", "source": source,
               "recognized": recognized, "d": d,
+              "native_module_dispatches": coverage,
               "artifacts": {name: artifact_info(out / name)
                             for name in ("moe_layer.vmfb", "moe_layer.irpa", "moe_params.bin",
                                          "moe_ffn.sadesc", "route.vmfb", "moe_route.bin")}}
