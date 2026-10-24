@@ -1141,7 +1141,7 @@ This accepts the native IREE Top-2 router export on KV260. It does not yet
 cover route normalization, dynamic expert parameter selection, expert FFN,
 or an end-to-end Mixtral layer compiled from IREE.
 
-#### M5e native Top-2 to M4 route ABI bridge (host verified, 2026-10-24)
+#### M5e native Top-2 to M4 route ABI bridge (2026-10-24)
 
 `firmware/moe_route_from_top2/moe_route_from_top2.c` consumes the two raw f32
 values and i32 IDs emitted by the native IREE Top-2 export. Given the expert
@@ -1167,7 +1167,24 @@ byte offsets, normalized weights, and a successful firmware completion for
 each case, then writes `board_report.json`. This board test uses the saved
 M5d reference tensors as input, so it validates the bridge kernel independently
 of the native IREE export. The bridge has not yet been emitted by the IREE
-compiler or accepted on KV260. The end-to-end IREE MoE path remains incomplete.
+compiler. The end-to-end IREE MoE path remains incomplete.
+
+The user ran `~/moe-m5e/run_board.sh` on KV260. All three saved M5d Top-2
+fixtures passed through the rv32 bridge and produced valid M4 route records:
+
+| Case | IDs | Route weights | Bridge cycles | Result |
+|---|---|---|---:|---|
+| Ascending | `[15, 14]` | `[0.73105925, 0.26894078]` | 46048 | PASS |
+| Ties | `[0, 1]` | `[0.5, 0.5]` | 29913 | PASS |
+| Random | `[5, 1]` | `[0.99999917, 0.0000008315]` | 46032 | PASS |
+
+This accepts the standalone bridge on the board. Native IREE Top-2 and the
+bridge have passed independently; a single IREE program has not yet connected
+them. The compiler's embedded RISC-V code-table path currently emits a raw
+Top-2 kernel using integer comparisons without external calls, whereas the
+bridge's normalization uses soft-float helpers. Compiler integration must
+either embed those helpers in a position-independent code-table entry or
+implement the normalization without external calls.
 
 Next connect Top-2 values/IDs to the route bridge in the compiler/runtime,
 then extend the pattern through dynamic expert indexing and weighted combine. Lower the
