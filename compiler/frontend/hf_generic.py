@@ -992,9 +992,17 @@ def export(w, out, prefill=0, prefill_all=False, dyn_len=None):
     with open(os.path.join(out, "abi.txt"), "w") as f:      # (sa-llm-run --abi: test_hf_generic --skip-export)
         f.write("hfv\n" if dyn_len else "hf\n")
     flags = os.path.join(out, "compile_flags.txt")         # (compile_sa.sh: the compiler plans the SPAD for
-    if getattr(w.cache, "max_len", 256) != 256:            # dynamic lengths up to max_dynamic, default 256)
+    lines = []                                             # dynamic lengths up to max_dynamic, default 256)
+    if getattr(w.cache, "max_len", 256) != 256:
+        lines.append(f"--iree-sa-max-dynamic={w.cache.max_len}")
+    if any(isinstance(m, QMixtralMoe) for m in w.modules()):
+        # the router's scales and padding (16 floats each) would be inlined into
+        # its dispatch as constant tensors, which the sa backend cannot read;
+        # splats stay inlined (docs/moe_native_lowering_design.md §13)
+        lines.append("--iree-flow-inline-constants-max-byte-length=1")
+    if lines:
         with open(flags, "w") as f:
-            f.write(f"--iree-sa-max-dynamic={w.cache.max_len}\n")
+            f.write("".join(l + "\n" for l in lines))
     elif os.path.exists(flags):
         os.remove(flags)
     print(f"exported in {time.time() - t0:.0f} s: {mlir} ({os.path.getsize(mlir) / 1e6:.1f} MB), "

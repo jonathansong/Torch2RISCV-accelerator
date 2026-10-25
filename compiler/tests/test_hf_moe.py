@@ -12,6 +12,9 @@
     sa attention, QLinear, QMixtralMoe) against HF fp32: the top token, and
     every layer's expert ids where HF's routing is clear (check_model).
 
+  --model DIR --export OUT: also export that W8A8 model (decode + a 16-token
+    prefill) to OUT for compile_sa.sh, the KV scales calibrated on --tokens.
+
     python3 compiler/tests/test_hf_moe.py [--model DIR] [--export DIR]
 """
 import argparse
@@ -167,15 +170,24 @@ def check_model(model_dir, tokens, max_len=64):
           f"HF's gap > {MARGIN}; W8A8 router = fp32 router on the same hidden states")
 
 
+def export_model(model_dir, tokens, out, max_len=64, prefill=16):
+    from transformers import AutoModelForCausalLM
+    m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
+    hg.export(sa_decoder(m, max_len, tokens), out, prefill=prefill)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", help="a Mixtral checkpoint directory")
     ap.add_argument("--tokens", default="1,42,43", help="token ids for --model")
-    ap.add_argument("--export", help="the synthetic export's directory (default: a temporary one)")
+    ap.add_argument("--export", help="the export's directory (synthetic: default a temporary one)")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     if args.model:
-        check_model(args.model, [int(t) for t in args.tokens.split(",")])
+        tokens = [int(t) for t in args.tokens.split(",")]
+        check_model(args.model, tokens)
+        if args.export:
+            export_model(args.model, tokens, args.export)
         return
     check_block()
     if args.export:

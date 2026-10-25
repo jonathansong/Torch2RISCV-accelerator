@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): design; S0 spike (§11) and S1 frontend (§12) done, the rest not implemented.
+> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12) and S2 packing (§13) done, the rest not implemented.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -155,14 +155,17 @@ IREE region formation). `LowerMoeChain` is deleted.
 
 ### 5.1 Expert gathers to slices, then `PackLinearWeights`
 
-**Gather to slice** (a rewrite in `FormMoeRegions`'s file, run before
-packing). The pattern is a gather generic `G[n, k] = T[e[0], n, k]` (or
+**Gather to slice** (implemented in `PackLinearWeights.cpp`,
+`rewriteExpertGather`, run before its packing patterns). The pattern is a gather generic `G[n, k] = T[e[0], n, k]` (or
 `[n]` for a scale table) where:
 
 - `T` is a constant table;
 - `e` is a one-element index tensor;
 - the body is a single `tensor.extract` whose first index is
-  `index_cast(e[0])` and whose other indices are the loop indices in order.
+  `index_cast(e[0])` and whose other indices are the loop indices in order;
+- `e` comes, through slices and reshapes, from a sort's or topk's indices: the
+  decode embedding is the same one-row gather of a constant table at a token
+  id and must keep its form (the packed-gather path, plan §8.12 C6.0).
 
 It becomes `tensor.extract e[0]` → `index_cast` →
 `tensor.extract_slice T[i, 0, 0] [1, N, K]` (rank-reduced). The rewrite may run
@@ -369,7 +372,7 @@ only token and ID agreement are reported, not quality).
 |---|---|---|
 | S0 spike | **Done 2026-10-25 (§11).** Hand-written MLIR of one expert linear, four placements, two sizes | IR results recorded; R1 resolved |
 | S1 frontend | **Done 2026-10-25 (§12).** `QMixtralMoe` in `hf_generic` (padded router, explicit softmax), `test_hf_moe.py` | Host model: top tokens equal to HF; ids equal where HF's routing is clear; no softmax op, Top-2 over `[1, 16]` |
-| S2 packing | Gather-to-slice rewrite, `PackLinearWeights` expert tables | Lit; table packed at compile time (in the parameter archive) |
+| S2 packing | **Done 2026-10-25 (§13).** Gather-to-slice rewrite, `PackLinearWeights` expert tables | Lit; tables packed at compile time into the parameter archive |
 | S3 regions | `FormMoeRegions` rewrite | Lit, including 2 layers per function |
 | S4 backend | `ddrOf` dynamic index, LDPARAM sequence, kernels accept dynamic weights | `dispatch_check` on the synthetic model, all IDs |
 | S5 Top-2 | Semantic record, funcsim Top-2, runtime `rv_only` policy, compiler emits only `rv_only` code | `dispatch_check` of top2; sim e2e with `SA_RV` unset |
@@ -594,3 +597,61 @@ first version ran it after and reported wrong HF ids and tokens.
   `bufferization.to_buffer`) also fall back. A random dense Llama of the same
   size shows the same fallbacks with the same flags, so S2's compiled fixture
   needs larger dimensions (or this is fixed separately).
+
+## 13. S2 results (2026-10-25)
+
+**Implementation** (`compiler/plugins/sa/target/PackLinearWeights.cpp`):
+
+- `rewriteExpertGather`: the one-row gather at a Top-2 id becomes
+  `extract_slice T[id, 0, ..]`, and a collapse dropping its unit dimension
+  becomes the rank-reduced slice.
+- `expertSlice` / `packedWeights`: `rewriteMatmul` / `rewriteVecmat` accept a
+  weight that is such a slice of a constant int8 `[E, N, K]` table. They pack
+  the table along N (`packOf` with a packed dimension, `T$packed : [E, N/D,
+  K, D]`) and read `extract_slice Tp[id, 0, 0, 0] [1, N/D, K, D]`.
+- The existing gather redirection (embedding rows of a packed classifier)
+  only considers 2-D tables.
+
+Lit `sa_pack_expert_weights.mlir`: an expert gate weight and its scales
+gathered at a sort's index become a packed slice and a scale slice, and a
+gather at a non-Top-2 index is unchanged. The suite passes (28 tests). The
+golden corpus is identical (636 dispatches). That corpus is codegen only; for
+preprocessing, the new rewrites fire only on a sort's or topk's indices and on
+3-D expert tables, and the recent dense exports (SmolLM2, Gemma, Qwen3, Llama)
+contain no sort or topk.
+
+**tiny-mixtral, whole model** (`test_hf_moe.py --model ... --export`, decode
++ 16-token prefill, `compile_sa.sh` with D = 16, 4 ports, `--iree-sa-form-moe
+--iree-sa-riscv`):
+
+- `sa_packed.irpa` (214 MB) holds `layers.{0,1}.mlp.{gq,uq,dq}$packed`,
+  29,360,128 bytes each, plus the padded router `rq$packed` (16 KiB).
+- In the flow IR there is no `flow.tensor.load`. The 64 `flow.tensor.slice`
+  are prefill RoPE rows, present in a dense model of the same form too.
+- 192 dispatches on the SA, 7 on the host:
+
+| Host dispatch | Cause | Stage |
+|---|---|---|
+| gate/up of both experts (`matvec_like_224x16x1024`), down of each expert (`matvec_like_64x16x3584`, 3 executables) | `memref.load` of the id | S4 |
+| a prefill scale slice materialized as its own copy (`slow_memcpy`) | `memref.load` of the id | S4 (better: keep the slice in its consumer) |
+| `id_k = extsi(ids[k])` to i64, one dispatch per k | i64 scalar computation / 8-byte alignment | S3: `index_cast(extsi(x)) = index_cast(x)`, consumers take the i32 ids |
+
+**Constant inlining.** At first the decode router (`matvec_like_16x1024`)
+also fell back, with `bufferization.to_buffer`. Its scales and padding (16
+floats each, 64 bytes) are below IREE's
+`--iree-flow-inline-constants-max-byte-length` (256) and were inlined into
+the dispatch as constant tensors, which the SA backend cannot read. This is
+also why the H = 64 synthetic models' projections fall back (§12.3): their
+scales are under 256 bytes too. A threshold of 1 keeps splats inlined (they
+are always inlined) and keeps every other tensor constant a binding.
+`hf_generic.export` writes it into `compile_flags.txt` for models with
+`QMixtralMoe` only, so dense models compile as before. With it, the router
+runs on the SA.
+
+**Dispatch structure (input to S3/S4).** IREE (with aggressive fusion and
+`FormFfnRegions`) puts the gate and up projections of both experts in one
+dispatch: 4 contractions over the same x, two gatings and two amaxes. The
+down projections are one dispatch per expert. §5.3 assumed one FFN dispatch
+per expert, and `FfnPlan` matches two contractions. S3 either forms one FFN
+region per expert (the v1 table) or S4 expands two FFN kernels in one
+dispatch. The latter is close to v2's merged kernel (§9).
