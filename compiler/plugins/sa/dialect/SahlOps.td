@@ -87,21 +87,6 @@ def Sahl_Top2Op : Sahl_Op<"top2"> {
   let assemblyFormat = "$scores `,` $values `,` $indices attr-dict `:` type($scores) `,` type($values) `,` type($indices)";
 }
 
-def Sahl_RouteTop2Op : Sahl_Op<"route_top2"> {
-  let summary = "Normalize native Top-2 values and pack the MoE route ABI";
-  let description = [{
-    Reads [1, 2] f32 selected values and [1, 2] i32 expert IDs in DDR and
-    writes one 32-byte sa_moe_route v1 record. `experts` validates the IDs;
-    `stride` is the packed parameter byte stride. Finite scores with absolute
-    value below 512 are supported by the integer-only RISC-V lowering.
-  }];
-  let arguments = (ins Arg<AnyMemRef, "selected values", [MemRead]>:$values,
-                       Arg<AnyMemRef, "selected IDs", [MemRead]>:$indices,
-                       Arg<AnyMemRef, "route record", [MemWrite]>:$route,
-                       I64Attr:$experts, I64Attr:$stride);
-  let assemblyFormat = "$values `,` $indices `,` $route attr-dict `:` type($values) `,` type($indices) `,` type($route)";
-}
-
 def Sahl_ScopeOp : Sahl_Op<"scope", [SingleBlock, NoTerminator]> {
   let summary = "A piece of a dispatch: the local memory allocated inside is released at its end";
   let description = [{

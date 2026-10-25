@@ -26,13 +26,9 @@ void registerCloneCheapProducersPass();
 std::unique_ptr<Pass> createFormFfnRegionsPass(bool enabled);
 void registerFormFfnRegionsPass();
 
-// M5: batch-1 top-2 router projection and selection in one dispatch region.
+// MoE: a router's Top-2 in a dispatch region of its own (docs/moe_native_lowering_design.md §5.2).
 std::unique_ptr<Pass> createFormMoeRegionsPass(bool enabled);
 void registerFormMoeRegionsPass();
-
-// Replace a recognized MoE graph with its compiled SA HAL chain.
-std::unique_ptr<Pass> createLowerMoeChainPass(const std::string &bundle, bool modelABI = false);
-void registerLowerMoeChainPass();
 
 // Dispatch creation, after the regions are formed: decode's attention (q path,
 // scores, probabilities, p . V, int8 output) merged into one flow.dispatch.region

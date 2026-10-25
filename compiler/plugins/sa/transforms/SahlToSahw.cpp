@@ -483,26 +483,6 @@ bool Lowerer::lowerBlock(Block &block) {
       templ->setAttr("sa.riscv_only", bb.getUnitAttr());
       continue;
     }
-    if (auto route = dyn_cast<sahl::RouteTop2Op>(op)) {
-      int64_t experts = int64_t(route.getExperts()), stride = int64_t(route.getStride());
-      if (experts < 4 || experts > 16 || stride <= 0 || stride > UINT32_MAX / (experts - 1))
-        return fail("Top-2 route requires 4..16 experts and 32-bit parameter offsets");
-      SmallVector<int64_t> addresses;
-      for (Value v : {route.getValues(), route.getIndices(), route.getRoute()}) {
-        auto r = ddrOf(v);
-        if (!r || r->dyn || r->dynRows || r->dynMid || r->pitch)
-          return fail("Top-2 route requires contiguous DDR buffers");
-        auto base = r->base.getDefiningOp<sahw::BaseOp>();
-        if (!base) return fail("Top-2 route requires a binding base");
-        addresses.append({int64_t(base.getBinding()), int64_t(base.getConstant()), int64_t(base.getMul()),
-                          int64_t(base.getShift()), int64_t(base.getAdd()), r->off});
-      }
-      templ->setAttr("sa.moe.route_top2", bb.getDenseI64ArrayAttr(
-          {experts, stride}));
-      templ->setAttr("sa.moe.addresses", bb.getDenseI64ArrayAttr(addresses));
-      templ->setAttr("sa.riscv_only", bb.getUnitAttr());
-      continue;
-    }
     return fail("unsupported operation " + op->getName().getStringRef().str());
   }
   return err.empty();
@@ -1475,10 +1455,9 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
         return signalPassFailure();
       }
       if (t->hasAttr("sa.riscv_only") &&
-          (llvm::range_size(f.getBody().front().getOps<sahl::Top2Op>()) +
-               llvm::range_size(f.getBody().front().getOps<sahl::RouteTop2Op>()) != 1 ||
+          (llvm::range_size(f.getBody().front().getOps<sahl::Top2Op>()) != 1 ||
            !body.getRegion().front().empty())) {
-        f.emitError("sahl-to-sahw: MoE RISC-V dispatch must contain one router or route operation");
+        f.emitError("sahl-to-sahw: an MoE RISC-V-only dispatch must be one Top-2 and nothing else");
         t.erase();
         return signalPassFailure();
       }

@@ -3,6 +3,9 @@
 > Status (2026-10-24): M0–M4 full-device Mixtral inference and M5 native
 > one-input MoE compilation accepted on KV260. M5t passed four real layer-0
 > cases; maximum absolute output error was `0.000625316`. M6 remains open.
+> 2026-10-25: M5's compiler-owned HAL chain (`LowerMoeChain`, `--iree-sa-moe-bundle`, the
+> route kernels, the M5 board scripts) is superseded by and removed with the native lowering,
+> `docs/moe_native_lowering_design.md` (§19); the M5 sections below are the history.
 > 目标平台：AMD KV260 + PicoRV32 + SA accelerator
 > 编译路径：PyTorch/Hugging Face → IREE Flow → SAHL → SAHW → descriptor list 或 RISC-V 代码
 > 第一目标：不修改 GEMV RTL，实现 batch-1、W8A8、top-1/top-2 稀疏 MoE decode，并在模拟器和 KV260 上端到端验证。

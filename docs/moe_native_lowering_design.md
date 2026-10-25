@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): S0–S7 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. S8 (removing M5's chain) and v2 (§9) open.
+> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). Open: v2 (§9), a trained checkpoint.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -389,7 +389,7 @@ only token and ID agreement are reported, not quality).
 | S5 Top-2 | **Done 2026-10-25 (§16).** Top-2 through the RISC-V runtime's load / store, host build on the sim, runtime `rv_only` policy, compiler embeds only `rv_only` code | `dispatch_check` 198/198 incl. the Top-2; sim decode runs |
 | S6 e2e sim | **Done 2026-10-25 (§17).** tiny-mixtral through `compile_sa.sh`, `test_moe_sim.py` | Prefill ≡ decode and plan A ≡ descriptors byte-equal; host model argmax 28/28; golden + 198 MoE dispatches |
 | S7 board | **Accepted 2026-10-25 (§18).** `deploy_moe.sh` → `build/deploy_moe_tm`, `run_board_tests.sh moe` | Board ≡ sim 5/5 (prefill) and 28/28 (decode) steps; decode 16.0 ms per step |
-| S8 cleanup | Delete §6.3 and the M5 milestone scripts; update `moe_implementation_plan.md` and CLAUDE.md | Lit + golden |
+| S8 cleanup | **Done 2026-10-25 (§19).** §6.3 and M5's milestone scripts deleted | Lit 28/28, golden identical, the accepted bundle recompiles identically |
 
 Estimate: S0 1 day, S1–S3 3–4 days, S4 3–4 days, S5 2 days, S6–S8 2–3 days.
 
@@ -950,3 +950,58 @@ resident in the u-dma-buf window (260 MB).
 The checkpoint is random-initialized: these are functional and speed
 results, not quality ones. Quality needs a trained MoE checkpoint that fits
 the board (§10 R5).
+
+## 19. S8: M5's chain removed (2026-10-25)
+
+**Deleted (46 files):**
+
+- **Compiler**:
+  - `LowerMoeChain.cpp`, `MoeChainTemplate.inc`, `MoeModelTemplate.inc`;
+  - the options `--iree-sa-moe-bundle` and `--iree-sa-moe-model-abi`;
+  - `sahl.route_top2` and its lowerings (`SahlToSahw`; `buildRouteTop2`,
+    the Q15 softmax `routeScoreQ16` / `routeQ15ToF32` in `SahwToRiscv`);
+  - `FormMoeRegions`' full-graph match (`mixtralExpertShape`,
+    `packedExpertStride`, the `sa.moe.arch` / `dim` / `hidden` /
+    `expert_stride` function attributes).
+
+  The Top-2 region's `sa.moe.kind` is now `"top2"`.
+- **Frontend**: `moe_device_bundle.py`, `moe_iree_chain.py`, `moe_native.py`
+  (the fp32 M5h module; `hf_generic.QMixtralMoe` replaces it).
+- **Tests and scripts**:
+  - M5's board probes (`board_moe_{compiled_ffn, compiler_top2, iree_chain,
+    iree_ffn, m5t_diagnose, model_route, native_layer, native_model,
+    route_from_top2}.py`);
+  - the bundle builders `moe_m5{d,e,f,g,h,k_route,m,n,q,t}_board_bundle.py`
+    and `moe_m5t_diagnose.py`;
+  - the route and raw Top-2 kernels and their tests;
+  - `test_moe_{compiled_ffn_real, compiler_route, device_bundle,
+    model_route_host, native, native_compile, native_real, native_sim,
+    route_from_top2, route_from_top2_int, top2_raw}.py`;
+  - the MLIR fixtures `moe_parameter_probe`, `moe_route_top2_export`;
+  - the lit test `sahl_moe_route_top2.mlir`.
+- **Firmware**: `moe_top2_raw`, `moe_route_from_top2`,
+  `moe_route_from_top2_int` (M5's hand-written route kernels; the Top-2 is
+  now the compiler's code).
+
+**Kept:**
+
+- `sahl.top2` and its lowering, `buildRawTop2` (the compiler's Top-2), and
+  the `rv_only` flag and runtime policy;
+- `test_moe_compiler_riscv.py` (router → Top-2, now with its own
+  `topk_reference`);
+- the M0–M4 hand-written path (`frontend/moe.py`, `moe_hf.py`,
+  `runtime/tools/moe_m*.py`, `moe_model.py`, `firmware/moe_top1`,
+  `moe_top2`, their tests and board scripts): the reference implementation
+  M0–M4 were accepted with.
+
+`test_moe_m3b.py` is back to its pre-M5 state, which drops M5's route-bridge
+case.
+
+**Verification:**
+
+- Lit 28 / 28; golden 834 dispatches identical (with `moe_mixtral`);
+  `test_moe_compiler_riscv`, `test_moe_m3b` pass.
+- tiny-mixtral recompiled with the reduced compiler: the dispatch sources
+  and `sa_packed.irpa` are identical. The vmfb, compiled at an equal-length
+  path, differs from the board-accepted one only in the source paths it
+  records and the zip CRCs over them.

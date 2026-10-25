@@ -1,11 +1,11 @@
-// M5a: recognize a batch-1 router projection followed by descending top-2.
+// FormMoeRegions (docs/moe_native_lowering_design.md §5.2): a router projection followed by a descending Top-2 in a region of its own.
 // RUN: iree-opt --split-input-file --iree-sa-form-moe-regions="force=true" %s | FileCheck %s
 
 // CHECK-LABEL: func.func @route_top2
 // CHECK:       linalg.matmul
 // CHECK:       flow.dispatch.region
 // CHECK-SAME:    sa.moe.experts = 8 : i64
-// CHECK-SAME:    sa.moe.kind = "route_top2"
+// CHECK-SAME:    sa.moe.kind = "top2"
 // CHECK-SAME:    sa.moe.top_k = 2 : i64
 // CHECK:         iree_linalg_ext.topk
 // CHECK-SAME:    sa.moe.experts = 8 : i64
@@ -48,7 +48,7 @@ func.func @route_top2(%x: tensor<1x4xf32>, %w: tensor<4x8xf32>) -> (tensor<1x2xf
 // CHECK:       linalg.generic
 // CHECK:       flow.dispatch.region
 // CHECK-SAME:    sa.moe.experts = 8 : i64
-// CHECK-SAME:    sa.moe.kind = "route_top2"
+// CHECK-SAME:    sa.moe.kind = "top2"
 // CHECK:         iree_linalg_ext.topk
 // CHECK-SAME:    sa.moe.experts = 8 : i64
 func.func @quantized_router(%x: tensor<32xi8>, %w: tensor<1x32x8xi8>) -> (tensor<1x2xf32>, tensor<1x2xi32>) {

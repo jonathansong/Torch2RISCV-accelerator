@@ -13,7 +13,23 @@ import unittest
 
 import numpy as np
 
-from test_moe_top2_raw import topk_reference
+
+
+def topk_reference(scores):
+    """IREE TopkOp's descending scalar insertion (ordered >, an equal value before a larger id)."""
+    values = np.array([-np.inf, -np.inf], dtype=np.float32)
+    indices = np.array([0x7FFFFFFF, 0x7FFFFFFF], dtype=np.int32)
+    for i, score in enumerate(scores):
+        carry, carry_id = score, i
+        for k in range(2):
+            old, old_id = values[k], int(indices[k])
+            forward, reverse = bool(carry > old), bool(old > carry)
+            take_id = forward or (forward == reverse and carry_id < old_id)
+            values[k] = carry if forward else old
+            indices[k] = carry_id if take_id else old_id
+            carry = old if forward else carry
+            carry_id = old_id if take_id else carry_id
+    return values, indices
 
 
 REPO = Path(__file__).resolve().parents[2]

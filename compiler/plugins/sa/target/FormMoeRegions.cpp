@@ -1,9 +1,11 @@
-// M5: recognize a batch-1 top-2 router projection before dispatch creation.
-//
-// This pass deliberately forms only the router/top-k region. Expert lookup,
-// normalization, and FFN lowering are later M5 steps; preserving the original
-// topk operation keeps this first step semantics-neutral. A region is formed
-// only for a statically shaped 4..16-expert router and descending f32 topk.
+// sa preprocessing: an MoE router's Top-2 in a dispatch region of its own
+// (docs/moe_native_lowering_design.md §5.2). A Torch sort's two-element prefix
+// becomes an iree_linalg_ext.topk (i32 ids; the ids read as indices, the
+// expert slices' offsets, read the i32 ids: readIdsAsI32), and a descending
+// f32 Top-2 of a statically shaped 4..16-expert router projection is wrapped
+// in a region; sa-to-sahl makes it sahl.top2, which runs as RISC-V code only.
+// The experts' FFNs need no regions here: their slices of the packed tables
+// (PackLinearWeights) stay in the consuming dispatches.
 #include "SAPasses.h"
 
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
@@ -241,150 +243,6 @@ std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
   return experts;
 }
 
-bool derivesFromTop2Ids(Value value, IREE::LinalgExt::TopkOp topk, unsigned depth = 0) {
-  if (value == topk.getResult(1)) return true;
-  if (depth > 4) return false;
-  Operation *producer = value.getDefiningOp();
-  if (!producer || producer->getNumOperands() != 1 ||
-      !isa<arith::ExtSIOp, tensor::CollapseShapeOp, tensor::ExpandShapeOp,
-           tensor::CastOp>(producer))
-    return false;
-  return derivesFromTop2Ids(producer->getOperand(0), topk, depth + 1);
-}
-
-bool derivesFrom(Value value, Value ancestor, unsigned depth = 0) {
-  if (value == ancestor) return true;
-  if (depth > 16) return false;
-  Operation *producer = value.getDefiningOp();
-  if (!producer) return false;
-  for (Value operand : producer->getOperands())
-    if (derivesFrom(operand, ancestor, depth + 1)) return true;
-  return false;
-}
-
-// This is an annotation only. It intentionally requires the three expert
-// tables to share the same dynamic Top-2 IDs and verifies both FFN dimensions;
-// unsupported computation continues on IREE's ordinary fallback path.
-std::optional<std::pair<int64_t, int64_t>> mixtralExpertShape(
-    Operation *scope, IREE::LinalgExt::TopkOp topk, int64_t experts) {
-  auto projection = topk.getValues().getDefiningOp<linalg::MatmulOp>();
-  if (!projection) return std::nullopt;
-  auto input = dyn_cast<RankedTensorType>(projection.getDpsInputs()[0].getType());
-  if (!input || input.getRank() != 2 || input.getDimSize(0) != 1 ||
-      !input.getElementType().isF32()) return std::nullopt;
-  int64_t dim = input.getDimSize(1);
-  if (dim <= 0) return std::nullopt;
-  SmallVector<RankedTensorType> gathered;
-  scope->walk([&](linalg::GenericOp generic) {
-    if (generic.getNumDpsInputs() != 1 || generic->getNumResults() != 1 ||
-        !derivesFromTop2Ids(generic.getDpsInputs()[0], topk))
-      return;
-    auto result = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
-    if (!result || result.getRank() != 3 || result.getDimSize(0) != 2 ||
-        !result.getElementType().isF32())
-      return;
-    tensor::ExtractOp extract;
-    generic.walk([&](tensor::ExtractOp op) { extract = op; });
-    if (!extract || extract.getIndices().size() != 3) return;
-    auto expertIndex = extract.getIndices()[0].getDefiningOp<arith::IndexCastOp>();
-    auto row = extract.getIndices()[1].getDefiningOp<linalg::IndexOp>();
-    auto column = extract.getIndices()[2].getDefiningOp<linalg::IndexOp>();
-    if (!expertIndex || expertIndex.getIn() != generic.getRegion().front().getArgument(0) ||
-        !row || row.getDim() != 1 || !column || column.getDim() != 2)
-      return;
-    auto table = dyn_cast<RankedTensorType>(extract.getTensor().getType());
-    if (!table || table.getRank() != 3 || table.getDimSize(0) != experts ||
-        table.getDimSize(1) != result.getDimSize(1) ||
-        table.getDimSize(2) != result.getDimSize(2))
-      return;
-    gathered.push_back(result);
-  });
-  if (gathered.size() != 3) return std::nullopt;
-  int64_t hidden = 0;
-  unsigned inputTables = 0, outputTables = 0;
-  for (auto type : gathered) {
-    if (type.getDimSize(2) == dim) {
-      if (!hidden) hidden = type.getDimSize(1);
-      if (hidden == type.getDimSize(1)) ++inputTables;
-    } else if (type.getDimSize(1) == dim) {
-      if (!hidden) hidden = type.getDimSize(2);
-      if (hidden == type.getDimSize(2)) ++outputTables;
-    }
-  }
-  if (hidden <= dim || inputTables != 2 || outputTables != 1) return std::nullopt;
-  unsigned inputMatmuls = 0, outputMatmuls = 0;
-  Value downResult;
-  scope->walk([&](linalg::BatchMatmulOp matmul) {
-    auto lhs = dyn_cast<RankedTensorType>(matmul.getDpsInputs()[0].getType());
-    auto rhs = dyn_cast<RankedTensorType>(matmul.getDpsInputs()[1].getType());
-    if (!lhs || !rhs || lhs.getRank() != 3 || rhs.getRank() != 3 ||
-        lhs.getDimSize(0) != 2 || rhs.getDimSize(0) != 2 || rhs.getDimSize(2) != 1)
-      return;
-    if (lhs.getDimSize(1) == hidden && lhs.getDimSize(2) == dim &&
-        rhs.getDimSize(1) == dim)
-      ++inputMatmuls;
-    if (lhs.getDimSize(1) == dim && lhs.getDimSize(2) == hidden &&
-        rhs.getDimSize(1) == hidden) {
-      ++outputMatmuls;
-      downResult = matmul->getResult(0);
-    }
-  });
-  if (inputMatmuls != 2 || outputMatmuls != 1) return std::nullopt;
-  Value weightedResult;
-  scope->walk([&](linalg::GenericOp generic) {
-    if (generic.getNumDpsInputs() != 2 || generic->getNumResults() != 1) return;
-    auto type = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
-    if (!type || type.getShape() != ArrayRef<int64_t>({2, dim})) return;
-    Value first = generic.getDpsInputs()[0], second = generic.getDpsInputs()[1];
-    if (!((derivesFrom(first, downResult) && derivesFrom(second, topk.getResult(0))) ||
-          (derivesFrom(second, downResult) && derivesFrom(first, topk.getResult(0)))))
-      return;
-    auto yield = dyn_cast<linalg::YieldOp>(generic.getRegion().front().getTerminator());
-    if (yield && yield.getValues().size() == 1 &&
-        yield.getValues()[0].getDefiningOp<arith::MulFOp>())
-      weightedResult = generic->getResult(0);
-  });
-  if (!weightedResult) return std::nullopt;
-  bool combined = false;
-  scope->walk([&](linalg::GenericOp generic) {
-    if (generic.getNumDpsInputs() != 1 || generic.getDpsInputs()[0] != weightedResult ||
-        generic.getNumReductionLoops() != 1 || generic->getNumResults() != 1)
-      return;
-    auto type = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
-    auto yield = dyn_cast<linalg::YieldOp>(generic.getRegion().front().getTerminator());
-    if (type && type.getShape() == ArrayRef<int64_t>({1, dim}) && yield &&
-        yield.getValues().size() == 1 &&
-        yield.getValues()[0].getDefiningOp<arith::AddFOp>())
-      combined = true;
-  });
-  if (!combined) return std::nullopt;
-  return std::pair<int64_t, int64_t>{dim, hidden};
-}
-
-// sa-moe-parameters-v1 stores each weight before its per-row f32 scales,
-// aligning every section to 64 bytes. The route record needs this stride.
-std::optional<int64_t> packedExpertStride(int64_t dim, int64_t hidden,
-                                          int64_t experts) {
-  if (dim <= 0 || hidden <= 0 || dim > (1 << 20) || hidden > (1 << 20))
-    return std::nullopt;
-  uint64_t weightBytes = uint64_t(dim) * uint64_t(hidden);
-  uint64_t offset = 0;
-  auto append = [&](uint64_t bytes) {
-    offset = (offset + 63) & ~uint64_t(63);
-    offset += bytes;
-  };
-  append(weightBytes);
-  append(uint64_t(hidden) * 4);
-  append(weightBytes);
-  append(uint64_t(hidden) * 4);
-  append(weightBytes);
-  append(uint64_t(dim) * 4);
-  uint64_t stride = (offset + 63) & ~uint64_t(63);
-  if (stride == 0 || stride * uint64_t(experts - 1) > UINT32_MAX)
-    return std::nullopt;
-  return int64_t(stride);
-}
-
 struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FormMoeRegionsPass)
 
@@ -411,23 +269,7 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
     getOperation()->walk([&](IREE::LinalgExt::TopkOp topk) {
       if (auto experts = routerExperts(topk)) matches.emplace_back(topk, *experts);
     });
-    unsigned fullBlocks = 0;
     for (auto [topk, experts] : matches) {
-      Operation *scope = topk->getParentOp();
-      while (scope && scope->getName().getStringRef() != "util.func" &&
-             scope->getName().getStringRef() != "func.func")
-        scope = scope->getParentOp();
-      if (scope)
-        if (auto shape = mixtralExpertShape(scope, topk, experts)) {
-          if (auto stride = packedExpertStride(shape->first, shape->second, experts)) {
-            scope->setAttr("sa.moe.arch", rewriter.getStringAttr("mixtral_top2_ffn"));
-            scope->setAttr("sa.moe.dim", rewriter.getI64IntegerAttr(shape->first));
-            scope->setAttr("sa.moe.hidden", rewriter.getI64IntegerAttr(shape->second));
-            scope->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
-            scope->setAttr("sa.moe.expert_stride", rewriter.getI64IntegerAttr(*stride));
-            ++fullBlocks;
-          }
-        }
       topk->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
       topk->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(2));
       rewriter.setInsertionPoint(topk);
@@ -435,12 +277,11 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
       if (failed(region)) return signalPassFailure();
       (*region)->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
       (*region)->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(2));
-      (*region)->setAttr("sa.moe.kind", rewriter.getStringAttr("route_top2"));
+      (*region)->setAttr("sa.moe.kind", rewriter.getStringAttr("top2"));
     }
     if (report)
       llvm::errs() << "sa form-moe-regions: " << matches.size() << " top-2 router regions ("
-                   << convertedSorts << " Torch sort prefixes), " << fullBlocks
-                   << " full expert blocks\n";
+                   << convertedSorts << " Torch sort prefixes)\n";
   }
 
   Option<bool> enabled{*this, "enabled", llvm::cl::desc("Form MoE router regions"), llvm::cl::init(true)};

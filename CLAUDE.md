@@ -96,7 +96,7 @@ PicoRV32 control core). Start with `README.md`, then
 - Lifetime-based local memory planning (3a / 3b): designed, deferred
   (`docs/local_memory_planning.md`).
 - MoE (2026-10-21..25): `docs/moe_implementation_plan.md` M0–M5 (Mixtral layers on the
-  board, M5's compiler-owned HAL chain `LowerMoeChain`, to be removed); then the native
+  board; M5's compiler-owned HAL chain removed 2026-10-25); then the native
   lowering, `docs/moe_native_lowering_design.md` S0–S7: `hf_generic.QMixtralMoe` (W8A8),
   expert tables packed at compile time and selected by a dynamic slice whose DDR offset the
   device computes (`PackLinearWeights`, `SahlToSahw` `applyExpertBases`), the Top-2 as
@@ -104,5 +104,5 @@ PicoRV32 control core). Start with `README.md`, then
   `SA_RV=<dir with rvcode_host.so>` `SA_RV_ONLY=rv_only`). tiny-mixtral (random weights)
   accepted on the board 2026-10-25 (`deploy_moe.sh`, `run_board_tests.sh moe`): bit-exact
   with the sim, decode 16.0 ms per step. Checks: `test_hf_moe.py`, `test_moe_sim.py`,
-  `dispatch_check.py --ids .. --rv <bundle>/rv`, golden case `moe_mixtral`. Open: S8 (delete
-  M5's chain), v2 (both experts in one dispatch), a trained checkpoint for quality.
+  `dispatch_check.py --ids .. --rv <bundle>/rv`, golden case `moe_mixtral`. Open: v2 (both experts
+  in one dispatch), a trained checkpoint for quality.
