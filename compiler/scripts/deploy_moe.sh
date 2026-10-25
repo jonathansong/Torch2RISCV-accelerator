@@ -24,9 +24,9 @@ else
 fi
 for f in sa.vmfb sa_packed.irpa; do ln -f "$B/$f" "$D/$f" 2>/dev/null || cp "$B/$f" "$D/$f"; done
 cp "$B"/s6/{prompt,expected_tokens,expected_logits}.npy "$D/"
-# the window: the sim's device peak (sa-llm-run's report) + 32 MB
+# the window: the sim's device peak (sa-llm-run's report, in MiB) + 32 MiB
 peak=$(grep -ho 'peak [0-9.]* MB' "$B"/s6/*.run.log 2>/dev/null | awk '{print $2}' | sort -n | tail -1)
-mb=$("$SA_PY" -c "import math, os, sys; p = float(sys.argv[1] or 0) * 1e6 or os.path.getsize(sys.argv[2]) * 1.15
+mb=$("$SA_PY" -c "import math, os, sys; p = float(sys.argv[1] or 0) * 2**20 or os.path.getsize(sys.argv[2]) * 1.15
 print(math.ceil(p / 2**20) + 32)" "${peak:-}" "$D/sa_packed.irpa")
 echo "the functional simulator (decode only) $mb" > "$D/board.txt"
 # --prefill only for an export with prefill (test_hf_moe --prefill 0: decode only)
