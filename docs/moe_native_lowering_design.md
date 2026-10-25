@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend. Decode estimated at about 100–110 ms per step on the board (§22). The backend takes Top-k of up to 64 experts since §23: the 2-layer Granite runs end to end on the sim, bit-exact across its forms.
+> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend. Decode estimated at about 100–110 ms per step on the board (§22). The backend takes Top-k of up to 64 experts since §23: the 2-layer Granite runs end to end on the sim, bit-exact across its forms. **Granite (24 layers, Top-8 of 32) accepted on the KV260 (§24)**: decode bit-exact with the sim, 104.4 ms per step (9.58 tok/s).
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -1258,5 +1258,74 @@ board, the Top-k calls are the other item to look at.
   `sahl_moe_topk.mlir` (Top-8 of 32), `sa_form_moe_regions.mlir` (Granite's
   Torch spelling).
 
-**Next.** The whole 24-layer model on the sim, then the board: its int8
-weights (about 1.33 GB) need a u-dma-buf pool larger than today's 1280 MiB.
+**Next.** The whole 24-layer model on the sim, then the board (§24).
+
+## 24. Granite on the KV260 (accepted 2026-10-25)
+
+**The pool.** About 1.33 GB of int8 weights: the board's u-dma-buf pool went
+from 1280 to 1536 MiB, the global CMA from 256 to 128 MiB
+(`docs/kv260_upgrade_plan.md` K5-M).
+
+**Export.** `test_hf_moe.py --model .../granite-3.1-1b-a400m-base --export-only
+--prefill 0`: decode only. With prefill rows (one at a time, each with its 8
+experts), the traced graph of 24 layers grows past 10 GB (a 4-layer export:
+0.27 GB of parameters, 1.9 GB more while exporting, linear in the layers);
+grouping a chunk's rows by expert is M6. The KV scales are calibrated on 3
+tokens and the cache is 64 long: a bit-exactness and speed bundle, not the
+quality one (that is K per channel on 1024 WikiText-2 tokens, §21).
+
+**The checks against HF and the host model.** Two of `test_hf_moe.py`'s checks
+and one of `test_moe_sim.py`'s are reported, not asserted, for this model
+(`--hf-reported`, `--host-reported`):
+
+- W8A8 against HF fp32: at the first position the logits differ by 137%
+  (rel L2), against about 20% at the next ones. The first token's hidden
+  state has large outliers that per-token int8 quantization handles badly. The
+  W8A8 top token differs from fp32's at about 10% of positions (§21), and
+  through 24 layers the hidden states' error changes some experts where HF's
+  routing is clear. The router's own check (W8A8 against an fp32 router on the
+  same hidden state, where its gap is clear) stays asserted and passes.
+- The device against the host W8A8 model: argmax 20 / 28, correlation min
+  0.955, mean 0.985. **The host against itself with 1e-6 relative noise on the
+  routers' inputs: 22 / 28, min 0.965, mean 0.989**, the same spread. The
+  routing has near ties (8th vs 9th score within 0.01 in 68 of 672 layer-steps,
+  within 0.001 in 5), so a rounding difference swaps an expert and the change
+  grows through the layers. Bit-exactness is checked where it is defined:
+  `dispatch_check` (60 / 60 at T = 16, 32, 48, 64), plan A against the
+  descriptor lists (byte-equal), and the board against the sim.
+
+**Command buffer splits.** The first board run took 141.4 ms per step with 217
+descriptor lists per step. §23's `util.optimization_barrier`s reached Stream,
+where each split the command buffer, one list per expert. They are now marked
+`sa.moe.isolate` and `iree-sa-drop-moe-isolation` removes them in the dispatch
+region formation hook (IREE patch 0004), once they have kept the experts'
+epilogues apart: 25 lists per step (one per layer, split at the Top-8 calls,
+and the classifier), the dispatches and logits unchanged. Wrapping each
+expert's chain in a dispatch region instead failed: the contraction's
+`collapse_shape` stayed inside before the epilogue (IREE's reshape propagation
+moves it out of the way otherwise), and the backend fell back to the host.
+
+**Board** (commit `35db39f`, `d16_100mhz_w128_p6_gemv_np4_pcpi`, 100 MHz,
+rt_fw v7, window 1315 MB = the sim's peak 1282.4 MiB + 32;
+`build/deploy_moe_granite24/results/35db39f/moe_granite24/.../llm` and
+`.../llm_decode`):
+
+| Test | Logits vs sim | Tokens | Speed | Dispatches per step |
+|---|---|---|---|---|
+| `llm --decode-only`: 28 steps | bit-exact 28 / 28 | identical | 104.4 ms per step (9.58 tok/s) | 25 lists, 24 RISC-V (Top-8) |
+| `llm` (no prefill export: the same decode run) | bit-exact 28 / 28 | identical | 104.4 ms per step | 25 lists, 24 RISC-V |
+
+Against §22's estimate (93–99 ms of device time, about 100–110 ms on the
+board with the Top-k calls) the step lands at the low end of the board
+range. The weight-stream bound of the step's 429 MB is 67 ms: the gap is the
+experts' tails (§22) and the 24 Top-8 calls. `deploy_moe.sh` read the sim's
+peak as 10^6 bytes (it is MiB): the first board run ran out of device memory
+loading the parameters (fixed in `9797dbf`).
+
+**Next.**
+
+- A kernel over a layer's k experts (§9's v2): up to about 18% of the step
+  (§22), the tails overlapped with the next expert's weight stream.
+- The quality bundle: K per channel, the KV scales on 1024 WikiText-2 tokens, a
+  longer cache; teacher-forced on the board.
+- Prefill: M6, grouped by expert (also the export's memory).
