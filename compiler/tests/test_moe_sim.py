@@ -66,9 +66,12 @@ def main():
     ap.add_argument("--prompt", default="1,415,2936,9060,285,1142,28705,28740,28723,13,1014,3075,349,264,1179,1170,"
                     "302,11843,28713,304,1413,272,1080,5853")
     ap.add_argument("--generate", type=int, default=4)
-    ap.add_argument("--prefill", type=int, default=16)
+    ap.add_argument("--prefill", type=int, default=16, help="0: the export has no prefill (test_hf_moe --prefill 0)")
     ap.add_argument("--mb", type=int, default=320)
     ap.add_argument("--min-corr", type=float, default=0.99)
+    ap.add_argument("--host-reported", action="store_true", help="report the host model's argmax and correlation, "
+                    "do not check them: a model whose routing has near ties (Granite, 24 layers: the host against "
+                    "itself with 1e-6 noise differs as much, docs/moe_native_lowering_design.md §24)")
     args = ap.parse_args()
     prompt = [int(t) for t in args.prompt.split(",")]
     rv = os.path.join(args.bundle, "rv")
@@ -81,7 +84,8 @@ def main():
                 [f"--generate={G}"])
     V = a.size // (P + G)
     a = a.reshape(P + G, V)
-    b = sim_run(args.bundle, prompt, f"{out}/B_prefill.f32", {"SA_RV": rv, "SA_RV_ONLY": "rv_only"}, args.mb,
+    b = None if not args.prefill else \
+        sim_run(args.bundle, prompt, f"{out}/B_prefill.f32", {"SA_RV": rv, "SA_RV_ONLY": "rv_only"}, args.mb,
                 [f"--generate={G}", f"--prefill={args.prefill}"]).reshape(-1, V)
     c = sim_run(args.bundle, prompt, f"{out}/C_planA.f32", {"SA_RV": rv}, args.mb,
                 [f"--generate={G}"]).reshape(-1, V)
@@ -98,12 +102,12 @@ def main():
     ref = np.stack([w(torch.tensor([[t]]), torch.tensor([[p]]))[0, -1].numpy() for p, t in enumerate(toks)])
 
     ok = True
-    b_same = b.shape == (1 + G, V) and np.array_equal(b.view(np.uint32), a[P - 1:].view(np.uint32))
+    b_same = b is None or (b.shape == (1 + G, V) and np.array_equal(b.view(np.uint32), a[P - 1:].view(np.uint32)))
     c_same = c.shape == a.shape and np.array_equal(c.view(np.uint32), a.view(np.uint32))
     corr = [float(np.corrcoef(a[i], ref[i])[0, 1]) for i in range(P + G)]
     same = [int(a[i].argmax()) == int(ref[i].argmax()) for i in range(P + G)]
     print(f"B prefill {args.prefill} vs A decode, last prompt position + {G} steps: "
-          f"{'byte-equal' if b_same else 'DIFFERENT'}")
+          f"{'not run (--prefill 0: an export without prefill)' if b is None else 'byte-equal' if b_same else 'DIFFERENT'}")
     print(f"C plan A vs A descriptors, {P + G} steps: {'byte-equal' if c_same else 'DIFFERENT'}")
     print(f"A vs the host model, {P + G} steps: argmax equal in {sum(same)}/{len(same)}, corr min {min(corr):.5f} "
           f"mean {np.mean(corr):.5f}")
@@ -111,7 +115,7 @@ def main():
         if not s or cr < args.min_corr:
             print(f"  step {i}: device top {int(a[i].argmax())}, host {int(ref[i].argmax())}, corr {cr:.5f}")
     # (a truncated model's logits are nearly flat: its argmax is reported, not checked)
-    ok = b_same and c_same and (all(same) or args.layers) and min(corr) > args.min_corr
+    ok = b_same and c_same and (args.host_reported or ((all(same) or args.layers) and min(corr) > args.min_corr))
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

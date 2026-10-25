@@ -19,6 +19,7 @@
     python3 compiler/tests/test_hf_moe.py [--model DIR [--layers N]] [--export DIR]
 """
 import argparse
+import gc
 import os
 import re
 import sys
@@ -129,7 +130,7 @@ def check_export(out):
 MARGIN = 0.05     # HF's 2nd vs 3rd router logit: closer, a W8A8 model may pick either (reported, not checked)
 
 
-def check_model(model_dir, tokens, max_len=64, layers=None):
+def check_model(model_dir, tokens, max_len=64, layers=None, hf_reported=False):
     """Top tokens equal to HF fp32's; expert ids equal where HF's routing is
     clear (MARGIN); and on the W8A8 model's own hidden states, its W8A8 router
     picks the ids an fp32 router would (the router's quantization alone). HF
@@ -181,16 +182,21 @@ def check_model(model_dir, tokens, max_len=64, layers=None):
               f"logit rel L2 {float((lg - r).norm() / r.norm()):.4f}, experts: {'; '.join(line)}")
     for n in near:
         print(f"  near tie, differs: {n}")
-    # (a truncated model's logits are nearly flat: its top token is reported, not checked)
-    assert tok_ok or layers, "top tokens differ from HF"
-    assert ids_ok, f"expert ids differ from HF where its routing is clear (gap > {MARGIN})"
+    # (a truncated model's logits are nearly flat: its top token is reported, not checked; with
+    # --hf-reported both comparisons with HF fp32 are: a trained model's W8A8 top token differs from
+    # fp32's at ~10% of positions, and its hidden states' error, largest at the first position,
+    # changes the experts of deeper layers; the router's own check stays)
+    assert tok_ok or layers or hf_reported, "top tokens differ from HF"
+    assert ids_ok or hf_reported, f"expert ids differ from HF where its routing is clear (gap > {MARGIN})"
     assert router_ok, "the W8A8 router picks other ids than an fp32 router on the same hidden state (clear gap)"
     print(f"model: {model_dir}: {len(tokens)} steps: top tokens {'equal to HF fp32' if tok_ok else 'reported'}; "
-          f"expert ids equal where "
+          f"expert ids {'equal' if ids_ok else 'reported'} where "
           f"HF's gap > {MARGIN}; W8A8 router = fp32 router on the same hidden states where its gap > {MARGIN}")
 
 
 def export_model(model_dir, tokens, out, max_len=64, prefill=16, layers=None):
+    """prefill 0: decode only (a large MoE's prefill rows, one at a time with each row's k experts,
+    make a traced graph past 10 GB at Granite's 24 layers; M6 groups them)."""
     m = hg.hf_model(model_dir, layers)
     hg.export(sa_decoder(m, max_len, tokens), out, prefill=prefill)
 
@@ -200,14 +206,21 @@ def main():
     ap.add_argument("--model", help="a Mixtral checkpoint directory")
     ap.add_argument("--tokens", default="1,42,43", help="token ids for --model")
     ap.add_argument("--layers", type=int, help="--model: only its first N layers")
+    ap.add_argument("--prefill", type=int, default=16, help="--export: the prefill chunk's rows (0: decode only)")
+    ap.add_argument("--export-only", action="store_true", help="--model --export: no check (a large model: "
+                    "the check in a process of its own, the fp32 models of both do not fit in 10 GB)")
+    ap.add_argument("--hf-reported", action="store_true", help="--model: report the top tokens and expert ids "
+                    "against HF fp32, do not check them (a trained model's W8A8 error, e.g. Granite's 24 layers)")
     ap.add_argument("--export", help="the export's directory (synthetic: default a temporary one)")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     if args.model:
         tokens = [int(t) for t in args.tokens.split(",")]
-        check_model(args.model, tokens, layers=args.layers)
+        if not args.export_only:
+            check_model(args.model, tokens, layers=args.layers, hf_reported=args.hf_reported)
+            gc.collect()           # (the check's fp32 models before the export's)
         if args.export:
-            export_model(args.model, tokens, args.export, layers=args.layers)
+            export_model(args.model, tokens, args.export, prefill=args.prefill, layers=args.layers)
         return
     check_block()
     if args.export:
