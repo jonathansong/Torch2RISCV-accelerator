@@ -9,13 +9,24 @@
 > layers) on the board, and a streaming GEMV unit for decode fed by four DMA
 > ports (K2b, 64 B/cycle at 100 MHz). Decode on the board, bit-exact with the
 > sim: Qwen3-0.6B 6.28 tok/s (prefill 15.9), SmolLM2-135M 17.0, stories15M
-> 131.7. The accelerator's buffers come from a 1280 MiB pool reserved at boot.
+> 131.7. The accelerator's buffers come from a pool reserved at boot (1536 MiB
+> since v2.4).
 > Unmodified HuggingFace models now compile whole through the generic path
 > ([generality plan](docs/generality_implementation_plan.md) §13.2), every
 > dispatch on the accelerator, bit-exact with the sim, decode / prefill tok/s:
 > SmolLM2-135M 22.1 / 60.5, Gemma-3-270M 15.0 / 62.6, Qwen3-0.6B 7.0 / 20.8,
 > Llama-3.2-1B 4.0 / 15.1 (public W8A8 checkpoints, int8 KV cache; board
 > perplexity within 1-16% of fp32).
+> **Results v2.4 (2026-10-25, tag `v2.4-kv260`,
+> [results_v2.4](docs/results_v2.4.md))**: a trained mixture-of-experts model,
+> Granite-3.1-1B-A400M (24 layers, 32 experts, 8 per token), compiled from the
+> unmodified HuggingFace checkpoint ([native MoE
+> lowering](docs/moe_native_lowering_design.md)): every executable on the
+> accelerator, the router's Top-8 as RISC-V code on the PicoRV32, the experts'
+> weights selected on the device with no readback to the ARM; decode 8.98 tok/s,
+> bit-exact with the sim; board teacher forcing over two 2048-token windows PPL
+> 6.528 (fp32 6.386), top-1 92.1%. Decode only so far (prefill grouped by expert
+> is next). The dense models and their numbers are those of v2.3.
 > **Results v2.3 (2026-10-20, tag `v2.3-kv260`,
 > [results_v2.3](docs/results_v2.3.md))**: with the three fusions below, decode /
 > prefill tok/s SmolLM2-135M 27.0 / 73.6, Gemma-3-270M 17.6 / 78.9, Qwen3-0.6B
@@ -235,6 +246,12 @@ milestone: phase3, phase4, m1-m5, l0-l2) is on the `pynq-z1` branch (tag
 
 ## Documentation
 
+- [Results v2.4](docs/results_v2.4.md) - a trained MoE on the board (tag
+  `v2.4-kv260`): Granite-3.1-1B-A400M's speed, quality and bit-exactness, the
+  dense models with this release's runtime
+- [Native MoE lowering](docs/moe_native_lowering_design.md) - mixture of
+  experts as ordinary SA dispatches: packed expert tables, device-computed
+  expert offsets, the Top-k on the RISC-V core, from tiny-mixtral to Granite
 - [Results v2.3](docs/results_v2.3.md) - the board numbers with the fusions
   (tag `v2.3-kv260`): speed, long context, the RISC-V paths, against v2.2
 - [Results v2.2](docs/results_v2.2.md) - the consolidated board numbers
