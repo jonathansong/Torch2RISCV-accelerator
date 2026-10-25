@@ -777,8 +777,11 @@ bool Lowerer::generic(linalg::GenericOp g, const RowSel *sel) {
          ::sa::FUNC_NONE, rk, 0);
       return err.empty();
     }
+    // a 1-D length not a multiple of D (an MoE Top-2's [2]): the lanes past it
+    // hold whatever the word had, masked by VALID (the identity in their place)
+    const bool partial = n % d != 0;
     ve(e.o, std::nullopt, dst, ::sa::VT_F32, n, ::sa::VOP_COPY, 1.0f, NEG0, ::sa::FUNC_NONE, rk,
-       uint32_t(inner / d));
+       uint32_t(partial ? (n + d - 1) / d : inner / d), uint32_t(partial ? n : 0));
     return combine();
   }
   for (unsigned r = 0; r < unsigned(g.getNumDpsInits()); ++r) {

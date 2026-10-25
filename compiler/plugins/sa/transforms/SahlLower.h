@@ -180,6 +180,24 @@ private:
   };
   std::optional<Ddr> ddrOf(Value v, bool allowPitch = false);
 
+  // MoE expert slices (docs/moe_native_lowering_design.md §6): a DDR view at a
+  // row of a table given by an id in DDR (memref.load, index_cast) has a BASE
+  // of its own, tagged; after the lowering every DMA on it reads the real BASE
+  // and adds P = id * stride (bytes) to its DDR address, P computed once at the
+  // start of the body (applyExpertBases).
+  struct ExpertBase {
+    Value real;                // the binding's BASE
+    Value idBase;              // the id: an i32 (or an i64's low word) in DDR
+    int64_t idOff = 0;
+    int64_t stride = 0;        // bytes per id
+    int64_t maxId = 0;         // the table's rows - 1
+  };
+  llvm::DenseMap<Value, ExpertBase> expertBases;
+  std::map<std::tuple<const void *, int64_t, int64_t, int64_t, const void *>, Value> expertTagged;
+  // the id's DDR (base, byte offset) if |index| is index_cast(memref.load) of one
+  std::optional<std::pair<Value, int64_t>> expertId(Value index);
+  bool applyExpertBases();
+
   // rows of a dynamic length T (bytes per row = f(T)): row r at DDR offset
   // r * bytes; a PARAM accumulates the offset on the device (SETREG PARAM +=
   // PARAM), so each DMA has two dynamic fields (address, bytes)

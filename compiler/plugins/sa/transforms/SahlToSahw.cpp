@@ -29,7 +29,136 @@ bool Lowerer::run() {
     return fail("sahl.kernel \"" + k.getKind().str() + "\" not expanded by sahl-expand-kernels" +
                 (why ? " (" + why.getValue().str() + ")" : std::string()));
   }
-  return lowerBlock(f.getBody().front());
+  return lowerBlock(f.getBody().front()) && applyExpertBases();
+}
+
+// An id read as an index (an MoE expert slice's offset): index_cast(memref.load
+// M[c..]) of an i32 / i64 DDR buffer at constant indices.
+static memref::LoadOp expertIdLoad(Value index) {
+  auto c = index.getDefiningOp<arith::IndexCastOp>();
+  auto ld = c ? c.getIn().getDefiningOp<memref::LoadOp>() : memref::LoadOp();
+  if (!ld || !(ld.getType().isInteger(32) || ld.getType().isInteger(64))) return {};
+  for (Value i : ld.getIndices())
+    if (!getConstantIntValue(i)) return {};
+  return ld;
+}
+
+std::optional<std::pair<Value, int64_t>> Lowerer::expertId(Value index) {
+  auto ld = expertIdLoad(index);
+  if (!ld) return std::nullopt;
+  auto mt = cast<MemRefType>(ld.getMemref().getType());
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (failed(mt.getStridesAndOffset(strides, offset))) return std::nullopt;
+  int64_t elem = 0;
+  for (auto [i, st] : llvm::zip(ld.getIndices(), strides)) elem += *getConstantIntValue(i) * st;
+  auto r = ddrOf(ld.getMemref());
+  if (!r || r->dyn || r->dynRows || r->dynMid || r->pitch || r->base.getDefiningOp<sahw::BaseOp>() == nullptr ||
+      expertBases.count(r->base))
+    return std::nullopt;
+  int64_t off = r->off + elem * int64_t(esize(r->et));
+  if (off % 4) return std::nullopt;
+  return std::make_pair(r->base, off);
+}
+
+// P = id * stride for every tagged BASE, at the start of the body (after a
+// FENCE: the ids are the previous dispatch's, and no leading LD goes to
+// sahw.head ahead of it); then each DMA on a tagged BASE reads the real one
+// and adds P to its DDR address (a dynamic slot, add mode). A stride within
+// LDPARAM's 16-bit factor: one LDPARAM; beyond: id * stride on the VE (exact
+// in fp32, checked), through an output-only binding's first 8 bytes (written
+// by the dispatch later) into a PARAM.
+bool Lowerer::applyExpertBases() {
+  if (expertBases.empty()) return true;
+  Block &blk = *bb.getBlock();
+  if (blk.empty()) return fail("expert slice in an empty body");
+  Operation *first = &blk.front();
+  OpBuilder pb(first);
+  sahw::FenceOp::create(pb, loc, int64_t(0));
+  // the scratch: an output-only binding (every use a sahl.store into it or a view of it)
+  std::optional<Ddr> scratch;
+  auto outputOnly = [&](Value v) {
+    SmallVector<Value> work = {v};
+    bool stored = false;
+    for (unsigned i = 0; i < work.size(); ++i)
+      for (Operation *u : work[i].getUsers()) {
+        if (isa<memref::SubViewOp, memref::CastOp, memref::CollapseShapeOp, memref::ExpandShapeOp>(u)) {
+          work.push_back(u->getResult(0));
+          continue;
+        }
+        auto st = dyn_cast<sahl::StoreOp>(u);
+        if (!st || st.getDst() != work[i]) return false;
+        stored = true;
+      }
+    return stored;
+  };
+  for (auto sub : f.getBody().front().getOps<IREE::HAL::InterfaceBindingSubspanOp>()) {
+    if (!outputOnly(sub.getResult())) continue;
+    auto r = ddrOf(sub.getResult());
+    if (r && !r->dyn && !r->dynRows && r->off % 8 == 0 && r->n * int64_t(esize(r->et)) >= 8) {
+      scratch = r;
+      break;
+    }
+  }
+  err.clear();                                     // (a binding ddrOf could not read is just not a scratch)
+  std::map<std::tuple<const void *, int64_t, int64_t>, Value> pOf;
+  for (auto &[tagged, eb] : expertBases) {
+    auto key = std::make_tuple(eb.idBase.getAsOpaquePointer(), eb.idOff, eb.stride);
+    Value &p = pOf[key];
+    if (!p) {
+      if (eb.stride <= 0 || eb.maxId * eb.stride >= (int64_t(1) << 31))
+        return fail("expert slice: the table's byte offsets beyond 32 bits");
+      p = privateParam();
+      if (eb.stride <= 0xFFFF) {
+        sahw::LdParamOp::create(pb, loc, eb.idBase, p, eb.idOff, eb.stride, 0, ValueRange{});
+      } else {
+        for (int64_t e = 1; e <= eb.maxId; ++e)
+          if (double(float(e)) * double(float(eb.stride)) != double(e * eb.stride) ||
+              double(float(double(e) * double(eb.stride))) != double(e * eb.stride))
+            return fail("expert slice: id * stride not exact in fp32");
+        if (!scratch) return fail("expert slice: no output-only binding for the id's byte offset");
+        uint32_t w0 = ::sa::laddr(::sa::MEM_ACC, 0), w1 = ::sa::laddr(::sa::MEM_ACC, 1);
+        int64_t off8 = eb.idOff & ~int64_t(7);
+        sahw::LdOp::create(pb, loc, eb.idBase, off8, int64_t(w0), 1, 8, 8, 0, ValueRange{});
+        {
+          OpBuilder::InsertionGuard g(bb);
+          StaticLen fixedLen(*this);               // (a full word, never row mode's dynamic LEN)
+          Operation *savedVe = lastVe;
+          bb.setInsertionPoint(first);
+          ve({w0, ::sa::VT_I32}, std::nullopt, w1, ::sa::VT_I32, d, ::sa::VOP_COPY, float(eb.stride), 0.0f);
+          lastVe = savedVe;
+        }
+        sahw::StOp::create(pb, loc, scratch->base, scratch->off, int64_t(w1), 1, 8, 8, ValueRange{});
+        sahw::FenceOp::create(pb, loc, int64_t(0));
+        sahw::LdParamOp::create(pb, loc, scratch->base, p, scratch->off + (eb.idOff - off8), 1, 0, ValueRange{});
+      }
+    }
+    for (OpOperand &use : llvm::make_early_inc_range(tagged.getUses())) {
+      Operation *op = use.getOwner();
+      use.set(eb.real);                            // (first: appending the slot's PARAM reallocates the operands)
+      auto addSlot = [&](auto o, int32_t field) -> bool {
+        SmallVector<int32_t> fields(o.getDynFields());
+        SmallVector<bool> adds(o.getDynAdd());
+        if (fields.size() >= 2) return fail("expert slice: a DMA with no dynamic slot left");
+        for (auto [fl, ad] : llvm::zip(fields, adds))
+          if (fl == field && !ad) return fail("expert slice: a DMA whose address a PARAM replaces");
+        fields.push_back(field);
+        adds.push_back(true);
+        o.getDynMutable().append(p);
+        o.setDynFields(fields);
+        o.setDynAdd(adds);
+        return true;
+      };
+      bool ok;
+      if (auto o = dyn_cast<sahw::LdOp>(op)) ok = addSlot(o, ::sa::DYN_DMA_DDR);
+      else if (auto o = dyn_cast<sahw::StOp>(op)) ok = addSlot(o, ::sa::DYN_DMA_DDR);
+      else if (auto o = dyn_cast<sahw::LdParamOp>(op)) ok = addSlot(o, ::sa::DYN_LDPARAM_ADDR);
+      else ok = fail("expert slice read by " + op->getName().getStringRef().str());
+      if (!ok) return false;
+    }
+    tagged.getDefiningOp()->erase();
+  }
+  return true;
 }
 
 bool Lowerer::lowerBlock(Block &block) {
@@ -201,6 +330,13 @@ bool Lowerer::lowerBlock(Block &block) {
             IREE::TensorExt::DispatchWorkloadOrdinalOp, func::ReturnOp>(op))
       continue;
     if (op->getDialect() && op->getDialect()->getNamespace() == "util") continue;
+    // an MoE expert id read as a DDR view's offset (ddrOf: an expert slice)
+    if (auto ld = dyn_cast<memref::LoadOp>(op);
+        ld && llvm::all_of(ld->getUsers(), [&](Operation *u) {
+          return isa<arith::IndexCastOp>(u) && expertIdLoad(u->getResult(0)) == ld &&
+                 llvm::all_of(u->getUsers(), [](Operation *v) { return isa<memref::SubViewOp>(v); });
+        }))
+      continue;
     if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtUIOp, arith::ShLIOp, arith::OrIOp, arith::ShRUIOp,
             arith::DivUIOp>(op))
       continue;
@@ -662,6 +798,9 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
   // a subview offset that is a push constant's Lin (in elements), e.g. a layer's
   // offset into a KV cache once iree-flow-generalize-executables made it an operand
   std::optional<Lin> dynElems;
+  // a row of a table at an id in DDR (an MoE expert slice): (the id, the stride and rows of its dimension)
+  std::optional<std::pair<Value, int64_t>> expert;
+  int64_t expertStride = 0, expertRows = 0;
   Value cur = v;
   while (true) {
     Operation *op = cur.getDefiningOp();
@@ -672,10 +811,20 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
       int64_t so;
       if (failed(st.getStridesAndOffset(ss, so))) return fail("subview source strides"), std::nullopt;
       unsigned di = 0;
+      int64_t dim = -1;
       for (auto [o, str] : llvm::zip(s.getStaticOffsets(), ss)) {
+        ++dim;
         if (o == 0) continue;                      // (row 0 of rows a dynamic stride apart: a cursor's view)
         if (ShapedType::isDynamic(str)) return fail("dynamic subview"), std::nullopt;
         if (ShapedType::isDynamic(o)) {
+          if (auto id = expertId(s.getOffsets()[di])) {
+            if (expert) return fail("DDR view at two expert ids"), std::nullopt;
+            expert = id;
+            expertStride = str;
+            expertRows = st.getDimSize(dim);
+            ++di;
+            continue;
+          }
           auto l = linOf(s.getOffsets()[di++]);
           if (!l || dynElems || l->shift) return fail("dynamic subview"), std::nullopt;
           if (l->isConst()) {
@@ -714,6 +863,7 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
     r.et = mt.getElementType();
     uint32_t es = esize(r.et);
     if (!es) return fail("DDR element type"), std::nullopt;
+    if (expert && dynElems) return fail("DDR view at an expert id and a push constant"), std::nullopt;
     if (dynElems) {                                // the base: the binding + the push constant's bytes
       if (!off.isConst()) return fail("dynamic subview of a binding at a dynamic offset"), std::nullopt;
       Lin b{dynElems->ord, dynElems->mul * es, 0, dynElems->add * es + off.add};
@@ -723,6 +873,19 @@ std::optional<Lowerer::Ddr> Lowerer::ddrOf(Value v, bool allowPitch) {
     } else {
       r.base = baseFor(int(sub.getBinding().getZExtValue()), off);
       r.off = (off.isConst() ? off.add : 0) + elem * es;
+    }
+    if (expert) {                                  // its own BASE, tagged (applyExpertBases)
+      if (ShapedType::isDynamic(expertRows) || expertRows < 1) return fail("expert table rows"), std::nullopt;
+      auto key = std::make_tuple(r.base.getAsOpaquePointer(), expert->second, expertStride * int64_t(es), expertRows,
+                                 expert->first.getAsOpaquePointer());
+      Value &tagged = expertTagged[key];
+      if (!tagged) {
+        auto b = r.base.getDefiningOp<sahw::BaseOp>();
+        tagged = sahw::BaseOp::create(regB, loc, regB.getType<sahw::BaseType>(), b.getBinding(), b.getConstant(),
+                                      b.getMul(), b.getShift(), b.getAdd(), IntegerAttr());
+        expertBases[tagged] = {r.base, expert->first, expert->second, expertStride * int64_t(es), expertRows - 1};
+      }
+      r.base = tagged;
     }
     r.n = mt.getNumElements();
     r.dynRows = dynRows;

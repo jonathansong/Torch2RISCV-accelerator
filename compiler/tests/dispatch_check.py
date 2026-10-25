@@ -14,7 +14,9 @@ Inputs: push constants that are binding offsets take the first call site's
 values (util.assume.int); dynamic lengths (workload ordinals) take --t;
 fp32 data is normal(0, 1), int8 / int32 data int8-valued, i64 scalars
 (token, position, row) --t - 3 (rows partly masked), i64 vectors distinct values
-ending at --t - 3.
+ending at --t - 3. With --ids, a binding read as indices (tensor.extract +
+index_cast: an MoE Top-2's expert ids, docs/moe_native_lowering_design.md §6)
+holds those values, repeated.
 
     python3 compiler/tests/dispatch_check.py <sources dir> <binaries dir> [--d D] [--t 16] [numbers...]
 
@@ -118,6 +120,7 @@ def binding_regions(func, interp):
 
 FULL_I8 = False
 POS = None                                  # --pos
+IDS = None                                  # --ids
 
 
 def fill(rng, et, n, t):
@@ -133,6 +136,19 @@ def fill(rng, et, n, t):
         last = t - 3 if POS is None else POS
         return np.maximum(0, last - np.arange(n)[::-1]).astype(np.int64).tobytes()
     return bytes(n)
+
+
+def index_subspans(func):
+    """The subspans whose loaded tensor is read as indices: tensor.extract of
+    it into an arith.index_cast (the expert ids of a dynamic slice)."""
+    loads, out = {}, []
+    for op in ops_of(func):
+        if op.name == "iree_tensor_ext.dispatch.tensor.load":
+            loads[op.results[0]] = op.operands[0]
+        if op.name == "tensor.extract" and op.operands[0] in loads and \
+                any(u.owner.name == "arith.index_cast" for u in op.results[0].uses):
+            out.append(loads[op.operands[0]])
+    return out
 
 
 def call_sites(func):
@@ -159,12 +175,16 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
     probe = O.Interp({}, consts, d)
     regions = binding_regions(func, probe)
     rng = np.random.default_rng(seed)
+    idx_bindings = {probe.val(v)[1] for v in index_subspans(func)} if IDS else set()
     bufs = {}
     for b, regs in regions.items():
         size = max(o + n for o, n, _, _ in regs)
         buf = bytearray(-(-size // 64) * 64 + 64)
         for o, n, et, w in regs:
-            buf[o:o + n] = fill(rng, et, n // ELEM_BYTES[et], t)
+            if b in idx_bindings and not w and et in ("i32", "i64"):
+                buf[o:o + n] = np.resize(np.array(IDS, O.NP[et]), n // ELEM_BYTES[et]).tobytes()
+            else:
+                buf[o:o + n] = fill(rng, et, n // ELEM_BYTES[et], t)
         bufs[b] = buf
     want = {b: bytearray(v) for b, v in bufs.items()}
     O.run_dispatch(func, want, consts, d)
@@ -257,9 +277,11 @@ def main():
     ap.add_argument("--dirty", action="store_true", help="local memories start with garbage, not zeros")
     ap.add_argument("--full-i8", action="store_true", help="int8 data over [-128, 127] (default [-127, 127], "
                     "the range of the frontend's own quantization)")
+    ap.add_argument("--ids", help="comma-separated values of the bindings read as indices (MoE expert ids)")
     ap.add_argument("numbers", nargs="*")
     args = ap.parse_args()
-    global FULL_I8, POS
+    global FULL_I8, POS, IDS
+    IDS = [int(v) for v in args.ids.split(",")] if args.ids else None
     POS = args.pos
     FULL_I8 = args.full_i8
     global SKEW, DIRTY

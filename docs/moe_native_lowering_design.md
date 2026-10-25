@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12), S2 packing (§13) and S3 regions (§14) done; S4 next.
+> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12), S2 packing (§13), S3 regions (§14) and S4 backend (§15) done; S5 next.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -385,7 +385,7 @@ only token and ID agreement are reported, not quality).
 | S1 frontend | **Done 2026-10-25 (§12).** `QMixtralMoe` in `hf_generic` (padded router, explicit softmax), `test_hf_moe.py` | Host model: top tokens equal to HF; ids equal where HF's routing is clear; no softmax op, Top-2 over `[1, 16]` |
 | S2 packing | **Done 2026-10-25 (§13).** Gather-to-slice rewrite, `PackLinearWeights` expert tables | Lit; tables packed at compile time into the parameter archive |
 | S3 regions | **Done 2026-10-25 (§14).** One FFN region per expert (already `FormFfnRegions`'), ids read as i32 | Lit; no id-extension dispatches; golden identical |
-| S4 backend | `ddrOf` dynamic index, LDPARAM sequence, kernels accept dynamic weights | `dispatch_check` on the synthetic model, all IDs |
+| S4 backend | **Done 2026-10-25 (§15).** Tagged expert BASEs, the P prologue, the dynamic slots | Every tiny-mixtral dispatch on the SA; `dispatch_check` bit-exact except the Top-2 (S5) |
 | S5 Top-2 | Semantic record, funcsim Top-2, runtime `rv_only` policy, compiler emits only `rv_only` code | `dispatch_check` of top2; sim e2e with `SA_RV` unset |
 | S6 e2e sim | tiny-mixtral through `compile_sa.sh` | Gates 1–4 of §7; golden re-recorded |
 | S7 board | Bundle, board run | Gates 5–6 |
@@ -713,3 +713,74 @@ Lit 28/28; golden identical (636 dispatches).
 **Not done in S3:** removing the M5 full-graph match (`mixtralExpertShape`,
 the function attributes) and `LowerMoeChain`. The new frontend never
 matches it, and it is deleted with the rest of M5's chain in S8.
+
+## 15. S4 results (2026-10-25)
+
+**Implementation** (`SahlToSahw.cpp`, `SahlLower.h`):
+
+- `ddrOf` recognizes a subview offset that is `index_cast(memref.load
+  ids[c])` of an i32 / i64 DDR buffer (`expertId`). The view gets a **tagged
+  BASE**: a `sahw.base` of its own, keyed by the binding, the id's address
+  and the byte stride.
+- `memref.load` ops whose only uses are such offsets are skipped by
+  `lowerBlock`.
+- After the lowering, `applyExpertBases`:
+  1. puts a FENCE at the start of the body. The ids are the previous
+     dispatch's. With the FENCE, no leading LD reaches `sahw.head` ahead of
+     it; such dispatches give up the head prefetch.
+  2. computes each distinct P = id × stride once:
+     - a stride ≤ 65535: one LDPARAM (`mul = stride`);
+     - a larger one: LD the ids' 8-byte word into ACC word 0, one VE (I32 →
+       I32, A = stride) into word 1, ST into the first word of an
+       output-only binding (written by the dispatch later), FENCE, LDPARAM.
+       Refused unless every `e × stride` (e < rows) is exact in fp32 and
+       below 2^31.
+  3. points every DMA on a tagged BASE (LD, ST, LDPARAM) at the real BASE and
+     appends a dynamic slot (its DDR / address field, add mode, P). The base
+     is replaced first: appending the slot's operand reallocates the op's
+     operands. Refused, with a host fallback, when a DMA has both slots taken
+     or its address field is a replace-mode slot.
+
+**Hardware check.** `sa_cmdfetch.v` applies the slots one per cycle and
+writes each result back into the descriptor word (lines 360–362). Two add
+slots on one field therefore compose, as `sa_funcsim.py` does. An RTL run of
+this case is left to the board stage.
+
+**A pre-existing bug found by the per-dispatch check** (`SahlLowerGeneric.cpp`):
+
+- A 1-D reduction whose length is not a multiple of D (the Top-2 softmax's
+  sum over 2) reduced the whole word, garbage lanes included: NaN with
+  `--dirty`, 11.26 instead of 1.195 on clean memory.
+- It now passes VALID = n and ROWLEN = ⌈n / D⌉, so the masked lanes take the
+  identity.
+- No dense dispatch has such a reduction; the golden corpus is unchanged.
+
+**Verification.**
+
+- Lit `sahl_expert_slice.mlir`:
+  - a 256-byte stride (one LDPARAM);
+  - a 131072-byte stride (the VE path through the output's first word);
+  - a stride of 2^24 + 1, refused as inexact.
+- `dispatch_check.py --ids LIST` fills the bindings read as indices with
+  those ids.
+- S0 spike, synthetic size: ids 0..3, all equal to the oracle, which depends
+  on the id (outputs for ids 0 and 3 differ).
+- tiny-mixtral's gate size, a looped GEMV with two add slots on the DDR
+  field: ids 0, 1, 3, 6, 7 equal.
+- tiny-mixtral whole model: 198 dispatches on the SA, none on the host.
+- `dispatch_check` with `--dirty --ids 7,0` and with `--pos 0 --ids 2,5`:
+  197 of 198 equal to the oracle. The Top-2 (`topk_1x16xf32`) is not
+  checkable: the oracle has no `iree_linalg_ext.topk`, and the functional
+  simulator cannot run its RISC-V code (S5).
+- Lit 29/29; golden identical (636).
+
+**PARAMs** (from the compiled descriptors):
+
+| Dispatch | PARAMs in use |
+|---|---:|
+| router | 0 |
+| FFN of expert k (`expandFfn`, unrolled at this size) | 2 (P_w, P_s) |
+| down of expert 0 | 1 |
+| down of expert 1 + combine (both experts' scales) | 4 |
+
+The register file has 8, so this fits with room to spare.
