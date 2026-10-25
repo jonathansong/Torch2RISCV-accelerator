@@ -344,40 +344,40 @@ bool Lowerer::lowerBlock(Block &block) {
     if (auto bc = dyn_cast<arith::BitcastOp>(op); bc && bc.getType().isF32() && linOf(bc.getIn())) continue;
     if (isa<arith::AddIOp, arith::MulIOp>(op) && op->hasAttr("sa.index")) continue;   // (an expanded kernel's count: its Lin used)
     if (auto l = dyn_cast<sahl::LoadOp>(op)) {
-      bool rawTop2Input = false;
-      for (auto top2 : block.getOps<sahl::Top2Op>())
-        rawTop2Input |= top2.getScores() == l.getDst();
-      if (rawTop2Input) continue;
+      bool rawTopkInput = false;
+      for (auto topk : block.getOps<sahl::TopkOp>())
+        rawTopkInput |= topk.getScores() == l.getDst();
+      if (rawTopkInput) continue;
       if (!load(l)) return false;
       continue;
     }
     if (auto s = dyn_cast<sahl::StoreOp>(op)) {
-      bool rawTop2Output = false;
-      for (auto top2 : block.getOps<sahl::Top2Op>())
-        rawTop2Output |= top2.getValues() == s.getSrc() || top2.getIndices() == s.getSrc();
-      if (rawTop2Output) continue;
+      bool rawTopkOutput = false;
+      for (auto topk : block.getOps<sahl::TopkOp>())
+        rawTopkOutput |= topk.getValues() == s.getSrc() || topk.getIndices() == s.getSrc();
+      if (rawTopkOutput) continue;
       if (!store(s)) return false;
       continue;
     }
     if (auto fl = dyn_cast<linalg::FillOp>(op)) {
-      // The RISC-V-only raw Top-2 kernel starts from these exact sentinels in
+      // The RISC-V-only raw Top-k kernel starts from these exact sentinels in
       // registers. The tensor fills were fused into its dispatch; emitting a
       // separate descriptor fill would be redundant (and i32 fills are not
       // supported by the generic descriptor path).
-      bool top2Sentinel = false;
-      for (auto top2 : block.getOps<sahl::Top2Op>()) {
-        if (fl.getDpsInits()[0] == top2.getValues()) {
+      bool topkSentinel = false;
+      for (auto topk : block.getOps<sahl::TopkOp>()) {
+        if (fl.getDpsInits()[0] == topk.getValues()) {
           auto c = fl.getDpsInputs()[0].getDefiningOp<arith::ConstantOp>();
           auto v = c ? dyn_cast<FloatAttr>(c.getValue()) : FloatAttr();
-          top2Sentinel = v && v.getValue().isInfinity() && v.getValue().isNegative();
-        } else if (fl.getDpsInits()[0] == top2.getIndices()) {
+          topkSentinel = v && v.getValue().isInfinity() && v.getValue().isNegative();
+        } else if (fl.getDpsInits()[0] == topk.getIndices()) {
           auto c = fl.getDpsInputs()[0].getDefiningOp<arith::ConstantOp>();
           auto v = c ? dyn_cast<IntegerAttr>(c.getValue()) : IntegerAttr();
-          top2Sentinel = v && v.getValue().getSExtValue() == 0x7fffffff;
+          topkSentinel = v && v.getValue().getSExtValue() == 0x7fffffff;
         }
-        if (top2Sentinel) break;
+        if (topkSentinel) break;
       }
-      if (top2Sentinel) continue;
+      if (topkSentinel) continue;
       auto c = constF32(fl.getDpsInputs()[0]);
       if (!c) return fail("fill with a non-constant or non-fp32 value");
       fills[fl.getDpsInits()[0]] = *c;
@@ -448,37 +448,38 @@ bool Lowerer::lowerBlock(Block &block) {
       }
       continue;
     }
-    if (auto top2 = dyn_cast<sahl::Top2Op>(op)) {
+    if (auto topk = dyn_cast<sahl::TopkOp>(op)) {
       SmallVector<int64_t> addresses;
-      Value scoreDdr = top2.getScores(), valuesDdr = top2.getValues(), indicesDdr = top2.getIndices();
+      Value scoreDdr = topk.getScores(), valuesDdr = topk.getValues(), indicesDdr = topk.getIndices();
       unsigned scoreLoads = 0, valueStores = 0, indexStores = 0;
       for (auto l : block.getOps<sahl::LoadOp>()) {
-        if (l.getDst() == top2.getScores()) {
+        if (l.getDst() == topk.getScores()) {
           scoreDdr = l.getSrc();
           ++scoreLoads;
         }
       }
       for (auto s : block.getOps<sahl::StoreOp>()) {
-        if (s.getSrc() == top2.getValues()) {
+        if (s.getSrc() == topk.getValues()) {
           valuesDdr = s.getDst();
           ++valueStores;
         }
-        if (s.getSrc() == top2.getIndices()) {
+        if (s.getSrc() == topk.getIndices()) {
           indicesDdr = s.getDst();
           ++indexStores;
         }
       }
       if (scoreLoads > 1 || valueStores > 1 || indexStores > 1)
-        return fail("Top-2 requires one input load and at most one store per output");
+        return fail("Top-k requires one input load and at most one store per output");
       for (Value v : {scoreDdr, valuesDdr, indicesDdr}) {
         auto r = ddrOf(v);
-        if (!r || r->dyn || r->dynRows || r->dynMid || r->pitch) return fail("Top-2 requires contiguous DDR buffers");
+        if (!r || r->dyn || r->dynRows || r->dynMid || r->pitch) return fail("Top-k requires contiguous DDR buffers");
         auto base = r->base.getDefiningOp<sahw::BaseOp>();
-        if (!base) return fail("Top-2 requires a binding base");
+        if (!base) return fail("Top-k requires a binding base");
         addresses.append({int64_t(base.getBinding()), int64_t(base.getConstant()), int64_t(base.getMul()),
                           int64_t(base.getShift()), int64_t(base.getAdd()), r->off});
       }
-      templ->setAttr("sa.moe.raw_top2", bb.getI64IntegerAttr(top2.getExperts()));
+      templ->setAttr("sa.moe.raw_topk", bb.getI64IntegerAttr(topk.getExperts()));
+      templ->setAttr("sa.moe.top_k", bb.getI64IntegerAttr(topk.getK()));
       templ->setAttr("sa.moe.addresses", bb.getDenseI64ArrayAttr(addresses));
       templ->setAttr("sa.riscv_only", bb.getUnitAttr());
       continue;
@@ -1455,9 +1456,9 @@ struct SahlToSahwPass : public PassWrapper<SahlToSahwPass, OperationPass<ModuleO
         return signalPassFailure();
       }
       if (t->hasAttr("sa.riscv_only") &&
-          (llvm::range_size(f.getBody().front().getOps<sahl::Top2Op>()) != 1 ||
+          (llvm::range_size(f.getBody().front().getOps<sahl::TopkOp>()) != 1 ||
            !body.getRegion().front().empty())) {
-        f.emitError("sahl-to-sahw: an MoE RISC-V-only dispatch must be one Top-2 and nothing else");
+        f.emitError("sahl-to-sahw: an MoE RISC-V-only dispatch must be one Top-k and nothing else");
         t.erase();
         return signalPassFailure();
       }

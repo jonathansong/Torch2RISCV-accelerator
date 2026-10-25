@@ -16,7 +16,7 @@ compiler/sim/sa_sim_server.py):
      KV scales calibrated on the export's tokens, teacher-forced on A's tokens:
      argmax per step and correlation (rounding order differs, so not bit-exact)
 
-    python3 compiler/tests/test_moe_sim.py --bundle DIR --model DIR [--prompt ...] [--generate 4]
+    python3 compiler/tests/test_moe_sim.py --bundle DIR --model DIR [--layers N] [--prompt ...] [--generate 4]
 """
 import argparse
 import os
@@ -61,6 +61,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bundle", required=True)
     ap.add_argument("--model", required=True, help="the checkpoint the bundle was exported from")
+    ap.add_argument("--layers", type=int, help="the export's first N layers (test_hf_moe --layers)")
     ap.add_argument("--calib", default="1,42,43", help="the export's KV calibration tokens (test_hf_moe --tokens)")
     ap.add_argument("--prompt", default="1,415,2936,9060,285,1142,28705,28740,28723,13,1014,3075,349,264,1179,1170,"
                     "302,11843,28713,304,1413,272,1080,5853")
@@ -91,9 +92,8 @@ def main():
 
     print("host model:")
     import test_hf_moe as HM
-    from transformers import AutoModelForCausalLM
     torch.set_grad_enabled(False)
-    m = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, attn_implementation="sdpa").eval()
+    m = HM.hg.hf_model(args.model, args.layers)
     w = HM.sa_decoder(m, 64, [int(t) for t in args.calib.split(",")])
     ref = np.stack([w(torch.tensor([[t]]), torch.tensor([[p]]))[0, -1].numpy() for p, t in enumerate(toks)])
 
@@ -110,7 +110,8 @@ def main():
     for i, (s, cr) in enumerate(zip(same, corr)):
         if not s or cr < args.min_corr:
             print(f"  step {i}: device top {int(a[i].argmax())}, host {int(ref[i].argmax())}, corr {cr:.5f}")
-    ok = b_same and c_same and all(same) and min(corr) > args.min_corr
+    # (a truncated model's logits are nearly flat: its argmax is reported, not checked)
+    ok = b_same and c_same and (all(same) or args.layers) and min(corr) > args.min_corr
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

@@ -104,5 +104,7 @@ PicoRV32 control core). Start with `README.md`, then
   `SA_RV=<dir with rvcode_host.so>` `SA_RV_ONLY=rv_only`). tiny-mixtral (random weights)
   accepted on the board 2026-10-25 (`deploy_moe.sh`, `run_board_tests.sh moe`): bit-exact
   with the sim, decode 16.0 ms per step. Checks: `test_hf_moe.py`, `test_moe_sim.py`,
-  `dispatch_check.py --ids .. --rv <bundle>/rv`, golden case `moe_mixtral`. Open: v2 (both experts
-  in one dispatch), a trained checkpoint for quality.
+  `dispatch_check.py --ids .. --rv <bundle>/rv`, golden cases `moe_mixtral`, `moe_granite`. Since
+  2026-10-25 a trained checkpoint, Granite-3.1-1B-A400M (Top-8 of 32): host quality (§21), decode
+  estimate (§22), Top-k of up to 64 experts in the backend, 2 layers bit-exact on the sim (§23).
+  Open: the full model on the sim and the board (u-dma-buf pool > 1280 MiB).

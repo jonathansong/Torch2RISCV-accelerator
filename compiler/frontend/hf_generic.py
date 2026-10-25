@@ -906,7 +906,16 @@ def quantize(model):
             else:
                 continue
             setattr(mod, cname, q)
-    # tied tensors: one Parameter object for each shared int8 table
+    # a final division of the logits (Granite's logits_scaling) folded into the
+    # classifier's row scales: the VE divides only as 1 / x
+    cfg = getattr(model, "config", None)
+    ls = getattr(cfg, "logits_scaling", None)
+    head = getattr(model, "lm_head", None)
+    if ls not in (None, 1, 1.0) and isinstance(head, QLinear):
+        head.s_w = torch.nn.Parameter(head.s_w.detach() / float(ls), requires_grad=False)
+        cfg.logits_scaling = 1.0
+        n["logits_scaling"] = float(ls)
+        # tied tensors: one Parameter object for each shared int8 table
     params = {}
     for mod in model.modules():
         for pname in ("wq", "q"):

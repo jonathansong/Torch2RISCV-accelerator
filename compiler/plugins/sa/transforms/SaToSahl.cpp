@@ -672,15 +672,16 @@ struct SaToSahlPass : public PassWrapper<SaToSahlPass, OperationPass<func::FuncO
       if (auto topk = dyn_cast<IREE::LinalgExt::TopkOp>(op);
           topk && topk->hasAttr("sa.moe.experts")) {
         auto experts = topk->getAttrOfType<IntegerAttr>("sa.moe.experts");
-        if (!experts || !isa<MemRefType>(topk.getValues().getType()) ||
+        auto k = topk->getAttrOfType<IntegerAttr>("sa.moe.top_k");
+        if (!experts || !k || !isa<MemRefType>(topk.getValues().getType()) ||
             !isa<MemRefType>(topk.getOutputValues().getType()) ||
             !isa<MemRefType>(topk.getOutputIndices().getType())) {
-          topk.emitError("sa-to-sahl: MoE Top-2 requires bufferized memrefs");
+          topk.emitError("sa-to-sahl: MoE Top-k requires bufferized memrefs");
           return signalPassFailure();
         }
         OpBuilder b(topk);
-        sahl::Top2Op::create(b, topk.getLoc(), topk.getValues(), topk.getOutputValues(),
-                             topk.getOutputIndices(), experts);
+        sahl::TopkOp::create(b, topk.getLoc(), topk.getValues(), topk.getOutputValues(),
+                             topk.getOutputIndices(), experts, k);
         topk.erase();
         continue;
       }

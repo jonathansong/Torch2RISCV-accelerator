@@ -68,6 +68,8 @@ CASES = [
     # native MoE (docs/moe_native_lowering_design.md): tiny-mixtral, 2 layers, decode + prefill rows; expert
     # slices at device-computed offsets (S4), the Top-2 RISC-V only (S5)
     ("moe_mixtral", "build/moe/native/tm/sa_sources", ["--iree-sa-max-dynamic=64"]),
+    # Top-8 of 32 experts, k > 2: the experts' down epilogues isolated (Granite-3.1-1B-A400M, 2 layers, §23)
+    ("moe_granite", "build/moe/granite/l2/sa_sources", ["--iree-sa-max-dynamic=64"]),
 ]
 
 

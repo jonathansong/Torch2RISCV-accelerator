@@ -1,11 +1,11 @@
-// FormMoeRegions (docs/moe_native_lowering_design.md §5.2): a router projection followed by a descending Top-2 in a region of its own.
+// FormMoeRegions (docs/moe_native_lowering_design.md §5.2, §23): a router projection followed by a descending Top-k in a region of its own.
 // RUN: iree-opt --split-input-file --iree-sa-form-moe-regions="force=true" %s | FileCheck %s
 
 // CHECK-LABEL: func.func @route_top2
 // CHECK:       linalg.matmul
 // CHECK:       flow.dispatch.region
 // CHECK-SAME:    sa.moe.experts = 8 : i64
-// CHECK-SAME:    sa.moe.kind = "top2"
+// CHECK-SAME:    sa.moe.kind = "topk"
 // CHECK-SAME:    sa.moe.top_k = 2 : i64
 // CHECK:         iree_linalg_ext.topk
 // CHECK-SAME:    sa.moe.experts = 8 : i64
@@ -48,7 +48,7 @@ func.func @route_top2(%x: tensor<1x4xf32>, %w: tensor<4x8xf32>) -> (tensor<1x2xf
 // CHECK:       linalg.generic
 // CHECK:       flow.dispatch.region
 // CHECK-SAME:    sa.moe.experts = 8 : i64
-// CHECK-SAME:    sa.moe.kind = "top2"
+// CHECK-SAME:    sa.moe.kind = "topk"
 // CHECK:         iree_linalg_ext.topk
 // CHECK-SAME:    sa.moe.experts = 8 : i64
 func.func @quantized_router(%x: tensor<32xi8>, %w: tensor<1x32x8xi8>) -> (tensor<1x2xf32>, tensor<1x2xi32>) {
@@ -108,21 +108,25 @@ func.func @uninitialized_top2(%x: tensor<1x4xf32>, %w: tensor<4x8xf32>) -> (tens
 
 // -----
 
-// K=3 must remain on IREE's ordinary path.
-// CHECK-LABEL: func.func @not_top2
+// K equal to the number of experts (a full sort, no selection) remains on IREE's ordinary path.
+// CHECK-LABEL: func.func @not_a_selection
 // CHECK-NOT: flow.dispatch.region
-func.func @not_top2(%x: tensor<1x4xf32>, %w: tensor<4x8xf32>) -> (tensor<1x3xf32>, tensor<1x3xi32>) {
+func.func @not_a_selection(%x: tensor<1x4xf32>, %w: tensor<4x8xf32>) -> (tensor<1x8xf32>, tensor<1x8xi32>) {
   %e = tensor.empty() : tensor<1x8xf32>
   %scores = linalg.matmul ins(%x, %w : tensor<1x4xf32>, tensor<4x8xf32>) outs(%e : tensor<1x8xf32>) -> tensor<1x8xf32>
-  %ve = tensor.empty() : tensor<1x3xf32>
-  %ie = tensor.empty() : tensor<1x3xi32>
+  %ve = tensor.empty() : tensor<1x8xf32>
+  %ie = tensor.empty() : tensor<1x8xi32>
+  %ninf = arith.constant 0xFF800000 : f32
+  %maxidx = arith.constant 2147483647 : i32
+  %vi = linalg.fill ins(%ninf : f32) outs(%ve : tensor<1x8xf32>) -> tensor<1x8xf32>
+  %ii = linalg.fill ins(%maxidx : i32) outs(%ie : tensor<1x8xi32>) -> tensor<1x8xi32>
   %v, %i = iree_linalg_ext.topk dimension(1) ins(%scores : tensor<1x8xf32>)
-      outs(%ve, %ie : tensor<1x3xf32>, tensor<1x3xi32>) {
+      outs(%vi, %ii : tensor<1x8xf32>, tensor<1x8xi32>) {
   ^bb0(%a: f32, %b: f32):
     %gt = arith.cmpf ogt, %a, %b : f32
     iree_linalg_ext.yield %gt : i1
-  } -> tensor<1x3xf32>, tensor<1x3xi32>
-  return %v, %i : tensor<1x3xf32>, tensor<1x3xi32>
+  } -> tensor<1x8xf32>, tensor<1x8xi32>
+  return %v, %i : tensor<1x8xf32>, tensor<1x8xi32>
 }
 
 // -----
@@ -144,8 +148,8 @@ func.func @not_router(%scores: tensor<1x8xf32>) -> (tensor<1x2xf32>, tensor<1x2x
 
 // -----
 
-// torch.topk is imported as a full descending sort and a two-element prefix.
-// The pass must form the same device Top-2 region for that frontend spelling.
+// torch.topk is imported as a full descending sort and a k-element prefix.
+// The pass must form the same device Top-k region for that frontend spelling.
 // CHECK-LABEL: func.func @torch_sort_prefix
 // CHECK:       linalg.matmul
 // CHECK:       flow.dispatch.region
@@ -172,6 +176,39 @@ func.func @torch_sort_prefix(%x: tensor<1x32xf32>, %w: tensor<32x4xf32>) -> (ten
   %values = tensor.extract_slice %sorted#0[0, 0] [1, 2] [1, 1] : tensor<1x4xf32> to tensor<1x2xf32>
   %indices = tensor.extract_slice %sorted#1[0, 0] [1, 2] [1, 1] : tensor<1x4xi64> to tensor<1x2xi64>
   return %values, %indices : tensor<1x2xf32>, tensor<1x2xi64>
+}
+
+// -----
+
+// Granite MoE's router: a Top-8 of 32 experts, same spelling.
+// CHECK-LABEL: func.func @torch_sort_prefix_top8
+// CHECK:       flow.dispatch.region
+// CHECK-SAME:    sa.moe.experts = 32 : i64
+// CHECK-SAME:    sa.moe.kind = "topk"
+// CHECK-SAME:    sa.moe.top_k = 8 : i64
+// CHECK:         iree_linalg_ext.topk
+// CHECK-SAME:    outs({{.*}} : tensor<1x8xf32>, tensor<1x8xi32>)
+// CHECK-NOT:   iree_linalg_ext.sort
+func.func @torch_sort_prefix_top8(%x: tensor<1x64xf32>, %w: tensor<64x32xf32>) -> (tensor<1x8xf32>, tensor<1x8xi64>) {
+  %c0 = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<1x32xf32>
+  %init = linalg.fill ins(%c0 : f32) outs(%empty : tensor<1x32xf32>) -> tensor<1x32xf32>
+  %scores = linalg.matmul ins(%x, %w : tensor<1x64xf32>, tensor<64x32xf32>) outs(%init : tensor<1x32xf32>) -> tensor<1x32xf32>
+  %ids_empty = tensor.empty() : tensor<1x32xi64>
+  %ids = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} outs(%ids_empty : tensor<1x32xi64>) {
+  ^bb0(%old: i64):
+    %index = linalg.index 1 : index
+    %cast = arith.index_cast %index : index to i64
+    linalg.yield %cast : i64
+  } -> tensor<1x32xi64>
+  %sorted:2 = iree_linalg_ext.sort dimension(1) outs(%scores, %ids : tensor<1x32xf32>, tensor<1x32xi64>) {
+  ^bb0(%a: f32, %b: f32, %ia: i64, %ib: i64):
+    %ge = arith.cmpf oge, %a, %b : f32
+    iree_linalg_ext.yield %ge : i1
+  } -> tensor<1x32xf32>, tensor<1x32xi64>
+  %values = tensor.extract_slice %sorted#0[0, 0] [1, 8] [1, 1] : tensor<1x32xf32> to tensor<1x8xf32>
+  %indices = tensor.extract_slice %sorted#1[0, 0] [1, 8] [1, 1] : tensor<1x32xi64> to tensor<1x8xi64>
+  return %values, %indices : tensor<1x8xf32>, tensor<1x8xi64>
 }
 
 // -----

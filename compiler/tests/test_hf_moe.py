@@ -7,7 +7,8 @@
       logit apart), output within the W8A8 error, rows (prefill) = row by row;
     - export (hf_generic.export, decode + a 16-token prefill): no softmax op,
       the Top-2 over the padded [1, 16] scores (no sliced scores);
-  --model DIR: a Mixtral checkpoint (build/llm_cache/TitanML-tiny-mixtral):
+  --model DIR: a Mixtral-style checkpoint (build/llm_cache/TitanML-tiny-mixtral;
+    Granite MoE: --layers 2 of build/llm_cache/granite-3.1-1b-a400m-base):
     decode of --tokens on the host, the W8A8 model (SaDecoder: int8 KV cache,
     sa attention, QLinear, QMixtralMoe) against HF fp32: the top token, and
     every layer's expert ids where HF's routing is clear (check_model).
@@ -15,7 +16,7 @@
   --model DIR --export OUT: also export that W8A8 model (decode + a 16-token
     prefill) to OUT for compile_sa.sh, the KV scales calibrated on --tokens.
 
-    python3 compiler/tests/test_hf_moe.py [--model DIR] [--export DIR]
+    python3 compiler/tests/test_hf_moe.py [--model DIR [--layers N]] [--export DIR]
 """
 import argparse
 import os
@@ -56,9 +57,24 @@ def sa_decoder(m, max_len, calib_tokens):
     return hg.SaDecoder(m, max_len, kv)
 
 
+def moe_block(layer):
+    """A decoder layer's sparse MoE block (Mixtral: mlp, Granite MoE: block_sparse_moe)."""
+    return layer.mlp if hasattr(layer, "mlp") else layer.block_sparse_moe
+
+
+def router_of(block):
+    return block.gate if hasattr(getattr(block, "gate", None), "weight") else block.router
+
+
+def router_out(router, out):
+    """A router's forward output -> (logits, ids): Mixtral's (logits, weights, ids),
+    Granite MoE's (ids, weights, logits)."""
+    return (out[2], out[0]) if type(router).__name__ == "GraniteMoeTopKRouter" else (out[0], out[2])
+
+
 def hf_router_ids(block, x):
-    _, _, ids = block.gate(x.reshape(-1, x.shape[-1]))
-    return ids
+    r = router_of(block)
+    return router_out(r, r(x.reshape(-1, x.shape[-1])))[1]
 
 
 def check_block():
@@ -113,32 +129,33 @@ def check_export(out):
 MARGIN = 0.05     # HF's 2nd vs 3rd router logit: closer, a W8A8 model may pick either (reported, not checked)
 
 
-def check_model(model_dir, tokens, max_len=64):
+def check_model(model_dir, tokens, max_len=64, layers=None):
     """Top tokens equal to HF fp32's; expert ids equal where HF's routing is
     clear (MARGIN); and on the W8A8 model's own hidden states, its W8A8 router
     picks the ids an fp32 router would (the router's quantization alone). HF
     runs first: hf_generic's rewrites patch shared transformers functions."""
-    from transformers import AutoModelForCausalLM
     torch.set_grad_enabled(False)
-    ref = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32).eval()
+    ref = hg.hf_model(model_dir, layers)
     ref_logits_l = []          # [layer] -> router logits [T, E] (one call over all the tokens)
-    hooks = [layer.mlp.gate.register_forward_hook(lambda mod, i, o: ref_logits_l.append(o[0].clone()))
+    hooks = [router_of(moe_block(layer)).register_forward_hook(
+                 lambda mod, i, o: ref_logits_l.append(router_out(mod, o)[0].clone()))
              for layer in ref.model.layers]
     ref_logits = ref(torch.tensor([tokens])).logits[0]
     for h in hooks:
         h.remove()
     del ref
 
-    m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
-    fp32_router = [layer.mlp.gate.weight.detach().clone() for layer in m.model.layers]
+    m = hg.hf_model(model_dir, layers)
+    fp32_router = [router_of(moe_block(layer)).weight.detach().clone() for layer in m.model.layers]
+    k = router_of(moe_block(m.model.layers[0])).top_k
     w = sa_decoder(m, max_len, tokens)
     steps = []                 # per call of a block: (layer, W8A8 ids, fp32-router ids on the same x)
     for L, layer in enumerate(m.model.layers):
-        mod = layer.mlp
+        mod = moe_block(layer)
         def route(x, route=mod.route, L=L):
             r = route(x)
-            f = torch.topk((x @ fp32_router[L].t())[0], 2).indices
-            steps.append((L, r[1][0].tolist(), f.tolist()))
+            v, f = torch.topk((x @ fp32_router[L].t())[0], k + 1)
+            steps.append((L, r[1][0].tolist(), f[:k].tolist(), float(v[k - 1] - v[k])))
             return r
         mod.route = route
     L = len(m.model.layers)
@@ -149,11 +166,12 @@ def check_model(model_dir, tokens, max_len=64):
         r = ref_logits[p]
         tok_ok &= int(lg.argmax()) == int(r.argmax())
         line = []
-        for l, got, fp in steps[-L:]:
+        for l, got, fp, fgap in steps[-L:]:
             v, i = torch.sort(ref_logits_l[l][p], descending=True)
-            want, gap = i[:2].tolist(), float(v[1] - v[2])
+            want, gap = i[:k].tolist(), float(v[k - 1] - v[k])
             same = sorted(got) == sorted(want)
-            router_ok &= sorted(got) == sorted(fp)
+            if fgap > MARGIN:                  # (the fp32 router's own near ties: either way)
+                router_ok &= sorted(got) == sorted(fp)
             if gap > MARGIN:
                 ids_ok &= same
             elif not same:
@@ -163,16 +181,17 @@ def check_model(model_dir, tokens, max_len=64):
               f"logit rel L2 {float((lg - r).norm() / r.norm()):.4f}, experts: {'; '.join(line)}")
     for n in near:
         print(f"  near tie, differs: {n}")
-    assert tok_ok, "top tokens differ from HF"
+    # (a truncated model's logits are nearly flat: its top token is reported, not checked)
+    assert tok_ok or layers, "top tokens differ from HF"
     assert ids_ok, f"expert ids differ from HF where its routing is clear (gap > {MARGIN})"
-    assert router_ok, "the W8A8 router picks other ids than an fp32 router on the same hidden state"
-    print(f"model: {model_dir}: {len(tokens)} steps: top tokens equal to HF fp32; expert ids equal where "
-          f"HF's gap > {MARGIN}; W8A8 router = fp32 router on the same hidden states")
+    assert router_ok, "the W8A8 router picks other ids than an fp32 router on the same hidden state (clear gap)"
+    print(f"model: {model_dir}: {len(tokens)} steps: top tokens {'equal to HF fp32' if tok_ok else 'reported'}; "
+          f"expert ids equal where "
+          f"HF's gap > {MARGIN}; W8A8 router = fp32 router on the same hidden states where its gap > {MARGIN}")
 
 
-def export_model(model_dir, tokens, out, max_len=64, prefill=16):
-    from transformers import AutoModelForCausalLM
-    m = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="sdpa").eval()
+def export_model(model_dir, tokens, out, max_len=64, prefill=16, layers=None):
+    m = hg.hf_model(model_dir, layers)
     hg.export(sa_decoder(m, max_len, tokens), out, prefill=prefill)
 
 
@@ -180,14 +199,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", help="a Mixtral checkpoint directory")
     ap.add_argument("--tokens", default="1,42,43", help="token ids for --model")
+    ap.add_argument("--layers", type=int, help="--model: only its first N layers")
     ap.add_argument("--export", help="the export's directory (synthetic: default a temporary one)")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     if args.model:
         tokens = [int(t) for t in args.tokens.split(",")]
-        check_model(args.model, tokens)
+        check_model(args.model, tokens, layers=args.layers)
         if args.export:
-            export_model(args.model, tokens, args.export)
+            export_model(args.model, tokens, args.export, layers=args.layers)
         return
     check_block()
     if args.export:

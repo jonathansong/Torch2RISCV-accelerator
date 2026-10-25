@@ -80,7 +80,7 @@ struct SAOptions {
   // The gated FFN of decode in one dispatch (docs/fusion_design.md §4): the two
   // projections, the gating, the amax and the int8 output (FormFfnRegions.cpp).
   bool fuseFfn = false;
-  // MoE: an MoE router's Top-2 in a region of its own (FormMoeRegions.cpp,
+  // MoE: an MoE router's Top-k in a region of its own (FormMoeRegions.cpp,
   // docs/moe_native_lowering_design.md)
   bool formMoe = false;
   // Decode's attention in one dispatch (docs/fusion_design.md §6): the q path, the
@@ -127,7 +127,7 @@ struct SAOptions {
                      llvm::cl::desc("Decode's gated FFN (two projections, gating, amax, int8 output) in one dispatch "
                                     "(docs/fusion_design.md)."));
     binder.opt<bool>("iree-sa-form-moe", formMoe, llvm::cl::cat(category),
-                    llvm::cl::desc("An MoE router's Top-2 in a dispatch region of its own, run as RISC-V code "
+                    llvm::cl::desc("An MoE router's Top-k in a dispatch region of its own, run as RISC-V code "
                                    "(docs/moe_native_lowering_design.md)."));
     binder.opt<bool>("iree-sa-fuse-attn", fuseAttn, llvm::cl::cat(category),
                      llvm::cl::desc("Decode's attention (q path, scores, probabilities, p . V, int8 output) in one "
@@ -391,6 +391,7 @@ struct SASession final
     sa::registerCloneCheapProducersPass();
     sa::registerFormFfnRegionsPass();
     sa::registerFormMoeRegionsPass();
+    sa::registerIsolateMoeExpertsPass();
     sa::registerFormAttnRegionsPass();
     sa::registerLowerWorkgroupCountPass();
     sa::registerSahwPasses();
@@ -411,6 +412,7 @@ struct SASession final
       passManager.addPass(createCanonicalizerPass());
       passManager.addPass(sa::createFormFfnRegionsPass(true));
     }
+    if (options.formMoe) passManager.addPass(sa::createIsolateMoeExpertsPass());
   }
   // After IREE forms the dispatch regions (IREE patch 0004): the pieces keep the
   // forms of today's dispatches.

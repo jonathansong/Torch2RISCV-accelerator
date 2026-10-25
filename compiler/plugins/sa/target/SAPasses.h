@@ -29,6 +29,10 @@ void registerFormFfnRegionsPass();
 // MoE: a router's Top-2 in a dispatch region of its own (docs/moe_native_lowering_design.md §5.2).
 std::unique_ptr<Pass> createFormMoeRegionsPass(bool enabled);
 void registerFormMoeRegionsPass();
+// Each MoE expert's down-projection epilogue kept in its own dispatch with k > 2
+// (FormMoeRegions.cpp, docs/moe_native_lowering_design.md §23).
+std::unique_ptr<Pass> createIsolateMoeExpertsPass();
+void registerIsolateMoeExpertsPass();
 
 // Dispatch creation, after the regions are formed: decode's attention (q path,
 // scores, probabilities, p . V, int8 output) merged into one flow.dispatch.region

@@ -406,28 +406,24 @@ std::string riscvSymbol(StringRef exportName) {
 }
 
 namespace {
-// Ordered f32 greater-than using integer operations only. rv32imc has no F
-// extension, and this code table cannot contain calls to soft-float helpers.
-llvm::Value *rawTop2Greater(RvEmitter &e, llvm::Value *a, llvm::Value *b) {
-  auto ab = e.b.CreateAnd(a, e.c32(0x7FFFFFFF));
-  auto bb = e.b.CreateAnd(b, e.c32(0x7FFFFFFF));
-  auto nan = e.b.CreateOr(e.b.CreateICmpUGT(ab, e.c32(0x7F800000)),
-                          e.b.CreateICmpUGT(bb, e.c32(0x7F800000)));
-  auto bothZero = e.b.CreateAnd(e.b.CreateICmpEQ(ab, e.c32(0)), e.b.CreateICmpEQ(bb, e.c32(0)));
-  auto sa = e.b.CreateLShr(a, e.c32(31));
-  auto sb = e.b.CreateLShr(b, e.c32(31));
-  auto differentSigns = e.b.CreateICmpNE(sa, sb);
-  auto sameSignGreater = e.b.CreateSelect(e.b.CreateICmpEQ(sa, e.c32(0)),
-                                           e.b.CreateICmpUGT(a, b), e.b.CreateICmpULT(a, b));
-  auto greater = e.b.CreateSelect(differentSigns, e.b.CreateICmpULT(sa, sb), sameSignGreater);
-  return e.b.CreateAnd(greater, e.b.CreateNot(e.b.CreateOr(nan, bothZero)));
-}
-
-LogicalResult buildRawTop2(RvEmitter &e, sahw::TemplateOp t) {
-  auto experts = t->getAttrOfType<IntegerAttr>("sa.moe.raw_top2");
+// An MoE router's Top-k (docs/moe_native_lowering_design.md §16, §23), integer
+// operations only: rv32imc has no F extension, and this code table cannot
+// contain calls to soft-float helpers. Each score becomes an unsigned key in
+// the order of the f32 values (±0 one key: the comparison is ordered), and
+// enters a descending list of k (key, value, id) in the stack only if it
+// beats the k-th key: on the PicoRV32 every instruction is fetched from DDR,
+// so most scores cost one load, the key and one compare. Scanning the ids in
+// increasing order with a strict comparison keeps the lower id first on equal
+// scores, the topk's order.
+LogicalResult buildRawTopk(RvEmitter &e, sahw::TemplateOp t) {
+  auto expertsAttr = t->getAttrOfType<IntegerAttr>("sa.moe.raw_topk");
+  auto kAttr = t->getAttrOfType<IntegerAttr>("sa.moe.top_k");
   auto addresses = t->getAttrOfType<DenseI64ArrayAttr>("sa.moe.addresses");
-  if (!experts || experts.getInt() < 4 || experts.getInt() > 16 || !addresses || addresses.size() != 18)
-    return t.emitError("sa riscv: invalid raw Top-2 metadata");
+  if (!expertsAttr || !kAttr || !addresses || addresses.size() != 18)
+    return t.emitError("sa riscv: invalid raw Top-k metadata");
+  int64_t experts = expertsAttr.getInt(), k = kAttr.getInt();
+  if (experts < 2 || experts > 256 || k < 1 || k >= experts || k > 16)
+    return t.emitError("sa riscv: Top-") << k << " of " << experts << " experts not supported";
   auto fields = addresses.asArrayRef();
   // the three buffers' DDR addresses (i32); the words read through sa_rv_ldparam
   // and written through sa_rv_store32, so the portable IR runs on the host's
@@ -436,33 +432,81 @@ LogicalResult buildRawTop2(RvEmitter &e, sahw::TemplateOp t) {
   for (int i = 0; i < 3; ++i) {
     auto a = fields.slice(6 * i, 6);
     if (a[0] < 0 || a[0] >= t.getBindings() || a[3] < 0 || a[3] > 63 || a[5] < 0)
-      return t.emitError("sa riscv: invalid raw Top-2 binding or offset");
+      return t.emitError("sa riscv: invalid raw Top-k binding or offset");
     auto phys = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, e.bindArg, unsigned(a[0])));
     addrs[i] = e.b.CreateAdd(phys, e.b.CreateAdd(e.lin(a[1], a[2], a[3], a[4]), e.c32(a[5])));
   }
-  auto word = [&](int buf, int64_t i) { return e.b.CreateAdd(addrs[buf], e.c32(uint32_t(4 * i))); };
-  llvm::Value *values[2] = {e.c32(0xFF800000), e.c32(0xFF800000)};
-  llvm::Value *indices[2] = {e.c32(0x7FFFFFFF), e.c32(0x7FFFFFFF)};
-  for (int64_t i = 0; i < experts.getInt(); ++i) {
-    llvm::Value *carry = e.ldparam(word(0, i));
-    llvm::Value *carryId = e.c32(i);
-    for (unsigned k = 0; k < 2; ++k) {
-      auto forward = rawTop2Greater(e, carry, values[k]);
-      auto reverse = rawTop2Greater(e, values[k], carry);
-      auto equal = e.b.CreateICmpEQ(forward, reverse);
-      auto before = e.b.CreateICmpSLT(carryId, indices[k]);
-      auto takeId = e.b.CreateOr(forward, e.b.CreateAnd(equal, before));
-      auto nextValue = e.b.CreateSelect(forward, carry, values[k]);
-      auto nextId = e.b.CreateSelect(takeId, carryId, indices[k]);
-      carry = e.b.CreateSelect(forward, values[k], carry);
-      carryId = e.b.CreateSelect(takeId, indices[k], carryId);
-      values[k] = nextValue;
-      indices[k] = nextId;
-    }
+  auto &b = e.b;
+  auto *arr = llvm::ArrayType::get(e.i32, uint64_t(k));
+  llvm::Value *keys, *vals, *ids;
+  {
+    llvm::IRBuilder<> eb(e.entry, e.entry->begin());
+    keys = eb.CreateAlloca(arr, nullptr, "topk.keys");
+    vals = eb.CreateAlloca(arr, nullptr, "topk.values");
+    ids = eb.CreateAlloca(arr, nullptr, "topk.ids");
   }
-  for (unsigned k = 0; k < 2; ++k) {
-    e.store32(word(1, k), values[k]);
-    e.store32(word(2, k), indices[k]);
+  auto at = [&](llvm::Value *a, llvm::Value *j) { return b.CreateInBoundsGEP(arr, a, {e.c32(0), j}); };
+  // the topk's initialization: -inf and the largest id, below every key (key 0: no f32 maps to it)
+  for (int64_t j = 0; j < k; ++j) {
+    b.CreateStore(e.c32(0), at(keys, e.c32(j)));
+    b.CreateStore(e.c32(0xFF800000), at(vals, e.c32(j)));
+    b.CreateStore(e.c32(0x7FFFFFFF), at(ids, e.c32(j)));
+  }
+  llvm::AllocaInst *iSlot = e.newSlot("topk.i"), *jSlot = e.newSlot("topk.j");
+  b.CreateStore(e.c32(0), iSlot);
+  auto *loop = llvm::BasicBlock::Create(e.ctx, "topk.loop", e.fn);
+  auto *insert = llvm::BasicBlock::Create(e.ctx, "topk.insert", e.fn);
+  auto *test = llvm::BasicBlock::Create(e.ctx, "topk.test", e.fn);
+  auto *move = llvm::BasicBlock::Create(e.ctx, "topk.move", e.fn);
+  auto *place = llvm::BasicBlock::Create(e.ctx, "topk.place", e.fn);
+  auto *next = llvm::BasicBlock::Create(e.ctx, "topk.next", e.fn);
+  auto *done = llvm::BasicBlock::Create(e.ctx, "topk.done", e.fn);
+  b.CreateBr(loop);
+
+  b.SetInsertPoint(loop);
+  llvm::Value *i = b.CreateLoad(e.i32, iSlot);
+  llvm::Value *x = e.ldparam(b.CreateAdd(addrs[0], b.CreateShl(i, e.c32(2))));
+  llvm::Value *xc = b.CreateSelect(b.CreateICmpEQ(b.CreateAnd(x, e.c32(0x7FFFFFFF)), e.c32(0)), e.c32(0), x);
+  llvm::Value *key = b.CreateXor(xc, b.CreateOr(b.CreateAShr(xc, e.c32(31)), e.c32(0x80000000)));
+  llvm::Value *kth = b.CreateLoad(e.i32, at(keys, e.c32(k - 1)));
+  b.CreateCondBr(b.CreateICmpUGT(key, kth), insert, next);
+
+  b.SetInsertPoint(insert);
+  b.CreateStore(e.c32(k - 1), jSlot);
+  b.CreateBr(test);
+
+  // the entries below the new one move down one place
+  b.SetInsertPoint(test);
+  llvm::Value *j = b.CreateLoad(e.i32, jSlot);
+  auto *cmp = llvm::BasicBlock::Create(e.ctx, "topk.cmp", e.fn);
+  b.CreateCondBr(b.CreateICmpEQ(j, e.c32(0)), place, cmp);
+  b.SetInsertPoint(cmp);
+  llvm::Value *up = b.CreateSub(j, e.c32(1));
+  llvm::Value *upKey = b.CreateLoad(e.i32, at(keys, up));
+  b.CreateCondBr(b.CreateICmpUGT(key, upKey), move, place);
+  b.SetInsertPoint(move);
+  b.CreateStore(upKey, at(keys, j));
+  b.CreateStore(b.CreateLoad(e.i32, at(vals, up)), at(vals, j));
+  b.CreateStore(b.CreateLoad(e.i32, at(ids, up)), at(ids, j));
+  b.CreateStore(up, jSlot);
+  b.CreateBr(test);
+
+  b.SetInsertPoint(place);
+  llvm::Value *pj = b.CreateLoad(e.i32, jSlot);
+  b.CreateStore(key, at(keys, pj));
+  b.CreateStore(x, at(vals, pj));
+  b.CreateStore(i, at(ids, pj));
+  b.CreateBr(next);
+
+  b.SetInsertPoint(next);
+  llvm::Value *i1 = b.CreateAdd(b.CreateLoad(e.i32, iSlot), e.c32(1));
+  b.CreateStore(i1, iSlot);
+  b.CreateCondBr(b.CreateICmpULT(i1, e.c32(uint64_t(experts))), loop, done);
+
+  b.SetInsertPoint(done);
+  for (int64_t jj = 0; jj < k; ++jj) {
+    e.store32(b.CreateAdd(addrs[1], e.c32(uint32_t(4 * jj))), b.CreateLoad(e.i32, at(vals, e.c32(jj))));
+    e.store32(b.CreateAdd(addrs[2], e.c32(uint32_t(4 * jj))), b.CreateLoad(e.i32, at(ids, e.c32(jj))));
   }
   return success();
 }
@@ -481,8 +525,8 @@ LogicalResult buildFunction(RvEmitter &e, sahw::TemplateOp t) {
   e.pcArg->setName("push_constants");
   e.entry = llvm::BasicBlock::Create(e.ctx, "entry", e.fn);
   e.b.SetInsertPoint(e.entry);
-  if (t->hasAttr("sa.moe.raw_top2")) {
-    if (failed(buildRawTop2(e, t))) return failure();
+  if (t->hasAttr("sa.moe.raw_topk")) {
+    if (failed(buildRawTopk(e, t))) return failure();
     e.b.CreateRetVoid();
     return success();
   }

@@ -1,16 +1,29 @@
-// sa preprocessing: an MoE router's Top-2 in a dispatch region of its own
-// (docs/moe_native_lowering_design.md §5.2). A Torch sort's two-element prefix
-// becomes an iree_linalg_ext.topk (i32 ids; the ids read as indices, the
+// sa preprocessing: an MoE router's Top-k in a dispatch region of its own
+// (docs/moe_native_lowering_design.md §5.2, §23). A Torch sort's k-element
+// prefix becomes an iree_linalg_ext.topk (i32 ids; the ids read as indices, the
 // expert slices' offsets, read the i32 ids: readIdsAsI32), and a descending
-// f32 Top-2 of a statically shaped 4..16-expert router projection is wrapped
-// in a region; sa-to-sahl makes it sahl.top2, which runs as RISC-V code only.
+// f32 Top-k (k <= kMaxK) of a statically shaped router projection of
+// kMinExperts..kMaxExperts experts is wrapped in a region; sa-to-sahl makes it
+// sahl.topk, which runs as RISC-V code only.
 // The experts' FFNs need no regions here: their slices of the packed tables
 // (PackLinearWeights) stay in the consuming dispatches.
+//
+// iree-sa-isolate-moe-experts (after FormFfnRegions): with k > 2, IREE's
+// elementwise fusion merges the k experts' down-projection epilogues (i32 to
+// f32, the row scales selected by id, s_x, the routing weight) and their sum
+// into one dispatch, three or more bindings per expert: beyond the 15 BASE
+// registers at k = 8. A util.optimization_barrier on each expert's term (the
+// end of its epilogue, before the sum) keeps the epilogue with its contraction
+// (FormDispatchRegions fuses it there as a consumer) and leaves the sum one
+// f32 vector per expert (docs/moe_native_lowering_design.md §23). Top-2 keeps
+// the dispatches of before.
 #include "SAPasses.h"
 
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Flow/Transforms/RegionOpUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
+#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/DenseSet.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -23,6 +36,8 @@
 
 namespace mlir::iree_compiler::sa {
 namespace {
+
+constexpr int64_t kMinExperts = 4, kMaxExperts = 64, kMaxK = 16;
 
 bool comesFromProjection(Value value, llvm::DenseSet<Operation *> &seen, unsigned depth = 0) {
   Operation *op = value.getDefiningOp();
@@ -69,16 +84,18 @@ bool isIotaIndices(Value value) {
          index && index.getDim() == generic.getNumLoops() - 1;
 }
 
-tensor::ExtractSliceOp top2PrefixSlice(Value sorted) {
+// The sorted tensor's only use, a prefix [1, k] (or [k]) slice; k from it
+tensor::ExtractSliceOp topkPrefixSlice(Value sorted, int64_t &k) {
   if (!sorted.hasOneUse()) return {};
   auto slice = dyn_cast<tensor::ExtractSliceOp>(*sorted.user_begin());
   if (!slice || slice.getStaticOffsets() != ArrayRef<int64_t>({0, 0}) ||
-      slice.getStaticSizes() != ArrayRef<int64_t>({1, 2}) ||
+      slice.getStaticSizes().size() != 2 || slice.getStaticSizes()[0] != 1 ||
       slice.getStaticStrides() != ArrayRef<int64_t>({1, 1}))
     return {};
+  k = slice.getStaticSizes()[1];
   auto type = dyn_cast<RankedTensorType>(slice.getType());
-  return type && ((type.getRank() == 1 && type.getDimSize(0) == 2) ||
-                  (type.getRank() == 2 && type.getShape() == ArrayRef<int64_t>({1, 2})))
+  return type && ((type.getRank() == 1 && type.getDimSize(0) == k) ||
+                  (type.getRank() == 2 && type.getShape() == ArrayRef<int64_t>({1, k})))
              ? slice : tensor::ExtractSliceOp();
 }
 
@@ -113,7 +130,7 @@ Value rebuildOnI32(OpBuilder &b, Value v, Value ids64, Value ids32, unsigned dep
 }
 
 // The expert ids are extended back to the sort's i64 for the graph after the
-// Top-2. An id read as an index (tensor.extract + index_cast: the expert
+// Top-k. An id read as an index (tensor.extract + index_cast: the expert
 // slices, docs/moe_native_lowering_design.md §5.1) reads the i32 id instead,
 // index_cast(extsi(x)) = index_cast(x): no dispatch of its own for the
 // extension. Returns the number of ids so read.
@@ -148,7 +165,7 @@ unsigned readIdsAsI32(IRRewriter &rewriter, arith::ExtSIOp ext) {
   return n;
 }
 
-bool rewriteTorchTop2Sort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
+bool rewriteTorchTopkSort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
   if (sort.getNumResults() != 2 || sort.getDimension() != 1) return false;
   auto scoresType = dyn_cast<RankedTensorType>(sort.getOutputs()[0].getType());
   auto idsType = dyn_cast<RankedTensorType>(sort.getOutputs()[1].getType());
@@ -158,12 +175,13 @@ bool rewriteTorchTop2Sort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
       !scoresType.getElementType().isF32() || !idsType.getElementType().isInteger(64))
     return false;
   int64_t experts = scoresType.getDimSize(1);
-  if (experts < 4 || experts > 16 || !isIotaIndices(sort.getOutputs()[1])) return false;
+  if (experts < kMinExperts || experts > kMaxExperts || !isIotaIndices(sort.getOutputs()[1])) return false;
   llvm::DenseSet<Operation *> seen;
   if (!comesFromProjection(sort.getOutputs()[0], seen)) return false;
-  auto valueSlice = top2PrefixSlice(sort.getResult(0));
-  auto indexSlice = top2PrefixSlice(sort.getResult(1));
-  if (!valueSlice || !indexSlice) return false;
+  int64_t k = 0, kIds = 0;
+  auto valueSlice = topkPrefixSlice(sort.getResult(0), k);
+  auto indexSlice = topkPrefixSlice(sort.getResult(1), kIds);
+  if (!valueSlice || !indexSlice || k != kIds || k < 1 || k >= experts || k > kMaxK) return false;
   Block &comparator = sort.getRegion().front();
   if (comparator.getOperations().size() != 2 || comparator.getNumArguments() != 4) return false;
   auto cmp = dyn_cast<arith::CmpFOp>(comparator.front());
@@ -175,8 +193,8 @@ bool rewriteTorchTop2Sort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
   auto loc = sort.getLoc();
   auto f32 = rewriter.getF32Type();
   auto i32 = rewriter.getI32Type();
-  auto valuesType = RankedTensorType::get({1, 2}, f32);
-  auto indicesType = RankedTensorType::get({1, 2}, i32);
+  auto valuesType = RankedTensorType::get({1, k}, f32);
+  auto indicesType = RankedTensorType::get({1, k}, i32);
   Value negInf = arith::ConstantFloatOp::create(rewriter, loc,
       f32, APFloat(-std::numeric_limits<float>::infinity()));
   Value maxIndex = arith::ConstantIntOp::create(rewriter, loc, INT32_MAX, 32);
@@ -193,24 +211,25 @@ bool rewriteTorchTop2Sort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
   IREE::LinalgExt::YieldOp::create(rewriter, loc, greater);
   rewriter.setInsertionPointAfter(topk);
   SmallVector<ReassociationIndices> reassociation{{0, 1}};
-  Value values2 = topk.getResult(0);
-  auto indices64Type = RankedTensorType::get({1, 2}, rewriter.getI64Type());
+  Value valuesK = topk.getResult(0);
+  auto indices64Type = RankedTensorType::get({1, k}, rewriter.getI64Type());
   auto ext = arith::ExtSIOp::create(rewriter, loc, indices64Type, topk.getResult(1));
-  Value ids2 = ext;
+  Value idsK = ext;
   if (cast<RankedTensorType>(valueSlice.getType()).getRank() == 1)
-    values2 = tensor::CollapseShapeOp::create(rewriter, loc, valueSlice.getType(),
-                                               values2, reassociation);
+    valuesK = tensor::CollapseShapeOp::create(rewriter, loc, valueSlice.getType(),
+                                               valuesK, reassociation);
   if (cast<RankedTensorType>(indexSlice.getType()).getRank() == 1)
-    ids2 = tensor::CollapseShapeOp::create(rewriter, loc, indexSlice.getType(),
-                                            ids2, reassociation);
-  rewriter.replaceOp(valueSlice, values2);
-  rewriter.replaceOp(indexSlice, ids2);
+    idsK = tensor::CollapseShapeOp::create(rewriter, loc, indexSlice.getType(),
+                                            idsK, reassociation);
+  rewriter.replaceOp(valueSlice, valuesK);
+  rewriter.replaceOp(indexSlice, idsK);
   rewriter.eraseOp(sort);
   readIdsAsI32(rewriter, ext);
   return true;
 }
 
-std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
+// (experts, k) of a router's Top-k
+std::optional<std::pair<int64_t, int64_t>> routerExperts(IREE::LinalgExt::TopkOp topk) {
   if (topk.getIndices()) return std::nullopt;
   auto scores = dyn_cast<RankedTensorType>(topk.getValues().getType());
   auto values = dyn_cast<RankedTensorType>(topk.getOutputValues().getType());
@@ -222,13 +241,13 @@ std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
       values.getRank() != 2 || indices.getRank() != 2 ||
       scores.getDimSize(0) != 1 || values.getDimSize(0) != 1 ||
       indices.getDimSize(0) != 1 || topk.getDimension() != 1 ||
-      values.getDimSize(1) != 2 || indices.getDimSize(1) != 2)
+      values.getDimSize(1) != indices.getDimSize(1))
     return std::nullopt;
-  int64_t experts = scores.getDimSize(1);
-  if (experts < 4 || experts > 16) return std::nullopt;
+  int64_t experts = scores.getDimSize(1), k = values.getDimSize(1);
+  if (experts < kMinExperts || experts > kMaxExperts || k < 1 || k >= experts || k > kMaxK) return std::nullopt;
   // Top-K's scalar implementation reads both output buffers before inserting
   // each candidate. Only the descending sentinel initialization is safe to
-  // replace with a fresh Top-2 selection.
+  // replace with a fresh Top-k selection.
   if (!hasTopkInitialization(topk)) return std::nullopt;
   // This must be the router projection, rather than an unrelated top-k.
   llvm::DenseSet<Operation *> seen;
@@ -240,7 +259,7 @@ std::optional<int64_t> routerExperts(IREE::LinalgExt::TopkOp topk) {
       cmp.getLhs() != comparator.getArgument(0) ||
       cmp.getRhs() != comparator.getArgument(1))
     return std::nullopt;
-  return experts;
+  return std::make_pair(experts, k);
 }
 
 struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass<ModuleOp>> {
@@ -252,7 +271,7 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
 
   StringRef getArgument() const override { return "iree-sa-form-moe-regions"; }
   StringRef getDescription() const override {
-    return "Recognizes a batch-1 top-2 MoE router and forms its dispatch region";
+    return "Recognizes a batch-1 top-k MoE router and forms its dispatch region";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<IREE::Flow::FlowDialect, IREE::LinalgExt::IREELinalgExtDialect>();
@@ -264,23 +283,23 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
     SmallVector<IREE::LinalgExt::SortOp> sorts;
     getOperation()->walk([&](IREE::LinalgExt::SortOp sort) { sorts.push_back(sort); });
     unsigned convertedSorts = 0;
-    for (auto sort : sorts) convertedSorts += rewriteTorchTop2Sort(sort, rewriter);
-    SmallVector<std::pair<IREE::LinalgExt::TopkOp, int64_t>> matches;
+    for (auto sort : sorts) convertedSorts += rewriteTorchTopkSort(sort, rewriter);
+    SmallVector<std::tuple<IREE::LinalgExt::TopkOp, int64_t, int64_t>> matches;
     getOperation()->walk([&](IREE::LinalgExt::TopkOp topk) {
-      if (auto experts = routerExperts(topk)) matches.emplace_back(topk, *experts);
+      if (auto ek = routerExperts(topk)) matches.emplace_back(topk, ek->first, ek->second);
     });
-    for (auto [topk, experts] : matches) {
+    for (auto [topk, experts, k] : matches) {
       topk->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
-      topk->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(2));
+      topk->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(k));
       rewriter.setInsertionPoint(topk);
       auto region = IREE::Flow::wrapOpInDispatchRegion(rewriter, topk);
       if (failed(region)) return signalPassFailure();
       (*region)->setAttr("sa.moe.experts", rewriter.getI64IntegerAttr(experts));
-      (*region)->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(2));
-      (*region)->setAttr("sa.moe.kind", rewriter.getStringAttr("top2"));
+      (*region)->setAttr("sa.moe.top_k", rewriter.getI64IntegerAttr(k));
+      (*region)->setAttr("sa.moe.kind", rewriter.getStringAttr("topk"));
     }
     if (report)
-      llvm::errs() << "sa form-moe-regions: " << matches.size() << " top-2 router regions ("
+      llvm::errs() << "sa form-moe-regions: " << matches.size() << " top-k router regions ("
                    << convertedSorts << " Torch sort prefixes)\n";
   }
 
@@ -289,9 +308,97 @@ struct FormMoeRegionsPass : public PassWrapper<FormMoeRegionsPass, OperationPass
   Option<bool> report{*this, "report", llvm::cl::desc("Print the recognized region count"), llvm::cl::init(false)};
 };
 
+// int8 x int8 -> int32 with one reduction loop (FormFfnRegions' contractions)
+bool isInt8Contraction(Operation *op) {
+  auto g = dyn_cast_or_null<linalg::GenericOp>(op);
+  if (!g || g.getNumDpsInputs() != 2 || g.getNumDpsInits() != 1 || g.getNumReductionLoops() != 1) return false;
+  auto et = [](Value v) { return cast<ShapedType>(v.getType()).getElementType(); };
+  return et(g.getDpsInputs()[0]).isInteger(8) && et(g.getDpsInputs()[1]).isInteger(8) &&
+         et(g.getDpsInits()[0]).isInteger(32);
+}
+
+// an expert's weights: a slice of a packed table at a dynamic offset (the id)
+bool isExpertSlice(Value w) {
+  auto sl = w.getDefiningOp<tensor::ExtractSliceOp>();
+  return sl && !sl.getOffsets().empty();
+}
+
+// v depends on an int8 contraction outside the dispatch regions (bounded
+// search through the producers in the block; regions and other blocks end it)
+bool dependsOnContraction(Value v, Block *blk, llvm::DenseSet<Operation *> &seen, unsigned depth = 0) {
+  Operation *d = v.getDefiningOp();
+  if (!d || d->getBlock() != blk || depth > 24 || isa<IREE::Flow::DispatchRegionOp>(d) || !seen.insert(d).second)
+    return false;
+  if (isInt8Contraction(d)) return true;
+  for (Value o : d->getOperands())
+    if (dependsOnContraction(o, blk, seen, depth + 1)) return true;
+  return false;
+}
+
+struct IsolateMoeExpertsPass : public PassWrapper<IsolateMoeExpertsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(IsolateMoeExpertsPass)
+
+  IsolateMoeExpertsPass() = default;
+  IsolateMoeExpertsPass(const IsolateMoeExpertsPass &other) : PassWrapper(other) {}
+
+  StringRef getArgument() const override { return "iree-sa-isolate-moe-experts"; }
+  StringRef getDescription() const override {
+    return "Keeps each MoE expert's down-projection epilogue in its own dispatch (Top-k, k > 2)";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<IREE::Util::UtilDialect>();
+  }
+
+  void runOnOperation() override {
+    if (!force && !targetsSA(getOperation())) return;
+    unsigned n = 0;
+    getOperation()->walk([&](Block *blk) {
+      bool topkOver2 = llvm::any_of(*blk, [](Operation &op) {
+        auto k = op.getAttrOfType<IntegerAttr>("sa.moe.top_k");
+        return isa<IREE::Flow::DispatchRegionOp>(op) && k && k.getInt() > 2;
+      });
+      if (!topkOver2) return;
+      SmallVector<Value> ends;
+      for (Operation &op : *blk) {
+        if (!isInt8Contraction(&op) || !isExpertSlice(op.getOperand(1))) continue;
+        Value v = op.getResult(0);
+        while (v.hasOneUse()) {
+          Operation *u = *v.user_begin();
+          if (u->getBlock() != blk || u->getNumResults() != 1) break;
+          auto g = dyn_cast<linalg::GenericOp>(u);
+          if (!(g && g.getNumLoops() == g.getNumParallelLoops()) &&
+              !isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(u))
+            break;
+          // the sum with another expert's term: the term ends before it
+          bool other = llvm::any_of(u->getOperands(), [&](Value o) {
+            llvm::DenseSet<Operation *> seen;
+            return o != v && dependsOnContraction(o, blk, seen);
+          });
+          if (other) break;
+          v = u->getResult(0);
+        }
+        if (v != op.getResult(0)) ends.push_back(v);
+      }
+      for (Value v : ends) {
+        OpBuilder b(v.getContext());
+        b.setInsertionPointAfterValue(v);
+        auto barrier = IREE::Util::OptimizationBarrierOp::create(b, v.getLoc(), ValueRange{v});
+        v.replaceAllUsesExcept(barrier.getResult(0), barrier);
+        ++n;
+      }
+    });
+    if (report) llvm::errs() << "sa isolate-moe-experts: " << n << " expert terms\n";
+  }
+
+  Option<bool> force{*this, "force", llvm::cl::desc("Run without an sa device target (tests)"), llvm::cl::init(false)};
+  Option<bool> report{*this, "report", llvm::cl::desc("Print the isolated term count"), llvm::cl::init(false)};
+};
+
 } // namespace
 
 std::unique_ptr<Pass> createFormMoeRegionsPass(bool enabled) { return std::make_unique<FormMoeRegionsPass>(enabled); }
 void registerFormMoeRegionsPass() { PassRegistration<FormMoeRegionsPass>(); }
+std::unique_ptr<Pass> createIsolateMoeExpertsPass() { return std::make_unique<IsolateMoeExpertsPass>(); }
+void registerIsolateMoeExpertsPass() { PassRegistration<IsolateMoeExpertsPass>(); }
 
 } // namespace mlir::iree_compiler::sa

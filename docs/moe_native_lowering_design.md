@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend. Decode estimated at about 100–110 ms per step on the board (§22).
+> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend. Decode estimated at about 100–110 ms per step on the board (§22). The backend takes Top-k of up to 64 experts since §23: the 2-layer Granite runs end to end on the sim, bit-exact across its forms.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -1189,3 +1189,74 @@ schedule that streams expert i + 1's weights during expert i's tail, i.e. one
 kernel over the k experts (§9's v2, now with a real target: up to about 18%
 of the step for Granite, against 0.1% for tiny-mixtral). Measured on the
 board, the Top-k calls are the other item to look at.
+
+## 23. Top-k of up to 64 experts: Granite on the sim (2026-10-25)
+
+**What changed.**
+
+- `FormMoeRegions` takes a router's Top-k for 1 ≤ k < E, k ≤ 16, of 4 to
+  64 experts (the Torch sort's [1, k] prefix, or a topk with the sentinel
+  initialization); the region carries `sa.moe.top_k` = k and
+  `sa.moe.kind = "topk"`.
+- `sahl.top2` became `sahl.topk` with a `k` attribute; `sahl-to-sahw`
+  records `sa.moe.raw_topk` (E) and `sa.moe.top_k` on the template.
+- **The RISC-V Top-k** (`SahwToRiscv.cpp`, `buildRawTopk`) replaces the fully
+  unrolled Top-2 (E × k compare-and-swap networks: 256 at Top-8 of 32, about
+  5,000 instructions, each fetched from DDR at about 27 cycles). Each score
+  becomes an unsigned key in the order of its f32 value (±0 one key), and
+  enters a descending list of k entries in the stack only when it beats the
+  k-th key. Most scores cost a load, the key and one compare; the ids are
+  scanned in increasing order with a strict comparison, so equal scores keep
+  the lower id first, the topk's order. The outputs are those of the old
+  Top-2: tiny-mixtral's decode logits are byte-equal to the board-accepted
+  reference (below).
+- **`iree-sa-isolate-moe-experts`** (after `FormFfnRegions`, k > 2 only).
+  With 8 experts, IREE's elementwise fusion merged the 8 down-projection
+  epilogues and their sum into one dispatch of 30 bindings (each expert's
+  int32 result, its row scales selected by id, its s_x), past the 15 BASE
+  registers. A `util.optimization_barrier` on each expert's term (the end of
+  its epilogue, before the sum) keeps the epilogue in the expert's
+  down-projection dispatch, and the sum reads one f32 vector per expert.
+  Top-2 builds are unchanged.
+- **Frontend.** Granite divides the logits by `logits_scaling` (6); the VE
+  divides only as 1 / x, so `hf_generic.quantize` folds the factor into the
+  classifier's row scales (the reference changes by rounding only).
+  `test_hf_moe.py` and `test_moe_sim.py` take `--layers N` and both router
+  layouts (Mixtral's `mlp.gate`, Granite's `block_sparse_moe.router`); on a
+  truncated model, whose logits are nearly flat, the top token is reported,
+  not checked, and the router check skips the fp32 router's own near ties.
+
+**Granite, 2 layers** (`test_hf_moe.py --model .../granite-3.1-1b-a400m-base
+--layers 2 --export build/moe/granite/l2`, `compile_sa.sh` with
+`--iree-sa-form-moe`, D = 16, 4 ports):
+
+- 211 dispatches, all on the SA, none on the host; the Top-8 as RISC-V code.
+- `dispatch_check --ids 7,0,31,12,5,19,26,3 --rv`: 211 / 211 at T = 16
+  (`--pos 0`), 32 (`--dirty`), 48 and 64. At T = 17 and 33 the decode
+  attention kernel reports a TRANSPOSE shape error; the export's `--pad=16`
+  never runs those lengths (T is a multiple of 16), and the kernel passes at
+  every multiple.
+- `test_moe_sim.py --layers 2`: prefill ≡ decode (byte-equal) and plan A ≡
+  descriptor lists (byte-equal, 28 steps); against the host model, argmax 27 /
+  28 and correlation min 0.991, mean 0.997. The truncated model's logits are
+  nearly flat and its routing has near ties: a different expert from a
+  rounding difference changes a step more than on tiny-mixtral (0.9996).
+- Decode on the sim: 2 Top-8 calls per step (one per layer), 19 descriptor
+  lists per step.
+
+**Regression.**
+
+- tiny-mixtral recompiled (`build/moe/native/tm_topk`): 198 dispatches on the
+  SA; `test_moe_sim.py` PASS; its decode logits byte-equal to
+  `build/deploy_moe_tm/expected_logits.npy`, the reference the board matched
+  in S7; `dispatch_check --ids 7,0 --rv` 198 / 198 at T = 16 and 48.
+- Golden: the only change was tiny-mixtral's Top-2 dispatch, whose embedded
+  RISC-V code is new (golden's disassembly does not see the code, so it
+  reported the dispatch as equal up to register numbering). Re-recorded, and
+  a case `moe_granite` (211 dispatches) added: 1045 unique dispatches, equal
+  in two comparisons. Lit: `sa_isolate_moe_experts.mlir`,
+  `sahl_moe_topk.mlir` (Top-8 of 32), `sa_form_moe_regions.mlir` (Granite's
+  Torch spelling).
+
+**Next.** The whole 24-layer model on the sim, then the board: its int8
+weights (about 1.33 GB) need a u-dma-buf pool larger than today's 1280 MiB.
