@@ -66,7 +66,7 @@ struct RvEmitter {
   // true: as riscv32 inline assembly (.insn), compiled in-process (S4)
   bool insn;
   llvm::IRBuilder<> b{ctx};
-  llvm::Function *fn = nullptr, *ldparamFn = nullptr;
+  llvm::Function *fn = nullptr, *ldparamFn = nullptr, *store32Fn = nullptr;
   llvm::StringMap<llvm::Function *> pcpi;   // sa_rv_<operation>: one PCPI instruction each
   // the configuration keys' values written so far, when constant (mat_cfg, vec_cfg, gemv_cfg)
   std::map<uint32_t, uint64_t> known[3];
@@ -210,6 +210,17 @@ struct RvEmitter {
     auto *ld = b.CreateLoad(i32, b.CreateIntToPtr(addr, ptr));
     ld->setVolatile(true);
     return ld;
+  }
+  // a 32-bit word stored at a DDR address (a scalar kernel's result: the MoE Top-2)
+  void store32(llvm::Value *addr, llvm::Value *v) {
+    if (!insn) {
+      if (!store32Fn)
+        store32Fn = llvm::Function::Create(llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), {i32, i32}, false),
+                                           llvm::GlobalValue::ExternalLinkage, "sa_rv_store32", mod);
+      b.CreateCall(store32Fn, {addr, v});
+      return;
+    }
+    b.CreateStore(v, b.CreateIntToPtr(addr, ptr))->setVolatile(true);
   }
   // a configuration key (table 0 mat_cfg, 1 vec_cfg, 2 gemv_cfg), unless the same constant is there
   void cfg(unsigned table, uint32_t key, llvm::Value *v) {
@@ -492,19 +503,22 @@ LogicalResult buildRawTop2(RvEmitter &e, sahw::TemplateOp t) {
   if (!experts || experts.getInt() < 4 || experts.getInt() > 16 || !addresses || addresses.size() != 18)
     return t.emitError("sa riscv: invalid raw Top-2 metadata");
   auto fields = addresses.asArrayRef();
-  llvm::Value *pointers[3];
+  // the three buffers' DDR addresses (i32); the words read through sa_rv_ldparam
+  // and written through sa_rv_store32, so the portable IR runs on the host's
+  // sim transport too (docs/moe_native_lowering_design.md §16)
+  llvm::Value *addrs[3];
   for (int i = 0; i < 3; ++i) {
     auto a = fields.slice(6 * i, 6);
     if (a[0] < 0 || a[0] >= t.getBindings() || a[3] < 0 || a[3] > 63 || a[5] < 0)
       return t.emitError("sa riscv: invalid raw Top-2 binding or offset");
     auto phys = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, e.bindArg, unsigned(a[0])));
-    auto offset = e.b.CreateAdd(e.lin(a[1], a[2], a[3], a[4]), e.c32(a[5]));
-    pointers[i] = e.b.CreateIntToPtr(e.b.CreateAdd(phys, offset), e.ptr);
+    addrs[i] = e.b.CreateAdd(phys, e.b.CreateAdd(e.lin(a[1], a[2], a[3], a[4]), e.c32(a[5])));
   }
+  auto word = [&](int buf, int64_t i) { return e.b.CreateAdd(addrs[buf], e.c32(uint32_t(4 * i))); };
   llvm::Value *values[2] = {e.c32(0xFF800000), e.c32(0xFF800000)};
   llvm::Value *indices[2] = {e.c32(0x7FFFFFFF), e.c32(0x7FFFFFFF)};
   for (int64_t i = 0; i < experts.getInt(); ++i) {
-    llvm::Value *carry = e.b.CreateLoad(e.i32, e.b.CreateConstGEP1_32(e.i32, pointers[0], unsigned(i)));
+    llvm::Value *carry = e.ldparam(word(0, i));
     llvm::Value *carryId = e.c32(i);
     for (unsigned k = 0; k < 2; ++k) {
       auto forward = rawTop2Greater(e, carry, values[k]);
@@ -521,8 +535,8 @@ LogicalResult buildRawTop2(RvEmitter &e, sahw::TemplateOp t) {
     }
   }
   for (unsigned k = 0; k < 2; ++k) {
-    e.b.CreateStore(values[k], e.b.CreateConstGEP1_32(e.i32, pointers[1], k));
-    e.b.CreateStore(indices[k], e.b.CreateConstGEP1_32(e.i32, pointers[2], k));
+    e.store32(word(1, k), values[k]);
+    e.store32(word(2, k), indices[k]);
   }
   return success();
 }

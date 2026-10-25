@@ -169,16 +169,18 @@ def read(data):
 
 
 def read_ext(data):
-    """bytes -> [dict(prefix, prefix_reads, writes, reads, head, spad_b, prefix_reg)]
+    """bytes -> [dict(prefix, prefix_reads, writes, reads, head, spad_b, prefix_reg, rv_only)]
     per export (version 3; before: none, every binding read and written)."""
     f = HDR.unpack_from(data, 0)
     n = f[4]
     if f[1] < 3:
-        return [dict(prefix=0, prefix_reads=0, writes=0xFFFF, reads=0xFFFF, head=0, spad_b=True, prefix_reg=0)] * n
+        return [dict(prefix=0, prefix_reads=0, writes=0xFFFF, reads=0xFFFF, head=0, spad_b=True, prefix_reg=0,
+                     rv_only=False)] * n
     out = []
     for i in range(n):
         p, pr, w, r, h, fl, reg, _ = EXT.unpack_from(data, f[10] + EXT.size * i)
-        out.append(dict(prefix=p, prefix_reads=pr, writes=w, reads=r, head=h, spad_b=bool(fl & 1), prefix_reg=reg))
+        out.append(dict(prefix=p, prefix_reads=pr, writes=w, reads=r, head=h, spad_b=bool(fl & 1), prefix_reg=reg,
+                        rv_only=bool(fl & 2)))
     return out
 
 

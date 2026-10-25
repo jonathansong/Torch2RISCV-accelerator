@@ -555,6 +555,36 @@ class Interp:
         self.set(op.results[0], T(out, orig.et))
 
 
+    def op_iree_linalg_ext_topk(self, op):
+        """Descending Top-K along the last dimension as IREE's scalar insertion
+        does it (the MoE Top-2, its comparator ordered >): each element inserted
+        into the outputs' current values (the -inf / INT32_MAX sentinels), an
+        equal value placed before a larger id."""
+        if len(op.operands) != 3:
+            raise NotImplementedError("oracle: topk with input indices")
+        blk = op.regions[0].blocks[0]
+        cmp = [o.operation for o in blk.operations][0]
+        if cmp.name != "arith.cmpf" or "ogt" not in str(cmp):
+            raise NotImplementedError("oracle: topk comparator other than ordered >")
+        x, v0, i0 = (self.val(o) for o in op.operands)
+        xs = np.asarray(x.arr, np.uint32).view(np.float32)
+        vals = np.array(np.asarray(v0.arr, np.uint32).view(np.float32), copy=True)
+        ids = np.array(np.asarray(i0.arr, np.int64), copy=True)
+        rows, n = xs.reshape(-1, xs.shape[-1]), xs.shape[-1]
+        vr, ir_ = vals.reshape(-1, vals.shape[-1]), ids.reshape(-1, ids.shape[-1])
+        for r in range(rows.shape[0]):
+            for j in range(n):
+                carry, cid = rows[r, j], j
+                for k in range(vr.shape[1]):
+                    old, oid = vr[r, k], int(ir_[r, k])
+                    fwd, rev = bool(carry > old), bool(old > carry)
+                    take = fwd or (fwd == rev and cid < oid)
+                    vr[r, k], ir_[r, k] = (carry if fwd else old), (cid if take else oid)
+                    carry, cid = (old if fwd else carry), (oid if take else cid)
+        self.set(op.results[0], T(vals.view(np.uint32), v0.et))
+        self.set(op.results[1], T(ids, i0.et))
+
+
 def red_sum(e2, d):
     """fp32 sums over the last axis in the device's order (DeviceModel.red_sum):
     words of D lanes accumulated in order, then a lane tree; +0 padding."""

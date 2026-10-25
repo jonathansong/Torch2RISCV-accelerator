@@ -205,8 +205,9 @@ void sa_context_profile_reset(void);
 // the descriptor list then) and its symbol; a dispatch through it (the pending
 // batch flushed first).
 // SA_RV=embedded: the executables' own code (S4; |embedded_phys|, 0: none) instead of an image.
+// |required|: an export with no descriptor form (the MoE Top-2), its code whatever SA_RV says.
 iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap,
-                           uint32_t embedded_phys, uint32_t* out_phys);
+                           uint32_t embedded_phys, bool required, uint32_t* out_phys);
 const char* sa_rv_symbol_at(uint32_t phys);
 // R5 (sa_rvsched.c, SA_R5): the host build of the core kernel at |phys| (the sim's schedule emulation calls it).
 typedef void (*sa_rv_host_fn_t)(const uint32_t* args, const uint32_t* constants);

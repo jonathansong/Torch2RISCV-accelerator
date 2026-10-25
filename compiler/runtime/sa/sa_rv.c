@@ -100,20 +100,47 @@ static iree_status_t sa_rv_load(sa_context_t* c) {
   return iree_ok_status();
 }
 
+// The argument block and the transport's scratch, once (SA_RV=embedded allocates
+// them at load; an export with no descriptor form needs them without SA_RV).
+static iree_status_t sa_rv_scratch_alloc(sa_context_t* c) {
+  if (sa_rv.scratch) return iree_ok_status();
+  void* raw = NULL;
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(sa_context_data_allocator(c), 64 + 64 * 4 + 256, &raw));
+  sa_rv.scratch = (uint32_t*)(((uintptr_t)raw + 63) & ~(uintptr_t)63);
+  return sa_context_phys(c, sa_rv.scratch, &sa_rv.scratch_phys);
+}
+
 // The function of an export (the symbol: the export's name with every
 // character but letters and digits as '_', SahwToRiscv.cpp riscvSymbol).
+// |required|: the export has no descriptor form (the MoE Top-2): its RISC-V
+// code whatever SA_RV and SA_RV_ONLY say, the executable's embedded code on the
+// board, else the SA_RV directory's (the sim runs its host build); 0 if neither.
+// SA_RV_ONLY=rv_only: only such exports run RISC-V code.
 iree_status_t sa_rv_lookup(sa_context_t* c, iree_string_view_t name, char* symbol, size_t cap,
-                           uint32_t embedded_phys, uint32_t* out_phys) {
+                           uint32_t embedded_phys, bool required, uint32_t* out_phys) {
   *out_phys = 0;
   if (sa_rv.state == 0) {
     IREE_RETURN_IF_ERROR(sa_rv_load(c));
   }
-  if ((sa_rv.state != 2 && sa_rv.state != 3) || name.size + 1 > cap) return iree_ok_status();
+  if (name.size + 1 > cap) return iree_ok_status();
   for (size_t i = 0; i < name.size; ++i) {
     char ch = name.data[i];
     symbol[i] = ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) ? ch : '_';
   }
   symbol[name.size] = 0;
+  if (required) {
+    if (embedded_phys && c->transport->run_call && strcmp(c->transport->name, "board") == 0) {
+      IREE_RETURN_IF_ERROR(sa_rv_scratch_alloc(c));
+      *out_phys = embedded_phys;
+    } else if (sa_rv.state == 2) {
+      sa_rv_entry_t key = {symbol, 0};
+      sa_rv_entry_t* e = (sa_rv_entry_t*)bsearch(&key, sa_rv.entries, sa_rv.count, sizeof(*sa_rv.entries), sa_rv_cmp);
+      if (e) *out_phys = sa_rv.code_phys + e->offset;
+    }
+    return iree_ok_status();
+  }
+  if (sa_rv.state != 2 && sa_rv.state != 3) return iree_ok_status();
+  if (strcmp(sa_rv.only, "rv_only") == 0) return iree_ok_status();
   if (sa_rv.only[0]) {
     bool hit = false;
     char list[512];

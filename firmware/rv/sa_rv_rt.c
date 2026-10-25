@@ -9,12 +9,15 @@
  * simulator; loads from the shared window */
 static void (*sim_cmd)(const uint64_t *desc);
 static uint32_t (*sim_load32)(uint32_t addr);
+static void (*sim_store32)(uint32_t addr, uint32_t value);
 static uint32_t mat[11], vec[16], gemv[4];
 void sa_rv_sim_init(void (*cmd)(const uint64_t *desc), uint32_t (*load32)(uint32_t addr))
 {
     sim_cmd = cmd;
     sim_load32 = load32;
 }
+/* (separate: a transport without it still runs code that stores nothing) */
+void sa_rv_sim_init_store(void (*store32)(uint32_t addr, uint32_t value)) { sim_store32 = store32; }
 static void run(uint64_t w0, uint64_t w1, uint64_t w2, uint64_t w3, uint64_t w4, uint64_t w5, uint64_t w6,
                 uint64_t w7)
 {
@@ -54,6 +57,7 @@ void sa_rv_gemv_run(uint32_t w, uint32_t c, uint32_t strips, uint32_t accumulate
 }
 void sa_rv_mat_fence(uint32_t mask) { run(0x10, mask, 0, 0, 0, 0, 0, 0); }
 uint32_t sa_rv_ldparam(uint32_t addr) { return sim_load32(addr); }   /* (each command ran to its end) */
+void sa_rv_store32(uint32_t addr, uint32_t value) { sim_store32(addr, value); }
 
 #elif defined(SA_RV_HOST)
 /* ---------------------------------------------------------------- the host's recorder */
@@ -76,6 +80,7 @@ uint32_t sa_rv_ldparam(uint32_t addr)
     sa_rv_host_note("ldparam", addr, v);
     return v;
 }
+void sa_rv_store32(uint32_t addr, uint32_t value) { sa_rv_host_note("store32", addr, value); }
 
 #else
 /* ---------------------------------------------------------------- the PicoRV32 */
@@ -94,4 +99,5 @@ uint32_t sa_rv_ldparam(uint32_t addr)
     (void)mat_fence(0);
     return *(volatile uint32_t *)(uintptr_t)addr;
 }
+void sa_rv_store32(uint32_t addr, uint32_t value) { *(volatile uint32_t *)(uintptr_t)addr = value; }
 #endif

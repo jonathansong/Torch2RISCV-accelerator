@@ -251,8 +251,6 @@ public:
         return exportOp.emitError() << "sa target: " << layout.getBindings().size() << " bindings (at most 16)";
       auto it = templates.find(exportOp.getSymName());
       if (it == templates.end()) return exportOp.emitError() << "sa target: no sahw.template for this export";
-      if (it->second->hasAttr("sa.riscv_only") && !options.riscv)
-        return exportOp.emitError("sa target: MoE Top-2 requires --iree-sa-riscv");
       sa::SerializedExport se;
       if (failed(sa::serializeTemplate(it->second, se))) return failure();
       if (!options.emitRiscv.empty() && !it->second.getUnsupported()) {   // (an export on the host: none)
@@ -271,19 +269,30 @@ public:
     llvm::sort(exports, [](auto &a, auto &b) { return a.first < b.first; });
 
     // S4: the exports' rv32 code (in the sorted order), appended after the extensions with a table
-    // (header word 48: its offset; per export the code's offset and bytes, 0 / 0: none)
+    // (header word 48: its offset; per export the code's offset and bytes, 0 / 0: none). Without
+    // --iree-sa-riscv only the exports that have no descriptor form (sa.riscv_only: the MoE
+    // Top-2) get code, the others none (docs/moe_native_lowering_design.md §16)
     std::vector<std::string> rvcode;
-    if (options.riscv) {
+    bool anyRvOnly = llvm::any_of(exports, [&](auto &ex) {
+      return templates.lookup(ex.second.name)->hasAttr("sa.riscv_only");
+    });
+    if (options.riscv || anyRvOnly) {
       SmallVector<sa::sahw::TemplateOp> ts;
       std::vector<sa::SerializedExport> sev(exports.size());
       SmallVector<const sa::SerializedExport *> ses;
+      SmallVector<size_t> which;
       for (auto [i, ex] : llvm::enumerate(exports)) {
         sa::sahw::TemplateOp t = templates.lookup(ex.second.name);
+        if (!options.riscv && !t->hasAttr("sa.riscv_only")) continue;
         if (failed(sa::serializeTemplate(t, sev[i]))) return failure();
         ts.push_back(t);
         ses.push_back(&sev[i]);
+        which.push_back(i);
       }
-      if (failed(sa::compileRiscv(ts, ses, rvcode, variantOp))) return failure();
+      std::vector<std::string> code;
+      if (failed(sa::compileRiscv(ts, ses, code, variantOp))) return failure();
+      rvcode.assign(exports.size(), std::string());
+      for (auto [k, i] : llvm::enumerate(which)) rvcode[i] = code[k];
     }
 
     // sa-desc version 3 (compiler/runtime/tools/sadesc.py): header, export

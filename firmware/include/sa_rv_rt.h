@@ -30,6 +30,8 @@ void sa_rv_mat_fence(uint32_t mask);
 /* LDPARAM: the 32-bit word at a DDR address, after the engines are idle (it may
  * have just been stored) */
 uint32_t sa_rv_ldparam(uint32_t addr);
+/* a 32-bit word stored at a DDR address (a scalar kernel's result: the MoE Top-2) */
+void sa_rv_store32(uint32_t addr, uint32_t value);
 
 #ifdef SA_RV_HOST
 /* the host's recorder (rv_equiv.py's harness): one line per PCPI operation */

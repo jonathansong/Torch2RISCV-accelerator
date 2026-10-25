@@ -33,7 +33,7 @@ class MoeCompilerRiscvTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertGreater(out.stat().st_size, 0)
 
-    def test_router_code_table_and_required_option(self):
+    def test_router_code_table_without_riscv_option(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             binaries, ir = root / "binaries", root / "ir"
@@ -41,12 +41,9 @@ class MoeCompilerRiscvTest(unittest.TestCase):
             ir.mkdir()
             common = [str(COMPILE), str(SOURCE), "--iree-hal-target-device=sa",
                       "--iree-sa-form-moe", "--iree-hal-link-executables=false"]
-            result = subprocess.run(common + ["-o", str(root / "without_riscv.vmfb")],
-                                    capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("MoE Top-2 requires --iree-sa-riscv", result.stderr)
-
-            result = subprocess.run(common + ["--iree-sa-riscv", f"--iree-sa-emit-riscv={ir}",
+            # without --iree-sa-riscv only the RISC-V-only export (the Top-2) gets
+            # embedded code (docs/moe_native_lowering_design.md §16)
+            result = subprocess.run(common + [f"--iree-sa-emit-riscv={ir}",
                                               f"--iree-hal-dump-executable-binaries-to={binaries}",
                                               "-o", str(root / "router.vmfb")],
                                     capture_output=True, text=True)
@@ -66,18 +63,26 @@ class MoeCompilerRiscvTest(unittest.TestCase):
                     self.assertGreater(code_bytes, 0)
                     self.assertLessEqual(code_offset + code_bytes, len(blob))
                     marked.append(path)
+                else:
+                    self.assertEqual(table, 0, f"{path.name}: code for an export with a descriptor form")
             self.assertEqual(len(marked), 1)
             raw_ir = next(ir.glob("*topk*.ll")).read_text()
-            self.assertEqual(raw_ir.count("store i32 "), 4)
-            self.assertNotIn("declare void @sa_rv_", raw_ir)
+            # the words read and written through the runtime (the sim's host build can run it)
+            self.assertEqual(raw_ir.count("call void @sa_rv_store32("), 4)
+            self.assertIn("declare i32 @sa_rv_ldparam(i32)", raw_ir)
             if platform.system() == "Linux" and platform.machine() == "x86_64" and shutil.which("clang-18"):
                 self.check_host_ir(root, next(ir.glob("*topk*.ll")), raw_ir)
 
     def check_host_ir(self, root, ir_path, raw_ir):
-        """Run the emitted target-neutral IR with physical-style 32-bit addresses."""
+        """Run the emitted target-neutral IR with physical-style 32-bit addresses
+        (the runtime's word load and store as plain accesses)."""
         host = root / "top2_ir_host.so"
-        subprocess.run(["clang-18", "-O2", "-fPIC", "-shared", str(ir_path), "-o", str(host)], check=True,
-                       capture_output=True, text=True)
+        shim = root / "rt.c"
+        shim.write_text("#include <stdint.h>\n"
+                        "uint32_t sa_rv_ldparam(uint32_t a) { return *(volatile uint32_t *)(uintptr_t)a; }\n"
+                        "void sa_rv_store32(uint32_t a, uint32_t v) { *(volatile uint32_t *)(uintptr_t)a = v; }\n")
+        subprocess.run(["clang-18", "-O2", "-fPIC", "-shared", "-Wno-override-module", str(ir_path), str(shim),
+                        "-o", str(host)], check=True, capture_output=True, text=True)
         symbol = re.search(r"define void @([A-Za-z0-9_]+)\(", raw_ir).group(1)
         fn = getattr(ctypes.CDLL(str(host)), symbol)
         fn.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]

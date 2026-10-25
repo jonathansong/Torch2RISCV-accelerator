@@ -247,12 +247,14 @@ iree_status_t sa_executable_append(iree_hal_executable_t* executable, uint32_t o
   sa_export_t* xm = &e->exports[ordinal];
   if (xm->rv_state == 0) {
     IREE_RETURN_IF_ERROR(sa_rv_lookup(e->context, x->name, xm->rv_symbol, sizeof(xm->rv_symbol), xm->rv_embedded,
-                                      &xm->rv_phys));
+                                      x->rv_only, &xm->rv_phys));
     xm->rv_state = xm->rv_phys ? 2 : 1;
   }
-  if (x->rv_only && (xm->rv_state != 2 || !xm->rv_embedded || xm->rv_phys != xm->rv_embedded))
+  if (x->rv_only && xm->rv_state != 2)
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
-                            "sa: MoE Top-2 requires SA_RV=embedded on the board");
+                            "sa: '%.*s' has RISC-V code only (the MoE Top-2): on the board its executable's "
+                            "embedded code (compiled for it), on the sim SA_RV=<a directory with its host build, "
+                            "compiler/tests/rv_image.py>", (int)x->name.size, x->name.data);
   if (xm->rv_state == 2) {
     uint32_t phys[16];
     for (uint32_t i = 0; i < binding_count && i < 16; ++i) {

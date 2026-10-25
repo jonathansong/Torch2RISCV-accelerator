@@ -16,7 +16,9 @@ fp32 data is normal(0, 1), int8 / int32 data int8-valued, i64 scalars
 (token, position, row) --t - 3 (rows partly masked), i64 vectors distinct values
 ending at --t - 3. With --ids, a binding read as indices (tensor.extract +
 index_cast: an MoE Top-2's expert ids, docs/moe_native_lowering_design.md §6)
-holds those values, repeated.
+holds those values, repeated. An export with RISC-V code only (the MoE Top-2)
+runs its host build from --rv DIR (compiler/tests/rv_image.py's rvcode_host.so,
+the functional simulator executing its commands, loads and stores).
 
     python3 compiler/tests/dispatch_check.py <sources dir> <binaries dir> [--d D] [--t 16] [numbers...]
 
@@ -121,6 +123,31 @@ def binding_regions(func, interp):
 FULL_I8 = False
 POS = None                                  # --pos
 IDS = None                                  # --ids
+RV = None                                   # --rv
+
+
+def run_rv(sim, name, phys, consts, scratch):
+    """The export's host build (SA_RV_SIM: its commands as one-descriptor lists on
+    the simulator, as sa_transport_sim.c does), at the bindings' addresses."""
+    import ctypes
+    lib = ctypes.CDLL(os.path.join(RV, "rvcode_host.so"))
+    def cmd(p):
+        sim.ddr_write(scratch, np.array([p[i] for i in range(8)] + [0x12, 0x5A] + [0] * 6, np.uint64).tobytes())
+        sim.run_list(scratch)
+    def load(a):
+        return int(sim.ddr_read(a, 4).view("<u4")[0])
+    def store(a, v):
+        sim.ddr_write(a, np.array([v], "<u4").tobytes())
+    CMD = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_uint64))
+    LD = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_uint32)
+    ST = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.c_uint32)
+    cbs = (CMD(cmd), LD(load), ST(store))                  # (kept alive for the call)
+    lib.sa_rv_sim_init(cbs[0], cbs[1])
+    lib.sa_rv_sim_init_store(cbs[2])
+    fn = getattr(lib, re.sub(r"[^A-Za-z0-9]", "_", name))
+    b = (ctypes.c_uint32 * 16)(*[int(x) for x in phys[:16]])
+    c = (ctypes.c_uint32 * 48)(*[int(x) for x in list(consts)[:48]])
+    fn(b, c)
 
 
 def fill(rng, et, n, t):
@@ -214,6 +241,10 @@ def check(src, blob, d, t, seed=1, verbose=False, site=0):
         sim.trace = []
     try:
         sim.run_list(lst_addr)
+        if ext.get("rv_only"):
+            if not RV:
+                return "RISC-V only (--rv DIR: its host build)"
+            run_rv(sim, name, phys, consts, lst_addr - 0x10000)   # (a free page below the list)
     except SaError as e:
         return f"device error: {e}"
     if os.environ.get("SA_DC_TRACE"):
@@ -278,10 +309,12 @@ def main():
     ap.add_argument("--full-i8", action="store_true", help="int8 data over [-128, 127] (default [-127, 127], "
                     "the range of the frontend's own quantization)")
     ap.add_argument("--ids", help="comma-separated values of the bindings read as indices (MoE expert ids)")
+    ap.add_argument("--rv", help="a directory with rvcode_host.so (rv_image.py): exports with RISC-V code only")
     ap.add_argument("numbers", nargs="*")
     args = ap.parse_args()
-    global FULL_I8, POS, IDS
+    global FULL_I8, POS, IDS, RV
     IDS = [int(v) for v in args.ids.split(",")] if args.ids else None
+    RV = args.rv
     POS = args.pos
     FULL_I8 = args.full_i8
     global SKEW, DIRTY

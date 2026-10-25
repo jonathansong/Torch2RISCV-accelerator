@@ -88,6 +88,9 @@ static void sa_sim_rv_cmd(const uint64_t* w) {
 static uint32_t sa_sim_rv_load32(uint32_t a) {
   return *(volatile uint32_t*)(sa_sim_rv_tp->mem + (a - sa_sim_rv_tp->mem_phys));
 }
+static void sa_sim_rv_store32(uint32_t a, uint32_t v) {
+  *(volatile uint32_t*)(sa_sim_rv_tp->mem + (a - sa_sim_rv_tp->mem_phys)) = v;
+}
 static iree_status_t sa_sim_run_call(sa_transport_t* t, uint32_t code_phys, uint32_t args_phys, const char* symbol,
                                      sa_completion_t* out) {
   (void)code_phys;
@@ -101,6 +104,10 @@ static iree_status_t sa_sim_run_call(sa_transport_t* t, uint32_t code_phys, uint
         (void (*)(void (*)(const uint64_t*), uint32_t (*)(uint32_t)))dlsym(sa_sim_rv_so, "sa_rv_sim_init");
     if (!init) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa sim: no sa_rv_sim_init in %s", path);
     init(sa_sim_rv_cmd, sa_sim_rv_load32);
+    // (an older rvcode_host.so has no stores)
+    void (*init_store)(void (*)(uint32_t, uint32_t)) =
+        (void (*)(void (*)(uint32_t, uint32_t)))dlsym(sa_sim_rv_so, "sa_rv_sim_init_store");
+    if (init_store) init_store(sa_sim_rv_store32);
   }
   void (*fn)(const uint32_t*, const uint32_t*) = (void (*)(const uint32_t*, const uint32_t*))dlsym(sa_sim_rv_so, symbol);
   if (!fn) return iree_make_status(IREE_STATUS_NOT_FOUND, "sa sim: no function %s in rvcode_host.so", symbol);

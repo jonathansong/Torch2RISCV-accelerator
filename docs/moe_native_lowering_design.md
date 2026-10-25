@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12), S2 packing (§13), S3 regions (§14) and S4 backend (§15) done; S5 next.
+> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12), S2 packing (§13), S3 regions (§14), S4 backend (§15) and S5 Top-2 (§16) done; S6 next.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -386,7 +386,7 @@ only token and ID agreement are reported, not quality).
 | S2 packing | **Done 2026-10-25 (§13).** Gather-to-slice rewrite, `PackLinearWeights` expert tables | Lit; tables packed at compile time into the parameter archive |
 | S3 regions | **Done 2026-10-25 (§14).** One FFN region per expert (already `FormFfnRegions`'), ids read as i32 | Lit; no id-extension dispatches; golden identical |
 | S4 backend | **Done 2026-10-25 (§15).** Tagged expert BASEs, the P prologue, the dynamic slots | Every tiny-mixtral dispatch on the SA; `dispatch_check` bit-exact except the Top-2 (S5) |
-| S5 Top-2 | Semantic record, funcsim Top-2, runtime `rv_only` policy, compiler emits only `rv_only` code | `dispatch_check` of top2; sim e2e with `SA_RV` unset |
+| S5 Top-2 | **Done 2026-10-25 (§16).** Top-2 through the RISC-V runtime's load / store, host build on the sim, runtime `rv_only` policy, compiler embeds only `rv_only` code | `dispatch_check` 198/198 incl. the Top-2; sim decode runs |
 | S6 e2e sim | tiny-mixtral through `compile_sa.sh` | Gates 1–4 of §7; golden re-recorded |
 | S7 board | Bundle, board run | Gates 5–6 |
 | S8 cleanup | Delete §6.3 and the M5 milestone scripts; update `moe_implementation_plan.md` and CLAUDE.md | Lit + golden |
@@ -784,3 +784,63 @@ this case is left to the board stage.
 | down of expert 1 + combine (both experts' scales) | 4 |
 
 The register file has 8, so this fits with room to spare.
+
+## 16. S5 results (2026-10-25)
+
+**The sim needed no semantic record.** §7 planned a Python model of the Top-2
+for the simulator. The repository already runs generated RISC-V code on the
+sim: the portable LLVM IR (`--iree-sa-emit-riscv`) is compiled for the host
+(`compiler/tests/rv_image.py` → `rvcode_host.so`). `sa_transport_sim.c` calls
+it, its commands run as one-descriptor lists on the functional simulator, and
+its loads read the shared window. That executes the same code as the board,
+so it replaces the semantic record.
+
+The obstacle was the Top-2 kernel itself. M5's `buildRawTop2` read and wrote
+DDR through raw pointers to physical addresses. That works on the PicoRV32
+but not in a host process, so M5's Top-2 was only ever tested on the board.
+
+**Changes:**
+
+- **`SahwToRiscv.cpp`**:
+  - `buildRawTop2` reads the scores through `sa_rv_ldparam` and writes the
+    values and ids through a new `sa_rv_store32`.
+  - With `--iree-sa-riscv` (inline PCPI, in-process) both stay plain
+    volatile accesses; the load follows a FENCE.
+  - In the portable IR they are calls.
+- **Runtime shim** (`firmware/rv/sa_rv_rt.c`, `sa_rv_rt.h`):
+  `sa_rv_store32` for the PicoRV32 (a store), the host recorder (a note) and
+  the sim (a callback registered by `sa_rv_sim_init_store`, found with
+  `dlsym`, so an older `rvcode_host.so` still loads).
+- **`SATarget.cpp`**: without `--iree-sa-riscv`, the exports marked
+  `sa.riscv_only` (and only those) get embedded rv32 code. The old "requires
+  `--iree-sa-riscv`" error is gone. In tiny-mixtral one executable of 198
+  has a code table (4.5 KB).
+- **Runtime policy** (`sa_rv.c`, `sa_loader.c`): `sa_rv_lookup(..., required)`.
+  - An `rv_only` export runs RISC-V code whatever `SA_RV` and `SA_RV_ONLY`
+    say: on the board its executable's embedded code (the argument block
+    allocated on demand), on the sim the `SA_RV` directory's host build.
+  - Without either it fails with a message saying which is needed.
+  - `SA_RV_ONLY=rv_only` keeps every other export on descriptor lists.
+- **`dispatch_check.py --rv DIR`**: an `rv_only` export runs its host build,
+  with the functional simulator executing its commands, loads and stores.
+  `oracle.py` executes `iree_linalg_ext.topk` (IREE's scalar insertion, the
+  ordered `>` comparator, equal values ordered by id). `sadesc.read_ext`
+  reports `rv_only`.
+- **M5 tests**: `test_moe_compiler_riscv.py` and `test_moe_compiler_route.py`
+  now expect compilation without `--iree-sa-riscv` to succeed. The former
+  links its host run of the Top-2 IR with a two-function shim. Both pass.
+
+**Verification:**
+
+- `dispatch_check` on tiny-mixtral with `--rv`, `--dirty --ids 7,0` and
+  `--pos 0 --ids 2,5`: 198 / 198 equal to the oracle, the Top-2 included.
+  Without `--rv` the Top-2 reports "RISC-V only".
+- Sim decode of tokens 1, 42, 43 (`sa-llm-run --abi=hfv --pad=16
+  --valid_len=64`, `SA_RV=<rv dir> SA_RV_ONLY=rv_only`):
+  - 0 dispatches on the host, 6 as RISC-V code (the Top-2 of 2 layers ×
+    3 steps);
+  - top tokens 25591, 13899, 26962, the host W8A8 model's and HF fp32's.
+- Lit 29/29; golden identical (636); the host and aarch64 runtimes build.
+
+S6 compares the sim's logits with the host model and checks prefill against
+decode. S7 adds the board.

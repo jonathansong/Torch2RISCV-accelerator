@@ -28,8 +28,8 @@ class MoeCompilerRouteTest(unittest.TestCase):
             base_command = [str(COMPILE), str(SOURCE), "--compile-from=executable-configurations"]
             result = subprocess.run(base_command + ["-o", str(root / "without_riscv.vmfb")],
                                     capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("requires --iree-sa-riscv", result.stderr)
+            # (a RISC-V-only export is embedded without --iree-sa-riscv too: docs/moe_native_lowering_design.md §16)
+            self.assertEqual(result.returncode, 0, result.stderr)
             result = subprocess.run(base_command + ["--iree-sa-riscv", f"--iree-sa-emit-riscv={ir}",
                                                 f"--iree-hal-dump-executable-binaries-to={binaries}",
                                                 "-o", str(root / "route.vmfb")],
