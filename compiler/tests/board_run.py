@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = {"llm": "board_llm.py", "teacher": "board_teacher.py", "profile": "board_profile.py",
            "generate": "board_generate.py", "longctx": "board_longctx.py", "rvb": "board_rvb.py",
            "rvsched": "board_rvsched.py", "rvcode": "board_rvcode.py", "rvperf": "board_rvperf.py"}
-OUTPUTS = {"llm": ["tokens_board.txt"], "teacher": ["tf_board.npz"], "longctx": ["longctx_board.npz", "longctx_sweep_board.json"],
+OUTPUTS = {"llm": ["tokens_board.txt", "logits_board.f32"], "llm_decode": ["tokens_board.txt", "logits_board.f32"], "teacher": ["tf_board.npz"], "longctx": ["longctx_board.npz", "longctx_sweep_board.json"],
            "rvb": ["rvb_board.json"], "rvsched": ["rvsched_board.json", "rvsched_rv_board.json", "rvsched_rv_embedded_board.json", "rvsched_r5_board.json"],
            "rvcode": ["rvcode_board.json", "rvcode_embedded_board.json"],
            "rvperf": [f"rvperf_{r}.{x}" for r in ("desc", "rv", "sched", "sched_rv") for x in ("csv", "log")]}
@@ -100,6 +100,8 @@ def main():
     mode, args = sys.argv[1], sys.argv[2:]
     if mode == "profile" and "--batch" in args:
         mode = "profile_batch"
+    if mode == "llm" and "--decode-only" in args:     # (the prompt as decode steps: a results directory of its own)
+        mode = "llm_decode"
     script = SCRIPTS[mode.split("_")[0]]
     d = run_dir(mode, version())
     if mode.startswith("profile") and not any(a.startswith("SA_PROFILE_PERF=") for a in args):

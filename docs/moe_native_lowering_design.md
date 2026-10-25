@@ -388,7 +388,7 @@ only token and ID agreement are reported, not quality).
 | S4 backend | **Done 2026-10-25 (§15).** Tagged expert BASEs, the P prologue, the dynamic slots | Every tiny-mixtral dispatch on the SA; `dispatch_check` bit-exact except the Top-2 (S5) |
 | S5 Top-2 | **Done 2026-10-25 (§16).** Top-2 through the RISC-V runtime's load / store, host build on the sim, runtime `rv_only` policy, compiler embeds only `rv_only` code | `dispatch_check` 198/198 incl. the Top-2; sim decode runs |
 | S6 e2e sim | **Done 2026-10-25 (§17).** tiny-mixtral through `compile_sa.sh`, `test_moe_sim.py` | Prefill ≡ decode and plan A ≡ descriptors byte-equal; host model argmax 28/28; golden + 198 MoE dispatches |
-| S7 board | Bundle, board run | Gates 5–6 |
+| S7 board | **Staged 2026-10-25 (§18):** `deploy_moe.sh` → `build/deploy_moe_tm`, `run_board_tests.sh moe` | Gates 5–6 |
 | S8 cleanup | Delete §6.3 and the M5 milestone scripts; update `moe_implementation_plan.md` and CLAUDE.md | Lit + golden |
 
 Estimate: S0 1 day, S1–S3 3–4 days, S4 3–4 days, S5 2 days, S6–S8 2–3 days.
@@ -886,3 +886,32 @@ this correlation (§12.2: rel L2 ≈ 0.3 against ≈ 0.03 at the same step).
   Recording plus two comparisons pass.
 - The bundle was recompiled with the fix (sources unchanged). The S6 test
   and `dispatch_check --dirty --ids 7,0 --rv` pass on it (198 / 198).
+
+## 18. S7: the board bundle (staged 2026-10-25, not run yet)
+
+`compiler/scripts/deploy_moe.sh [build/moe/native/tm]` stages
+`build/deploy_moe_tm`, containing:
+
+- `sa.vmfb`, `sa_packed.irpa`;
+- the sim's decode-only run as the reference (`test_moe_sim.py` now writes
+  `prompt.npy`, `expected_tokens.npy`, `expected_logits.npy` into
+  `<bundle>/s6`);
+- the aarch64 `sa-llm-run`;
+- `rt_fw.bin` (v7: RT_CALL for the Top-2's embedded code);
+- the `d16_100mhz_w128_p6_gemv_np4_pcpi` overlay, `board_llm.py`,
+  `board_run.py`.
+
+The window is 260 MB, the sim's device peak (238 MB) plus 32. `sa_args.txt`
+is `--abi=hfv --pad=16 --valid_len=64 --prefill=16`.
+
+On the board, the Top-2 runs as the executable's embedded RISC-V code (the
+`rv_only` policy, §16, without `SA_RV`), and everything else runs as
+descriptor lists. `run_board_tests.sh moe` runs two tests:
+
+- `llm`: prefill + decode, compared from the prompt's last position on;
+- `llm --decode-only`: the whole prompt as decode steps.
+
+Both compare the logits bit for bit with the sim. `board_run.py` gives
+decode-only a results directory of its own (`llm_decode`) and keeps
+`logits_board.f32`. `board_llm.py` prints the ids when the checkpoint has no
+tokenizer.

@@ -31,6 +31,8 @@ def decoder(vocab):
     if os.path.exists(os.path.join(HERE, "tokenizer.json")):
         from hf_tokenizer import BpeTokenizer
         return BpeTokenizer(HERE).decode
+    if not os.path.exists(os.path.join(HERE, "tokenizer.bin")):    # (a checkpoint without one: the ids)
+        return lambda ids: " ".join(map(str, ids))
     from tokenizer import Tokenizer
     return Tokenizer(os.path.join(HERE, "tokenizer.bin"), vocab).decode
 

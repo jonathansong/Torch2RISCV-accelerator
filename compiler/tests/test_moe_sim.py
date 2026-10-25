@@ -10,6 +10,8 @@ compiler/sim/sa_sim_server.py):
   B  the same prompt through prefill (--prefill M): its last position and the
      generated steps byte-equal to A's
   C  plan A, every export as RISC-V code (SA_RV, no SA_RV_ONLY): byte-equal to A
+  (A's prompt, tokens and logits are written as the board's reference into
+  <bundle>/s6: prompt.npy, expected_tokens.npy, expected_logits.npy; deploy_moe.sh)
   ref the host model (test_hf_moe.sa_decoder: SaDecoder with QMixtralMoe), its
      KV scales calibrated on the export's tokens, teacher-forced on A's tokens:
      argmax per step and correlation (rounding order differs, so not bit-exact)
@@ -43,6 +45,8 @@ def sim_run(bundle, tokens, out, env_rv, mb, extra=(), d=16, valid_len=64):
     r = subprocess.run([RUN, "--device=sa", f"--module={bundle}/sa.vmfb", f"--parameters=model={bundle}/sa_packed.irpa",
                         "--abi=hfv", f"--pad={d}", f"--valid_len={valid_len}", "--tokens=" + ",".join(map(str, tokens)),
                         f"--logits_out={out}", *extra], capture_output=True, text=True, env=env)
+    with open(out + ".run.log", "w") as f:                 # (deploy_moe.sh reads the device memory peak)
+        f.write(r.stdout + r.stderr)
     if r.returncode:
         srv.kill()
     srv.wait(timeout=120)
@@ -81,6 +85,9 @@ def main():
     c = sim_run(args.bundle, prompt, f"{out}/C_planA.f32", {"SA_RV": rv}, args.mb,
                 [f"--generate={G}"]).reshape(-1, V)
     toks = prompt + [int(x) for x in a[P - 1:P + G - 1].argmax(1)]
+    np.save(f"{out}/prompt.npy", np.array(prompt, np.int64))          # (board_llm.py's reference)
+    np.save(f"{out}/expected_tokens.npy", np.array(toks, np.int64))
+    np.save(f"{out}/expected_logits.npy", a)
 
     print("host model:")
     import test_hf_moe as HM

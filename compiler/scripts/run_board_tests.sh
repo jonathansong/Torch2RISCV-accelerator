@@ -65,6 +65,7 @@ declare -A DIR=(
   [gemmac]=deploy_hfgen_gemmac_pcpi
   [qwen3c]=deploy_hfgen_qwen3c_pcpi
   [llamac]=deploy_hfgen_llamac_pcpi
+  [moe]=deploy_moe_tm
 )
 tests_of() {
   case $1 in
@@ -81,6 +82,9 @@ tests_of() {
     # the SwiGLU fusion (SA_FUSE_FFN=1, docs/fusion_design.md): bit-exact checks, decode speed, the RISC-V paths
     gemmaf|gemmaf2|gemmaa|gemmac) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" "longctx --sweep 64,128,256,512" \
       "rvsched" "rvcode --embedded" "rvsched --rv --embedded" ;;
+    # native MoE (docs/moe_native_lowering_design.md S7, compiler/scripts/deploy_moe.sh): tiny-mixtral,
+    # prefill + decode and decode only, bit-exact with the sim
+    moe) printf '%s\n' "llm" "llm --decode-only" ;;
     smollm2f|qwen3f|llamaf|smollm2f2|qwen3f2|llamaf2|smollm2a|qwen3a|llamaa|smollm2c|qwen3c|llamac) printf '%s\n' "llm" "profile 40 --prompt 32 --batch" "profile 40 --prompt 32" "longctx" \
       "longctx --sweep 64,256,512,1024,2048" "rvsched" "rvcode --embedded" "rvsched --rv --embedded" ;;
   esac
@@ -90,7 +94,7 @@ SEL=("$@")
 [ ${#SEL[@]} -eq 0 ] && SEL=(rvb gemma qwen3 llama)
 for b in "${SEL[@]}"; do
   d=$H/${DIR[$b]:-}
-  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama smollm2 qwen3g gemmag llamag smollm2f gemmaf qwen3f llamaf smollm2f2 gemmaf2 qwen3f2 llamaf2 smollm2a gemmaa qwen3a llamaa smollm2c gemmac qwen3c llamac)"; continue; }
+  [ -n "${DIR[$b]:-}" ] || { echo "unknown bundle $b (rvb rvbc rvbe gemma qwen3 llama smollm2 qwen3g gemmag llamag smollm2f gemmaf qwen3f llamaf smollm2f2 gemmaf2 qwen3f2 llamaf2 smollm2a gemmaa qwen3a llamaa smollm2c gemmac qwen3c llamac moe)"; continue; }
   [ -d "$d" ] || { echo "[$b] $d not on the board: skipped"; continue; }
   while IFS= read -r t; do
     [ -n "$t" ] || continue
