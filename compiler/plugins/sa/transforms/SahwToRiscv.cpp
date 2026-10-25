@@ -414,7 +414,8 @@ namespace {
 // beats the k-th key: on the PicoRV32 every instruction is fetched from DDR,
 // so most scores cost one load, the key and one compare. Scanning the ids in
 // increasing order with a strict comparison keeps the lower id first on equal
-// scores, the topk's order.
+// scores, the topk's order. A NaN score is never selected (the topk's ordered > never
+// prefers it).
 LogicalResult buildRawTopk(RvEmitter &e, sahw::TemplateOp t) {
   auto expertsAttr = t->getAttrOfType<IntegerAttr>("sa.moe.raw_topk");
   auto kAttr = t->getAttrOfType<IntegerAttr>("sa.moe.top_k");
@@ -468,6 +469,8 @@ LogicalResult buildRawTopk(RvEmitter &e, sahw::TemplateOp t) {
   llvm::Value *x = e.ldparam(b.CreateAdd(addrs[0], b.CreateShl(i, e.c32(2))));
   llvm::Value *xc = b.CreateSelect(b.CreateICmpEQ(b.CreateAnd(x, e.c32(0x7FFFFFFF)), e.c32(0)), e.c32(0), x);
   llvm::Value *key = b.CreateXor(xc, b.CreateOr(b.CreateAShr(xc, e.c32(31)), e.c32(0x80000000)));
+  // NaN: key 0, never above the k-th (the topk's ordered > never takes it)
+  key = b.CreateSelect(b.CreateICmpUGT(b.CreateAnd(x, e.c32(0x7FFFFFFF)), e.c32(0x7F800000)), e.c32(0), key);
   llvm::Value *kth = b.CreateLoad(e.i32, at(keys, e.c32(k - 1)));
   b.CreateCondBr(b.CreateICmpUGT(key, kth), insert, next);
 

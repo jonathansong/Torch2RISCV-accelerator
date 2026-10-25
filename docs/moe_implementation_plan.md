@@ -6,6 +6,12 @@
 > 2026-10-25: M5's compiler-owned HAL chain (`LowerMoeChain`, `--iree-sa-moe-bundle`, the
 > route kernels, the M5 board scripts) is superseded by and removed with the native lowering,
 > `docs/moe_native_lowering_design.md` (§19); the M5 sections below are the history.
+> 2026-10-25: retired. The M0–M4 hand-written path (`frontend/moe.py`, `moe_hf.py`, the
+> `runtime/tools/moe_m*.py` tools, `firmware/moe_top1` / `moe_top2`, their tests and board
+> scripts) is deleted: the native lowering replaces it, up to Granite-3.1-1B-A400M accepted on the
+> board (`docs/moe_native_lowering_design.md` §24). The code is at the tag `moe-m0-m4-final`. This
+> document is the record of M0–M5; its M6 section was written for M5's ABI and is out of date:
+> grouped prefill is to be designed on the native lowering.
 > 目标平台：AMD KV260 + PicoRV32 + SA accelerator
 > 编译路径：PyTorch/Hugging Face → IREE Flow → SAHL → SAHW → descriptor list 或 RISC-V 代码
 > 第一目标：不修改 GEMV RTL，实现 batch-1、W8A8、top-1/top-2 稀疏 MoE decode，并在模拟器和 KV260 上端到端验证。

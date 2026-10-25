@@ -100,7 +100,7 @@ PicoRV32 control core). Start with `README.md`, then
 - Lifetime-based local memory planning (3a / 3b): designed, deferred
   (`docs/local_memory_planning.md`).
 - MoE (2026-10-21..25): `docs/moe_implementation_plan.md` M0–M5 (Mixtral layers on the
-  board; M5's compiler-owned HAL chain removed 2026-10-25); then the native
+  board; M5's compiler-owned HAL chain removed 2026-10-25, the M0–M4 code too, at the tag `moe-m0-m4-final`); then the native
   lowering, `docs/moe_native_lowering_design.md` S0–S7: `hf_generic.QMixtralMoe` (W8A8),
   expert tables packed at compile time and selected by a dynamic slice whose DDR offset the
   device computes (`PackLinearWeights`, `SahlToSahw` `applyExpertBases`), the Top-2 as

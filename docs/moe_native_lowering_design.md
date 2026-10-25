@@ -996,7 +996,7 @@ the board (§10 R5).
 - the M0–M4 hand-written path (`frontend/moe.py`, `moe_hf.py`,
   `runtime/tools/moe_m*.py`, `moe_model.py`, `firmware/moe_top1`,
   `moe_top2`, their tests and board scripts): the reference implementation
-  M0–M4 were accepted with.
+  M0–M4 were accepted with. (Deleted on 2026-10-25 after §24, at the tag `moe-m0-m4-final`.)
 
 `test_moe_m3b.py` is back to its pre-M5 state, which drops M5's route-bridge
 case.
