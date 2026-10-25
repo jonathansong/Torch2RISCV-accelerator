@@ -576,17 +576,99 @@ class QLinear(torch.nn.Module):
         self.bias = None if lin.bias is None else torch.nn.Parameter(lin.bias.detach().float(), requires_grad=False)
 
     def forward(self, x):
-        if "act" in SA_FP32:                     # (attribution: weight-only int8)
-            y = torch.matmul(x, (self.wq.to(torch.float32) * self.s_w[:, None]).t())
-            return y if self.bias is None else y + self.bias
-        xq, s_x = _quant_act(x)
-        # on rows [tokens, in] (qhf's form): a 3-D int32 matmul is exported as a
-        # batch_matmul accumulating in i64, which the sa backend leaves to the host
-        rows = xq.reshape(-1, xq.shape[-1])
-        acc = torch.matmul(rows.to(torch.int32), self.wq.to(torch.int32).t())
-        acc = acc.reshape(tuple(xq.shape[:-1]) + (acc.shape[-1],))
-        y = (acc.to(torch.float32) * self.s_w) * s_x
+        y = _qlinear(x, self.wq, self.s_w)
         return y if self.bias is None else y + self.bias
+
+
+def _qlinear(x, wq, s_w):
+    """QLinear's product: int8 rows wq [out, in] with per-row scales s_w [out]."""
+    if "act" in SA_FP32:                         # (attribution: weight-only int8)
+        return torch.matmul(x, (wq.to(torch.float32) * s_w[:, None]).t())
+    xq, s_x = _quant_act(x)
+    # on rows [tokens, in] (qhf's form): a 3-D int32 matmul is exported as a
+    # batch_matmul accumulating in i64, which the sa backend leaves to the host
+    rows = xq.reshape(-1, xq.shape[-1])
+    acc = torch.matmul(rows.to(torch.int32), wq.to(torch.int32).t())
+    acc = acc.reshape(tuple(xq.shape[:-1]) + (acc.shape[-1],))
+    return (acc.to(torch.float32) * s_w) * s_x
+
+
+ROUTER_PAD = 16          # the router's expert axis padded to this (a multiple of the array size D)
+
+
+class QMixtralMoe(torch.nn.Module):
+    """A Mixtral sparse MoE block, W8A8 (docs/moe_native_lowering_design.md §4):
+    a router QLinear padded to ROUTER_PAD rows (-inf scores on the padding), the
+    Top-2 of its logits, their softmax (= Mixtral's renormalized Top-2
+    probabilities), and the two selected SwiGLU experts, each one row of int8
+    tables [E, out, in] selected by its id (index_select: on the device a
+    dynamic slice of the packed table). Rows (prefill) one at a time, each with
+    its own Top-2. Ties: torch.topk's order (the device takes the lower id)."""
+    def __init__(self, block):
+        super().__init__()
+        router, ex = block.gate, block.experts
+        E, H = router.weight.shape
+        if getattr(router, "top_k", 2) != 2 or E < 2 or E > ROUTER_PAD:
+            raise NotImplementedError(f"{type(block).__name__}: Top-{router.top_k} of {E} experts "
+                                      f"(supported: Top-2 of at most {ROUTER_PAD})")
+        I = ex.intermediate_dim
+        rw = torch.zeros(ROUTER_PAD, H)
+        rw[:E] = router.weight.detach().float()
+        rq, rs = _quantize_rows(rw)
+        pad = torch.zeros(ROUTER_PAD)
+        pad[E:] = float("-inf")
+        gu = ex.gate_up_proj.detach().float()                          # [E, 2 I, H]: gate rows, then up rows
+
+        def table(w):                                                  # [E, out, in] -> int8 rows, scales
+            qs = [_quantize_rows(w[e]) for e in range(E)]
+            return torch.stack([q for q, _ in qs]), torch.stack([s for _, s in qs])
+        p = lambda t: torch.nn.Parameter(t, requires_grad=False)
+        self.rq, self.rs, self.pad = p(rq), p(rs), p(pad)
+        (gq, gs), (uq, us), (dq, ds) = table(gu[:, :I]), table(gu[:, I:]), table(ex.down_proj.detach().float())
+        self.gq, self.gs, self.uq, self.us, self.dq, self.ds = p(gq), p(gs), p(uq), p(us), p(dq), p(ds)
+        self.act_fn = ex.act_fn
+        self.E = E
+
+    def route(self, x):
+        """x [1, H] -> (Top-2 logits [1, 2], ids [1, 2], weights [1, 2])"""
+        scores = _qlinear(x, self.rq, self.rs) + self.pad
+        vals, ids = torch.topk(scores, 2, dim=-1)
+        e = torch.exp(vals - vals[:, :1])                              # (vals[:, 0] the larger one)
+        return vals, ids, e * torch.reciprocal(e.sum(dim=-1, keepdim=True))
+
+    def _row(self, x):
+        _, ids, w = self.route(x)
+        y = 0
+        for k in range(2):
+            i = ids[0, k:k + 1]
+            g = _qlinear(x, self.gq.index_select(0, i)[0], self.gs.index_select(0, i)[0])
+            u = _qlinear(x, self.uq.index_select(0, i)[0], self.us.index_select(0, i)[0])
+            yk = _qlinear(self.act_fn(g) * u, self.dq.index_select(0, i)[0], self.ds.index_select(0, i)[0])
+            y = y + w[:, k:k + 1] * yk
+        return y
+
+    def forward(self, hidden_states):
+        shape = hidden_states.shape
+        rows = hidden_states.reshape(-1, shape[-1])
+        out = [self._row(rows[r:r + 1]) for r in range(rows.shape[0])]
+        return (out[0] if len(out) == 1 else torch.cat(out)).reshape(shape)
+
+
+def moe_rewrite(model):
+    """Mixtral-style sparse MoE blocks (a Top-k router `gate` with a weight
+    [E, H], `experts` with 3-D gate_up_proj / down_proj) -> QMixtralMoe."""
+    n = 0
+    for mod in list(model.modules()):
+        for cname, child in list(mod.named_children()):
+            if not type(child).__name__.endswith("SparseMoeBlock"):
+                continue
+            ex = getattr(child, "experts", None)
+            if not (hasattr(getattr(child, "gate", None), "weight") and hasattr(ex, "gate_up_proj")
+                    and hasattr(ex, "down_proj")) or getattr(child, "shared_expert", None) is not None:
+                raise NotImplementedError(f"{type(child).__name__}: not a Mixtral-style MoE block")
+            setattr(mod, cname, QMixtralMoe(child))
+            n += 1
+    return n
 
 
 class QEmbedding(torch.nn.Module):
@@ -780,8 +862,10 @@ def quantize(model):
     embedding) is quantized once and the int8 tensor shared (the packed-gather
     optimization of the sa backend reads it once, plan §8.12 C6.0). A weight
     with `_sa_qs` (an imported checkpoint, ct_import.py) keeps its int8 rows
-    and scales as they are."""
+    and scales as they are. Mixtral-style MoE blocks -> QMixtralMoe (moe_rewrite)."""
     shared, n = {}, {"linear": 0, "embedding": 0, "imported": 0}
+    if m := moe_rewrite(model):
+        n["moe"] = m
 
     def qs_of(weight):
         key = weight.data_ptr()

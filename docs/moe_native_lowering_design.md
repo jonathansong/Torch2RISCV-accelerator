@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): design; S0 spike done (§11), the rest not implemented.
+> Status (2026-10-25): design; S0 spike (§11) and S1 frontend (§12) done, the rest not implemented.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -69,63 +69,82 @@ Top-k > 2, grouped prefill (M6), fusing both experts into one dispatch (§9, v2)
 
 ## 4. Frontend: the W8A8 Mixtral block (`hf_generic`)
 
-`hf_generic` replaces each `MixtralSparseMoeBlock` (its forward loops over the
-experts with data-dependent masks and cannot be exported) with `QMixtralMoe`.
-It reuses `QLinear`'s conventions (`_quant_act`, `_quantize_rows`):
+**Implemented (S1, 2026-10-25)**: `QMixtralMoe` and `moe_rewrite` in
+`compiler/frontend/hf_generic.py`, called by `quantize()`; test
+`compiler/tests/test_hf_moe.py` (§12).
+
+transformers' `MixtralSparseMoeBlock` (5.x: a `MixtralTopKRouter` `gate` with
+a weight `[E, H]`, and `MixtralExperts` with `gate_up_proj [E, 2I, H]` and
+`down_proj [E, H, I]`) loops over the experts with data-dependent masks and
+cannot be exported. `moe_rewrite` replaces it with `QMixtralMoe`, which reuses
+`QLinear`'s conventions (`_quant_act`, `_quantize_rows`; its product is now the
+shared `_qlinear(x, wq, s_w)`):
 
 ```python
 class QMixtralMoe(torch.nn.Module):
-    # router: QLinear with E rows padded to Ep = a multiple of D (zero rows),
-    #         pad: f32 [Ep], 0 for the E experts, -inf for the padding
-    # gate_q, up_q: int8 [E, I, H]   gate_s, up_s: f32 [E, I]
-    # down_q:       int8 [E, H, I]   down_s:       f32 [E, H]
-    def forward(self, x):                                  # x: [1, H] f32
-        scores = self.router(x) + self.pad                 # [1, Ep] f32, no slice
+    # rq, rs: the router, E rows padded to ROUTER_PAD = 16 (zero rows)
+    # pad: f32 [16], 0 for the E experts, -inf for the padding
+    # gq, uq: int8 [E, I, H]   gs, us: f32 [E, I]   (gate_up_proj split)
+    # dq:     int8 [E, H, I]   ds:     f32 [E, H]
+    def route(self, x):                                    # x: [1, H] f32
+        scores = _qlinear(x, self.rq, self.rs) + self.pad  # [1, 16], no slice
         vals, ids = torch.topk(scores, 2, dim=-1)          # descending
-        w = _softmax2(vals)                                # exp / sum / recip, no linalg.softmax
+        e = torch.exp(vals - vals[:, :1])                  # no linalg.softmax
+        return vals, ids, e * torch.reciprocal(e.sum(dim=-1, keepdim=True))
+
+    def _row(self, x):
+        _, ids, w = self.route(x)
         y = 0
         for k in range(2):                                 # unrolled
-            e = ids[:, k]                                  # [1] i64
-            g = _qlinear_rows(x, self.gate_q.index_select(0, e)[0],
-                              self.gate_s.index_select(0, e)[0])
-            u = _qlinear_rows(x, self.up_q.index_select(0, e)[0],
-                              self.up_s.index_select(0, e)[0])
-            h = torch.nn.functional.silu(g) * u
-            yk = _qlinear_rows(h, self.down_q.index_select(0, e)[0],
-                               self.down_s.index_select(0, e)[0])
+            i = ids[0, k:k + 1]                            # [1] i64
+            g = _qlinear(x, self.gq.index_select(0, i)[0], self.gs.index_select(0, i)[0])
+            u = _qlinear(x, self.uq.index_select(0, i)[0], self.us.index_select(0, i)[0])
+            yk = _qlinear(self.act_fn(g) * u, self.dq.index_select(0, i)[0],
+                          self.ds.index_select(0, i)[0])
             y = y + w[:, k:k + 1] * yk
         return y
+
+    def forward(self, hidden_states):                      # [.., H]: rows one at a time
+        ...
 ```
 
-- `_qlinear_rows` is `QLinear.forward` with the weight and scale passed in. The
-  graph per expert is then the same as a dense SwiGLU FFN except for the
-  weight operand, so `FormFfnRegions` and the GEMV matchers see the forms they
+- The graph per expert is the same as a dense SwiGLU FFN except for the weight
+  operand, so `FormFfnRegions` and the GEMV matchers see the forms they
   already know. `index_select` exports as a gather generic, which the compiler
-  rewrites into a dynamic slice (§5.1). Left as it is, IREE fuses the gather
-  with the `.to(int32)` into a dispatch that writes an i32 copy of the expert,
-  followed by an i32 × i32 → i64 matmul, and both run on the host (§11.1).
-- The router's expert axis stays padded to a multiple of D, and `-inf` scores
-  mark the padding. Slicing the scores to E < D puts the dequantization on the
-  host ("innermost size not a multiple of D"), and the slice between the
-  projection and the sort also hides the router from Top-2 recognition
-  (§11.1). With finite real scores, Top-2 never picks a padded lane.
+  rewrites into a dynamic slice (§5.1, S2). Left as it is, IREE fuses the
+  gather with the `.to(int32)` into a dispatch that writes an i32 copy of the
+  expert, followed by an i32 × i32 → i64 matmul, and both run on the host
+  (§11.1, §12.3).
+- The router's expert axis stays padded to 16, and `-inf` scores mark the
+  padding. Slicing the scores to E < D puts the dequantization on the host
+  ("innermost size not a multiple of D"), and the slice between the projection
+  and the sort also hides the router from Top-2 recognition (§11.1). With
+  finite real scores, Top-2 never picks a padded lane. With the padding, the
+  existing recognition finds the Top-2 and it compiles for the SA (§12.3).
 - `torch.softmax` exports as `linalg.softmax`, which the SA backend does not
-  lower (§11.1). `_softmax2` writes it out as max, exp, sum and recip, as
-  `hf_generic`'s attention already does.
+  lower (§11.1). `route` writes it out as exp, sum and recip. The first value
+  is the larger one, so no max is needed. Its `[2]`-sized reduction and
+  elementwise op compile for the SA (§12.3).
 - The activation is quantized once. Router and both experts compute
   `_quant_act(x)` on the same `x`, and IREE CSE merges them.
-- **Semantics.** Mixtral renormalizes the Top-2 probabilities, which equals a
-  softmax over the two selected logits. Ties go to the lower expert ID. The
-  host reference uses a stable descending sort, because `torch.topk` does not
-  specify the order of ties.
-- Prefill: for `T > 1` rows, `forward` runs row by row (the `_attention_rows`
-  idea), each row with its own Top-2.
-- The router is W8A8, like M4f (8/8 routing agreement with fp32 in M4b).
-  §10 R5 has the fp32 option.
+- **Semantics.** Mixtral's router softmaxes all E logits, takes the Top-2 and
+  renormalizes. That equals a softmax over the two selected logits, which is
+  what `route` computes. Ties follow `torch.topk`'s order on the host; the
+  device takes the lower expert ID. Exact ties are not expected on real
+  scores.
+- Prefill: for `T > 1` rows, `forward` runs row by row, each row with its own
+  Top-2. The rows-by-row result equals one row at a time exactly (§12.1).
+- Only Top-2 of at most 16 experts, without shared experts. Anything else
+  raises `NotImplementedError` rather than being approximated.
+- The router is W8A8. On tiny-mixtral, an fp32 router on the same hidden
+  states picks the same ids as the W8A8 router at every step (§12.2), so
+  router quantization is not where routing differs from HF.
 
 Calibration and quality evaluation reuse the existing `hf_generic` and
 `quality_eval.py` flows. The packed `sa-moe-parameters-v1` format remains only
-for the M0–M5 tests.
+for the M0–M5 tests. The dense path's export is unchanged: a random 2-layer
+Llama exports to byte-identical MLIR and parameters before and after the
+`_qlinear` refactor.
 
 ## 5. Preprocessing passes
 
@@ -349,7 +368,7 @@ only token and ID agreement are reported, not quality).
 | Stage | Work | Gate |
 |---|---|---|
 | S0 spike | **Done 2026-10-25 (§11).** Hand-written MLIR of one expert linear, four placements, two sizes | IR results recorded; R1 resolved |
-| S1 frontend | `QMixtralMoe` in `hf_generic` (padded router, `_softmax2`), synthetic fixture, tiny-mixtral export | Host reference agrees with HF top tokens and IDs; no `linalg.softmax`, no sliced scores |
+| S1 frontend | **Done 2026-10-25 (§12).** `QMixtralMoe` in `hf_generic` (padded router, explicit softmax), `test_hf_moe.py` | Host model: top tokens equal to HF; ids equal where HF's routing is clear; no softmax op, Top-2 over `[1, 16]` |
 | S2 packing | Gather-to-slice rewrite, `PackLinearWeights` expert tables | Lit; table packed at compile time (in the parameter archive) |
 | S3 regions | `FormMoeRegions` rewrite | Lit, including 2 layers per function |
 | S4 backend | `ddrOf` dynamic index, LDPARAM sequence, kernels accept dynamic weights | `dispatch_check` on the synthetic model, all IDs |
@@ -393,11 +412,13 @@ smaller step.
 - **R4: plan A call latency.** Each `rv_only` dispatch is an ARM → PicoRV32
   call per layer. M5 measured Top-2 + route at 8.4K cycles. The ARM-side call
   overhead is measured at S7.
-- **R5: router precision.** W8A8 routing flips on real checkpoints would show
-  up as ID disagreement in S6 on a trained model. The option is an fp32
-  router: E rows times H as VE multiply + reduce-sum over fp32 weights (E·H/D
-  = 512 VE words for tiny-mixtral), a new generic form, still bit-exact with
-  funcsim.
+- **R5: router precision.** On tiny-mixtral the W8A8 router picks the same
+  ids as an fp32 router on the same hidden states (§12.2). The ids that differ
+  from HF are near ties (HF's 2nd vs 3rd logit 0.002–0.008 apart) moved by the
+  hidden states' W8A8 error upstream, which an fp32 router would not change.
+  This is to recheck on a trained checkpoint, whose routing margins are
+  larger. The fp32 router stays an option: E rows times H as VE multiply +
+  reduce-sum over fp32 weights.
 - **R6: tie semantics against HF.** HF's `torch.topk` does not specify tie
   order. Exact ties are rare in real scores; the reference defines
   lower-ID-first.
@@ -503,3 +524,73 @@ region is formed before the folding.
 
 The expert base therefore takes the second dynamic slot of the looped LDs and
 the first of the tail's (§6.2).
+
+## 12. S1 results (2026-10-25)
+
+`compiler/tests/test_hf_moe.py` (synthetic by default; `--model DIR` for a
+checkpoint; `--export DIR` keeps the synthetic export).
+
+### 12.1 Synthetic block and export
+
+The synthetic model is a random 2-layer Mixtral: E = 4, H = 64, I = 128, its
+router weights drawn with σ = 0.5 so the routing is spread.
+
+- **Block**, 64 random rows: Top-2 ids equal to HF's on all 62 clearly routed
+  rows (2nd vs 3rd logit more than 5% apart). The output's relative L2
+  against HF fp32 is 0.020 on average and 0.059 at most (W8A8). Four rows
+  computed together are exactly equal to the rows computed one at a time.
+- **Export** (`hf_generic.export`, decode + 16-token prefill + prefill_kv):
+  no softmax op, and 66 `torch.aten.topk` (2 layers × (1 + 16 + 16) rows),
+  each over `!torch.vtensor<[1,16],f32>`.
+
+### 12.2 tiny-mixtral (host, 3 decode steps of tokens 1, 42, 43)
+
+The W8A8 model is `SaDecoder`: int8 KV cache calibrated on the three tokens,
+sa attention, `QLinear`, `QMixtralMoe`.
+
+| Pos | Top token (HF) | Logit rel L2 vs HF | Layer 0 experts | Layer 1 experts (HF) | HF layer-1 gap, 2nd vs 3rd |
+|---:|---:|---:|---|---|---:|
+| 0 | 25591 (25591) | 0.298 | [7, 1] = HF | [6, 4] ([6, 2]) | 0.0023 |
+| 1 | 13899 (13899) | 0.035 | [7, 1] = HF | [2, 5] = HF | 0.0173 |
+| 2 | 26962 (26962) | 0.323 | [7, 0] = HF | [2, 6] ([2, 0]) | 0.0075 |
+
+- Top tokens all equal to HF's, and all layer-0 ids equal (HF gaps
+  0.06–0.18).
+- The layer-1 ids that differ are near ties. The W8A8 router agrees with an
+  fp32 router on the same hidden states at all six steps (max logit
+  difference 0.0085–0.020), so the flips come from the W8A8 hidden states
+  upstream.
+- The two steps with a flipped expert have the large logit errors (0.30,
+  0.32). The step without one has 0.035, the size M4d measured for its
+  hybrid. The model is random-initialized: this is a functional check, not a
+  quality one.
+- M4's board run took the same layer-1 ids [2, 5] and [2, 6] at positions 1
+  and 2. Its HF reference was the W8A8-expert hybrid trace (M4c/M4d), not
+  pure fp32 HF.
+
+**Test pitfall.** hf_generic's rewrites (RoPE, RMSNorm, attention
+registration) patch transformers functions shared by every model in the
+process. A reference HF model must therefore run before them; the test's
+first version ran it after and reported wrong HF ids and tokens.
+
+### 12.3 What the synthetic export compiles to today
+
+`compile_sa.sh` with D = 16, 4 GEMV ports, `--iree-sa-form-moe` and
+`--iree-sa-riscv`:
+
+- **On the SA**:
+  - the Top-2 (`topk_1x16xf32`, the `rv_only` export);
+  - the softmax's `reduction_2_f32` and `elementwise_2_f32`;
+  - the activation and hidden-state quantization.
+- **On the host, MoE-specific**:
+  - the expert gathers (`elementwise_broadcast_8192_i64xi32`: gather + i32
+    cast);
+  - the expert projections (`matmul_1x64x128_i32xi32xi64`,
+    `matmul_1x128x64_i32xi32xi64`).
+
+  Both are S2's work.
+- **On the host, not MoE-related**: at this tiny size (H = 64) the attention
+  projections (`matvec_like_4x16x64_i8xi8xi32` and its prefill forms, error
+  `bufferization.to_buffer`) also fall back. A random dense Llama of the same
+  size shows the same fallbacks with the same flags, so S2's compiled fixture
+  needs larger dimensions (or this is fixed separately).
