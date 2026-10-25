@@ -9,9 +9,9 @@
 #s = affine_map<(d0) -> ()>
 // CHECK-LABEL: func.func @top8
 // CHECK:       %[[T0:.+]] = linalg.generic {{.*}} ins(%{{.+}}, %{{.+}} : tensor<16xf32>, tensor<f32>)
-// CHECK:       %[[B0:.+]] = util.optimization_barrier %[[T0]]
+// CHECK:       %[[B0:.+]] = util.optimization_barrier {sa.moe.isolate} %[[T0]]
 // CHECK:       %[[T1:.+]] = linalg.generic {{.*}} ins(%{{.+}}, %{{.+}} : tensor<16xf32>, tensor<f32>)
-// CHECK:       %[[B1:.+]] = util.optimization_barrier %[[T1]]
+// CHECK:       %[[B1:.+]] = util.optimization_barrier {sa.moe.isolate} %[[T1]]
 // CHECK:       linalg.generic {{.*}} ins(%[[B0]], %[[B1]] :
 func.func @top8(%x: tensor<32xi8>, %table: tensor<4x32x16xi8>, %ids: tensor<2xi32>, %w0: tensor<f32>,
                 %w1: tensor<f32>, %scores: tensor<1x4xf32>) -> (tensor<16xf32>, tensor<1x8xf32>) {
@@ -113,4 +113,21 @@ func.func @top2(%x: tensor<32xi8>, %table: tensor<4x32x16xi8>, %ids: tensor<2xi3
     linalg.yield %v : i32
   } -> tensor<16xi32>
   return %y, %r : tensor<16xi32>, tensor<1x2xf32>
+}
+
+// -----
+
+// DropMoeIsolation: once the dispatch regions are formed, the marked barriers go (the others stay).
+// RUN: iree-opt --split-input-file --iree-sa-drop-moe-isolation %s | FileCheck %s --check-prefix=DROP
+// CHECK-LABEL: func.func @drop
+// DROP-LABEL: func.func @drop
+// DROP:       %[[S:.+]] = arith.addf %arg0, %arg1
+// DROP-NOT:   util.optimization_barrier {sa.moe.isolate}
+// DROP:       %[[K:.+]] = util.optimization_barrier %[[S]]
+// DROP:       return %[[S]], %[[K]]
+func.func @drop(%a: tensor<4xf32>, %b: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %s = arith.addf %a, %b : tensor<4xf32>
+  %i = util.optimization_barrier {sa.moe.isolate} %s : tensor<4xf32>
+  %k = util.optimization_barrier %s : tensor<4xf32>
+  return %i, %k : tensor<4xf32>, tensor<4xf32>
 }

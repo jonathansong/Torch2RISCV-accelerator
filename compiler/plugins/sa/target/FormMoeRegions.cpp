@@ -16,7 +16,9 @@
 // end of its epilogue, before the sum) keeps the epilogue with its contraction
 // (FormDispatchRegions fuses it there as a consumer) and leaves the sum one
 // f32 vector per expert (docs/moe_native_lowering_design.md §23). Top-2 keeps
-// the dispatches of before.
+// the dispatches of before. The barriers carry sa.moe.isolate, and
+// iree-sa-drop-moe-isolation removes them once the dispatch regions are
+// formed: left to Stream, each split the command buffer (§24).
 #include "SAPasses.h"
 
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
@@ -383,6 +385,7 @@ struct IsolateMoeExpertsPass : public PassWrapper<IsolateMoeExpertsPass, Operati
         OpBuilder b(v.getContext());
         b.setInsertionPointAfterValue(v);
         auto barrier = IREE::Util::OptimizationBarrierOp::create(b, v.getLoc(), ValueRange{v});
+        barrier->setAttr("sa.moe.isolate", b.getUnitAttr());
         v.replaceAllUsesExcept(barrier.getResult(0), barrier);
         ++n;
       }
@@ -400,5 +403,28 @@ std::unique_ptr<Pass> createFormMoeRegionsPass(bool enabled) { return std::make_
 void registerFormMoeRegionsPass() { PassRegistration<FormMoeRegionsPass>(); }
 std::unique_ptr<Pass> createIsolateMoeExpertsPass() { return std::make_unique<IsolateMoeExpertsPass>(); }
 void registerIsolateMoeExpertsPass() { PassRegistration<IsolateMoeExpertsPass>(); }
+
+namespace {
+struct DropMoeIsolationPass : public PassWrapper<DropMoeIsolationPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DropMoeIsolationPass)
+  StringRef getArgument() const override { return "iree-sa-drop-moe-isolation"; }
+  StringRef getDescription() const override {
+    return "Removes iree-sa-isolate-moe-experts' barriers once the dispatch regions are formed";
+  }
+  void runOnOperation() override {
+    SmallVector<IREE::Util::OptimizationBarrierOp> barriers;
+    getOperation()->walk([&](IREE::Util::OptimizationBarrierOp op) {
+      if (op->hasAttr("sa.moe.isolate")) barriers.push_back(op);
+    });
+    for (auto op : barriers) {
+      op->replaceAllUsesWith(op->getOperands());
+      op->erase();
+    }
+  }
+};
+} // namespace
+
+std::unique_ptr<Pass> createDropMoeIsolationPass() { return std::make_unique<DropMoeIsolationPass>(); }
+void registerDropMoeIsolationPass() { PassRegistration<DropMoeIsolationPass>(); }
 
 } // namespace mlir::iree_compiler::sa

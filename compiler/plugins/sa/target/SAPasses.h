@@ -33,6 +33,9 @@ void registerFormMoeRegionsPass();
 // (FormMoeRegions.cpp, docs/moe_native_lowering_design.md §23).
 std::unique_ptr<Pass> createIsolateMoeExpertsPass();
 void registerIsolateMoeExpertsPass();
+// Its barriers removed after dispatch region formation (FormMoeRegions.cpp).
+std::unique_ptr<Pass> createDropMoeIsolationPass();
+void registerDropMoeIsolationPass();
 
 // Dispatch creation, after the regions are formed: decode's attention (q path,
 // scores, probabilities, p . V, int8 output) merged into one flow.dispatch.region

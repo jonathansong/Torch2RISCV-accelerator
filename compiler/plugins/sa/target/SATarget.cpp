@@ -392,6 +392,7 @@ struct SASession final
     sa::registerFormFfnRegionsPass();
     sa::registerFormMoeRegionsPass();
     sa::registerIsolateMoeExpertsPass();
+    sa::registerDropMoeIsolationPass();
     sa::registerFormAttnRegionsPass();
     sa::registerLowerWorkgroupCountPass();
     sa::registerSahwPasses();
@@ -417,6 +418,7 @@ struct SASession final
   // After IREE forms the dispatch regions (IREE patch 0004): the pieces keep the
   // forms of today's dispatches.
   void extendDispatchRegionFormationPassPipeline(OpPassManager &passManager) override {
+    if (options.formMoe) passManager.addPass(sa::createDropMoeIsolationPass());
     if (options.fuseAttn) passManager.addPass(sa::createFormAttnRegionsPass(options.codegenReport, options.maxDynamic,
                                                                             options.fuseAttnChunk));
   }
