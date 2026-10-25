@@ -65,6 +65,9 @@ CASES = [
     ("attn_qwen3", "build/fuse/qwen3_l2_attn/sa_sources", []),             # QK-norm, halves in alternating banks
     ("attn_llama", "build/fuse/llama_l2_attn/sa_sources", []),             # G = 4, head_dim 64
     ("attn_qwen3_t2048", "build/fuse/q3lc_attn/sa_sources", ["--iree-sa-max-dynamic=2048"]),   # the tiled form
+    # native MoE (docs/moe_native_lowering_design.md): tiny-mixtral, 2 layers, decode + prefill rows; expert
+    # slices at device-computed offsets (S4), the Top-2 RISC-V only (S5)
+    ("moe_mixtral", "build/moe/native/tm/sa_sources", ["--iree-sa-max-dynamic=64"]),
 ]
 
 

@@ -29,6 +29,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "llvm/ADT/MapVector.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 
@@ -192,7 +193,7 @@ private:
     int64_t stride = 0;        // bytes per id
     int64_t maxId = 0;         // the table's rows - 1
   };
-  llvm::DenseMap<Value, ExpertBase> expertBases;
+  llvm::MapVector<Value, ExpertBase> expertBases;   // (in creation order: the prologue's is deterministic)
   std::map<std::tuple<const void *, int64_t, int64_t, int64_t, const void *>, Value> expertTagged;
   // the id's DDR (base, byte offset) if |index| is index_cast(memref.load) of one
   std::optional<std::pair<Value, int64_t>> expertId(Value index);

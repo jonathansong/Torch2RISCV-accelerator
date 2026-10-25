@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12), S2 packing (§13), S3 regions (§14), S4 backend (§15) and S5 Top-2 (§16) done; S6 next.
+> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12), S2 packing (§13), S3 regions (§14), S4 backend (§15), S5 Top-2 (§16) and S6 sim end to end (§17) done; S7 (board) next.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -387,7 +387,7 @@ only token and ID agreement are reported, not quality).
 | S3 regions | **Done 2026-10-25 (§14).** One FFN region per expert (already `FormFfnRegions`'), ids read as i32 | Lit; no id-extension dispatches; golden identical |
 | S4 backend | **Done 2026-10-25 (§15).** Tagged expert BASEs, the P prologue, the dynamic slots | Every tiny-mixtral dispatch on the SA; `dispatch_check` bit-exact except the Top-2 (S5) |
 | S5 Top-2 | **Done 2026-10-25 (§16).** Top-2 through the RISC-V runtime's load / store, host build on the sim, runtime `rv_only` policy, compiler embeds only `rv_only` code | `dispatch_check` 198/198 incl. the Top-2; sim decode runs |
-| S6 e2e sim | tiny-mixtral through `compile_sa.sh` | Gates 1–4 of §7; golden re-recorded |
+| S6 e2e sim | **Done 2026-10-25 (§17).** tiny-mixtral through `compile_sa.sh`, `test_moe_sim.py` | Prefill ≡ decode and plan A ≡ descriptors byte-equal; host model argmax 28/28; golden + 198 MoE dispatches |
 | S7 board | Bundle, board run | Gates 5–6 |
 | S8 cleanup | Delete §6.3 and the M5 milestone scripts; update `moe_implementation_plan.md` and CLAUDE.md | Lit + golden |
 
@@ -844,3 +844,45 @@ but not in a host process, so M5's Top-2 was only ever tested on the board.
 
 S6 compares the sim's logits with the host model and checks prefill against
 decode. S7 adds the board.
+
+## 17. S6 results (2026-10-25)
+
+**Bundle.** `build/moe/native/tm` holds the bundle, and S7 uses it:
+`test_hf_moe.py --model build/llm_cache/TitanML-tiny-mixtral --export`, then
+`compile_sa.sh` with D = 16, 4 ports and `--iree-sa-form-moe
+--iree-sa-emit-riscv=<bundle>/rv_ll`, then `rv_image.py` into `<bundle>/rv`.
+
+- 198 dispatches, all on the SA, none on the host.
+- `sa_packed.irpa` 214 MB.
+- The KV scales are calibrated on tokens 1, 42, 43. The checkpoint is
+  random-initialized, so this is a functional check, not a quality one.
+
+**`compiler/tests/test_moe_sim.py`** (on the sim, a 24-token prompt and 4
+generated tokens):
+
+| Run | Dispatches | Result |
+|---|---|---|
+| A: decode of the prompt, descriptor lists, the Top-2 as RISC-V code (`SA_RV_ONLY=rv_only`) | 84 lists, 56 RISC-V (Top-2), 0 host | the reference for B and C |
+| B: the prompt through `--prefill 16` (two chunks, the rows' MoE one row at a time) | 82 lists, 72 RISC-V (64 prefill rows + 8 decode), 0 host | last prompt position and 4 steps **byte-equal** to A |
+| C: plan A, every export as generated RISC-V code (host build) | 1568 RISC-V, 0 lists | 28 steps **byte-equal** to A |
+| ref: the host W8A8 model (`SaDecoder`, `QMixtralMoe`), teacher-forced on A's tokens | — | argmax equal in 28 / 28, correlation min 0.99957, mean 0.99982 |
+
+The expert ids cannot be read from the device run. They are covered
+indirectly: the per-dispatch check verifies the Top-2 and the expert slices
+for given ids, and a flipped expert changes a step's logits by far more than
+this correlation (§12.2: rel L2 ≈ 0.3 against ≈ 0.03 at the same step).
+
+**Golden.**
+
+- New case `moe_mixtral` (`build/moe/native/tm/sa_sources`): 198 dispatches,
+  all compiling.
+- The corpus is now 834 unique dispatches. The 610 recorded before are
+  byte-identical, and the 26 that already failed to compile (host fallbacks
+  of the older cases) are unchanged.
+- **Nondeterminism found and fixed.** The first comparison after recording
+  differed in 2 MoE dispatches. `applyExpertBases` iterated a `DenseMap`
+  keyed by `Value`, so the prologue's order (P computations, PARAMs)
+  followed pointer hashes. It is now a `MapVector`, in creation order.
+  Recording plus two comparisons pass.
+- The bundle was recompiled with the fix (sources unchanged). The S6 test
+  and `dispatch_check --dirty --ids 7,0 --rv` pass on it (198 / 198).
