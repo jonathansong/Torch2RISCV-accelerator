@@ -194,9 +194,16 @@ def check_model(model_dir, tokens, max_len=64, layers=None, hf_reported=False):
           f"HF's gap > {MARGIN}; W8A8 router = fp32 router on the same hidden states where its gap > {MARGIN}")
 
 
-def export_model(model_dir, tokens, out, max_len=64, prefill=16, layers=None):
+def export_model(model_dir, tokens, out, max_len=64, prefill=16, layers=None, kv_channel="", kv_calib=None):
     """prefill 0: decode only (a large MoE's prefill rows, one at a time with each row's k experts,
-    make a traced graph past 10 GB at Granite's 24 layers; M6 groups them)."""
+    make a traced graph past 10 GB at Granite's 24 layers; M6 groups them). kv_calib (FILE:TOKENS) /
+    kv_channel: the KV scales as the dense models' bundles (hf_generic.load: text from FILE, per
+    channel K), not on the token ids (a bundle for quality, docs/moe_native_lowering_design.md §25)."""
+    if kv_calib or kv_channel:
+        w = hg.load(model_dir, max_len, quant=True, rope=True, attn=True, layers=layers, kv_channel=kv_channel,
+                    kv_calib=hg.kv_calib_arg(kv_calib))
+        hg.export(w, out, prefill=prefill)
+        return
     m = hg.hf_model(model_dir, layers)
     hg.export(sa_decoder(m, max_len, tokens), out, prefill=prefill)
 
@@ -207,6 +214,9 @@ def main():
     ap.add_argument("--tokens", default="1,42,43", help="token ids for --model")
     ap.add_argument("--layers", type=int, help="--model: only its first N layers")
     ap.add_argument("--prefill", type=int, default=16, help="--export: the prefill chunk's rows (0: decode only)")
+    ap.add_argument("--max-len", type=int, default=64, help="--export: the KV cache's length")
+    ap.add_argument("--kv-channel", default="", help="--export: k / v / kv per cache channel (hf_generic.calibrate_kv)")
+    ap.add_argument("--kv-calib", help="--export: FILE[:TOKENS] text for the KV scales (default: the --tokens ids)")
     ap.add_argument("--export-only", action="store_true", help="--model --export: no check (a large model: "
                     "the check in a process of its own, the fp32 models of both do not fit in 10 GB)")
     ap.add_argument("--hf-reported", action="store_true", help="--model: report the top tokens and expert ids "
@@ -220,7 +230,8 @@ def main():
             check_model(args.model, tokens, layers=args.layers, hf_reported=args.hf_reported)
             gc.collect()           # (the check's fp32 models before the export's)
         if args.export:
-            export_model(args.model, tokens, args.export, prefill=args.prefill, layers=args.layers)
+            export_model(args.model, tokens, args.export, max_len=args.max_len, prefill=args.prefill, layers=args.layers,
+                         kv_channel=args.kv_channel, kv_calib=args.kv_calib)
         return
     check_block()
     if args.export:

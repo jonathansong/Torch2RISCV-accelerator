@@ -31,14 +31,16 @@ print(math.ceil(p / 2**20) + 32)" "${peak:-}" "$D/sa_packed.irpa")
 echo "the functional simulator (decode only) $mb" > "$D/board.txt"
 # --prefill only for an export with prefill (test_hf_moe --prefill 0: decode only)
 grep -q "@prefill" "$B/qllama.mlir" && pf=" --prefill=$SA_D" || pf=
-echo "--abi=hfv --pad=$SA_D --valid_len=64$pf" > "$D/sa_args.txt"
+# the KV cache's length (the export's --iree-sa-max-dynamic; hf_generic's default 256)
+vl=$(grep -o -- '--iree-sa-max-dynamic=[0-9]*' "$B/compile_flags.txt" 2>/dev/null | cut -d= -f2)
+echo "--abi=hfv --pad=$SA_D --valid_len=${vl:-256}$pf" > "$D/sa_args.txt"
 {
   echo "commit $(git -C "$SA_REPO" rev-parse HEAD)$(git -C "$SA_REPO" diff --quiet HEAD -- compiler firmware || echo ' (dirty)')"
   echo "built $(date -Iseconds), SA_D=$SA_D SA_GEMV_PORTS=$SA_GEMV_PORTS, from ${B#$SA_REPO/}"
 } > "$D/build_info.txt"
 make -C "$SA_REPO/firmware/rt" >/dev/null
 stage_runtime "$D"
-cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/runtime/test/board_launcher.py" "$SA_REPO/driver/pynq_matmul.py" \
+cp "$SA_COMPILER/tests/board_llm.py" "$SA_COMPILER/tests/board_teacher.py" "$SA_COMPILER/tests/board_profile.py" "$SA_COMPILER/runtime/test/board_launcher.py" "$SA_REPO/driver/pynq_matmul.py" \
    "$SA_REPO/firmware/rt/rt_fw.bin" "$D/"
 stage_overlay "$D"
 ls -la "$D"

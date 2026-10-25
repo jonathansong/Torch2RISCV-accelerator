@@ -20,6 +20,7 @@ compiler/sim/sa_sim_server.py):
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -31,6 +32,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 RUN = os.path.join(REPO, "build", "iree", "build-sa-host", "runtime", "plugins", "hal", "drivers", "sa", "sa-llm-run")
+
+
+def cache_len(bundle):
+    """The export's KV cache length (compile_flags.txt's --iree-sa-max-dynamic; hf_generic's default 256
+    otherwise), sa-llm-run's --valid_len."""
+    try:
+        m = re.search(r"--iree-sa-max-dynamic=(\d+)", open(os.path.join(bundle, "compile_flags.txt")).read())
+    except OSError:
+        m = None
+    return int(m.group(1)) if m else 256
 
 
 def sim_run(bundle, tokens, out, env_rv, mb, extra=(), d=16, valid_len=64):
@@ -75,20 +86,21 @@ def main():
     args = ap.parse_args()
     prompt = [int(t) for t in args.prompt.split(",")]
     rv = os.path.join(args.bundle, "rv")
+    valid_len = cache_len(args.bundle)
     out = os.path.join(args.bundle, "s6")
     os.makedirs(out, exist_ok=True)
     P, G = len(prompt), args.generate
 
     print("sim runs:")
     a = sim_run(args.bundle, prompt, f"{out}/A_decode.f32", {"SA_RV": rv, "SA_RV_ONLY": "rv_only"}, args.mb,
-                [f"--generate={G}"])
+                [f"--generate={G}"], valid_len=valid_len)
     V = a.size // (P + G)
     a = a.reshape(P + G, V)
     b = None if not args.prefill else \
         sim_run(args.bundle, prompt, f"{out}/B_prefill.f32", {"SA_RV": rv, "SA_RV_ONLY": "rv_only"}, args.mb,
-                [f"--generate={G}", f"--prefill={args.prefill}"]).reshape(-1, V)
+                [f"--generate={G}", f"--prefill={args.prefill}"], valid_len=valid_len).reshape(-1, V)
     c = sim_run(args.bundle, prompt, f"{out}/C_planA.f32", {"SA_RV": rv}, args.mb,
-                [f"--generate={G}"]).reshape(-1, V)
+                [f"--generate={G}"], valid_len=valid_len).reshape(-1, V)
     toks = prompt + [int(x) for x in a[P - 1:P + G - 1].argmax(1)]
     np.save(f"{out}/prompt.npy", np.array(prompt, np.int64))          # (board_llm.py's reference)
     np.save(f"{out}/expected_tokens.npy", np.array(toks, np.int64))
