@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend.
+> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend. Decode estimated at about 100–110 ms per step on the board (§22).
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -1121,3 +1121,71 @@ attention and SFU. The worst layer (5) still shares 96.2% of its experts.
 step (each expert 1 MB gate + up and 0.5 MB down), so the per-dispatch fixed
 cost weighs more than on tiny-mixtral (§20's v2 conclusion to recheck); and
 on the board, a u-dma-buf pool larger than today's 1280 MiB.
+
+## 22. Granite decode estimated from a proxy (2026-10-25)
+
+The backend cannot compile Granite yet (§21), but the cost of each dispatch
+depends on its shapes, not on k or E. `compiler/scripts/moe_granite_proxy.sh`
+builds a proxy with Granite's shapes in a form v1 compiles: a random-weight
+Mixtral, 2 layers, H = 1024, I = 512, 16 heads of 64 (8 KV heads), vocabulary
+49152 (tied), 16 experts, Top-2. It exports, compiles (`--iree-sa-form-moe`,
+D = 16, 4 ports), builds the RISC-V image and traces 2 prefill chunks and 2
+decode steps on the sim (`build/perfmodel/moe_gp.trace`). The command-level
+model (`perf_model.py`, the 4-port calibration `qwen3g_cal.json`) gives
+each dispatch's cycles. The proxy compiles to 54 decode dispatches per step,
+all on the SA (the Top-2 as `rv_only` code, not in the trace).
+
+**One proxy layer, decode, modeled cycles** (T ≈ 34):
+
+| Part | Cycles | GEMV bound (64 B / cycle) |
+|---|---:|---:|
+| norms (2) | 7.7K | |
+| q, k, v, o projections | 55.6K | 49.2K |
+| RoPE, cache writes | 1.9K | |
+| attention core | 28.1K | |
+| router (16 × 1024, EX path) | 4.3K | |
+| softmax of the Top-2 | 0.8K | |
+| expert FFN, one call (gate + up, gating, amax, int8) | 21.2K | 16.4K (77%) |
+| expert down, first expert | 9.3K | 8.2K (88%) |
+| expert down, second expert + combine | 13.1K | 8.2K (62%) |
+
+**Extrapolated to Granite** (24 layers, Top-8 of 32; the router twice the
+proxy's rows; the down of every expert after the first priced with the
+combine, 13.1K):
+
+| Part | Cycles per step | Share |
+|---|---:|---:|
+| experts' FFN (24 × 8 × 21.2K) | 4.07M | 41% |
+| experts' down + combine (24 × (9.3K + 7 × 13.1K)) | 2.42M | 25% |
+| attention, norms, router (24 × 102.6K) | 2.46M | 25% |
+| classifier + embedding | 0.90M | 9% |
+| **step** | **9.85M = 98.5 ms** | |
+
+If the combine is paid once per layer rather than per expert, the downs take
+1.88M and the step 93 ms. The weight-stream bound of the step's 429 MB is
+67 ms, so the device sits at 68–72% of it, against about 91% for the dense
+Llama-3.2-1B (`results_v2.3.md`).
+
+**On the board**, add the Top-k calls: the board measured 0.76 ms more than
+the model per tiny-mixtral step (§20), for 2 MoE layers, which covers the
+Top-2 on the PicoRV32, the descriptor list split around it and the host's
+submission. Scaled to 24 layers that is about 9 ms, more if the Top-8 of 32
+takes noticeably longer than the Top-2 of 8. **Estimate: about 100–110 ms per
+decode step, 9–10 tok/s**, at short context; the attention core grows with T.
+
+**Where the gap to the bound is.** The experts' time over their stream bound
+is 1.78M cycles (18 ms), from two places:
+
+- each expert FFN's tail (the gating of the last chunk, amax, int8 output:
+  4.8K per call) is not overlapped with anything. At I = 512 an expert is only
+  1 MB of gate + up, so the tail is 23% of its stream, against 10% for
+  tiny-mixtral's I = 3584 (§20);
+- the down projections' fixed costs and the combine.
+
+Joining a layer's expert dispatches into one list, or dropping the FENCEs
+(§20's measure, on the proxy's Top-2), saves 1.3K cycles per 2 layers: the
+tails are dependencies, not dispatch overhead. Recovering them takes a
+schedule that streams expert i + 1's weights during expert i's tail, i.e. one
+kernel over the k experts (§9's v2, now with a real target: up to about 18%
+of the step for Granite, against 0.1% for tiny-mixtral). Measured on the
+board, the Top-k calls are the other item to look at.
