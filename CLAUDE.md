@@ -20,9 +20,13 @@ PicoRV32 control core). Start with `README.md`, then
   file); `--wait` does not pipe stdout (redirect to a log in the script); pass
   environment with `-E NAME=value`. A unit name used before needs
   `systemctl --user reset-failed <name>`.
-- **The board**: `ubuntu@192.168.0.121` (KV260). You cannot ssh to it. Prepare
-  bundles and give the user the `scp` commands, the board command and the command
-  to copy the results back; they run them and say "result copied".
+- **The board**: `ubuntu@10.42.0.216` (KV260), reachable by ssh key
+  (`ssh -o BatchMode=yes ubuntu@10.42.0.216`): copy bundles with rsync, run the tests
+  and copy the results back yourself (into `build/deploy_*/results`). sudo asks for a
+  password the user gives; never write it into files. Tests as root need
+  `source /etc/profile.d/pynq_venv.sh` (and `xrt_setup.sh`) first, as
+  `run_board_tests.sh` does, and `/home/ubuntu` paths (`~` is `/root` under sudo).
+  Ask before reboots or changes to the boot configuration.
 - **Git**: commit after verification, never rewrite history, **push only when the
   user asks**. End commit messages with
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
