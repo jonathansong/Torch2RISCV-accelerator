@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend. Decode estimated at about 100–110 ms per step on the board (§22). The backend takes Top-k of up to 64 experts since §23: the 2-layer Granite runs end to end on the sim, bit-exact across its forms. **Granite (24 layers, Top-8 of 32) accepted on the KV260 (§24)**: decode bit-exact with the sim, 104.4 ms per step (9.58 tok/s).
+> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend. Decode estimated at about 100–110 ms per step on the board (§22). The backend takes Top-k of up to 64 experts since §23: the 2-layer Granite runs end to end on the sim, bit-exact across its forms. **Granite (24 layers, Top-8 of 32) accepted on the KV260 (§24)**: decode bit-exact with the sim, 104.4 ms per step (9.58 tok/s). **Quality on the board (§25)**: PPL 6.528 against fp32's 6.386, top-1 92.1%, KL 0.030 (2 × 2048 tokens).
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -1329,3 +1329,38 @@ loading the parameters (fixed in `9797dbf`).
 - The quality bundle: K per channel, the KV scales on 1024 WikiText-2 tokens, a
   longer cache; teacher-forced on the board.
 - Prefill: M6, grouped by expert (also the export's memory).
+
+## 25. Granite's quality on the KV260 (2026-10-25)
+
+**The bundle** (`build/moe/granite/granite24q` → `build/deploy_moe_granite24q`,
+commit `15dcf0e`): the dense models' long-context settings. `test_hf_moe.py
+--export-only --prefill 0 --max-len 2048 --kv-channel k --kv-calib
+build/llm_cache/wikitext-2-raw-v1-train.txt:2048`: K per channel, the KV scales
+on 2048 WikiText-2 train tokens (`hf_generic.load`), a 2048-token cache,
+decode only. 60 executables on the SA; `dispatch_check` 60 / 60 at T = 16,
+1024 and 2048 (the attention's tiled form); sim device peak 1330 MiB, window
+1362 MB. `board_quality.py prep --tokens 4096 --window 2048`: two windows of
+the WikiText-2 test set from token 0, fp32 PPL 6.386.
+
+**Board** (`d16_100mhz_w128_p6_gemv_np4_pcpi`, 100 MHz, rt_fw v7;
+`build/deploy_moe_granite24q/results/15dcf0e/...`, scored into
+`build/quality/granite_board_2048.json`):
+
+| Test | Result |
+|---|---|
+| `llm` (decode only, 28 steps) | logits bit-exact with the sim 28 / 28, tokens identical |
+| `teacher` (2 × 2048 tokens through decode) | **PPL 6.528** (fp32 6.386), **top-1 vs fp32 92.1%**, **KL(fp32 ‖ device) 0.030** over the top 64 (94.5% of the mass); 157.7 ms per step on average over positions 0–2047 |
+| `profile 40 --prompt 32 --batch` | 111.3 ms per step (8.98 tok/s): device 103.2 ms = 25 descriptor lists 94.1 ms + 24 Top-8 calls 9.1 ms (8.8%); the rest of the runtime 5.8 ms |
+
+**Against the dense models** (board teacher forcing, `results_v2.2.md` §3;
+SmolLM2, Qwen3, Llama at 2048, Gemma at 512): top-1 90.7%, 88.4%, 91.9%,
+76.9%; Llama's KL 0.031. Granite's W8A8 loss is among the smallest, and its
+first position's outliers (§24) do not show in the windows' totals.
+
+**Speed in context.** The descriptor lists' 94.1 ms match §22's 93–99 ms of
+modeled device time. The Top-8 calls cost 0.38 ms each, as the tiny-mixtral
+measurement predicted (§22). Decode slows with the context: 157.7 ms per step
+on average over a 2048-token window.
+
+**Next.** v2's kernel over a layer's experts (up to about 18% of the step,
+§22); the Top-8 calls (8.8%); prefill (M6).

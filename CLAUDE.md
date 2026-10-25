@@ -112,4 +112,5 @@ PicoRV32 control core). Start with `README.md`, then
   2026-10-25 a trained checkpoint, Granite-3.1-1B-A400M (Top-8 of 32): host quality (§21), decode
   estimate (§22), Top-k of up to 64 experts in the backend (§23); **accepted on the board 2026-10-25
   (§24)**: 24 layers decode-only, bit-exact with the sim, 104.4 ms per step (9.58 tok/s), pool now
-  1536 MiB. Open: the k-expert kernel (v2, up to ~18%), the quality bundle, prefill (M6).
+  1536 MiB; quality on the board (§25, K per channel, 2048 cache): PPL 6.528 vs fp32 6.386, top-1
+  92.1%, KL 0.030. Open: the k-expert kernel (v2, up to ~18%), the Top-8 calls (8.8%), prefill (M6).
