@@ -173,3 +173,44 @@ func.func @torch_sort_prefix(%x: tensor<1x32xf32>, %w: tensor<32x4xf32>) -> (ten
   %indices = tensor.extract_slice %sorted#1[0, 0] [1, 2] [1, 1] : tensor<1x4xi64> to tensor<1x2xi64>
   return %values, %indices : tensor<1x2xf32>, tensor<1x2xi64>
 }
+
+// -----
+
+// After the Torch sort prefix becomes a Top-2 (i32 ids, extended to i64 for
+// the graph), an id read as an index (the expert slice's offset) reads the i32
+// id: no i64 extension left on that path (docs/moe_native_lowering_design.md §14).
+// CHECK-LABEL: func.func @expert_id_as_index
+// CHECK:         %[[R:.+]] = flow.dispatch.region
+// CHECK:         %[[FLAT:.+]] = tensor.collapse_shape %[[R]] {{\[\[}}0, 1{{\]\]}} : tensor<1x2xi32> into tensor<2xi32>
+// CHECK:         %[[ONE:.+]] = tensor.extract_slice %[[FLAT]][1] [1] [1] : tensor<2xi32> to tensor<1xi32>
+// CHECK:         %[[ID:.+]] = tensor.extract %[[ONE]][%{{.+}}] : tensor<1xi32>
+// CHECK:         %[[I:.+]] = arith.index_cast %[[ID]] : i32 to index
+// CHECK:         tensor.extract_slice %{{.+}}[%[[I]], 0] [1, 8] [1, 1] : tensor<4x8xi8> to tensor<8xi8>
+// CHECK-NOT:     tensor.extract %{{.+}} : tensor<1xi64>
+func.func @expert_id_as_index(%x: tensor<1x32xf32>, %w: tensor<32x4xf32>, %table: tensor<4x8xi8>) -> tensor<8xi8> {
+  %c0 = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<1x4xf32>
+  %init = linalg.fill ins(%c0 : f32) outs(%empty : tensor<1x4xf32>) -> tensor<1x4xf32>
+  %scores = linalg.matmul ins(%x, %w : tensor<1x32xf32>, tensor<32x4xf32>) outs(%init : tensor<1x4xf32>) -> tensor<1x4xf32>
+  %ids_empty = tensor.empty() : tensor<1x4xi64>
+  %ids = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} outs(%ids_empty : tensor<1x4xi64>) {
+  ^bb0(%old: i64):
+    %i = linalg.index 1 : index
+    %cast = arith.index_cast %i : index to i64
+    linalg.yield %cast : i64
+  } -> tensor<1x4xi64>
+  %sorted:2 = iree_linalg_ext.sort dimension(1) outs(%scores, %ids : tensor<1x4xf32>, tensor<1x4xi64>) {
+  ^bb0(%a: f32, %b: f32, %ia: i64, %ib: i64):
+    %ge = arith.cmpf oge, %a, %b : f32
+    iree_linalg_ext.yield %ge : i1
+  } -> tensor<1x4xf32>, tensor<1x4xi64>
+  %values = tensor.extract_slice %sorted#0[0, 0] [1, 2] [1, 1] : tensor<1x4xf32> to tensor<1x2xf32>
+  %indices = tensor.extract_slice %sorted#1[0, 0] [1, 2] [1, 1] : tensor<1x4xi64> to tensor<1x2xi64>
+  %flat = tensor.collapse_shape %indices [[0, 1]] : tensor<1x2xi64> into tensor<2xi64>
+  %one = tensor.extract_slice %flat[1] [1] [1] : tensor<2xi64> to tensor<1xi64>
+  %c0i = arith.constant 0 : index
+  %id = tensor.extract %one[%c0i] : tensor<1xi64>
+  %i = arith.index_cast %id : i64 to index
+  %row = tensor.extract_slice %table[%i, 0] [1, 8] [1, 1] : tensor<4x8xi8> to tensor<8xi8>
+  return %row : tensor<8xi8>
+}

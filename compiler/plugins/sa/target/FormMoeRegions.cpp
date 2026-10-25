@@ -80,6 +80,72 @@ tensor::ExtractSliceOp top2PrefixSlice(Value sorted) {
              ? slice : tensor::ExtractSliceOp();
 }
 
+// The view chain from |ids64| = extsi(|ids32|) to |v| (extract_slice,
+// collapse_shape, expand_shape), rebuilt on the i32 ids; null if |v| is not
+// such a view.
+Value rebuildOnI32(OpBuilder &b, Value v, Value ids64, Value ids32, unsigned depth = 0) {
+  if (v == ids64) return ids32;
+  Operation *def = v.getDefiningOp();
+  if (!def || depth > 8) return {};
+  auto as32 = [&](Type t) { return cast<RankedTensorType>(t).clone(b.getI32Type()); };
+  if (auto sl = dyn_cast<tensor::ExtractSliceOp>(def)) {
+    Value src = rebuildOnI32(b, sl.getSource(), ids64, ids32, depth + 1);
+    if (!src) return {};
+    b.setInsertionPointAfter(sl);
+    return tensor::ExtractSliceOp::create(b, sl.getLoc(), as32(sl.getType()), src, sl.getMixedOffsets(),
+                                          sl.getMixedSizes(), sl.getMixedStrides());
+  }
+  if (auto cs = dyn_cast<tensor::CollapseShapeOp>(def)) {
+    Value src = rebuildOnI32(b, cs.getSrc(), ids64, ids32, depth + 1);
+    if (!src) return {};
+    b.setInsertionPointAfter(cs);
+    return tensor::CollapseShapeOp::create(b, cs.getLoc(), as32(cs.getType()), src, cs.getReassociationIndices());
+  }
+  if (auto es = dyn_cast<tensor::ExpandShapeOp>(def)) {
+    Value src = rebuildOnI32(b, es.getSrc(), ids64, ids32, depth + 1);
+    if (!src || !cast<RankedTensorType>(es.getType()).hasStaticShape()) return {};
+    b.setInsertionPointAfter(es);
+    return tensor::ExpandShapeOp::create(b, es.getLoc(), as32(es.getType()), src, es.getReassociationIndices());
+  }
+  return {};
+}
+
+// The expert ids are extended back to the sort's i64 for the graph after the
+// Top-2. An id read as an index (tensor.extract + index_cast: the expert
+// slices, docs/moe_native_lowering_design.md §5.1) reads the i32 id instead,
+// index_cast(extsi(x)) = index_cast(x): no dispatch of its own for the
+// extension. Returns the number of ids so read.
+unsigned readIdsAsI32(IRRewriter &rewriter, arith::ExtSIOp ext) {
+  Value ids64 = ext.getResult(), ids32 = ext.getIn();
+  SmallVector<tensor::ExtractOp> reads;
+  SmallVector<Value> work = {ids64};
+  for (unsigned i = 0; i < work.size() && i < 64; ++i)
+    for (Operation *u : work[i].getUsers()) {
+      if (auto ex = dyn_cast<tensor::ExtractOp>(u)) reads.push_back(ex);
+      else if (isa<tensor::ExtractSliceOp, tensor::CollapseShapeOp, tensor::ExpandShapeOp>(u))
+        work.push_back(u->getResult(0));
+    }
+  unsigned n = 0;
+  for (tensor::ExtractOp ex : reads) {
+    SmallVector<arith::IndexCastOp> casts;
+    for (Operation *u : ex->getUsers())
+      if (auto c = dyn_cast<arith::IndexCastOp>(u)) casts.push_back(c);
+    if (casts.empty()) continue;
+    OpBuilder b(ex);
+    Value src = rebuildOnI32(b, ex.getTensor(), ids64, ids32);
+    if (!src) continue;
+    b.setInsertionPoint(ex);
+    Value id = tensor::ExtractOp::create(b, ex.getLoc(), src, ex.getIndices());
+    for (arith::IndexCastOp c : casts) {
+      rewriter.setInsertionPoint(c);
+      rewriter.replaceOpWithNewOp<arith::IndexCastOp>(c, c.getType(), id);
+    }
+    if (ex->use_empty()) rewriter.eraseOp(ex);
+    ++n;
+  }
+  return n;
+}
+
 bool rewriteTorchTop2Sort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
   if (sort.getNumResults() != 2 || sort.getDimension() != 1) return false;
   auto scoresType = dyn_cast<RankedTensorType>(sort.getOutputs()[0].getType());
@@ -127,7 +193,8 @@ bool rewriteTorchTop2Sort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
   SmallVector<ReassociationIndices> reassociation{{0, 1}};
   Value values2 = topk.getResult(0);
   auto indices64Type = RankedTensorType::get({1, 2}, rewriter.getI64Type());
-  Value ids2 = arith::ExtSIOp::create(rewriter, loc, indices64Type, topk.getResult(1));
+  auto ext = arith::ExtSIOp::create(rewriter, loc, indices64Type, topk.getResult(1));
+  Value ids2 = ext;
   if (cast<RankedTensorType>(valueSlice.getType()).getRank() == 1)
     values2 = tensor::CollapseShapeOp::create(rewriter, loc, valueSlice.getType(),
                                                values2, reassociation);
@@ -137,6 +204,7 @@ bool rewriteTorchTop2Sort(IREE::LinalgExt::SortOp sort, IRRewriter &rewriter) {
   rewriter.replaceOp(valueSlice, values2);
   rewriter.replaceOp(indexSlice, ids2);
   rewriter.eraseOp(sort);
+  readIdsAsI32(rewriter, ext);
   return true;
 }
 

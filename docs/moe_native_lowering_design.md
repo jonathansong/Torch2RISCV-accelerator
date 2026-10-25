@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12) and S2 packing (§13) done, the rest not implemented.
+> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12), S2 packing (§13) and S3 regions (§14) done; S4 next.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -234,6 +234,17 @@ generic lowering already supports (v2 folds them into the expert kernel).
 | down_k | `h_q · W_down[ids[k]]` → `y_k` f32 | linear (GEMV) | dynamic weight / scale base |
 | combine | `w0 · y0 + w1 · y1` (+ residual) | generic | none |
 
+As compiled for tiny-mixtral after S3 (§14), one decode MoE layer is 8
+dispatches:
+
+1. router;
+2. Top-2;
+3. the softmax's reduction and elementwise op (2 dispatches);
+4. the FFN of expert 0, then of expert 1 (2 dispatches);
+5. down of expert 0, which stores its raw i32 accumulator;
+6. down of expert 1 with both dequantizations and the combine (IREE fuses
+   the combine into it).
+
 ## 6. Backend: dynamic expert base
 
 ### 6.1 Representation
@@ -373,7 +384,7 @@ only token and ID agreement are reported, not quality).
 | S0 spike | **Done 2026-10-25 (§11).** Hand-written MLIR of one expert linear, four placements, two sizes | IR results recorded; R1 resolved |
 | S1 frontend | **Done 2026-10-25 (§12).** `QMixtralMoe` in `hf_generic` (padded router, explicit softmax), `test_hf_moe.py` | Host model: top tokens equal to HF; ids equal where HF's routing is clear; no softmax op, Top-2 over `[1, 16]` |
 | S2 packing | **Done 2026-10-25 (§13).** Gather-to-slice rewrite, `PackLinearWeights` expert tables | Lit; tables packed at compile time into the parameter archive |
-| S3 regions | `FormMoeRegions` rewrite | Lit, including 2 layers per function |
+| S3 regions | **Done 2026-10-25 (§14).** One FFN region per expert (already `FormFfnRegions`'), ids read as i32 | Lit; no id-extension dispatches; golden identical |
 | S4 backend | `ddrOf` dynamic index, LDPARAM sequence, kernels accept dynamic weights | `dispatch_check` on the synthetic model, all IDs |
 | S5 Top-2 | Semantic record, funcsim Top-2, runtime `rv_only` policy, compiler emits only `rv_only` code | `dispatch_check` of top2; sim e2e with `SA_RV` unset |
 | S6 e2e sim | tiny-mixtral through `compile_sa.sh` | Gates 1–4 of §7; golden re-recorded |
@@ -648,10 +659,57 @@ are always inlined) and keeps every other tensor constant a binding.
 `QMixtralMoe` only, so dense models compile as before. With it, the router
 runs on the SA.
 
-**Dispatch structure (input to S3/S4).** IREE (with aggressive fusion and
-`FormFfnRegions`) puts the gate and up projections of both experts in one
-dispatch: 4 contractions over the same x, two gatings and two amaxes. The
-down projections are one dispatch per expert. §5.3 assumed one FFN dispatch
-per expert, and `FfnPlan` matches two contractions. S3 either forms one FFN
-region per expert (the v1 table) or S4 expands two FFN kernels in one
-dispatch. The latter is close to v2's merged kernel (§9).
+**Dispatch structure.** *Corrected in S3 (§14): an earlier version of
+this paragraph said that the gate and up projections of both experts share
+one dispatch. That was a misreading. The dumped source holds two variants
+(the SA one and the VMVX host fallback), each with one expert's two table
+loads.* `FormFfnRegions` already forms one FFN region per expert. The
+dispatch is one executable called once per expert, at ids `%46` and `%48`.
+
+## 14. S3 results (2026-10-25)
+
+**Regions.** Split mode (v1) needs no new region pass:
+
+- `FormFfnRegions` already forms one FFN region per expert. Each expert's
+  gate and up contractions share x, and the other expert's slice is separate.
+- IREE forms the down projections, and fuses the combine into the second
+  one.
+- The Top-2 region and its attributes stay on the region, as before.
+- Merged mode (v2, §9) will be a second region shape in `FormMoeRegions`
+  behind a flag. Its acceptance is byte-equal logits against split mode
+  (same per-expert arithmetic, another schedule).
+
+**Ids read as i32** (`FormMoeRegions.cpp`, `readIdsAsI32`):
+
+- `rewriteTorchTop2Sort` replaces the sort with a Top-2 that returns i32 ids
+  and extends them to i64 for the rest of the graph.
+- IREE turned each expert's id into its own one-element extension dispatch,
+  on the host ("i64 scalar computation", "load not 8-byte aligned").
+- Now every `tensor.extract` of the ids that feeds an `index_cast` reads the
+  i32 ids through the same view chain, rebuilt on i32. This holds because
+  `index_cast(extsi(x)) = index_cast(x)`.
+- Lit: `sa_form_moe_regions.mlir` `@expert_id_as_index`.
+
+**tiny-mixtral** (same flags as §13): 192 dispatches on the SA, 6 on the host,
+all with `memref.load` of the id (S4):
+
+- the FFN of each expert;
+- the down projections (3 executables);
+- the prefill scale copy.
+
+The two id extensions are gone. The two FFN dispatches are now separate
+executables, because they read the id at different static offsets of the
+ids buffer (`ids[0]`, `ids[1]`). That costs one more descriptor template per
+FFN shape.
+
+**Prefill scale copy.** In the row-by-row prefill, IREE materializes one
+expert's down-projection scales as a 4 KiB copy (`slow_memcpy`, dynamic
+offset) instead of cloning the slice into its consumer, as it does in
+decode. S4's lowering takes it to the SA as a dynamic LD + ST. M6's grouped
+prefill replaces this path, so it is not worth fighting IREE's fusion here.
+
+Lit 28/28; golden identical (636 dispatches).
+
+**Not done in S3:** removing the M5 full-graph match (`mixtralExpertShape`,
+the function attributes) and `LowerMoeChain`. The new frontend never
+matches it, and it is deleted with the rest of M5's chain in S8.
