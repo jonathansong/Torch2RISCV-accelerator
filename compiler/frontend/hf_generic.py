@@ -593,29 +593,37 @@ def _qlinear(x, wq, s_w):
     return (acc.to(torch.float32) * s_w) * s_x
 
 
-ROUTER_PAD = 16          # the router's expert axis padded to this (a multiple of the array size D)
+ROUTER_PAD = 16          # the router's expert axis padded to a multiple of this (of the array size D)
+# Top-k routers whose weights are the softmax of the k selected logits (Mixtral's
+# renormalized Top-k probabilities equal it): the semantics QMixtralMoe computes
+MOE_ROUTERS = ("MixtralTopKRouter", "GraniteMoeTopKRouter")
 
 
 class QMixtralMoe(torch.nn.Module):
-    """A Mixtral sparse MoE block, W8A8 (docs/moe_native_lowering_design.md §4):
-    a router QLinear padded to ROUTER_PAD rows (-inf scores on the padding), the
-    Top-2 of its logits, their softmax (= Mixtral's renormalized Top-2
-    probabilities), and the two selected SwiGLU experts, each one row of int8
-    tables [E, out, in] selected by its id (index_select: on the device a
-    dynamic slice of the packed table). Rows (prefill) one at a time, each with
-    its own Top-2. Ties: torch.topk's order (the device takes the lower id)."""
+    """A Mixtral-style sparse MoE block, W8A8 (docs/moe_native_lowering_design.md §4):
+    a router QLinear padded to a multiple of ROUTER_PAD rows (-inf scores on the
+    padding), the Top-k of its logits, their softmax (Mixtral's renormalized
+    Top-k probabilities; Granite MoE's router), and the k selected SwiGLU
+    experts, each one row of int8 tables [E, out, in] selected by its id
+    (index_select: on the device a dynamic slice of the packed table). Rows
+    (prefill) one at a time, each with its own Top-k. Ties: torch.topk's order
+    (the device takes the lower id). The fp32 router (router_fp32, not a
+    parameter) is kept for the routing analysis (quality_eval.py --moe-routing)."""
     def __init__(self, block):
         super().__init__()
-        router, ex = block.gate, block.experts
+        router = getattr(block, "gate", None) if hasattr(getattr(block, "gate", None), "weight") else block.router
+        ex = block.experts
         E, H = router.weight.shape
-        if getattr(router, "top_k", 2) != 2 or E < 2 or E > ROUTER_PAD:
-            raise NotImplementedError(f"{type(block).__name__}: Top-{router.top_k} of {E} experts "
-                                      f"(supported: Top-2 of at most {ROUTER_PAD})")
+        k = getattr(router, "top_k", 0)
+        if type(router).__name__ not in MOE_ROUTERS or not 1 <= k < E:
+            raise NotImplementedError(f"{type(block).__name__}: router {type(router).__name__}, Top-{k} of {E} "
+                                      f"(supported: the softmax over the Top-k logits of {', '.join(MOE_ROUTERS)})")
         I = ex.intermediate_dim
-        rw = torch.zeros(ROUTER_PAD, H)
+        Ep = -(-E // ROUTER_PAD) * ROUTER_PAD
+        rw = torch.zeros(Ep, H)
         rw[:E] = router.weight.detach().float()
         rq, rs = _quantize_rows(rw)
-        pad = torch.zeros(ROUTER_PAD)
+        pad = torch.zeros(Ep)
         pad[E:] = float("-inf")
         gu = ex.gate_up_proj.detach().float()                          # [E, 2 I, H]: gate rows, then up rows
 
@@ -627,19 +635,20 @@ class QMixtralMoe(torch.nn.Module):
         (gq, gs), (uq, us), (dq, ds) = table(gu[:, :I]), table(gu[:, I:]), table(ex.down_proj.detach().float())
         self.gq, self.gs, self.uq, self.us, self.dq, self.ds = p(gq), p(gs), p(uq), p(us), p(dq), p(ds)
         self.act_fn = ex.act_fn
-        self.E = E
+        self.E, self.k = E, k
+        self.router_fp32 = router.weight.detach().float().clone()     # (an attribute: not exported)
 
     def route(self, x):
-        """x [1, H] -> (Top-2 logits [1, 2], ids [1, 2], weights [1, 2])"""
+        """x [1, H] -> (Top-k logits [1, k], ids [1, k], weights [1, k])"""
         scores = _qlinear(x, self.rq, self.rs) + self.pad
-        vals, ids = torch.topk(scores, 2, dim=-1)
+        vals, ids = torch.topk(scores, self.k, dim=-1)
         e = torch.exp(vals - vals[:, :1])                              # (vals[:, 0] the larger one)
         return vals, ids, e * torch.reciprocal(e.sum(dim=-1, keepdim=True))
 
     def _row(self, x):
         _, ids, w = self.route(x)
         y = 0
-        for k in range(2):
+        for k in range(self.k):
             i = ids[0, k:k + 1]
             g = _qlinear(x, self.gq.index_select(0, i)[0], self.gs.index_select(0, i)[0])
             u = _qlinear(x, self.uq.index_select(0, i)[0], self.us.index_select(0, i)[0])
@@ -655,17 +664,21 @@ class QMixtralMoe(torch.nn.Module):
 
 
 def moe_rewrite(model):
-    """Mixtral-style sparse MoE blocks (a Top-k router `gate` with a weight
-    [E, H], `experts` with 3-D gate_up_proj / down_proj) -> QMixtralMoe."""
+    """Mixtral-style sparse MoE blocks (Mixtral's *SparseMoeBlock, Granite MoE's
+    GraniteMoeMoE: a Top-k router `gate` / `router` with a weight [E, H],
+    `experts` with 3-D gate_up_proj / down_proj, no shared expert) -> QMixtralMoe."""
     n = 0
     for mod in list(model.modules()):
         for cname, child in list(mod.named_children()):
-            if not type(child).__name__.endswith("SparseMoeBlock"):
+            name = type(child).__name__
+            if not (name.endswith("SparseMoeBlock") or name == "GraniteMoeMoE"):
                 continue
             ex = getattr(child, "experts", None)
-            if not (hasattr(getattr(child, "gate", None), "weight") and hasattr(ex, "gate_up_proj")
-                    and hasattr(ex, "down_proj")) or getattr(child, "shared_expert", None) is not None:
-                raise NotImplementedError(f"{type(child).__name__}: not a Mixtral-style MoE block")
+            router = getattr(child, "gate", None) if hasattr(getattr(child, "gate", None), "weight") \
+                else getattr(child, "router", None)
+            if not (hasattr(router, "weight") and hasattr(ex, "gate_up_proj") and hasattr(ex, "down_proj")) \
+                    or getattr(child, "shared_expert", None) is not None:
+                raise NotImplementedError(f"{name}: not a Mixtral-style MoE block")
             setattr(mod, cname, QMixtralMoe(child))
             n += 1
     return n

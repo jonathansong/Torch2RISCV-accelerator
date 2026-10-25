@@ -25,6 +25,10 @@ Variants (names on the command line, --variants):
 
     python3 compiler/tests/quality_eval.py --model build/llm_cache/SmolLM2-135M \\
         --ct build/llm_cache/SmolLM2-135M-W8A8 [--tokens 1024 --window 256] [--out results.json]
+--moe-routing (an MoE model, hf_generic.QMixtralMoe): per variant, the experts it
+selects against the fp32 model's at every layer and position (the share of the k
+experts in common, and how often the sets are equal), and the router alone: its
+W8A8 Top-k against an fp32 router on the same (the variant's own) hidden state.
 """
 import argparse
 import contextlib
@@ -73,15 +77,51 @@ def logits_steps(dec, ids):
     return torch.stack([dec(torch.tensor([[t]]), torch.tensor([[p]]))[0, -1] for p, t in enumerate(ids)]).float()
 
 
+ROUTES = None                       # --moe-routing: {"ids": {layer: [k ids per position]}, "own": ...}
+
+
+def instrument(model):
+    """--moe-routing: record each MoE layer's selected experts (an fp32 model's
+    routers by a hook; a quantized one's QMixtralMoe.route, with an fp32 router's
+    Top-k on the same input), layers in model order, positions in call order."""
+    if ROUTES is None:
+        return
+    layer = 0
+    for mod in model.modules():
+        if isinstance(mod, H.QMixtralMoe):
+            def route(x, route=mod.route, mod=mod, l=layer):
+                r = route(x)
+                ROUTES["ids"].setdefault(l, []).append(r[1][0].numpy().copy())
+                own = torch.topk((x @ mod.router_fp32.t())[0], mod.k).indices
+                ROUTES["own"].setdefault(l, []).append(own.numpy().copy())
+                return r
+            mod.route = route
+            layer += 1
+        elif type(mod).__name__ in H.MOE_ROUTERS:
+            def hook(m, i, o, l=layer):
+                idx = next(t for t in o if t.dtype == torch.int64)
+                ROUTES["ids"].setdefault(l, []).extend(r.copy() for r in idx.numpy())
+            mod.register_forward_hook(hook)
+            layer += 1
+
+
+def overlap(a, b):
+    """[N, k] id sets: (mean share in common, share of equal sets)"""
+    common = np.array([len(set(x) & set(y)) for x, y in zip(a, b)])
+    return common.mean() / a.shape[1], float(np.mean(common == a.shape[1]))
+
+
 def build(name, args):
     """(callable ids -> logits [L, V], context manager) of a variant."""
     import test_hf_generic as TH
     if name == "fp32":
         m = H.hf_model(args.model)
+        instrument(m)
         return lambda ids: logits_full(m, ids), contextlib.nullcontext
     if name in ("w8a8", "ct-w8a8"):
         m = H.hf_model(args.model if name == "w8a8" else args.ct)
         H.quantize(m)
+        instrument(m)
         return lambda ids: logits_full(m, ids), contextlib.nullcontext
     base, _, opts = name.partition(":")
     if base in ("sa", "ct-sa"):
@@ -103,6 +143,7 @@ def build(name, args):
                              kv_scales=kv[0] if kv else None, kv_channel=kv_channel,
                              kv_calib=H.kv_calib_arg(args.kv_calib))
                 kv[:] = [dec.kv_scales]
+                instrument(dec.model)
                 out = logits_steps(dec, ids)
                 del dec
                 return out
@@ -125,9 +166,14 @@ def main():
     ap.add_argument("--ref-cache", help="the fp32 reference's logits (.npy): loaded if present, else saved, so that "
                     "each variant can run in a process of its own (Llama-1B: fp32 and an sa form do not fit in 10 GB together)")
     ap.add_argument("--kv-calib", help="FILE[:TOKENS] text for the sa variants' KV scales (default: export_hf.CALIB)")
+    ap.add_argument("--moe-routing", action="store_true", help="also the MoE layers' expert selection against fp32's")
     ap.add_argument("--ranges", help="also per range of positions within the window, e.g. 0,256,512,1024,2048 "
                     "(the long-context loss by position, iree_compiler_plan.md §8.22)")
     args = ap.parse_args()
+    global ROUTES
+    if args.moe_routing:
+        ROUTES = {"ids": {}, "own": {}}
+        args.ref_cache = None            # (the fp32 run gives the reference routing too)
     edges = [int(x) for x in args.ranges.split(",")] if args.ranges else []
     torch.set_grad_enabled(False)
     names = (args.variants or "fp32,w8a8,sa" + (",ct-w8a8,ct-sa" if args.ct else "")).split(",")
@@ -140,6 +186,7 @@ def main():
     # process, so the fp32 / w8a8 forms run before any sa one
     order = sorted(names, key=lambda n: "sa" in n.partition(":")[0].split("-"))
     ref, res = None, {}
+    ref_routes = []                      # --moe-routing: per window {layer: [L, k]} of fp32
     if args.ref_cache and os.path.exists(args.ref_cache):
         a = np.load(args.ref_cache, mmap_mode="r")
         assert a.shape[:2] == (len(wins), args.window), (a.shape, len(wins), args.window)
@@ -152,8 +199,15 @@ def main():
         pos = {"nll": np.zeros(args.window), "agree": np.zeros(args.window), "kl": np.zeros(args.window)}
         refs = [] if ref is None else ref
         with ctx():
+            routes = []                  # per window (layer -> [L, k] ids, [L, k] fp32-router ids)
             for w, win in enumerate(wins):
+                if ROUTES is not None:
+                    ROUTES["ids"].clear()
+                    ROUTES["own"].clear()
                 lg = f(win)
+                if ROUTES is not None:
+                    routes.append(({l: np.stack(v) for l, v in ROUTES["ids"].items()},
+                                   {l: np.stack(v) for l, v in ROUTES["own"].items()}))
                 tgt = torch.tensor(win[1:] + [0])
                 r = None if ref is None else ref[w]
                 for c in range(0, len(win), 256):        # (row blocks: a 2048-token window's [L, V] fp32 is 1.2 GB)
@@ -187,6 +241,28 @@ def main():
         gc.collect()
         P = len(wins) * (args.window - 1)
         res[name] = {"ppl": math.exp(nll / P), "seconds": round(time.time() - t0, 1)}
+        if ROUTES is not None and name == "fp32":
+            ref_routes = [r[0] for r in routes]
+        elif ROUTES is not None and routes and routes[0][0]:
+            layers = sorted(ref_routes[0])
+            per_layer = []
+            for l in layers:
+                a = np.concatenate([r[0][l] for r in routes])
+                b = np.concatenate([rr[l] for rr in ref_routes])
+                o = np.concatenate([r[1][l] for r in routes]) if routes[0][1] else None
+                per_layer.append((overlap(a, b), overlap(a, o) if o is not None else (float("nan"),) * 2))
+            share = float(np.mean([p[0][0] for p in per_layer]))
+            exact = float(np.mean([p[0][1] for p in per_layer]))
+            own = float(np.mean([p[1][0] for p in per_layer]))
+            own_exact = float(np.mean([p[1][1] for p in per_layer]))
+            worst = int(np.argmin([p[0][0] for p in per_layer]))
+            res[name]["routing"] = {"share_vs_fp32": share, "same_set_vs_fp32": exact,
+                                    "router_share_vs_fp32_router": own, "router_same_set": own_exact,
+                                    "per_layer_share": [p[0][0] for p in per_layer]}
+            print(f"    routing vs fp32: {100 * share:.1f}% of the experts in common, the same set at "
+                  f"{100 * exact:.1f}% of positions (worst layer {layers[worst]}: {100 * per_layer[worst][0][0]:.1f}%); "
+                  f"the W8A8 router vs an fp32 router on the same input: {100 * own:.1f}% ({100 * own_exact:.1f}% same set)",
+                  flush=True)
         if n:
             res[name].update(top1=agree / n, corr=corr / n, kl=kl / n)
         if edges:                        # (positions [a, b) of every window; the PPL over the targets of [a, b))

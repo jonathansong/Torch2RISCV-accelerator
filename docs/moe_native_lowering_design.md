@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). Open: a trained checkpoint.
+> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). A trained checkpoint, Granite-3.1-1B-A400M (32 experts, Top-8), evaluated on the host (§21): W8A8 quality in line with the dense models; its compilation needs Top-k > 2 and E > 16 in the backend.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -434,7 +434,8 @@ smaller step.
   from HF are near ties (HF's 2nd vs 3rd logit 0.002–0.008 apart) moved by the
   hidden states' W8A8 error upstream, which an fp32 router would not change.
   This is to recheck on a trained checkpoint, whose routing margins are
-  larger. The fp32 router stays an option: E rows times H as VE multiply +
+  larger. Rechecked on Granite (§21): the W8A8 router agrees with an fp32
+  router on 99.3% of the selected experts on the same hidden states. The fp32 router stays an option: E rows times H as VE multiply +
   reduce-sum over fp32 weights.
 - **R6: tie semantics against HF.** HF's `torch.topk` does not specify tie
   order. Exact ties are rare in real scores; the reference defines
@@ -1062,3 +1063,61 @@ of the step's ~82 MB of weights):
 
 None of these is specific to MoE. Speeding up decode further is the dense
 path's agenda (CLAUDE.md: W4A8 weights, LD / GEMV width, command issue).
+
+## 21. A trained checkpoint: Granite-3.1-1B-A400M on the host (2026-10-25)
+
+**Why Granite.** tiny-mixtral has random weights, so its numbers say nothing
+about quality. `ibm-granite/granite-3.1-1b-a400m-base` (Apache-2.0, native in
+transformers) is a trained MoE that is close to what v1 implements: 24
+layers, H = 1024, 32 experts of I = 512, Top-8, the softmax over the Top-k
+logits (Mixtral's renormalized Top-k probabilities), gate / up / down tables
+laid out as Mixtral's, no shared expert. About 1.33 GB in int8, 400M
+parameters active per token.
+
+**Frontend.** `QMixtralMoe` now takes any Top-k router of that semantics
+(`hf_generic.MOE_ROUTERS`: Mixtral's, Granite MoE's); the router's expert
+axis is padded to a multiple of `ROUTER_PAD`, and `moe_rewrite` also matches
+`GraniteMoeMoE` (its router is `router`, not `gate`). Granite's scalar
+multipliers (embedding, residual, attention, logits) stay in the HF code and
+are traced with it. The tiny-mixtral export is byte-identical to S6's
+(`qllama.mlir`, `qllama.irpa`), and `test_hf_moe.py` passes. The backend is
+unchanged: it still takes Top-2 of 4 to 16 experts (`FormMoeRegions`), so
+Granite does not compile yet.
+
+**`quality_eval.py --moe-routing`** records, per MoE layer and position, the
+experts each variant selects, against the fp32 model's; and, for a quantized
+variant, the Top-k of an fp32 router on the variant's own hidden state (the
+router's quantization alone).
+
+**Results** (WikiText-2 test, 2048 tokens, windows of 256, teacher-forced,
+against the fp32 HF model; `build/quality/granite_moe_2048.json`):
+
+| Variant | PPL | top-1 vs fp32 | KL | Experts in common with fp32 | Same set of 8 | W8A8 router vs fp32 router, same input |
+|---|---:|---:|---:|---:|---:|---:|
+| fp32 | 10.32 | | | | | |
+| w8a8 | 10.99 | 91.8% | 0.062 | 97.7% | 81.7% | 99.3% (94.4% same set) |
+| sa:kch (the board's form) | 10.90 | 90.3% | 0.069 | 97.4% | 79.5% | 99.3% (94.4% same set) |
+
+`sa:kch` is W8A8 plus the int8 KV cache with K per channel (scales from 1024
+WikiText-2 train tokens, as the dense bundles), RoPE tables and the device's
+attention and SFU. The worst layer (5) still shares 96.2% of its experts.
+
+**Reading.**
+
+- The quantization loss is in the dense models' range under the same
+  protocol (self-quantized W8A8, 2048 tokens): KL 0.062 against SmolLM2's
+  0.102 and Qwen3's 0.039; top-1 91.8% against 87.6% and 89.1%. MoE adds no
+  visible loss of its own.
+- Routing differs from fp32 mostly through the hidden states, not the
+  router: on the same input the W8A8 router keeps 99.3% of the experts. The
+  differences are near ties, as on tiny-mixtral (R5). An fp32 router is not
+  needed.
+- With 8 of 32 experts, a changed set usually swaps one low-weight expert
+  (97.7% of the experts in common while the whole set matches at 81.7% of
+  the positions), so a routing difference moves the output little.
+
+**What compiling it needs.** Top-k for k up to 8 and E up to 32 in
+`FormMoeRegions` and the RISC-V Top-k; 24 layers × 8 expert calls per decode
+step (each expert 1 MB gate + up and 0.5 MB down), so the per-dispatch fixed
+cost weighs more than on tiny-mixtral (§20's v2 conclusion to recheck); and
+on the board, a u-dma-buf pool larger than today's 1280 MiB.
