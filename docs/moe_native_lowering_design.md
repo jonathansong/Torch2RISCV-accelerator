@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). Open: v2 (§9), a trained checkpoint.
+> Status (2026-10-25): S0–S8 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. M5's chain removed (§19). v2 measured and not pursued (§20: at most 0.1% of a step). Open: a trained checkpoint.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -394,6 +394,9 @@ only token and ID agreement are reported, not quality).
 Estimate: S0 1 day, S1–S3 3–4 days, S4 3–4 days, S5 2 days, S6–S8 2–3 days.
 
 ## 9. v2: one dispatch for both experts (after v1 is accepted)
+
+*Measured on 2026-10-25 and not pursued: §20. The bound below assumed
+dispatch boundaries that the batched runtime does not have.*
 
 v1 has about 8 dispatches per MoE layer against 2–3 for a dense FFN. Each
 boundary costs the small fixed LD / ST latency that the fusions removed
@@ -1005,3 +1008,57 @@ case.
   and `sa_packed.irpa` are identical. The vmfb, compiled at an equal-length
   path, differs from the board-accepted one only in the source paths it
   records and the zip CRCs over them.
+
+## 20. v2 measured: not worth implementing (2026-10-25)
+
+**Method.** `compiler/tests/moe_v2_bound.py` runs the command-level
+performance model (`perf_model.py`, the 4-port overlay's calibration
+`qwen3g_cal.json`) on a sim trace of the board bundle:
+
+```
+SA_RV=build/moe/native/tm/rv SA_RV_ONLY=rv_only DEPLOY=build MODEL=deploy_moe_tm MB=320 OUT=moe_tm \
+    compiler/scripts/perf_trace.sh
+```
+
+**The model matches the board.** It predicts a decode step of 1.524M cycles
+(15.24 ms). The board measures 16.0 ms of wall time, which also includes the
+four Top-2 RISC-V calls and the host's submissions.
+
+| Dispatch (one call) | Modeled cycles | Weights | GEMV stream bound (64 B / cycle) | Efficiency |
+|---|---:|---:|---:|---:|
+| FFN of an expert (gate + up, gating, amax, int8) | 127,265 | 7.34 MB | 114,688 | 90% |
+| down of expert 0 | 58,858 | 3.67 MB | 57,344 | 97% |
+| down of expert 1 + combine | 62,645 | 3.67 MB | 57,344 | 92% |
+| classifier (for comparison) | 562,590 | 32.8 MB | 512,000 | 91% |
+
+**What merging would save.** Per decode step (2 layers × 4 MoE dispatches):
+
+| Schedule | Cycles | Saved |
+|---|---:|---:|
+| the dispatches separate | 752,068 | |
+| one list per layer | 751,754 | 314 |
+| one list per layer, without any FENCE (not legal: an upper bound) | 750,891 | 1,177 = 0.08% of the step |
+
+Keeping the intermediates on chip (h: 3.5 KB, expert 0's accumulator: 4 KB,
+one ST and one LD each) adds a few hundred cycles more.
+
+**Why §9 overestimated it:**
+
+- The batched runtime already runs a step's dispatches in a few descriptor
+  lists: 3 per decode step on the board, split at the Top-2 RISC-V calls. A
+  dispatch boundary is therefore not a list overhead; at most it is a
+  FENCE, whose drain is short next to the weight streams.
+- Each expert FFN's remaining 10% is inside its kernel: the per-chunk
+  gating on the VE and the final amax / int8 pass. A merged kernel would
+  keep that.
+
+**Where the step's other 16% goes** (against the 1.28M-cycle stream bound
+of the step's ~82 MB of weights):
+
+- the decode attention, about 41K cycles per layer;
+- the FFN tails, about 12.6K per expert;
+- the small dispatches (norms, quantization, router);
+- on the board, the Top-2 calls.
+
+None of these is specific to MoE. Speeding up decode further is the dense
+path's agenda (CLAUDE.md: W4A8 weights, LD / GEMV width, command issue).
