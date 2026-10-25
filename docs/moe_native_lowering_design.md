@@ -1,6 +1,6 @@
 # Native MoE lowering: Mixtral experts as ordinary SA dispatches
 
-> Status (2026-10-25): design; S0 spike (§11), S1 frontend (§12), S2 packing (§13), S3 regions (§14), S4 backend (§15), S5 Top-2 (§16) and S6 sim end to end (§17) done; S7 (board) next.
+> Status (2026-10-25): S0–S7 done; **accepted on the KV260** (§18): tiny-mixtral, prefill + decode, bit-exact with the sim, decode 16.0 ms per step. S8 (removing M5's chain) and v2 (§9) open.
 > It replaces M5's compiler-owned
 > HAL chain (`LowerMoeChain`, [moe_implementation_plan.md](moe_implementation_plan.md)
 > §M5s/M5t) with a lowering that keeps the rest of the model in the same module.
@@ -388,7 +388,7 @@ only token and ID agreement are reported, not quality).
 | S4 backend | **Done 2026-10-25 (§15).** Tagged expert BASEs, the P prologue, the dynamic slots | Every tiny-mixtral dispatch on the SA; `dispatch_check` bit-exact except the Top-2 (S5) |
 | S5 Top-2 | **Done 2026-10-25 (§16).** Top-2 through the RISC-V runtime's load / store, host build on the sim, runtime `rv_only` policy, compiler embeds only `rv_only` code | `dispatch_check` 198/198 incl. the Top-2; sim decode runs |
 | S6 e2e sim | **Done 2026-10-25 (§17).** tiny-mixtral through `compile_sa.sh`, `test_moe_sim.py` | Prefill ≡ decode and plan A ≡ descriptors byte-equal; host model argmax 28/28; golden + 198 MoE dispatches |
-| S7 board | **Staged 2026-10-25 (§18):** `deploy_moe.sh` → `build/deploy_moe_tm`, `run_board_tests.sh moe` | Gates 5–6 |
+| S7 board | **Accepted 2026-10-25 (§18).** `deploy_moe.sh` → `build/deploy_moe_tm`, `run_board_tests.sh moe` | Board ≡ sim 5/5 (prefill) and 28/28 (decode) steps; decode 16.0 ms per step |
 | S8 cleanup | Delete §6.3 and the M5 milestone scripts; update `moe_implementation_plan.md` and CLAUDE.md | Lit + golden |
 
 Estimate: S0 1 day, S1–S3 3–4 days, S4 3–4 days, S5 2 days, S6–S8 2–3 days.
@@ -887,7 +887,7 @@ this correlation (§12.2: rel L2 ≈ 0.3 against ≈ 0.03 at the same step).
 - The bundle was recompiled with the fix (sources unchanged). The S6 test
   and `dispatch_check --dirty --ids 7,0 --rv` pass on it (198 / 198).
 
-## 18. S7: the board bundle (staged 2026-10-25, not run yet)
+## 18. S7: the board (accepted 2026-10-25)
 
 `compiler/scripts/deploy_moe.sh [build/moe/native/tm]` stages
 `build/deploy_moe_tm`, containing:
@@ -915,3 +915,38 @@ Both compare the logits bit for bit with the sim. `board_run.py` gives
 decode-only a results directory of its own (`llm_decode`) and keeps
 `logits_board.f32`. `board_llm.py` prints the ids when the checkpoint has no
 tokenizer.
+
+**Board results** (commit `b065671`, `d16_100mhz_w128_p6_gemv_np4_pcpi`, 100 MHz,
+rt_fw v7; `build/deploy_moe_tm/results/b065671/moe_tm/.../llm` and `.../llm_decode`):
+
+| Test | Logits vs sim | Tokens | Speed | Dispatches |
+|---|---|---|---|---|
+| `llm`: prefill 16 (2 chunks) + 4 decode steps | bit-exact 5 / 5 steps | identical | prefill 24 tokens 310.3 ms (77.4 tok/s, the first chunk includes loading); decode 16.1 ms per step (62.2 tok/s) | 82 lists, 72 RISC-V (Top-2), 0 host |
+| `llm --decode-only`: 28 steps | bit-exact 28 / 28 | identical | 16.0 ms per step (62.5 tok/s) | 84 lists, 56 RISC-V, 0 host |
+
+What this confirms on the hardware, beyond the sim:
+
+- the Top-2 running as the executable's embedded rv32 code through RT_CALL,
+  without `SA_RV`, between descriptor lists;
+- the expert offset computed on the device (LDPARAM, and the VE product
+  through the output's first word);
+- two add slots on one DDR field in `sa_cmdfetch.v` (looped GEMV LDs):
+  §15 had only read the RTL for this.
+
+**Speed in context.** Each decode step reads about 82 MB of weights:
+
+- two layers × two experts × 11.0 MB of expert weights;
+- the dense projections, about 2.6 MB per layer;
+- the router;
+- the 32.8 MB classifier.
+
+At the measured GEMV stream of 57.95 B/cycle (5.8 GB/s) that is about
+14.1 ms, so the 16.0 ms wall time per step is about 88% of the weight-stream
+bound. M4f's full-device run had no meaningful wall time: it reloaded each
+layer's 88 MB expert slot from a file at every step (§1 problem 5, the
+`board_moe_full_device.py` CMA path). This bundle keeps every expert table
+resident in the u-dma-buf window (260 MB).
+
+The checkpoint is random-initialized: these are functional and speed
+results, not quality ones. Quality needs a trained MoE checkpoint that fits
+the board (§10 R5).
