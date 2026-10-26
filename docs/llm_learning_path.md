@@ -14,7 +14,10 @@ pairs outside reading with the files in this repo that put the idea into
 practice, a lab that uses the real scripts, and questions to check yourself.
 Its companion, the [compiler learning path](compiler_learning_path.md),
 follows the same models through IREE and the `sa` backend; this one stays on
-the model, its numerics and the system that runs it.
+the model, its numerics and the system that runs it. The
+[MoE learning path](moe_learning_path.md) covers the mixture-of-experts
+models (tiny-mixtral, Granite-3.1-1B-A400M, release `v2.4-kv260`), from the
+routing semantics and the W8A8 block to the compiler and the board.
 
 The project history is a curriculum here too:
 - **L0–L5b** ([`llm_inference_plan.md`](llm_inference_plan.md)): llama2.c's

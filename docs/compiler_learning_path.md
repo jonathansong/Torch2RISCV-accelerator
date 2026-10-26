@@ -17,7 +17,10 @@ covers how they are compiled. Two walkthroughs follow single dispatches
 through every pass and are the best companions to stages 5–7:
 [`dispatch_walkthrough.md`](dispatch_walkthrough.md) (decode attention
 scores) and [`gemv_walkthrough.md`](gemv_walkthrough.md) (a decode linear
-layer on the streaming GEMV unit).
+layer on the streaming GEMV unit). The [MoE learning path](moe_learning_path.md)
+builds on stages 0–7 for the mixture-of-experts lowering (release
+`v2.4-kv260`: expert tables selected by a device-computed DDR base, the
+Top-k as embedded RISC-V code).
 
 The compiler's history, in [`iree_compiler_plan.md`](iree_compiler_plan.md):
 - **C0** export of a quantized llama with iree-turbine; **C1** the `sa` HAL
