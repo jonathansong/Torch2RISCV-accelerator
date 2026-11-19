@@ -78,42 +78,15 @@ PicoRV32 control core). Start with `README.md`, then
   `compiler/scripts/run_board_tests.sh` there when it changed); rerunning a bundle
   name that passed before needs `sudo REDO=1 bash run_board_tests.sh ...`.
 
-## Where the work stands (2026-10-25)
+## Where the work stands
 
-- Release `v2.2.1-kv260` (`docs/results_v2.2.md`): four models (SmolLM2-135M,
-  Gemma-3-270M, Qwen3-0.6B, Llama-3.2-1B) on the board, bit-exact.
-- Release `v2.3-kv260` (`docs/results_v2.3.md`, branch `kv260-v2.3`): the same with
-  the three fusions on by default; bundles `build/deploy_hfgen_*c_pcpi`.
-- Release `v2.4-kv260` (`docs/results_v2.4.md`, branch `kv260-v2.4`, 2026-10-25): Granite-3.1-1B-A400M
-  (MoE) on the board, decode-only, bit-exact, 8.98 tok/s, PPL 6.528 vs fp32 6.386; dense models as v2.3
-  (checked with the v2.4 runtime); pool 1536 MiB. Bundles `build/deploy_moe_granite24{,q}`.
-- Since then, cross-operator fusion (`docs/fusion_design.md`): SwiGLU (§4) and
-  decode attention (§6, kernel `attn_layer`, region pass
-  `FormAttnRegions.cpp` after IREE's region formation via patch 0004), both on by
-  default and accepted on the board (§4.9, §6.4.8).
-- Prefill chunk kernel (§6.7, 2026-10-19/20): `--iree-sa-fuse-attn-chunk`, kernel
-  `attn_chunk`, IREE patch 0005; accepted on the board on all four models (bundles
-  `*c`, §6.7.1): prefill −9% to −25% (40 tokens), −20% to −45% (2032 tokens),
-  decode unchanged. On by default since 2026-10-20 (`SA_FUSE_ATTN_CHUNK=0` off).
-- Fusion closed (2026-10-20, fusion_design.md §7): the chains left (residual +
-  RMSNorm + projection, prefill SwiGLU, the k / v path, q_proj / o_proj) are each
-  worth a few percent at most and deferred; decode is bound by the GEMV's weight
-  streaming. Next levers: W4A8 (weights), the hardware side (LD / GEMV width,
-  command issue), the results for the talk (2026-11-15).
-- Lifetime-based local memory planning (3a / 3b): designed, deferred
-  (`docs/local_memory_planning.md`).
-- MoE (2026-10-21..25): `docs/moe_implementation_plan.md` M0–M5 (Mixtral layers on the
-  board; M5's compiler-owned HAL chain removed 2026-10-25, the M0–M4 code too, at the tag `moe-m0-m4-final`); then the native
-  lowering, `docs/moe_native_lowering_design.md` S0–S7: `hf_generic.QMixtralMoe` (W8A8),
-  expert tables packed at compile time and selected by a dynamic slice whose DDR offset the
-  device computes (`PackLinearWeights`, `SahlToSahw` `applyExpertBases`), the Top-2 as
-  embedded RISC-V code (`rv_only`; runtime runs it whatever `SA_RV` says, the sim through
-  `SA_RV=<dir with rvcode_host.so>` `SA_RV_ONLY=rv_only`). tiny-mixtral (random weights)
-  accepted on the board 2026-10-25 (`deploy_moe.sh`, `run_board_tests.sh moe`): bit-exact
-  with the sim, decode 16.0 ms per step. Checks: `test_hf_moe.py`, `test_moe_sim.py`,
-  `dispatch_check.py --ids .. --rv <bundle>/rv`, golden cases `moe_mixtral`, `moe_granite`. Since
-  2026-10-25 a trained checkpoint, Granite-3.1-1B-A400M (Top-8 of 32): host quality (§21), decode
-  estimate (§22), Top-k of up to 64 experts in the backend (§23); **accepted on the board 2026-10-25
-  (§24)**: 24 layers decode-only, bit-exact with the sim, 104.4 ms per step (9.58 tok/s), pool now
-  1536 MiB; quality on the board (§25, K per channel, 2048 cache): PPL 6.528 vs fp32 6.386, top-1
-  92.1%, KL 0.030. Open: the k-expert kernel (v2, up to ~18%), the Top-8 calls (8.8%), prefill (M6).
+- Releases (frozen records): `v2.2.1-kv260` (`docs/results_v2.2.md`), `v2.3-kv260`
+  (`docs/results_v2.3.md`, fusions on), `v2.4-kv260` (`docs/results_v2.4.md`, Granite MoE);
+  branches `kv260-v2.x`. Board bundles of record: `build/deploy_hfgen_*c_pcpi`,
+  `build/deploy_moe_granite24{,q}`; the board's u-dma-buf pool is 1536 MiB.
+- Design records: `docs/fusion_design.md` (fusion, closed), `docs/moe_native_lowering_design.md`
+  (MoE), `docs/local_memory_planning.md` (deferred), `docs/fp16_gemv_design.md` (FP16 GEMV, next).
+- MoE on the sim needs `SA_RV=<dir with rvcode_host.so> SA_RV_ONLY=rv_only` (the Top-k is
+  embedded RISC-V code, run whatever `SA_RV` says on the board).
+- Next: `docs/future_work.md` (W4A8, MoE k-expert kernel and prefill, FP16 GEMV, CI;
+  gains, effort and the proposed order).
