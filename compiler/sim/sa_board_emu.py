@@ -10,6 +10,10 @@ start of the window (completion records at +0x2000) and writes RING_BASE /
 RING_SIZE / CPL_BASE; like rt_fw (firmware/rt/rt_fw.c) it then sets FW_STATE =
 RT_READY, polls RING_TAIL, runs each RUN_LIST entry (BASE0..3 from the entry,
 optional parameter block) and writes the completion record and RING_HEAD.
+--dump DIR writes, per served entry n, ring_<n>.entry.bin (the 64-byte entry),
+ring_<n>.list.bin (its descriptor list), ring_<n>.params.bin (the parameter
+block, if any) and ring_<n>.trace.npy (the commands the simulator executed,
+dynamic fields applied: SaFuncSim.trace rows), for docs/e2e_walkthrough.md.
 
     python3 compiler/sim/sa_board_emu.py --d 8 --file /dev/shm/sa_devmem -- <program> <args>
 runs the program with SA_TRANSPORT=board, SA_BOARD_DEVMEM and SA_BOARD_* set,
@@ -42,7 +46,7 @@ MBOX_PHYS = BRAM_ARM_BASE + MBOX
 CPL_OFFSET = 0x2000
 
 
-def serve(sim, dev, win, base, ring_entries, stop, log):
+def serve(sim, dev, win, base, ring_entries, stop, log, dump=None):
     """win: the device window (physical address base at index 0)."""
     mb = dev[MBOX_PHYS:MBOX_PHYS + 0x100].view("<u4")
     head = 0
@@ -59,12 +63,27 @@ def serve(sim, dev, win, base, ring_entries, stop, log):
             bases = [int(e[3 + i]) & 0xFFFFFFFF for i in range(4)]
             pb = int(e[7]) & 0xFFFFFFFF
             params = [int(v) for v in win[pb - base:pb - base + 32].view("<u4")] if pb else None
+            if dump:
+                la, n = int(e[1]) & 0xFFFFFFFF, int(e[2]) & 0xFFFFFFFF
+                stem = os.path.join(dump, f"ring_{head}")
+                win[64 * slot:64 * slot + 64].tofile(stem + ".entry.bin")
+                if n == 0:                       # (count 0: the list runs to its END descriptor)
+                    while win[la - base + 64 * n] != 0x12:
+                        n += 1
+                    n += 1
+                win[la - base:la - base + 64 * n].tofile(stem + ".list.bin")
+                if pb:
+                    win[pb - base:pb - base + 32].tofile(stem + ".params.bin")
+                sim.trace = []
             try:
                 exe = sim.run_list(int(e[1]) & 0xFFFFFFFF, int(e[2]) & 0xFFFFFFFF, bases, params)
                 end = sim.dl_status
             except SaError as err:
                 status = xstatus(err)
                 exe = err.index + 1 if err.index is not None else sim.dl_exec
+            if dump:
+                np.save(stem + ".trace.npy", np.asarray(sim.trace, np.uint64).reshape(-1, 10))
+                sim.trace = None
         c[1:8] = [status, 0, exe, end, 0, 0, 0]
         c[0] = seq
         head += 1
@@ -84,6 +103,7 @@ def main():
                     help="the mailbox's physical address (KV260: 0xA0011F00)")
     ap.add_argument("--mem-file", help="serve the window from this file (offset 0) and pass it as "
                     "SA_BOARD_MEM_DEV, as the KV260's u-dma-buf device")
+    ap.add_argument("--dump", help="write every ring entry, its list, parameter block and executed commands here")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args()
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
@@ -107,7 +127,9 @@ def main():
     mb[MBOX_CPL_BASE // 4] = args.base + CPL_OFFSET
     mb[MBOX_FW_STATE // 4] = RT_READY
     stop, log = threading.Event(), []
-    t = threading.Thread(target=serve, args=(sim, dev, win, args.base, args.ring, stop, log), daemon=True)
+    if args.dump:
+        os.makedirs(args.dump, exist_ok=True)
+    t = threading.Thread(target=serve, args=(sim, dev, win, args.base, args.ring, stop, log, args.dump), daemon=True)
     t.start()
     env = dict(os.environ, SA_TRANSPORT="board", SA_BOARD_DEVMEM=args.file,
                SA_BOARD_MEM=f"{args.base:#x}:{size:#x}", SA_BOARD_MBOX=f"{MBOX_PHYS:#x}",
