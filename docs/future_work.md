@@ -89,8 +89,8 @@ Each expert's weights then stream once per chunk instead of once per row. Plan i
 |---|---|---|
 | **CI** | every compiler change is checked by hand today | 2–3 days |
 | **Executable generalization upstream** (iree-org/iree #25059, design issue #25124) | removes patch 0003 from the local stack | depends on review |
-| Patch 0005 upstream (`insert_slice` → store fold) | a miscompile in IREE, fixed only locally | days |
-| Rebase onto a current IREE | pinned at `e4a3b0405d` (3.11.0) plus five patches; the cost grows with time | 1 week or more |
+| Patch 0004 upstream (plugin hook after region formation) | removes patch 0004; a second out-of-tree plugin needs the same kind of hook (see **Upstream** below) | depends on review |
+| Rebase onto a current IREE | pinned at `e4a3b0405d` (3.11.0) plus five patches; the cost grows with time; drops patch 0005 (fixed upstream in #24266, #24276) | 1 week or more |
 | Lifetime-based local memory planning (3a / 3b) | prefill and long context; designed in [`local_memory_planning.md`](local_memory_planning.md) | 2–3 weeks |
 
 **CI.**
@@ -116,6 +116,51 @@ meeting (2026-11-25); the level it belongs at (Flow before dedup, Stream, or reg
 formation) is the open question in #25124. Patch 0004, the plugin hook after
 dispatch region formation, is the other candidate once there is interest.
 
+Other out-of-tree IREE plugins need the same kind of hook, which makes the case
+for an upstream proposal stronger:
+- [google-coral/coralnpu-compiler](https://github.com/google-coral/coralnpu-compiler)
+  carries `iree-0010-pluginapi-add-pipeline-extension-hooks.patch`. It adds
+  `extendDispatchCreationPassPipeline` (at the end of dispatch creation) and
+  `extendStreamPassPipeline` (at the end of the Stream pipeline). Their plugin
+  uses the first to set a host or NPU affinity on each `flow.dispatch.workgroups`.
+- Their hook comes too late for us: our region passes must run on
+  `flow.dispatch.region` ops, before `ConvertDispatchRegionsToWorkgroups`.
+- [synaptics-torq/torq-compiler](https://github.com/synaptics-torq/torq-compiler)
+  avoids the problem by running `FormDispatchRegionsPass` itself, in its input
+  conversion pipeline.
+
+So one upstream design, a set of named extension points in the dispatch creation
+pipeline (after region formation, at the end) and at the end of Stream, would
+cover both plugins' patches. The proposal would cite both, after asking their
+maintainers whether they want to join it.
+
+**Rebase.** Torq documents the process it follows for each IREE release (3.12,
+3.13.1: IREE plus 12 patches), in
+[`doc/dev-manual/iree_upgrade.md`](https://github.com/synaptics-torq/torq-compiler/blob/main/doc/dev-manual/iree_upgrade.md).
+We adopt it:
+1. **A fresh base, not a rebase.** Check out the new IREE release tag and
+   cherry-pick `0001`–`0005` onto it one by one; do not rebase the old tree.
+2. **Check upstream before carrying a patch.** Search for the upstream PR and
+   read `git log` of the touched file. Drop what is already in the base: 0005 is
+   (#24266, #24276); 0001 / 0002 if #25037 / #25038 are in the release.
+3. **Resolve conflicts so the behaviour stays the same.** A check: diff each
+   resulting file against the old patched one.
+4. **One commit per API change** in the plugin, the first of them moving the pin,
+   so that every commit builds.
+5. **Test step by step:**
+   - lit;
+   - the golden corpus (expect deliberate diffs only where upstream changed the
+     codegen, and verify those cases);
+   - `dispatch_check`;
+   - end to end on the sim, byte for byte against the old build;
+   - the board.
+6. **Upstream the fixes found during testing.** Fixes go into new patches, each
+   proposed upstream when it makes sense, since every patch carried has to be
+   re-applied at the next rebase.
+
+Rebasing once per IREE release keeps each step small; the cost of the current
+pin grows with every month.
+
 ## 4. Measurements and releases
 
 | Item | Why |
@@ -137,7 +182,7 @@ dispatch region formation, is the other candidate once there is interest.
 6. **Release v2.5** once 3 and 4 are on the board.
 
 Running alongside, as the opportunities come:
-- the IREE rebase and the upstreaming of 0003 / 0005;
+- the IREE rebase and the upstreaming of 0003 / 0004;
 - new model families as generality tests;
 - the ARM and power measurements.
 
@@ -150,7 +195,7 @@ Running alongside, as the opportunities come:
 - **W4A8 quality.** Per-group scales may be needed for acceptable quality, and they
   cost hardware (a rescale per group). The host check comes first for that reason.
 - **IREE drift.** Each month on the pinned revision makes the rebase larger; the
-  patches that are not upstream (0003–0005) are the risk.
+  patches that are not upstream (0003, 0004) are the risk.
 - **Bit-exactness under new numerics.** FP32 accumulation (FP16) and group rescales
   (W4A8) make the order of operations part of the semantics; each design fixes it
   explicitly so the simulator stays bit-exact (see `fp16_gemv_design.md` §4).
